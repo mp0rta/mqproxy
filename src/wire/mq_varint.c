@@ -13,6 +13,9 @@ int mq_varint_len(uint64_t v)
 
 int mq_varint_encode(uint8_t *buf, size_t cap, uint64_t v)
 {
+    if (v > 0x3FFFFFFFFFFFFFFFULL)
+        return -1;
+
     int n = mq_varint_len(v);
     if ((size_t)n > cap)
         return -1;
