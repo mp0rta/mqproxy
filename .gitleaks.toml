@@ -1,0 +1,22 @@
+[extend]
+useDefault = true
+
+# Detect hardcoded 32-byte base64 secrets (e.g. PSK / symmetric keys):
+# 43 base64 chars + '=' padding, inside a quoted string literal.
+[[rules]]
+id = "mqproxy-psk"
+description = "Hardcoded 32-byte base64 secret in a string literal"
+regex = '''["']([A-Za-z0-9+/]{43}=)["']'''
+keywords = []
+
+[allowlist]
+description = "mqproxy allowlist"
+
+paths = [
+  '''^third_party/''',
+  '''^tests/certs/''',
+  '''^docs/superpowers/''',
+  '''^codeql-db/''',
+  '''^build/''',
+  '''^build-.*/''',
+]
