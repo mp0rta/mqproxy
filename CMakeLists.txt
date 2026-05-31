@@ -6,7 +6,8 @@ include(cmake/BuildSetup.cmake)
 
 add_library(mqproxy STATIC
     src/util/mq_log.c
-    src/wire/mq_varint.c)
+    src/wire/mq_varint.c
+    src/wire/mq_wire.c)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 enable_testing()
@@ -18,3 +19,8 @@ add_executable(test_varint tests/test_varint.c)
 target_link_libraries(test_varint mqproxy)
 target_include_directories(test_varint PRIVATE tests)
 add_test(NAME test_varint COMMAND test_varint)
+
+add_executable(test_wire tests/test_wire.c)
+target_link_libraries(test_wire mqproxy)
+target_include_directories(test_wire PRIVATE tests)
+add_test(NAME test_wire COMMAND test_wire)
