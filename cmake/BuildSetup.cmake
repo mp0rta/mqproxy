@@ -6,7 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # ---------- xquic ----------
 set(XQUIC_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/third_party/xquic/include)
 
-option(XQUIC_BUILD_DIR "Path to pre-built xquic build directory" "")
+set(XQUIC_BUILD_DIR "" CACHE PATH "Path to pre-built xquic build directory")
 
 if(XQUIC_BUILD_DIR)
     message(STATUS "Using pre-built xquic from: ${XQUIC_BUILD_DIR}")
