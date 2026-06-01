@@ -151,4 +151,31 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_socks5_listener PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_socks5_listener COMMAND test_socks5_listener)
+
+    # ---- mqproxy CLI (client/server binaries) ----
+    # The static library target is also named `mqproxy`; give the executable a
+    # distinct target name but emit it as the `mqproxy` binary.
+    add_executable(mqproxy_cli cli/main.c)
+    set_target_properties(mqproxy_cli PROPERTIES OUTPUT_NAME mqproxy)
+    target_link_libraries(mqproxy_cli
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m)
+    target_include_directories(mqproxy_cli PRIVATE src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    # Default cert/key for `server` come from the bundled test cert (so the
+    # binary is runnable out of the box); real deployments pass --cert/--key.
+    target_compile_definitions(mqproxy_cli PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(mqproxy_cli PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+
+    # CLI help / smoke test (shell): asserts --help works and unknown
+    # subcommands fail. Passes the binary path via $<TARGET_FILE:mqproxy>.
+    add_test(NAME test_cli_help
+        COMMAND ${CMAKE_COMMAND} -E env
+            sh ${CMAKE_SOURCE_DIR}/tests/test_cli_help.sh $<TARGET_FILE:mqproxy_cli>)
 endif()
