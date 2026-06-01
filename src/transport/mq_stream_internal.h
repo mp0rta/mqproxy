@@ -13,12 +13,16 @@
 
 struct mq_stream_s {
     xqc_stream_t *xs;
+    void *conn; /* owning mq_conn_t* (set by mq_conn for peer streams) */
 
     mq_stream_on_readable_fn on_readable;
     mq_stream_on_writable_fn on_writable;
     mq_stream_on_close_fn on_close;
     void *cb_user;
 };
+
+/* Set/get the owning mq_conn_t* (opaque void* to avoid a header cycle). */
+void mq_stream_set_conn(mq_stream_t *s, void *conn);
 
 /* Allocate an mq_stream around an existing xqc_stream_t and register it as
  * the stream's user_data. Returns NULL on alloc failure. */

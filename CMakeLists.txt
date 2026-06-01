@@ -10,6 +10,8 @@ add_library(mqproxy STATIC
     src/wire/mq_varint.c
     src/wire/mq_wire.c
     src/proxy/mq_relay.c
+    src/proxy/mq_client.c
+    src/proxy/mq_server.c
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
     src/transport/mq_engine.c
@@ -118,4 +120,20 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_conn_handshake PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_conn_handshake COMMAND test_conn_handshake)
+
+    add_executable(test_client_server tests/integration/test_client_server.c)
+    target_link_libraries(test_client_server
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m)
+    target_include_directories(test_client_server PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_client_server PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_client_server PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_client_server COMMAND test_client_server)
 endif()

@@ -32,6 +32,22 @@ typedef struct mq_alpn_ctx_s {
      * connection synchronously within xqc_connect on this single-threaded
      * engine, so this hand-off is race-free. Cleared on adoption. */
     mq_conn_t *pending_client_conn;
+
+    /* The most-recently-serviced server mq_conn, used to attribute a
+     * peer-initiated stream to its owning connection.
+     *
+     * The robust API for stream->conn is xqc_get_conn_alp_user_data_by_stream
+     * (used by xquic's own hq/h3 demos), but the prebuilt *shared* libxquic
+     * does not export it (only the static archive does, which we cannot link
+     * alongside the shared lib without duplicate symbols). As a portable
+     * substitute we record the conn in every server-side conn-level callback;
+     * on this single-threaded engine a server conn's conn_create_notify runs
+     * before any of that conn's stream_create_notify, so the first (control)
+     * peer stream is attributed correctly. KNOWN LIMITATION (Phase 1): with
+     * multiple clients whose handshakes interleave, the first stream of one
+     * conn could in principle be misattributed; revisit once the shared lib
+     * exports the alp accessor. */
+    mq_conn_t *active_server_conn;
 } mq_alpn_ctx_t;
 
 struct mq_conn_s {
@@ -45,6 +61,8 @@ struct mq_conn_s {
 
     void *owner;
 };
+
+static mq_alpn_ctx_t *mq_conn_actx(void *conn_user_data);
 
 /* ── ALP connection callbacks ───────────────────────────────────────────── */
 
@@ -83,11 +101,26 @@ mq_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_u
     c->have_cid = 1;
 
     xqc_conn_set_alp_user_data(conn, c);
+    if (actx) {
+        actx->active_server_conn = c;
+    }
 
     if (actx && actx->on_new_conn) {
         actx->on_new_conn(c, actx->user);
     }
     return 0;
+}
+
+/* Recover the per-engine ALP ctx from a conn-level callback (which receives the
+ * engine as conn_user_data). */
+static mq_alpn_ctx_t *
+mq_conn_actx(void *conn_user_data)
+{
+    mq_engine_t *eng = (mq_engine_t *)conn_user_data;
+    if (!eng) {
+        return NULL;
+    }
+    return (mq_alpn_ctx_t *)xqc_engine_get_priv_ctx(mq_engine_xqc(eng));
 }
 
 static int
@@ -101,6 +134,13 @@ mq_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_us
     if (!c) {
         return 0;
     }
+    /* NB: do NOT touch the ALP ctx (actx) here. During xqc_engine_destroy,
+     * xquic frees the ALPN registration list (and thus actx) BEFORE destroying
+     * connections, so xqc_engine_get_priv_ctx would return freed memory in the
+     * teardown path. active_server_conn need not be cleared: it is only read to
+     * attribute a *newly arriving* peer stream, and no new streams arrive on a
+     * connection after it closes; any later stream belongs to another conn
+     * whose create/handshake already refreshed the slot. */
     if (c->on_state) {
         c->on_state(c, MQ_CONN_CLOSED, c->on_state_user);
     }
@@ -113,8 +153,15 @@ mq_conn_handshake_finished(xqc_connection_t *conn, void *conn_user_data,
                            void *conn_proto_data)
 {
     (void)conn;
-    (void)conn_user_data;
     mq_conn_t *c = (mq_conn_t *)conn_proto_data;
+    /* For a server conn, refresh the active-conn slot so the imminent control
+     * stream is attributed to this connection (see active_server_conn). */
+    if (c && c->is_server) {
+        mq_alpn_ctx_t *actx = mq_conn_actx(conn_user_data);
+        if (actx) {
+            actx->active_server_conn = c;
+        }
+    }
     if (c && c->on_state) {
         c->on_state(c, MQ_CONN_ESTABLISHED, c->on_state_user);
     }
@@ -135,7 +182,8 @@ mq_conn_stream_create_notify(xqc_stream_t *stream, void *strm_user_data)
 
     /* Peer-initiated stream: wrap it and surface to the owner. The
      * connection's transport user_data is the mq_engine; from it we reach the
-     * per-engine ALP registration ctx (and its on_new_stream hook). */
+     * per-engine ALP registration ctx (and its on_new_stream hook). The owning
+     * mq_conn is the engine's active server conn (see active_server_conn). */
     mq_engine_t *eng = (mq_engine_t *)xqc_get_conn_user_data_by_stream(stream);
     mq_stream_t *s = mq_stream_wrap(stream);
     if (!s) {
@@ -144,6 +192,9 @@ mq_conn_stream_create_notify(xqc_stream_t *stream, void *strm_user_data)
     if (eng) {
         mq_alpn_ctx_t *actx =
             (mq_alpn_ctx_t *)xqc_engine_get_priv_ctx(mq_engine_xqc(eng));
+        if (actx) {
+            mq_stream_set_conn(s, actx->active_server_conn);
+        }
         if (actx && actx->on_new_stream) {
             actx->on_new_stream(s, actx->user);
         }

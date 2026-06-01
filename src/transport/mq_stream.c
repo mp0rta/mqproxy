@@ -129,6 +129,20 @@ mq_stream_id(const mq_stream_t *s)
     return xqc_stream_id(s->xs);
 }
 
+void *
+mq_stream_conn(const mq_stream_t *s)
+{
+    return s ? s->conn : NULL;
+}
+
+void
+mq_stream_set_conn(mq_stream_t *s, void *conn)
+{
+    if (s) {
+        s->conn = conn;
+    }
+}
+
 /* ── xquic stream notify callbacks (used by mq_conn's ALP tables) ───────── */
 
 xqc_int_t

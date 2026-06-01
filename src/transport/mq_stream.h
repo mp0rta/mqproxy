@@ -50,4 +50,10 @@ void mq_stream_close(mq_stream_t *s);
 /* The underlying xquic stream id. */
 uint64_t mq_stream_id(const mq_stream_t *s);
 
+/* The mq_conn_t* that owns this stream, or NULL. Set by the transport when a
+ * peer-initiated stream is surfaced, so the owner can recover the connection
+ * (e.g. to attach/look up per-conn state). Returned as void* to avoid a header
+ * cycle; callers cast to mq_conn_t*. */
+void *mq_stream_conn(const mq_stream_t *s);
+
 #endif /* MQ_TRANSPORT_MQ_STREAM_H */
