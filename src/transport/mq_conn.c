@@ -344,9 +344,16 @@ mq_conn_add_path(mq_conn_t *c, const char *local_ip, uint16_t local_port)
     return (int)new_path_id;
 }
 
-int
-mq_conn_path_state(const mq_conn_t *c, uint64_t path_id)
+/* ── Per-path stats (shared get_stats + free contract) ──────────────────────
+ *
+ * Fetch a connection-stats snapshot into *out. Returns 0 on success (and the
+ * caller MUST free out->paths_info with libc free()), -1 if the conn/engine is
+ * unknown (out is zeroed; nothing to free). Centralises the xqc_conn_get_stats
+ * call + ownership contract so callers don't duplicate (or mis-free) it. */
+static int
+mq_conn_stats_snapshot(const mq_conn_t *c, xqc_conn_stats_t *out)
 {
+    memset(out, 0, sizeof(*out));
     if (!c || !c->have_cid) {
         return -1;
     }
@@ -355,8 +362,21 @@ mq_conn_path_state(const mq_conn_t *c, uint64_t path_id)
         return -1;
     }
     /* cid is const-correct read-only here; xqc_conn_get_stats takes a const
-     * cid* and returns a snapshot with a heap-allocated paths_info we free. */
-    xqc_conn_stats_t st = xqc_conn_get_stats(xeng, &c->cid);
+     * cid* and returns a snapshot with a heap-allocated paths_info. xquic
+     * documents (xqc_conn_stats_t) that paths_info must be released with libc
+     * free() — NOT xqc_free — and may be NULL with count 0 (no free needed,
+     * free(NULL) is safe). */
+    *out = xqc_conn_get_stats(xeng, &c->cid);
+    return 0;
+}
+
+int
+mq_conn_path_state(const mq_conn_t *c, uint64_t path_id)
+{
+    xqc_conn_stats_t st;
+    if (mq_conn_stats_snapshot(c, &st) != 0) {
+        return -1;
+    }
     int state = -1;
     for (uint32_t i = 0; st.paths_info && i < st.paths_info_count; i++) {
         if (st.paths_info[i].path_id == path_id) {
@@ -366,6 +386,53 @@ mq_conn_path_state(const mq_conn_t *c, uint64_t path_id)
     }
     free(st.paths_info);
     return state;
+}
+
+int
+mq_conn_path_bytes(const mq_conn_t *c, uint64_t path_id, uint64_t *sent, uint64_t *recv)
+{
+    xqc_conn_stats_t st;
+    if (mq_conn_stats_snapshot(c, &st) != 0) {
+        return -1;
+    }
+    int rc = -1;
+    for (uint32_t i = 0; st.paths_info && i < st.paths_info_count; i++) {
+        if (st.paths_info[i].path_id == path_id) {
+            if (sent) {
+                *sent = st.paths_info[i].path_send_bytes;
+            }
+            if (recv) {
+                *recv = st.paths_info[i].path_recv_bytes;
+            }
+            rc = 0;
+            break;
+        }
+    }
+    free(st.paths_info);
+    return rc;
+}
+
+void
+mq_conn_dump_stats(mq_conn_t *c)
+{
+    xqc_conn_stats_t st;
+    if (mq_conn_stats_snapshot(c, &st) != 0) {
+        MQ_LOGI("mq_conn stats: no connection");
+        return;
+    }
+    if (!st.paths_info || st.paths_info_count == 0) {
+        MQ_LOGI("mq_conn stats: no path metrics");
+        free(st.paths_info); /* free(NULL) is safe; count 0 may carry a buffer */
+        return;
+    }
+    /* spec §23.1 per-path schema: bytes_sent / bytes_received per path. */
+    for (uint32_t i = 0; i < st.paths_info_count; i++) {
+        MQ_LOGI("mq_conn stats: path %llu: sent=%llu recv=%llu",
+                (unsigned long long)st.paths_info[i].path_id,
+                (unsigned long long)st.paths_info[i].path_send_bytes,
+                (unsigned long long)st.paths_info[i].path_recv_bytes);
+    }
+    free(st.paths_info);
 }
 
 void

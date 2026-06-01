@@ -138,6 +138,22 @@ int mq_conn_add_path(mq_conn_t *c, const char *local_ip, uint16_t local_port);
  * private xqc_multipath.h, so the literal 2 mirrors mqvpn's usage.) */
 int mq_conn_path_state(const mq_conn_t *c, uint64_t path_id);
 
+/* ── Per-path observability (spec §23.1) ────────────────────────────────────
+ *
+ * mq_conn_dump_stats: snapshot per-path byte counters via xqc_conn_get_stats
+ * and log each path's id / send-bytes / recv-bytes at INFO. If xquic reports no
+ * path metrics (paths_info == NULL or count == 0) it logs "no path metrics".
+ * The heap-allocated paths_info buffer is freed with libc free() (the xquic
+ * ownership contract — see xqc_conn_stats_t doc). Smoke-safe on any conn. */
+void mq_conn_dump_stats(mq_conn_t *c);
+
+/* mq_conn_path_bytes: read path_id's cumulative send/recv byte counters from
+ * the same stats snapshot. On success writes *sent / *recv and returns 0; if
+ * the conn is unknown or path_id has no metrics, returns -1 and leaves *sent /
+ * *recv untouched. sent / recv may be NULL (then only existence is checked). */
+int mq_conn_path_bytes(const mq_conn_t *c, uint64_t path_id, uint64_t *sent,
+                       uint64_t *recv);
+
 /* Send CONNECTION_CLOSE. The mq_conn is freed later via conn_close_notify. */
 void mq_conn_close(mq_conn_t *c);
 
