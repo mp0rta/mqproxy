@@ -9,7 +9,6 @@ void
 mq_socks5_parser_init(mq_socks5_parser_t *p)
 {
     p->phase = 0;
-    p->acc_len = 0;
 }
 
 /* Parse the greeting from buf[0..len). Sets *consumed.
@@ -33,9 +32,10 @@ parse_greeting(mq_socks5_parser_t *p, const uint8_t *buf, size_t len, size_t *co
         }
     }
 
+    if (!has_noauth) return MQ_SOCKS5_UNSUPPORTED;
     *consumed = total;
     p->phase = 1;
-    return has_noauth ? MQ_SOCKS5_GREETING_DONE : MQ_SOCKS5_UNSUPPORTED;
+    return MQ_SOCKS5_GREETING_DONE;
 }
 
 /* Parse the CONNECT request from buf[0..len). Sets *consumed and fills out.

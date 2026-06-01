@@ -15,8 +15,6 @@ typedef enum {
 
 typedef struct {
     int phase; /* 0 = expect greeting, 1 = expect request */
-    uint8_t acc[300];
-    size_t acc_len;
 } mq_socks5_parser_t;
 
 typedef struct {
