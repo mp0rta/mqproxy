@@ -79,7 +79,9 @@ struct mq_srv_data_s {
     struct event *wr_ev;      /* persistent EV_WRITE on fd, added on demand */
     mq_relay_t *relay;
     int reaped;
-    int graceful; /* error response sent with FIN: do NOT RESET on reap */
+    int graceful;     /* stream finished with FIN (or owes a FIN): do NOT RESET on reap */
+    int fin_sent;     /* a FIN was already sent on the QUIC stream (idempotency) */
+    int pending_reap; /* a direction hit EOF (simple-close): reap after this edge */
 
     uint8_t rxbuf[MQ_SERVER_REQ_MAX];
     size_t rxlen;
@@ -311,12 +313,96 @@ srv_data_fail(mq_srv_data_t *d, mq_tcp_err_t err)
     srv_data_reap(d);
 }
 
-/* relay on_done: both directions finished or a hard error — reap once. */
+/* Stop watching the origin fd for read/write edges. Called when the origin
+ * direction is finished (B EOF) so the level-triggered EV_READ on a half-closed
+ * fd cannot re-fire forever (the Phase-1 busy-spin), and on any reap. */
+static void
+srv_data_stop_fd_events(mq_srv_data_t *d)
+{
+    if (d->rd_ev) {
+        event_del(d->rd_ev);
+    }
+    if (d->wr_ev) {
+        event_del(d->wr_ev);
+    }
+}
+
+/* Send a clean FIN on the QUIC data stream (idempotent). The relay guarantees
+ * the B->A buffer is already drained when this fires, so a zero-length FIN just
+ * closes the send direction; the client then sees stream EOF (never a RESET).
+ * Marks the node graceful so reap will NOT RESET the stream. */
+static void
+srv_data_send_fin(mq_srv_data_t *d)
+{
+    if (d->fin_sent) {
+        return;
+    }
+    d->fin_sent = 1;
+    d->graceful = 1; /* a stream that owes/sent a FIN must never be RESET on reap */
+    if (d->stream) {
+        long n = mq_stream_send(d->stream, NULL, 0, /*fin=*/1);
+        if (n < 0) {
+            MQ_LOGW("mq_server: stream FIN send failed");
+        }
+    }
+}
+
+/* relay per-direction EOF: propagate a clean shutdown for the finished
+ * direction (FIN to the client on origin EOF; SHUT_WR to the origin on client
+ * FIN), stop watching the dead fd so it cannot busy-spin, and request a reap
+ * (simple-close, design §12.3: either direction EOF closes both).
+ *
+ * MUST NOT free the node here — the relay (and the libevent callback that
+ * triggered this) may still touch it after we return. The actual reap runs from
+ * srv_data_drain_pending once the triggering edge call has unwound. */
+static void
+srv_relay_dir_eof(mq_relay_t *r, mq_relay_dir_t dir, void *user)
+{
+    (void)r;
+    mq_srv_data_t *d = (mq_srv_data_t *)user;
+    if (dir == MQ_RELAY_DIR_BA) {
+        /* Origin (B) -> client (A) finished: origin recv hit EOF and the B->A
+         * buffer is flushed. Stop the (now level-triggered on a half-closed fd)
+         * origin read event to kill the busy-spin, then FIN the QUIC stream so
+         * the client observes a clean EOF with all bytes delivered. */
+        srv_data_stop_fd_events(d);
+        srv_data_send_fin(d);
+    } else {
+        /* Client (A) -> origin (B) finished: client sent FIN and A->B is flushed.
+         * Half-close the origin's write side so it sees EOF, and stop the origin
+         * read events (we are closing both under simple-close). The stream is
+         * already FIN'd by the client; mark graceful so reap will not RESET. */
+        if (d->fd >= 0) {
+            shutdown(d->fd, SHUT_WR);
+        }
+        srv_data_stop_fd_events(d);
+        d->graceful = 1;
+    }
+    d->pending_reap = 1;
+}
+
+/* If a direction EOF requested a simple-close reap during the edge that just
+ * ran, perform it now (after the relay/libevent callback has fully unwound, so
+ * reaping is free of use-after-free). */
+static void
+srv_data_drain_pending(mq_srv_data_t *d)
+{
+    if (d->pending_reap && !d->reaped) {
+        srv_data_reap(d);
+    }
+}
+
+/* relay on_done: BOTH directions finished or a hard error. We do NOT free here
+ * (the relay touches *r after on_done returns); instead request a deferred reap
+ * that srv_data_drain_pending performs once the edge call unwinds. On the clean
+ * both-EOF path srv_relay_dir_eof already sent the FIN and marked the node
+ * graceful, so reap will not RESET; on a hard error graceful stays 0 → RESET. */
 static void
 srv_relay_done(mq_relay_t *r, void *user)
 {
     (void)r;
-    srv_data_reap((mq_srv_data_t *)user);
+    mq_srv_data_t *d = (mq_srv_data_t *)user;
+    d->pending_reap = 1;
 }
 
 /* ── relay I/O adapters ──────────────────────────────────────────────────── */
@@ -415,6 +501,7 @@ srv_data_stream_readable(mq_stream_t *s, void *user)
     mq_srv_data_t *d = (mq_srv_data_t *)user;
     if (d->relay) {
         mq_relay_on_a_readable(d->relay);
+        srv_data_drain_pending(d);
     }
 }
 
@@ -426,6 +513,7 @@ srv_data_stream_writable(mq_stream_t *s, void *user)
     mq_srv_data_t *d = (mq_srv_data_t *)user;
     if (d->relay) {
         mq_relay_on_a_writable(d->relay);
+        srv_data_drain_pending(d);
     }
 }
 
@@ -448,6 +536,7 @@ srv_fd_readable_cb(evutil_socket_t fd, short what, void *arg)
     mq_srv_data_t *d = (mq_srv_data_t *)arg;
     if (d->relay) {
         mq_relay_on_b_readable(d->relay);
+        srv_data_drain_pending(d);
     }
 }
 
@@ -460,6 +549,7 @@ srv_fd_writable_cb(evutil_socket_t fd, short what, void *arg)
     mq_srv_data_t *d = (mq_srv_data_t *)arg;
     if (d->relay) {
         mq_relay_on_b_writable(d->relay);
+        srv_data_drain_pending(d);
     }
 }
 
@@ -480,6 +570,7 @@ srv_data_begin_relay(mq_srv_data_t *d)
     cfg.a_write = srv_a_write;
     cfg.b_read = srv_b_read;
     cfg.b_write = srv_b_write;
+    cfg.on_dir_eof = srv_relay_dir_eof;
     cfg.on_done = srv_relay_done;
     cfg.user = d;
 
@@ -506,9 +597,12 @@ srv_data_begin_relay(mq_srv_data_t *d)
     srv_send_tcp_resp(d->stream, MQ_STATUS_OK, MQ_TCP_OK, /*fin=*/0);
 
     /* Pump both directions once: any bytes the client already sent past the
-     * CONNECT_TCP_REQUEST, plus to register interest. */
+     * CONNECT_TCP_REQUEST, plus to register interest. A direction may already be
+     * at EOF here (e.g. an origin that closes immediately), so honor a pending
+     * simple-close reap afterward. */
     mq_relay_on_a_readable(d->relay);
     mq_relay_on_b_readable(d->relay);
+    srv_data_drain_pending(d);
 }
 
 /* Origin connect-completion one-shot: check SO_ERROR. */

@@ -13,10 +13,23 @@ typedef long (*mq_io_write_fn)(void *io, const unsigned char *buf, size_t len, i
 typedef struct mq_relay mq_relay_t;
 typedef void (*mq_relay_done_fn)(mq_relay_t *r, void *user);
 
+/* Which relay direction reached a clean EOF, reported via on_dir_eof. */
+typedef enum {
+    MQ_RELAY_DIR_AB = 0, /* A->B: A's source (e.g. QUIC stream) hit FIN/EOF */
+    MQ_RELAY_DIR_BA = 1, /* B->A: B's source (e.g. origin fd) hit EOF */
+} mq_relay_dir_t;
+
+typedef void (*mq_relay_dir_eof_fn)(mq_relay_t *r, mq_relay_dir_t dir, void *user);
+
 typedef struct {
     void *a_io, *b_io;
     mq_io_read_fn a_read, b_read;
     mq_io_write_fn a_write, b_write;
+    /* Called AT MOST ONCE per direction, the moment that direction's source has
+     * hit a clean EOF AND its buffered bytes are fully flushed to the sink. The
+     * owner uses this to propagate a clean shutdown (e.g. FIN on the peer) and to
+     * remove the dead source's read interest. Not called on hard error. */
+    mq_relay_dir_eof_fn on_dir_eof;
     mq_relay_done_fn
         on_done; /* called EXACTLY ONCE when both directions finished OR on hard error */
     void *user;

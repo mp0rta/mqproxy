@@ -318,6 +318,117 @@ echo_origin_down(echo_origin_t *o)
     if (o->listen_fd >= 0) close(o->listen_fd);
 }
 
+/* ── in-process bulk origin (sends N bytes, then closes; never reads) ───── */
+/* On accept, this origin streams a deterministic N-byte payload to the client
+ * (writing as flow control allows via an on-demand EV_WRITE) and then closes
+ * its socket. It is the "download to completion" peer for Case G. Byte i has
+ * value (i & 0xff); the client recomputes the same rolling checksum. */
+typedef struct {
+    struct event_base *base;
+    int listen_fd;
+    int conn_fd;
+    struct event *listen_ev;
+    struct event *write_ev;
+    size_t total; /* N bytes to send */
+    size_t sent;  /* bytes sent so far */
+    uint32_t sum; /* rolling checksum of bytes sent (for cross-check) */
+    int finished; /* all N bytes sent + socket closed */
+} bulk_origin_t;
+
+static void
+bulk_set_nonblock(int fd)
+{
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+static void
+bulk_write_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void)what;
+    bulk_origin_t *o = (bulk_origin_t *)arg;
+    unsigned char chunk[8192];
+    while (o->sent < o->total) {
+        size_t want = o->total - o->sent;
+        if (want > sizeof(chunk)) want = sizeof(chunk);
+        for (size_t i = 0; i < want; i++) {
+            chunk[i] = (unsigned char)((o->sent + i) & 0xff);
+        }
+        ssize_t w = send(fd, chunk, want, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                event_add(o->write_ev, NULL); /* resume on writable edge */
+                return;
+            }
+            break; /* hard error: stop */
+        }
+        if (w == 0) break;
+        for (ssize_t i = 0; i < w; i++)
+            o->sum += chunk[i];
+        o->sent += (size_t)w;
+    }
+    /* All bytes flushed (or errored): half-close the write side so the proxy
+     * sees EOF and propagates a clean FIN, then drop the fd. */
+    shutdown(fd, SHUT_WR);
+    if (o->write_ev) {
+        event_free(o->write_ev);
+        o->write_ev = NULL;
+    }
+    close(fd);
+    o->conn_fd = -1;
+    o->finished = 1;
+}
+
+static void
+bulk_accept_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void)what;
+    bulk_origin_t *o = (bulk_origin_t *)arg;
+    int c = accept(fd, NULL, NULL);
+    if (c < 0) return;
+    bulk_set_nonblock(c);
+    o->conn_fd = c;
+    o->write_ev = event_new(o->base, c, EV_WRITE, bulk_write_cb, o);
+    bulk_write_cb(c, EV_WRITE, o); /* prime the pump immediately */
+}
+
+static int
+bulk_origin_up(bulk_origin_t *o, struct event_base *base, size_t total,
+               uint16_t *out_port)
+{
+    memset(o, 0, sizeof(*o));
+    o->base = base;
+    o->conn_fd = -1;
+    o->total = total;
+    o->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (o->listen_fd < 0) return -1;
+    int one = 1;
+    setsockopt(o->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(o->listen_fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) return -1;
+    if (listen(o->listen_fd, 4) != 0) return -1;
+    socklen_t sl = sizeof(sa);
+    if (getsockname(o->listen_fd, (struct sockaddr *)&sa, &sl) != 0) return -1;
+    *out_port = ntohs(sa.sin_port);
+    bulk_set_nonblock(o->listen_fd);
+    o->listen_ev = event_new(base, o->listen_fd, EV_READ | EV_PERSIST, bulk_accept_cb, o);
+    event_add(o->listen_ev, NULL);
+    return 0;
+}
+
+static void
+bulk_origin_down(bulk_origin_t *o)
+{
+    if (o->write_ev) event_free(o->write_ev);
+    if (o->listen_ev) event_free(o->listen_ev);
+    if (o->conn_fd >= 0) close(o->conn_fd);
+    if (o->listen_fd >= 0) close(o->listen_fd);
+}
+
 /* ── data-stream client helper (test-only; mq_client tcp_open is Task 13) ── */
 /* Build a CONNECT_TCP_REQUEST to 127.0.0.1:port and capture stream rx. */
 typedef struct {
@@ -327,25 +438,65 @@ typedef struct {
     mq_connect_tcp_resp_t resp;
     size_t resp_consumed; /* bytes of rx the CONNECT_TCP_RESPONSE occupied */
     int payload_seen;     /* the echoed payload arrived after the response */
+
+    /* Bulk-download bookkeeping (Case G). The post-response payload may exceed
+     * the small rx[] above, so we count it out-of-band with a rolling checksum
+     * rather than buffering it all. */
+    int track_bulk;       /* enable bulk counting on the post-response stream */
+    size_t payload_bytes; /* count of post-CONNECT_TCP_RESPONSE payload bytes */
+    uint32_t payload_sum; /* rolling additive checksum of payload bytes */
+    int fin_seen;         /* the QUIC stream delivered a clean FIN */
+    int err_seen;         /* mq_stream_recv returned a hard error (RESET) */
 } datastream_t;
+
+/* Fold post-response bytes that are currently sitting in rx[] into the bulk
+ * counters, then drop them so rx[] never overflows on a long download. Only the
+ * response prefix is preserved in rx[]. */
+static void
+ds_drain_bulk(datastream_t *d)
+{
+    if (!d->track_bulk || !d->resp_seen) return;
+    if (d->rxlen <= d->resp_consumed) return;
+    size_t avail = d->rxlen - d->resp_consumed;
+    for (size_t i = 0; i < avail; i++) {
+        d->payload_sum += d->rx[d->resp_consumed + i];
+    }
+    d->payload_bytes += avail;
+    d->rxlen = d->resp_consumed; /* keep only the response prefix */
+}
 
 static void
 ds_readable(mq_stream_t *s, void *user)
 {
     datastream_t *d = (datastream_t *)user;
     for (;;) {
-        if (d->rxlen >= sizeof(d->rx)) break;
+        if (d->rxlen >= sizeof(d->rx)) {
+            /* rx[] full: in bulk mode, fold+drop to make room and keep reading. */
+            if (d->track_bulk && d->resp_seen) {
+                ds_drain_bulk(d);
+                if (d->rxlen >= sizeof(d->rx)) break; /* still full: give up */
+            } else {
+                break;
+            }
+        }
         int fin = 0;
         long n = mq_stream_recv(s, d->rx + d->rxlen, sizeof(d->rx) - d->rxlen, &fin);
-        if (n <= 0) break;
-        d->rxlen += (size_t)n;
-    }
-    if (!d->resp_seen) {
-        int c = mq_decode_connect_tcp_resp(d->rx, d->rxlen, &d->resp);
-        if (c > 0) {
-            d->resp_seen = 1;
-            d->resp_consumed = (size_t)c;
+        if (n < 0) {
+            d->err_seen = 1;
+            break;
         }
+        if (n > 0) d->rxlen += (size_t)n;
+        if (fin) d->fin_seen = 1;
+        if (n == 0 && !fin) break; /* EAGAIN: nothing more right now */
+        if (!d->resp_seen) {
+            int c = mq_decode_connect_tcp_resp(d->rx, d->rxlen, &d->resp);
+            if (c > 0) {
+                d->resp_seen = 1;
+                d->resp_consumed = (size_t)c;
+            }
+        }
+        ds_drain_bulk(d);
+        if (fin) break;
     }
     if (d->resp_seen && d->rxlen >= d->resp_consumed + 4) {
         if (memcmp(d->rx + d->resp_consumed, "ping", 4) == 0) d->payload_seen = 1;
@@ -612,6 +763,113 @@ test_data_stream_teardown(void)
     fixture_down(&f);
 }
 
+/* ── Case G: download to completion → ALL N bytes + clean FIN, no RESET ─── */
+/* The origin streams N bytes (N spans several packets / flow-control quanta)
+ * then closes. The client reads the data stream until the QUIC stream FIN and
+ * must observe EXACTLY N payload bytes with a matching checksum AND a clean FIN
+ * (never a reset/error). Against the pre-fix server this FAILS: completion reap
+ * runs with graceful==0 → RESET_STREAM, truncating un-acked STREAM data, so the
+ * client sees far fewer than N bytes and never a FIN. */
+static void
+test_data_stream_download_completion(void)
+{
+    g_auth_fired = g_auth_ok = 0;
+
+    fixture_t f;
+    if (fixture_up(&f, "secret") != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    const size_t N = 200000; /* > one MTU / flow-control quantum: multi-packet */
+    bulk_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(bulk_origin_up(&origin, f.base, N, &origin_port), 0);
+
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+
+    mq_conn_t *conn = mq_client_conn(f.client);
+    MQ_CHECK(conn != NULL);
+
+    datastream_t d;
+    memset(&d, 0, sizeof(d));
+    d.track_bulk = 1;
+    mq_stream_t *s = open_tcp_data_stream(conn, origin_port, &d);
+    MQ_CHECK(s != NULL);
+
+    /* Drive until the client sees the QUIC stream FIN (or the budget expires).
+     * A RESET would surface as err_seen / a missing FIN, not a clean fin_seen. */
+    pump_until(f.base, &d.fin_seen, 8000);
+
+    /* Compute the expected checksum the origin would have produced for N bytes. */
+    uint32_t expect_sum = 0;
+    for (size_t i = 0; i < N; i++)
+        expect_sum += (unsigned char)(i & 0xff);
+
+    MQ_CHECK(d.resp_seen);
+    MQ_CHECK_EQ_INT((int)d.resp.status, (int)MQ_STATUS_OK);
+    MQ_CHECK(d.fin_seen);           /* clean FIN, not a reset */
+    MQ_CHECK_EQ_INT(d.err_seen, 0); /* no hard error / RESET */
+    MQ_CHECK_EQ_INT((long long)d.payload_bytes, (long long)N); /* ALL bytes */
+    MQ_CHECK_EQ_INT((long long)d.payload_sum, (long long)expect_sum);
+
+    bulk_origin_down(&origin);
+    fixture_down(&f);
+}
+
+/* ── Case H: origin half-closes while client lingers → no busy-spin ─────── */
+/* The origin sends a tiny reply then closes (recv→0 at the proxy). The client
+ * keeps its side open briefly. Against the pre-fix server, the EOF'd origin fd's
+ * level-triggered EV_READ re-fires forever (one event_base_loop iteration never
+ * returns), so the bounded pump budget below is blown / the test hangs. After
+ * the fix, the dead fd's read event is event_del'd on EOF and a FIN is
+ * propagated, so the client gets the reply + a clean FIN well within budget. */
+static void
+test_data_stream_halfclose_nospin(void)
+{
+    g_auth_fired = g_auth_ok = 0;
+
+    fixture_t f;
+    if (fixture_up(&f, "secret") != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    const size_t N = 64; /* tiny reply */
+    bulk_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(bulk_origin_up(&origin, f.base, N, &origin_port), 0);
+
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+
+    mq_conn_t *conn = mq_client_conn(f.client);
+    MQ_CHECK(conn != NULL);
+
+    datastream_t d;
+    memset(&d, 0, sizeof(d));
+    d.track_bulk = 1;
+    mq_stream_t *s = open_tcp_data_stream(conn, origin_port, &d);
+    MQ_CHECK(s != NULL);
+
+    uint64_t start = now_ms();
+    /* Bounded budget: a busy-spin would make a single loop iteration never
+     * return, so wall-clock would blow far past this. */
+    pump_until(f.base, &d.fin_seen, 5000);
+    uint64_t elapsed = now_ms() - start;
+
+    MQ_CHECK(d.resp_seen);
+    MQ_CHECK(d.fin_seen);
+    MQ_CHECK_EQ_INT(d.err_seen, 0);
+    MQ_CHECK_EQ_INT((long long)d.payload_bytes, (long long)N);
+    /* Completed well within the budget (no spin): generous ceiling. */
+    MQ_CHECK(elapsed < 5000);
+
+    bulk_origin_down(&origin);
+    fixture_down(&f);
+}
+
 static void
 test_client_server(void)
 {
@@ -621,6 +879,8 @@ test_client_server(void)
     test_data_stream_refused();
     test_data_stream_preauth_reset();
     test_data_stream_teardown();
+    test_data_stream_download_completion();
+    test_data_stream_halfclose_nospin();
 }
 
 MQ_TEST_MAIN(test_client_server())

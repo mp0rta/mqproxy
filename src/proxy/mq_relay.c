@@ -5,12 +5,14 @@
 
 struct mq_relay {
     mq_relay_cfg_t cfg;
-    mq_buf_t ab; /* A -> B */
-    mq_buf_t ba; /* B -> A */
-    int a_eof;   /* A's source hit EOF */
-    int b_eof;   /* B's source hit EOF */
-    int done;    /* on_done already fired */
-    int error;   /* a hard error occurred */
+    mq_buf_t ab;         /* A -> B */
+    mq_buf_t ba;         /* B -> A */
+    int a_eof;           /* A's source hit EOF */
+    int b_eof;           /* B's source hit EOF */
+    int ab_eof_signaled; /* on_dir_eof(AB) already fired */
+    int ba_eof_signaled; /* on_dir_eof(BA) already fired */
+    int done;            /* on_done already fired */
+    int error;           /* a hard error occurred */
 };
 
 mq_relay_t *
@@ -95,7 +97,38 @@ static void
 maybe_done(mq_relay_t *r)
 {
     if (r->done) return;
-    if (r->error || (dir_finished(r->a_eof, &r->ab) && dir_finished(r->b_eof, &r->ba))) {
+
+    /* On a hard error, skip the per-direction notifications and go straight to
+     * the (reaping) on_done with r->error set. on_done may free r — touch nothing
+     * of *r afterward. */
+    if (r->error) {
+        r->done = 1;
+        if (r->cfg.on_done) r->cfg.on_done(r, r->cfg.user);
+        return;
+    }
+
+    /* Per-direction clean-EOF notifications fire the moment a direction's source
+     * has EOF'd AND its buffered bytes are fully flushed to the sink. The owner
+     * uses these to propagate a clean shutdown (FIN on the peer) and to drop the
+     * dead source's read interest (killing any level-triggered busy-spin).
+     *
+     * Contract: on_dir_eof is a pure side-effect notification — the owner MUST
+     * NOT free the relay from it. (The owner can reap AFTER the edge call that
+     * triggered this returns.) That keeps the both-directions completion model
+     * below intact for the relay's own unit tests, while letting an owner apply
+     * a simple-close policy out of band. */
+    if (!r->ab_eof_signaled && dir_finished(r->a_eof, &r->ab)) {
+        r->ab_eof_signaled = 1;
+        if (r->cfg.on_dir_eof) r->cfg.on_dir_eof(r, MQ_RELAY_DIR_AB, r->cfg.user);
+    }
+    if (!r->ba_eof_signaled && dir_finished(r->b_eof, &r->ba)) {
+        r->ba_eof_signaled = 1;
+        if (r->cfg.on_dir_eof) r->cfg.on_dir_eof(r, MQ_RELAY_DIR_BA, r->cfg.user);
+    }
+
+    /* Both directions finished (source EOF + buffer drained): the relay is done.
+     * on_done may free r — touch nothing of *r afterward. */
+    if (dir_finished(r->a_eof, &r->ab) && dir_finished(r->b_eof, &r->ba)) {
         r->done = 1;
         if (r->cfg.on_done) r->cfg.on_done(r, r->cfg.user);
     }
