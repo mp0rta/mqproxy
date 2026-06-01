@@ -27,7 +27,7 @@
 
 #include <event2/event.h>
 
-#include "proxy/mq_relay.h"
+#include "proxy/mq_flow.h"
 #include "transport/mq_conn.h"
 #include "transport/mq_engine.h"
 #include "transport/mq_stream.h"
@@ -62,26 +62,25 @@ struct mq_srv_conn_s {
 
 /* Per-data-stream state: one CONNECT_TCP request + its origin fd + relay.
  *
+ * The stream⇄fd relay machinery (I/O adapters, fd events, completion/FIN/
+ * half-close/deferred-reap) lives in the shared mq_flow module; this node owns
+ * the protocol-specific phases on top of it.
+ *
  * Lifecycle phases:
  *   1. Header accumulation: buffer bytes until CONNECT_TCP_REQUEST decodes.
  *   2. Connecting: non-blocking connect() in flight; a one-shot EV_WRITE event
  *      on the origin fd fires when the connect completes (or errors).
- *   3. Relaying: relay is live; persistent EV_READ/EV_WRITE events on the fd and
- *      the stream's read/write callbacks drive the relay edges.
- *   4. Reaped: stream closed, fd closed, events freed, relay freed, unlinked.
+ *   3. Relaying: mq_flow drives the relay (mq_flow_begin_relay).
+ *   4. Reaped: flow reaped (closes stream + fd once), node unlinked + freed.
  */
 struct mq_srv_data_s {
     mq_srv_conn_t *sc;
-    mq_stream_t *stream;      /* NULL'd by the stream on_close callback */
-    int fd;                   /* origin socket, -1 once closed */
+    mq_flow_t *flow;          /* shared stream⇄fd relay node (owns stream + fd) */
+    mq_stream_t *stream;      /* header phase: the data stream (also held by flow) */
+    int fd;                   /* origin socket during connect; handed to flow on relay */
     struct event *connect_ev; /* one-shot EV_WRITE to detect connect completion */
-    struct event *rd_ev;      /* persistent EV_READ on fd (relay phase) */
-    struct event *wr_ev;      /* persistent EV_WRITE on fd, added on demand */
-    mq_relay_t *relay;
     int reaped;
-    int graceful;     /* stream finished with FIN (or owes a FIN): do NOT RESET on reap */
-    int fin_sent;     /* a FIN was already sent on the QUIC stream (idempotency) */
-    int pending_reap; /* a direction hit EOF (simple-close): reap after this edge */
+    int graceful; /* pre-relay error path sent a FIN'd response: do NOT RESET */
 
     uint8_t rxbuf[MQ_SERVER_REQ_MAX];
     size_t rxlen;
@@ -254,8 +253,11 @@ srv_data_unlink(mq_srv_data_t *d)
     }
 }
 
-/* Reap a data stream exactly once: close stream + fd, free events + relay,
- * unlink and free the node. Safe to call from any phase. */
+/* Reap a data stream exactly once: reap its flow (which closes stream + fd,
+ * frees events + relay), free the connect event, unlink and free the node. Safe
+ * from any phase. Re-entrancy: reaping the flow may invoke srv_flow_on_reap
+ * (which sets d->flow = NULL); the d->reaped guard makes the whole thing
+ * idempotent. */
 static void
 srv_data_reap(mq_srv_data_t *d)
 {
@@ -268,41 +270,51 @@ srv_data_reap(mq_srv_data_t *d)
         event_free(d->connect_ev);
         d->connect_ev = NULL;
     }
-    if (d->rd_ev) {
-        event_free(d->rd_ev);
-        d->rd_ev = NULL;
-    }
-    if (d->wr_ev) {
-        event_free(d->wr_ev);
-        d->wr_ev = NULL;
-    }
-    if (d->fd >= 0) {
-        close(d->fd);
-        d->fd = -1;
-    }
-    if (d->stream) {
-        /* Detach our callbacks so the imminent stream close_notify does not
-         * call back into a freed node. On the graceful error path the response
-         * was already sent with FIN — do NOT RESET (RESET would discard the
-         * un-acked response). Otherwise abort the stream with RESET_STREAM. The
-         * mq_stream is freed by the transport's stream_close_notify. */
-        mq_stream_set_cbs(d->stream, NULL, NULL, NULL, NULL);
-        if (!d->graceful) {
-            mq_stream_close(d->stream);
-        }
+    if (d->flow) {
+        /* Relay phase: the flow owns the stream + fd; reaping it closes both. */
+        mq_flow_t *fl = d->flow;
+        d->flow = NULL;
         d->stream = NULL;
-    }
-    if (d->relay) {
-        mq_relay_free(d->relay);
-        d->relay = NULL;
+        d->fd = -1;
+        mq_flow_reap(fl);
+    } else {
+        /* Pre-relay (header / connect phase): no flow yet. Close the stream/fd
+         * directly. On the graceful error path the FIN'd response was already
+         * sent — do NOT RESET (RESET would discard the un-acked response). */
+        if (d->stream) {
+            mq_stream_set_cbs(d->stream, NULL, NULL, NULL, NULL);
+            if (!d->graceful) {
+                mq_stream_close(d->stream);
+            }
+            d->stream = NULL;
+        }
+        if (d->fd >= 0) {
+            close(d->fd);
+            d->fd = -1;
+        }
     }
     srv_data_unlink(d);
     free(d);
 }
 
-/* Error path: send CONNECT_TCP_RESPONSE(ERROR, err) with FIN, then reap the
- * node gracefully (no RESET). The stream finishes naturally, delivering the
- * response to the client before close. */
+/* Flow reap callback: the shared relay node has closed stream + fd and is about
+ * to free itself. Drop our pointer and reap the protocol node. Guarded by
+ * d->reaped so a reap initiated from srv_data_reap (which nulls d->flow first)
+ * does not recurse. */
+static void
+srv_flow_on_reap(mq_flow_t *fl, void *user)
+{
+    (void)fl;
+    mq_srv_data_t *d = (mq_srv_data_t *)user;
+    d->flow = NULL;
+    d->stream = NULL;
+    d->fd = -1;
+    srv_data_reap(d);
+}
+
+/* Error path (pre-relay only): send CONNECT_TCP_RESPONSE(ERROR, err) with FIN,
+ * then reap the node gracefully (no RESET). The stream finishes naturally,
+ * delivering the response to the client before close. */
 static void
 srv_data_fail(mq_srv_data_t *d, mq_tcp_err_t err)
 {
@@ -313,296 +325,34 @@ srv_data_fail(mq_srv_data_t *d, mq_tcp_err_t err)
     srv_data_reap(d);
 }
 
-/* Stop watching the origin fd for read/write edges. Called when the origin
- * direction is finished (B EOF) so the level-triggered EV_READ on a half-closed
- * fd cannot re-fire forever (the Phase-1 busy-spin), and on any reap. */
-static void
-srv_data_stop_fd_events(mq_srv_data_t *d)
-{
-    if (d->rd_ev) {
-        event_del(d->rd_ev);
-    }
-    if (d->wr_ev) {
-        event_del(d->wr_ev);
-    }
-}
-
-/* Send a clean FIN on the QUIC data stream (idempotent). The relay guarantees
- * the B->A buffer is already drained when this fires, so a zero-length FIN just
- * closes the send direction; the client then sees stream EOF (never a RESET).
- * Marks the node graceful so reap will NOT RESET the stream. */
-static void
-srv_data_send_fin(mq_srv_data_t *d)
-{
-    if (d->fin_sent) {
-        return;
-    }
-    d->fin_sent = 1;
-    d->graceful = 1; /* a stream that owes/sent a FIN must never be RESET on reap */
-    if (d->stream) {
-        long n = mq_stream_send(d->stream, NULL, 0, /*fin=*/1);
-        if (n < 0) {
-            MQ_LOGW("mq_server: stream FIN send failed");
-        }
-    }
-}
-
-/* relay per-direction EOF: propagate a clean shutdown for the finished
- * direction (FIN to the client on origin EOF; SHUT_WR to the origin on client
- * FIN), stop watching the dead fd so it cannot busy-spin, and request a reap
- * (simple-close, design §12.3: either direction EOF closes both).
- *
- * MUST NOT free the node here — the relay (and the libevent callback that
- * triggered this) may still touch it after we return. The actual reap runs from
- * srv_data_drain_pending once the triggering edge call has unwound. */
-static void
-srv_relay_dir_eof(mq_relay_t *r, mq_relay_dir_t dir, void *user)
-{
-    (void)r;
-    mq_srv_data_t *d = (mq_srv_data_t *)user;
-    if (dir == MQ_RELAY_DIR_BA) {
-        /* Origin (B) -> client (A) finished: origin recv hit EOF and the B->A
-         * buffer is flushed. Stop the (now level-triggered on a half-closed fd)
-         * origin read event to kill the busy-spin, then FIN the QUIC stream so
-         * the client observes a clean EOF with all bytes delivered. */
-        srv_data_stop_fd_events(d);
-        srv_data_send_fin(d);
-    } else {
-        /* Client (A) -> origin (B) finished: client sent FIN and A->B is flushed.
-         * Half-close the origin's write side so it sees EOF, and stop the origin
-         * read events (we are closing both under simple-close). The stream is
-         * already FIN'd by the client; mark graceful so reap will not RESET. */
-        if (d->fd >= 0) {
-            shutdown(d->fd, SHUT_WR);
-        }
-        srv_data_stop_fd_events(d);
-        d->graceful = 1;
-    }
-    d->pending_reap = 1;
-}
-
-/* If a direction EOF requested a simple-close reap during the edge that just
- * ran, perform it now (after the relay/libevent callback has fully unwound, so
- * reaping is free of use-after-free). */
-static void
-srv_data_drain_pending(mq_srv_data_t *d)
-{
-    if (d->pending_reap && !d->reaped) {
-        srv_data_reap(d);
-    }
-}
-
-/* relay on_done: BOTH directions finished or a hard error. We do NOT free here
- * (the relay touches *r after on_done returns); instead request a deferred reap
- * that srv_data_drain_pending performs once the edge call unwinds. On the clean
- * both-EOF path srv_relay_dir_eof already sent the FIN and marked the node
- * graceful, so reap will not RESET; on a hard error graceful stays 0 → RESET. */
-static void
-srv_relay_done(mq_relay_t *r, void *user)
-{
-    (void)r;
-    mq_srv_data_t *d = (mq_srv_data_t *)user;
-    d->pending_reap = 1;
-}
-
-/* ── relay I/O adapters ──────────────────────────────────────────────────── */
-/* A side = QUIC stream. */
-static long
-srv_a_read(void *io, unsigned char *buf, size_t cap, int *eof, int *wb)
-{
-    mq_srv_data_t *d = (mq_srv_data_t *)io;
-    if (!d->stream) {
-        *eof = 1;
-        return 0;
-    }
-    int fin = 0;
-    long n = mq_stream_recv(d->stream, buf, cap, &fin);
-    if (n < 0) {
-        return -1;
-    }
-    if (fin) {
-        *eof = 1;
-    }
-    if (n == 0 && !fin) {
-        *wb = 1;
-    }
-    return n;
-}
-
-static long
-srv_a_write(void *io, const unsigned char *buf, size_t len, int *wb)
-{
-    mq_srv_data_t *d = (mq_srv_data_t *)io;
-    if (!d->stream) {
-        return -1;
-    }
-    long n = mq_stream_send(d->stream, buf, len, 0);
-    if (n < 0) {
-        return -1;
-    }
-    if (n == 0 && len > 0) {
-        *wb = 1; /* flow-control blocked; resumes on stream on_writable */
-    }
-    return n;
-}
-
-/* B side = origin TCP fd. */
-static long
-srv_b_read(void *io, unsigned char *buf, size_t cap, int *eof, int *wb)
-{
-    mq_srv_data_t *d = (mq_srv_data_t *)io;
-    if (d->fd < 0) {
-        *eof = 1;
-        return 0;
-    }
-    ssize_t n = recv(d->fd, buf, cap, 0);
-    if (n == 0) {
-        *eof = 1;
-        return 0;
-    }
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            *wb = 1;
-            return 0;
-        }
-        return -1;
-    }
-    return (long)n;
-}
-
-static long
-srv_b_write(void *io, const unsigned char *buf, size_t len, int *wb)
-{
-    mq_srv_data_t *d = (mq_srv_data_t *)io;
-    if (d->fd < 0) {
-        return -1;
-    }
-    ssize_t n = send(d->fd, buf, len, MSG_NOSIGNAL);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            *wb = 1;
-            /* Ensure we get a writable edge to resume. */
-            if (d->wr_ev) {
-                event_add(d->wr_ev, NULL);
-            }
-            return 0;
-        }
-        return -1;
-    }
-    return (long)n;
-}
-
-/* ── relay edge wiring ───────────────────────────────────────────────────── */
-/* Stream readable → A is the source for A->B. */
-static void
-srv_data_stream_readable(mq_stream_t *s, void *user)
-{
-    (void)s;
-    mq_srv_data_t *d = (mq_srv_data_t *)user;
-    if (d->relay) {
-        mq_relay_on_a_readable(d->relay);
-        srv_data_drain_pending(d);
-    }
-}
-
-/* Stream writable → A is the destination for B->A. */
-static void
-srv_data_stream_writable(mq_stream_t *s, void *user)
-{
-    (void)s;
-    mq_srv_data_t *d = (mq_srv_data_t *)user;
-    if (d->relay) {
-        mq_relay_on_a_writable(d->relay);
-        srv_data_drain_pending(d);
-    }
-}
-
-/* Stream closed by the transport: drop our pointer, then reap. */
-static void
-srv_data_stream_closed(mq_stream_t *s, void *user)
-{
-    (void)s;
-    mq_srv_data_t *d = (mq_srv_data_t *)user;
-    d->stream = NULL; /* the transport frees it after this returns */
-    srv_data_reap(d);
-}
-
-/* Origin fd readable → B is the source for B->A. */
-static void
-srv_fd_readable_cb(evutil_socket_t fd, short what, void *arg)
-{
-    (void)fd;
-    (void)what;
-    mq_srv_data_t *d = (mq_srv_data_t *)arg;
-    if (d->relay) {
-        mq_relay_on_b_readable(d->relay);
-        srv_data_drain_pending(d);
-    }
-}
-
-/* Origin fd writable → B is the destination for A->B. One-shot per add. */
-static void
-srv_fd_writable_cb(evutil_socket_t fd, short what, void *arg)
-{
-    (void)fd;
-    (void)what;
-    mq_srv_data_t *d = (mq_srv_data_t *)arg;
-    if (d->relay) {
-        mq_relay_on_b_writable(d->relay);
-        srv_data_drain_pending(d);
-    }
-}
-
-/* Transition a connected fd into the relay phase: build the relay, register
- * persistent read + on-demand write events, send CONNECT_TCP_RESPONSE(OK), and
- * pump once. */
+/* Transition a connected fd into the relay phase: create the shared flow (taking
+ * ownership of the stream + fd), send CONNECT_TCP_RESPONSE(OK), and start
+ * relaying. The flow re-wires the stream callbacks and pumps both directions
+ * once (forwarding any bytes the client sent past the CONNECT_TCP_REQUEST). */
 static void
 srv_data_begin_relay(mq_srv_data_t *d)
 {
     mq_server_t *srv = d->sc->server;
     struct event_base *base = mq_engine_base(srv->eng);
 
-    mq_relay_cfg_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.a_io = d;
-    cfg.b_io = d;
-    cfg.a_read = srv_a_read;
-    cfg.a_write = srv_a_write;
-    cfg.b_read = srv_b_read;
-    cfg.b_write = srv_b_write;
-    cfg.on_dir_eof = srv_relay_dir_eof;
-    cfg.on_done = srv_relay_done;
-    cfg.user = d;
-
-    d->relay = mq_relay_new(&cfg);
-    if (!d->relay) {
-        MQ_LOGE("mq_server: relay alloc failed");
+    d->flow = mq_flow_new(&d->flow, base, d->stream, d->fd, srv_flow_on_reap, d);
+    if (!d->flow) {
+        MQ_LOGE("mq_server: flow alloc failed");
         srv_data_fail(d, MQ_TCP_CONN_REFUSED);
         return;
     }
+    /* The flow owns the stream + fd now; clear our pre-relay handles so reap
+     * goes through the flow. */
+    d->fd = -1;
 
-    d->rd_ev = event_new(base, d->fd, EV_READ | EV_PERSIST, srv_fd_readable_cb, d);
-    d->wr_ev = event_new(base, d->fd, EV_WRITE, srv_fd_writable_cb, d);
-    if (!d->rd_ev || !d->wr_ev) {
-        MQ_LOGE("mq_server: fd event alloc failed");
-        srv_data_fail(d, MQ_TCP_CONN_REFUSED);
-        return;
-    }
-    event_add(d->rd_ev, NULL);
-
-    /* Re-wire the stream callbacks for the relay phase (readable/writable). */
-    mq_stream_set_cbs(d->stream, srv_data_stream_readable, srv_data_stream_writable,
-                      srv_data_stream_closed, d);
-
+    /* Send the success response BEFORE starting the relay so it precedes any
+     * relayed origin bytes on the stream. */
     srv_send_tcp_resp(d->stream, MQ_STATUS_OK, MQ_TCP_OK, /*fin=*/0);
 
-    /* Pump both directions once: any bytes the client already sent past the
-     * CONNECT_TCP_REQUEST, plus to register interest. A direction may already be
-     * at EOF here (e.g. an origin that closes immediately), so honor a pending
-     * simple-close reap afterward. */
-    mq_relay_on_a_readable(d->relay);
-    mq_relay_on_b_readable(d->relay);
-    srv_data_drain_pending(d);
+    if (mq_flow_begin_relay(d->flow) != 0) {
+        MQ_LOGE("mq_server: begin relay failed");
+        srv_data_reap(d);
+    }
 }
 
 /* Origin connect-completion one-shot: check SO_ERROR. */
@@ -778,6 +528,18 @@ srv_data_header_readable(mq_stream_t *s, void *user)
     srv_data_dial(d, &req);
 }
 
+/* Header-phase stream close: the stream closed before the relay started (no
+ * flow yet). Drop our pointer and reap. (Once the relay starts, the flow owns
+ * the stream-close callback.) */
+static void
+srv_data_header_closed(mq_stream_t *s, void *user)
+{
+    (void)s;
+    mq_srv_data_t *d = (mq_srv_data_t *)user;
+    d->stream = NULL; /* the transport frees it after this returns */
+    srv_data_reap(d);
+}
+
 /* Attach a new data stream: allocate state, link it, start header buffering. */
 static void
 srv_attach_data_stream(mq_srv_conn_t *sc, mq_stream_t *s)
@@ -794,7 +556,7 @@ srv_attach_data_stream(mq_srv_conn_t *sc, mq_stream_t *s)
     d->next = sc->data_head;
     sc->data_head = d;
 
-    mq_stream_set_cbs(s, srv_data_header_readable, NULL, srv_data_stream_closed, d);
+    mq_stream_set_cbs(s, srv_data_header_readable, NULL, srv_data_header_closed, d);
 
     /* Bytes may already be buffered in the stream; try decoding immediately. */
     srv_data_header_readable(s, d);
