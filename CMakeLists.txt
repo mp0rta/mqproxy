@@ -152,6 +152,22 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_socks5_listener COMMAND test_socks5_listener)
 
+    add_executable(test_e2e_single_path tests/integration/test_e2e_single_path.c)
+    target_link_libraries(test_e2e_single_path
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m)
+    target_include_directories(test_e2e_single_path PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_e2e_single_path PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_e2e_single_path PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_e2e_single_path COMMAND test_e2e_single_path)
+
     # ---- mqproxy CLI (client/server binaries) ----
     # The static library target is also named `mqproxy`; give the executable a
     # distinct target name but emit it as the `mqproxy` binary.
