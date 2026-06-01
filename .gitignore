@@ -8,5 +8,6 @@ tmp/
 # Build artifacts
 build/
 build-*/
+build_*/
 *.o
 *.d
