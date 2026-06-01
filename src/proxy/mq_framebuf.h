@@ -35,18 +35,13 @@ typedef struct {
  * observed during the fill; the caller may treat a FIN-without-decode as
  * malformed.
  *
- * Returns:
- *   >0  new total fb->len (bytes are available to attempt a decode);
- *    0  no new bytes right now (EAGAIN) — caller still re-attempts decode on
- *       whatever is already buffered, exactly as before;
- *   -1  hard stream error (e.g. RESET) before a frame. Callers that fail hard
- *       on a pre-frame error act on this; callers that historically retried the
- *       decode regardless may ignore the distinction and still decode fb.
+ * Returns 0 on success (the caller then attempts a decode on fb->buf/fb->len —
+ * whether or not new bytes arrived), or -1 on a hard stream error (e.g. RESET)
+ * before a frame. Callers that fail hard on a pre-frame error check for <0;
+ * callers that historically retried the decode regardless may ignore the return.
  *
- * Note the buffer-full case is NOT reported here: when fb is full the helper
- * simply stops reading and returns fb->len (>0); the caller owns the
- * "full without a valid frame ⇒ malformed" decision after its decode attempt,
- * preserving each call site's exact policy. */
+ * The buffer-full and "full without a valid frame ⇒ malformed" decisions stay
+ * with the caller (after its decode attempt), preserving each site's policy. */
 int mq_framebuf_fill(mq_stream_t *s, mq_framebuf_t *fb, int *fin);
 
 #endif /* MQ_FRAMEBUF_H */

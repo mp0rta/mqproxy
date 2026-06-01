@@ -8,8 +8,6 @@ mq_framebuf_fill(mq_stream_t *s, mq_framebuf_t *fb, int *fin)
         return -1;
     }
 
-    int got = 0; /* any new bytes appended this call */
-
     for (;;) {
         if (fb->len >= sizeof(fb->buf)) {
             break; /* buffer full: stop; caller decides malformed after decode */
@@ -23,7 +21,6 @@ mq_framebuf_fill(mq_stream_t *s, mq_framebuf_t *fb, int *fin)
         }
         if (n > 0) {
             fb->len += (size_t)n;
-            got = 1;
         }
         if (f && fin) {
             *fin = 1;
@@ -33,5 +30,5 @@ mq_framebuf_fill(mq_stream_t *s, mq_framebuf_t *fb, int *fin)
         }
     }
 
-    return got ? (int)fb->len : 0;
+    return 0;
 }
