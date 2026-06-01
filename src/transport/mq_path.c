@@ -177,7 +177,12 @@ mq_path_open(mq_engine_t *eng, uint64_t path_id, const char *local_ip,
     p->eng = eng;
     p->path_id = path_id;
     p->fd = fd;
-    p->user = NULL;
+    /* Default the packet_process user_data to the engine. xquic hands this
+     * value to the server "before accept" send callback (and server_accept)
+     * as conn_user_data, and mq_engine's send callback recovers the engine
+     * by casting conn_user_data -> mq_engine_t*. Owners may override via
+     * mq_path_set_user, but the value must remain engine-recoverable. */
+    p->user = eng;
 
     /* Read back the actual bound address (resolves ephemeral port). */
     p->local_addrlen = sizeof(p->local_addr);

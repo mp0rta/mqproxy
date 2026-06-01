@@ -13,7 +13,9 @@ add_library(mqproxy STATIC
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
     src/transport/mq_engine.c
-    src/transport/mq_path.c)
+    src/transport/mq_path.c
+    src/transport/mq_conn.c
+    src/transport/mq_stream.c)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 enable_testing()
@@ -80,4 +82,40 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_path_bind PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_path_bind COMMAND test_path_bind)
+
+    # Self-signed cert/key for the loopback handshake test. Committed under
+    # tests/certs (test-only); regenerated at configure time if missing.
+    set(MQ_CERT_DIR "${CMAKE_SOURCE_DIR}/tests/certs")
+    set(MQ_CERT_FILE "${MQ_CERT_DIR}/test.crt")
+    set(MQ_KEY_FILE "${MQ_CERT_DIR}/test.key")
+    if(NOT EXISTS "${MQ_CERT_FILE}" OR NOT EXISTS "${MQ_KEY_FILE}")
+        find_program(OPENSSL_BIN openssl REQUIRED)
+        file(MAKE_DIRECTORY "${MQ_CERT_DIR}")
+        message(STATUS "Generating self-signed test cert in ${MQ_CERT_DIR}")
+        execute_process(
+            COMMAND ${OPENSSL_BIN} req -x509 -newkey rsa:2048 -nodes
+                    -keyout "${MQ_KEY_FILE}" -out "${MQ_CERT_FILE}"
+                    -days 3650 -subj "/CN=mqproxy-test"
+            RESULT_VARIABLE _cert_rc
+            OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _cert_rc EQUAL 0)
+            message(FATAL_ERROR "openssl failed to generate test cert")
+        endif()
+    endif()
+
+    add_executable(test_conn_handshake tests/integration/test_conn_handshake.c)
+    target_link_libraries(test_conn_handshake
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m)
+    target_include_directories(test_conn_handshake PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_conn_handshake PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_conn_handshake PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_conn_handshake COMMAND test_conn_handshake)
 endif()

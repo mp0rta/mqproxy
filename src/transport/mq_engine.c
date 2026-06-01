@@ -124,10 +124,91 @@ mq_engine_write_socket(const unsigned char *buf, size_t size,
                                      peer_addrlen, conn_user_data);
 }
 
+/* Server accept callback (REQUIRED for server). user_data is what mq_path
+ * passed to xqc_engine_packet_process — i.e. the engine. Bind the engine as
+ * the connection's transport user_data so the send callback can recover it,
+ * then accept. The application-protocol mq_conn is created by the ALP
+ * conn_create_notify (see mq_conn.c). */
+static int
+mq_engine_server_accept(xqc_engine_t *engine, xqc_connection_t *conn,
+                        const xqc_cid_t *cid, void *user_data)
+{
+    (void)engine;
+    (void)cid;
+    mq_engine_t *e = (mq_engine_t *)user_data;
+    xqc_conn_set_transport_user_data(conn, e);
+    return 0;
+}
+
+/* Server refuse callback. No transport-level context is allocated in accept
+ * (the engine is borrowed, not owned), so nothing to free here. */
+static void
+mq_engine_server_refuse(xqc_engine_t *engine, xqc_connection_t *conn,
+                        const xqc_cid_t *cid, void *user_data)
+{
+    (void)engine;
+    (void)conn;
+    (void)cid;
+    (void)user_data;
+}
+
+/* CID update notify (REQUIRED for both client and server). The mq_conn keys
+ * off the original scid, which xquic keeps valid for the connection's life,
+ * so there is nothing to re-key here. */
+static void
+mq_engine_conn_update_cid(xqc_connection_t *conn, const xqc_cid_t *retire_cid,
+                          const xqc_cid_t *new_cid, void *conn_user_data)
+{
+    (void)conn;
+    (void)retire_cid;
+    (void)new_cid;
+    (void)conn_user_data;
+}
+
+/* Client TLS certificate verify (REQUIRED for client). The proxy trusts its
+ * own peer (the cert is pinned out-of-band by deployment), so accept. */
+static int
+mq_engine_cert_verify(const unsigned char *certs[], const size_t cert_len[],
+                      size_t certs_len, void *conn_user_data)
+{
+    (void)certs;
+    (void)cert_len;
+    (void)certs_len;
+    (void)conn_user_data;
+    return 0;
+}
+
+/* Client token / session / transport-param save callbacks (REQUIRED for
+ * client). No 0-RTT / resumption store in the proxy yet, so these are no-ops. */
+static void
+mq_engine_save_token(const unsigned char *token, unsigned token_len, void *conn_user_data)
+{
+    (void)token;
+    (void)token_len;
+    (void)conn_user_data;
+}
+
+static void
+mq_engine_save_session(const char *data, size_t data_len, void *conn_user_data)
+{
+    (void)data;
+    (void)data_len;
+    (void)conn_user_data;
+}
+
+static void
+mq_engine_save_tp(const char *data, size_t data_len, void *conn_user_data)
+{
+    (void)data;
+    (void)data_len;
+    (void)conn_user_data;
+}
+
 /* ── lifecycle ────────────────────────────────────────────────────────── */
 
-mq_engine_t *
-mq_engine_new(int is_server, struct event_base *base)
+static mq_engine_t *
+mq_engine_new_impl(int is_server, struct event_base *base, const char *cert_file,
+                   const char *key_file)
 {
     mq_engine_t *e = calloc(1, sizeof(*e));
     if (!e) {
@@ -164,8 +245,15 @@ mq_engine_new(int is_server, struct event_base *base)
     memset(&ssl_config, 0, sizeof(ssl_config));
     ssl_config.ciphers = XQC_TLS_CIPHERS;
     ssl_config.groups = XQC_TLS_GROUPS;
-    /* NB: server mode additionally needs cert_file/private_key_file set by a
-     * later task before accepting connections. Boot-only here. */
+    /* Server mode needs cert_file/private_key_file to complete handshakes.
+     * xquic stores its own copies during xqc_engine_create, so the const
+     * cast here is safe (the strings are only read). */
+    if (cert_file) {
+        ssl_config.cert_file = (char *)cert_file;
+    }
+    if (key_file) {
+        ssl_config.private_key_file = (char *)key_file;
+    }
 
     xqc_engine_callback_t engine_cbs = {
         .set_event_timer = mq_engine_set_event_timer,
@@ -179,6 +267,18 @@ mq_engine_new(int is_server, struct event_base *base)
     xqc_transport_callbacks_t tcbs = {
         .write_socket = mq_engine_write_socket,
         .write_socket_ex = mq_engine_write_socket_ex,
+        .conn_update_cid_notify = mq_engine_conn_update_cid,
+        /* Server-only: accept/refuse and the pre-accept send path. Harmless
+         * to register on a client engine (never invoked). */
+        .server_accept = mq_engine_server_accept,
+        .server_refuse = mq_engine_server_refuse,
+        .conn_send_packet_before_accept = mq_engine_write_socket,
+        /* Client-only: TLS verify + resumption-store hooks. Harmless on a
+         * server engine (never invoked). */
+        .cert_verify_cb = mq_engine_cert_verify,
+        .save_token = mq_engine_save_token,
+        .save_session_cb = mq_engine_save_session,
+        .save_tp_cb = mq_engine_save_tp,
     };
 
     xqc_config_t config;
@@ -204,6 +304,22 @@ fail:
     }
     free(e);
     return NULL;
+}
+
+mq_engine_t *
+mq_engine_new(int is_server, struct event_base *base)
+{
+    return mq_engine_new_impl(is_server, base, NULL, NULL);
+}
+
+mq_engine_t *
+mq_engine_new_server(struct event_base *base, const char *cert_file, const char *key_file)
+{
+    if (!cert_file || !key_file) {
+        MQ_LOGE("mq_engine: server engine requires cert_file and key_file");
+        return NULL;
+    }
+    return mq_engine_new_impl(/*is_server=*/1, base, cert_file, key_file);
 }
 
 void
@@ -264,6 +380,10 @@ mq_engine_free(mq_engine_t *e)
     if (e->ev_engine) {
         event_free(e->ev_engine);
     }
+    /* NB: the ALP registration context (mq_conn's alpn ctx, also stashed in
+     * priv_ctx) is owned and freed by xquic itself in xqc_engine_destroy
+     * (xqc_engine_free_alpn_list). We must NOT free priv_ctx here — doing so
+     * would double-free. */
     if (e->engine) {
         xqc_engine_destroy(e->engine);
     }

@@ -28,6 +28,15 @@ typedef struct mq_engine_s mq_engine_t;
  * Returns NULL on failure (engine create / event_base alloc). */
 mq_engine_t *mq_engine_new(int is_server, struct event_base *base);
 
+/* Create a server-mode engine with a TLS certificate + private key (PEM
+ * files). Required before a server engine can complete handshakes.
+ *
+ * cert_file / key_file are borrowed for the duration of this call only
+ * (xquic copies the paths into its ssl config). base is borrowed/owned as
+ * in mq_engine_new. Returns NULL on failure. */
+mq_engine_t *mq_engine_new_server(struct event_base *base, const char *cert_file,
+                                  const char *key_file);
+
 /* Run the event loop (event_base_dispatch). Blocks until mq_engine_stop. */
 void mq_engine_run(mq_engine_t *e);
 
