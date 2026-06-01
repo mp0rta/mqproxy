@@ -6,6 +6,7 @@ include(cmake/BuildSetup.cmake)
 
 add_library(mqproxy STATIC
     src/util/mq_log.c
+    src/util/mq_buf.c
     src/wire/mq_varint.c
     src/wire/mq_wire.c)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
@@ -24,3 +25,8 @@ add_executable(test_wire tests/test_wire.c)
 target_link_libraries(test_wire mqproxy)
 target_include_directories(test_wire PRIVATE tests)
 add_test(NAME test_wire COMMAND test_wire)
+
+add_executable(test_buf tests/test_buf.c)
+target_link_libraries(test_buf mqproxy)
+target_include_directories(test_buf PRIVATE tests)
+add_test(NAME test_buf COMMAND test_buf)
