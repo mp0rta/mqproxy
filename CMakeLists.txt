@@ -12,7 +12,8 @@ add_library(mqproxy STATIC
     src/proxy/mq_relay.c
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
-    src/transport/mq_engine.c)
+    src/transport/mq_engine.c
+    src/transport/mq_path.c)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 enable_testing()
@@ -66,4 +67,17 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_engine_boot PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_engine_boot COMMAND test_engine_boot)
+
+    add_executable(test_path_bind tests/integration/test_path_bind.c)
+    target_link_libraries(test_path_bind
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m)
+    target_include_directories(test_path_bind PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_path_bind PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_path_bind COMMAND test_path_bind)
 endif()
