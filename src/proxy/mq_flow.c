@@ -65,14 +65,6 @@ flow_unlink(mq_flow_t *f)
 
 /* ── reap ─────────────────────────────────────────────────────────────────── */
 void
-mq_flow_mark_graceful(mq_flow_t *f)
-{
-    if (f) {
-        f->graceful = 1;
-    }
-}
-
-void
 mq_flow_reap(mq_flow_t *f)
 {
     if (!f || f->reaped) {
@@ -408,20 +400,6 @@ mq_flow_new(mq_flow_t **list_head, struct event_base *base, mq_stream_t *stream,
     return f;
 }
 
-void
-mq_flow_set_fd(mq_flow_t *f, int fd)
-{
-    if (f) {
-        f->fd = fd;
-    }
-}
-
-int
-mq_flow_fd(const mq_flow_t *f)
-{
-    return f ? f->fd : -1;
-}
-
 int
 mq_flow_prebuffer(mq_flow_t *f, const void *data, size_t len)
 {
@@ -442,12 +420,6 @@ mq_flow_prebuffer(mq_flow_t *f, const void *data, size_t len)
     f->pre_len = len;
     f->pre_off = 0;
     return 0;
-}
-
-mq_stream_t *
-mq_flow_stream(const mq_flow_t *f)
-{
-    return f ? f->stream : NULL;
 }
 
 int

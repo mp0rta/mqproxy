@@ -494,15 +494,19 @@ mq_engine_free(mq_engine_t *e)
     if (!e) {
         return;
     }
-    if (e->ev_engine) {
-        event_free(e->ev_engine);
-    }
     /* NB: the ALP registration context (mq_conn's alpn ctx, also stashed in
      * priv_ctx) is owned and freed by xquic itself in xqc_engine_destroy
      * (xqc_engine_free_alpn_list). We must NOT free priv_ctx here — doing so
      * would double-free. */
+    /* Destroy the engine FIRST, then free ev_engine. xquic may re-arm its main
+     * timer via set_event_timer (which references e->ev_engine) while it tears
+     * down connections during xqc_engine_destroy; freeing ev_engine beforehand
+     * would make that a use-after-free on the freed event. */
     if (e->engine) {
         xqc_engine_destroy(e->engine);
+    }
+    if (e->ev_engine) {
+        event_free(e->ev_engine);
     }
     /* Close the qlog fd AFTER engine destroy so any qlog lines emitted while the
      * engine tears down its connections still land in the file. */

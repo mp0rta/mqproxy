@@ -32,11 +32,6 @@ typedef struct mq_path mq_path_t;
 mq_path_t *mq_path_open(mq_engine_t *eng, uint64_t path_id, const char *local_ip,
                         uint16_t local_port);
 
-/* Set the conn_user_data value handed to xqc_engine_packet_process for
- * datagrams received on this path. Task 10 sets the mq_conn here; default is
- * NULL. */
-void mq_path_set_user(mq_path_t *p, void *user);
-
 /* The underlying UDP socket fd (>= 0), or -1 if p is NULL. */
 int mq_path_fd(const mq_path_t *p);
 

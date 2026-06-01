@@ -50,22 +50,12 @@ mq_flow_t *mq_flow_new(mq_flow_t **list_head, struct event_base *base,
                        mq_stream_t *stream, int fd, mq_flow_on_reap_fn on_reap,
                        void *user);
 
-/* Replace the flow's B-side fd (e.g. once a non-blocking connect completes).
- * The fd must be non-blocking. Only valid before mq_flow_begin_relay. */
-void mq_flow_set_fd(mq_flow_t *flow, int fd);
-
-/* The flow's current B-side fd, or -1. */
-int mq_flow_fd(const mq_flow_t *flow);
-
 /* Inject `len` bytes the owner already pulled off the A-side stream BEFORE the
  * relay started (e.g. payload that trailed a decoded response frame in the same
  * read). The relay drains these toward B (the fd) ahead of any fresh stream
  * reads, so they are not lost. Copies the data. Must be called before
  * mq_flow_begin_relay. Returns 0 on success, -1 on bad state / OOM. */
 int mq_flow_prebuffer(mq_flow_t *flow, const void *data, size_t len);
-
-/* The flow's A-side stream, or NULL once detached/reaped. */
-mq_stream_t *mq_flow_stream(const mq_flow_t *flow);
 
 /* Enter the relaying phase: build the relay, register a persistent EV_READ and
  * an on-demand EV_WRITE on the fd, re-wire the stream callbacks to drive the
@@ -74,18 +64,13 @@ mq_stream_t *mq_flow_stream(const mq_flow_t *flow);
  * be set and the fd must be connected & non-blocking.
  *
  * Returns 0 on success. On failure (relay/event alloc) returns -1 and the flow
- * is left intact for the caller to fail+reap (mq_flow_mark_graceful + reap, or
- * its own error path); the caller decides how to notify the peer.
+ * is left intact for the caller to fail+reap (the caller's own error path);
+ * the caller decides how to notify the peer.
  *
  * After a successful return the flow drives itself to completion via libevent
  * and the stream callbacks; on completion it self-requests a deferred reap and
  * invokes on_reap. */
 int mq_flow_begin_relay(mq_flow_t *flow);
-
-/* Mark the flow graceful: its reap must NOT RESET the stream (used when the
- * stream already carries / will carry a FIN, e.g. the protocol error path sent
- * a response with fin=1). */
-void mq_flow_mark_graceful(mq_flow_t *flow);
 
 /* Reap the flow exactly once: detach stream callbacks, close stream (RESET only
  * if not graceful) + fd, free events + relay, run on_reap, unlink from the
