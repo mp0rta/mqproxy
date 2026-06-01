@@ -21,20 +21,17 @@
 #include <event2/event.h>
 
 #include "proxy/mq_flow.h"
+#include "proxy/mq_framebuf.h"
 #include "transport/mq_stream.h"
 #include "util/mq_log.h"
 #include "wire/mq_wire.h"
 
 #define MQ_CLIENT_ALPN "mqproxy-tcp/1"
 
-/* Upper bound on the AUTH_RESPONSE frame; beyond this without a valid decode we
- * treat the stream as malformed (Phase 1: fail closed). The encoded response is
- * tiny (status+error+server_id+features+padding), well under this. */
-#define MQ_CLIENT_RESP_MAX 512
-
-/* Upper bound on the buffered CONNECT_TCP_RESPONSE before we declare it
- * malformed and fail the open. */
-#define MQ_CLIENT_TCP_RESP_MAX 512
+/* The buffered AUTH_RESPONSE / CONNECT_TCP_RESPONSE is bounded by
+ * MQ_FRAMEBUF_CAP (512): both frames are tiny (status + error + small fields),
+ * well under that. Exceeding the bound without a valid decode is malformed
+ * (Phase 1: fail closed). */
 
 /* Bound on pre-auth queued tcp_open requests. Beyond this we fail-fast new
  * opens (cb with CONN_REFUSED) rather than grow unboundedly. */
@@ -81,8 +78,7 @@ struct mq_client_data_s {
     void *user;
     mq_tcp_open_cb cb;
 
-    uint8_t rxbuf[MQ_CLIENT_TCP_RESP_MAX];
-    size_t rxlen;
+    mq_framebuf_t rx;
 
     struct mq_client_data_s *next;
 };
@@ -104,8 +100,7 @@ struct mq_client_s {
     void *on_state_user;
 
     /* AUTH_RESPONSE accumulation buffer. */
-    uint8_t rxbuf[MQ_CLIENT_RESP_MAX];
-    size_t rxlen;
+    mq_framebuf_t rx;
 
     int authed;
     int auth_reported; /* on_auth fired exactly once */
@@ -212,34 +207,18 @@ client_data_header_readable(mq_stream_t *s, void *user)
     mq_client_data_t *d = (mq_client_data_t *)user;
 
     int fin = 0;
-    for (;;) {
-        if (d->rxlen >= sizeof(d->rxbuf)) {
-            break;
-        }
-        int f = 0;
-        long n = mq_stream_recv(s, d->rxbuf + d->rxlen, sizeof(d->rxbuf) - d->rxlen, &f);
-        if (n < 0) {
-            /* Hard error / RESET before a response: fail the open. */
-            client_data_report(d, 0, MQ_TCP_CONN_REFUSED);
-            client_data_reap(d);
-            return;
-        }
-        if (n > 0) {
-            d->rxlen += (size_t)n;
-        }
-        if (f) {
-            fin = 1;
-        }
-        if (n == 0) {
-            break; /* EAGAIN: nothing more right now */
-        }
+    if (mq_framebuf_fill(s, &d->rx, &fin) < 0) {
+        /* Hard error / RESET before a response: fail the open. */
+        client_data_report(d, 0, MQ_TCP_CONN_REFUSED);
+        client_data_reap(d);
+        return;
     }
 
     mq_connect_tcp_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    int consumed = mq_decode_connect_tcp_resp(d->rxbuf, d->rxlen, &resp);
+    int consumed = mq_decode_connect_tcp_resp(d->rx.buf, d->rx.len, &resp);
     if (consumed < 0) {
-        if (d->rxlen >= sizeof(d->rxbuf) || fin) {
+        if (d->rx.len >= sizeof(d->rx.buf) || fin) {
             /* Oversized or stream FIN'd without a valid response: malformed. */
             MQ_LOGW("mq_client: CONNECT_TCP_RESPONSE malformed/oversized");
             client_data_report(d, 0, MQ_TCP_CONN_REFUSED);
@@ -270,14 +249,14 @@ client_data_header_readable(mq_stream_t *s, void *user)
     d->local_fd = -1;
 
     /* CRITICAL: while buffering the response we may have pulled payload bytes
-     * that trailed the CONNECT_TCP_RESPONSE in the same read into rxbuf. The
+     * that trailed the CONNECT_TCP_RESPONSE in the same read into rx.buf. The
      * relay reads fresh from the stream, so hand these leftover bytes to the
      * flow's prebuffer or they would be silently dropped (truncating the
      * download by exactly the trailing amount). */
     size_t consumed_sz = (size_t)consumed;
-    if (d->rxlen > consumed_sz) {
-        if (mq_flow_prebuffer(d->flow, d->rxbuf + consumed_sz, d->rxlen - consumed_sz) !=
-            0) {
+    if (d->rx.len > consumed_sz) {
+        if (mq_flow_prebuffer(d->flow, d->rx.buf + consumed_sz,
+                              d->rx.len - consumed_sz) != 0) {
             MQ_LOGE("mq_client: prebuffer failed");
             client_data_reap(d);
             return;
@@ -426,22 +405,11 @@ client_ctrl_readable(mq_stream_t *s, void *user)
         return;
     }
 
-    for (;;) {
-        if (c->rxlen >= sizeof(c->rxbuf)) {
-            break; /* buffer full, handled as malformed below */
-        }
-        int fin = 0;
-        long n =
-            mq_stream_recv(s, c->rxbuf + c->rxlen, sizeof(c->rxbuf) - c->rxlen, &fin);
-        if (n <= 0) {
-            break; /* no more data right now */
-        }
-        c->rxlen += (size_t)n;
-    }
+    mq_framebuf_fill(s, &c->rx, NULL);
 
     mq_auth_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    int consumed = mq_decode_auth_resp(c->rxbuf, c->rxlen, &resp);
+    int consumed = mq_decode_auth_resp(c->rx.buf, c->rx.len, &resp);
     if (consumed >= 0) {
         int ok = (resp.status == MQ_STATUS_OK);
         client_report_auth(c, ok, resp.error_code);
@@ -450,9 +418,9 @@ client_ctrl_readable(mq_stream_t *s, void *user)
 
     /* decode failed: could be "need more" or malformed. Phase 1: once we have
      * accumulated past a sane bound without a valid frame, treat as malformed. */
-    if (c->rxlen >= MQ_CLIENT_RESP_MAX) {
+    if (c->rx.len >= sizeof(c->rx.buf)) {
         MQ_LOGW("mq_client: AUTH_RESPONSE exceeded %d bytes, treating as malformed",
-                MQ_CLIENT_RESP_MAX);
+                MQ_FRAMEBUF_CAP);
         client_report_auth(c, 0, MQ_AUTH_FAILED);
     }
 }

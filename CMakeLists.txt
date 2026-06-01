@@ -11,6 +11,7 @@ add_library(mqproxy STATIC
     src/wire/mq_wire.c
     src/proxy/mq_relay.c
     src/proxy/mq_flow.c
+    src/proxy/mq_framebuf.c
     src/proxy/mq_client.c
     src/proxy/mq_server.c
     src/ingress/mq_socks5.c

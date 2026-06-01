@@ -28,6 +28,7 @@
 #include <event2/event.h>
 
 #include "proxy/mq_flow.h"
+#include "proxy/mq_framebuf.h"
 #include "transport/mq_conn.h"
 #include "transport/mq_engine.h"
 #include "transport/mq_stream.h"
@@ -37,10 +38,10 @@
 #define MQ_SERVER_ALPN "mqproxy-tcp/1"
 #define MQ_SERVER_ID   "mqproxy-server"
 
-/* Upper bound on the buffered AUTH_REQUEST before we declare it malformed.
- * The full frame is at most version + client_id(<=64) + auth_token(<=256) +
- * features + padding, comfortably under 512. */
-#define MQ_SERVER_REQ_MAX 512
+/* The buffered AUTH_REQUEST / CONNECT_TCP_REQUEST is bounded by MQ_FRAMEBUF_CAP
+ * (512): the full frame is at most version + client_id(<=64) + auth_token(<=256)
+ * + host/port + small fields, comfortably under that. Exceeding the bound without
+ * a decode is malformed. */
 
 typedef struct mq_srv_conn_s mq_srv_conn_t;
 typedef struct mq_srv_data_s mq_srv_data_t;
@@ -53,8 +54,7 @@ struct mq_srv_conn_s {
     int auth_done;           /* AUTH_RESPONSE sent (control stream settled) */
     mq_stream_t *ctrl;
 
-    uint8_t rxbuf[MQ_SERVER_REQ_MAX];
-    size_t rxlen;
+    mq_framebuf_t rx;
 
     /* Intrusive singly-linked list of active data streams / relays. */
     mq_srv_data_t *data_head;
@@ -82,9 +82,8 @@ struct mq_srv_data_s {
     int reaped;
     int graceful; /* pre-relay error path sent a FIN'd response: do NOT RESET */
 
-    uint8_t rxbuf[MQ_SERVER_REQ_MAX];
-    size_t rxlen;
-    size_t hdr_consumed; /* bytes of rxbuf the CONNECT_TCP_REQUEST occupied */
+    mq_framebuf_t rx;
+    size_t hdr_consumed; /* bytes of rx.buf the CONNECT_TCP_REQUEST occupied */
 
     mq_srv_data_t *next;
 };
@@ -154,24 +153,13 @@ srv_ctrl_readable(mq_stream_t *s, void *user)
         return;
     }
 
-    for (;;) {
-        if (sc->rxlen >= sizeof(sc->rxbuf)) {
-            break;
-        }
-        int fin = 0;
-        long n =
-            mq_stream_recv(s, sc->rxbuf + sc->rxlen, sizeof(sc->rxbuf) - sc->rxlen, &fin);
-        if (n <= 0) {
-            break;
-        }
-        sc->rxlen += (size_t)n;
-    }
+    mq_framebuf_fill(s, &sc->rx, NULL);
 
     mq_auth_req_t req;
     memset(&req, 0, sizeof(req));
-    int consumed = mq_decode_auth_req(sc->rxbuf, sc->rxlen, &req);
+    int consumed = mq_decode_auth_req(sc->rx.buf, sc->rx.len, &req);
     if (consumed < 0) {
-        if (sc->rxlen >= MQ_SERVER_REQ_MAX) {
+        if (sc->rx.len >= sizeof(sc->rx.buf)) {
             /* Malformed / oversized: count the attempt, reject, close. */
             srv->auth_attempts++;
             sc->auth_done = 1;
@@ -347,11 +335,11 @@ srv_data_begin_relay(mq_srv_data_t *d)
     d->fd = -1;
 
     /* Hand any client bytes that trailed the CONNECT_TCP_REQUEST (already pulled
-     * into rxbuf during header buffering) to the flow's prebuffer so they reach
+     * into rx.buf during header buffering) to the flow's prebuffer so they reach
      * the origin and are not lost. */
-    if (d->rxlen > d->hdr_consumed) {
-        if (mq_flow_prebuffer(d->flow, d->rxbuf + d->hdr_consumed,
-                              d->rxlen - d->hdr_consumed) != 0) {
+    if (d->rx.len > d->hdr_consumed) {
+        if (mq_flow_prebuffer(d->flow, d->rx.buf + d->hdr_consumed,
+                              d->rx.len - d->hdr_consumed) != 0) {
             MQ_LOGE("mq_server: prebuffer failed");
             srv_data_reap(d);
             return;
@@ -512,33 +500,22 @@ srv_data_header_readable(mq_stream_t *s, void *user)
 {
     mq_srv_data_t *d = (mq_srv_data_t *)user;
 
-    for (;;) {
-        if (d->rxlen >= sizeof(d->rxbuf)) {
-            break;
-        }
-        int fin = 0;
-        long n =
-            mq_stream_recv(s, d->rxbuf + d->rxlen, sizeof(d->rxbuf) - d->rxlen, &fin);
-        if (n <= 0) {
-            break;
-        }
-        d->rxlen += (size_t)n;
-    }
+    mq_framebuf_fill(s, &d->rx, NULL);
 
     mq_connect_tcp_req_t req;
-    int consumed = mq_decode_connect_tcp_req(d->rxbuf, d->rxlen, &req);
+    int consumed = mq_decode_connect_tcp_req(d->rx.buf, d->rx.len, &req);
     if (consumed < 0) {
-        if (d->rxlen >= sizeof(d->rxbuf)) {
+        if (d->rx.len >= sizeof(d->rx.buf)) {
             MQ_LOGW("mq_server: CONNECT_TCP_REQUEST malformed/oversized, resetting");
             srv_data_reap(d);
         }
         return; /* otherwise need more bytes */
     }
 
-    /* Header complete. Record how much rxbuf the request occupied: any bytes the
-     * client sent PAST the request were already pulled into rxbuf by the loop
-     * above, so they must be handed to the flow's prebuffer at relay start (else
-     * they are lost — the relay reads fresh from the stream). Then dial. */
+    /* Header complete. Record how much of rx.buf the request occupied: any bytes
+     * the client sent PAST the request were already pulled into rx.buf by the
+     * fill above, so they must be handed to the flow's prebuffer at relay start
+     * (else they are lost — the relay reads fresh from the stream). Then dial. */
     d->hdr_consumed = (size_t)consumed;
     srv_data_dial(d, &req);
 }
