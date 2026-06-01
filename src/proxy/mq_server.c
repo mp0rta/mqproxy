@@ -84,6 +84,7 @@ struct mq_srv_data_s {
 
     uint8_t rxbuf[MQ_SERVER_REQ_MAX];
     size_t rxlen;
+    size_t hdr_consumed; /* bytes of rxbuf the CONNECT_TCP_REQUEST occupied */
 
     mq_srv_data_t *next;
 };
@@ -345,6 +346,18 @@ srv_data_begin_relay(mq_srv_data_t *d)
      * goes through the flow. */
     d->fd = -1;
 
+    /* Hand any client bytes that trailed the CONNECT_TCP_REQUEST (already pulled
+     * into rxbuf during header buffering) to the flow's prebuffer so they reach
+     * the origin and are not lost. */
+    if (d->rxlen > d->hdr_consumed) {
+        if (mq_flow_prebuffer(d->flow, d->rxbuf + d->hdr_consumed,
+                              d->rxlen - d->hdr_consumed) != 0) {
+            MQ_LOGE("mq_server: prebuffer failed");
+            srv_data_reap(d);
+            return;
+        }
+    }
+
     /* Send the success response BEFORE starting the relay so it precedes any
      * relayed origin bytes on the stream. */
     srv_send_tcp_resp(d->stream, MQ_STATUS_OK, MQ_TCP_OK, /*fin=*/0);
@@ -522,9 +535,11 @@ srv_data_header_readable(mq_stream_t *s, void *user)
         return; /* otherwise need more bytes */
     }
 
-    /* Header complete. Stop header-buffering callbacks (re-wired in relay phase)
-     * and dial the origin. Any bytes past the header stay readable on the stream
-     * and are pumped once the relay starts. */
+    /* Header complete. Record how much rxbuf the request occupied: any bytes the
+     * client sent PAST the request were already pulled into rxbuf by the loop
+     * above, so they must be handed to the flow's prebuffer at relay start (else
+     * they are lost — the relay reads fresh from the stream). Then dial. */
+    d->hdr_consumed = (size_t)consumed;
     srv_data_dial(d, &req);
 }
 

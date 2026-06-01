@@ -870,6 +870,343 @@ test_data_stream_halfclose_nospin(void)
     fixture_down(&f);
 }
 
+/* ── Task 13: real mq_client_tcp_open end-to-end ────────────────────────────
+ *
+ * These exercise the CLIENT data path (mq_client_tcp_open), not the test-only
+ * raw-stream helper above. A socketpair() stands in for the local app socket:
+ * one end (local_fd) is handed to the client as the relay's B side; the test
+ * drives/reads the OTHER end (app_fd) as the application would. */
+
+/* tcp_open callback bookkeeping. */
+typedef struct {
+    int fired;
+    int ok;
+    mq_tcp_err_t err;
+} open_result_t;
+
+static void
+on_tcp_open(int ok, mq_tcp_err_t err, void *user)
+{
+    open_result_t *r = (open_result_t *)user;
+    r->fired = 1;
+    r->ok = ok;
+    r->err = err;
+}
+
+/* Build an IPv4 host buffer for 127.0.0.1 into host[4]. */
+static void
+v4_loopback(uint8_t host[4])
+{
+    uint32_t v4 = htonl(INADDR_LOOPBACK);
+    memcpy(host, &v4, 4);
+}
+
+/* Case I — client tcp_open echo: app→local_fd→client→stream→server→origin→back. */
+static void
+test_client_open_echo(void)
+{
+    g_auth_fired = g_auth_ok = 0;
+    g_auth_err = MQ_AUTH_FAILED;
+
+    fixture_t f;
+    if (fixture_up(&f, "secret") != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    echo_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(echo_origin_up(&origin, f.base, &origin_port), 0);
+
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+
+    int sp[2];
+    MQ_CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+    echo_set_nonblock(sp[0]);
+    echo_set_nonblock(sp[1]);
+    int app_fd = sp[0];
+    int local_fd = sp[1]; /* handed to the client */
+
+    open_result_t res;
+    memset(&res, 0, sizeof(res));
+    uint8_t host[4];
+    v4_loopback(host);
+    mq_client_tcp_open(mq_client_tcp_open_core(f.client), host, 4, MQ_ADDR_IPV4,
+                       origin_port, local_fd, &res, on_tcp_open);
+
+    pump_until(f.base, &res.fired, 4000);
+    MQ_CHECK(res.fired);
+    MQ_CHECK_EQ_INT(res.ok, 1);
+    MQ_CHECK_EQ_INT((int)res.err, (int)MQ_TCP_OK);
+
+    /* Write "ping" into the app end; expect it echoed back through the path. */
+    MQ_CHECK_EQ_INT((int)write(app_fd, "ping", 4), 4);
+
+    char rx[16];
+    size_t got = 0;
+    uint64_t deadline = now_ms() + 4000;
+    while (got < 4 && now_ms() < deadline) {
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+        ssize_t n = recv(app_fd, rx + got, sizeof(rx) - got, 0);
+        if (n > 0) got += (size_t)n;
+    }
+    MQ_CHECK_EQ_INT((int)got, 4);
+    MQ_CHECK(memcmp(rx, "ping", 4) == 0);
+
+    close(app_fd);
+    echo_origin_down(&origin);
+    fixture_down(&f);
+}
+
+/* Case J — client-side download completion: ALL N bytes + clean EOF on local_fd,
+ * no truncation. Proves the client relay propagates the server's stream FIN to a
+ * shutdown/close of the local fd. */
+static void
+test_client_open_download(void)
+{
+    g_auth_fired = g_auth_ok = 0;
+
+    fixture_t f;
+    if (fixture_up(&f, "secret") != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    const size_t N = 200000;
+    bulk_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(bulk_origin_up(&origin, f.base, N, &origin_port), 0);
+
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+
+    int sp[2];
+    MQ_CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+    echo_set_nonblock(sp[0]);
+    echo_set_nonblock(sp[1]);
+    int app_fd = sp[0];
+    int local_fd = sp[1];
+
+    open_result_t res;
+    memset(&res, 0, sizeof(res));
+    uint8_t host[4];
+    v4_loopback(host);
+    mq_client_tcp_open(mq_client_tcp_open_core(f.client), host, 4, MQ_ADDR_IPV4,
+                       origin_port, local_fd, &res, on_tcp_open);
+
+    pump_until(f.base, &res.fired, 4000);
+    MQ_CHECK(res.fired);
+    MQ_CHECK_EQ_INT(res.ok, 1);
+
+    /* Drain the app end until clean EOF (recv == 0), counting bytes + checksum. */
+    size_t got = 0;
+    uint32_t sum = 0;
+    int eof = 0;
+    uint64_t deadline = now_ms() + 8000;
+    while (!eof && now_ms() < deadline) {
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+        unsigned char buf[8192];
+        for (;;) {
+            ssize_t n = recv(app_fd, buf, sizeof(buf), 0);
+            if (n > 0) {
+                for (ssize_t i = 0; i < n; i++)
+                    sum += buf[i];
+                got += (size_t)n;
+            } else if (n == 0) {
+                eof = 1; /* clean EOF: the FIN propagated to a local-fd close */
+                break;
+            } else {
+                break; /* EAGAIN */
+            }
+        }
+    }
+
+    uint32_t expect = 0;
+    for (size_t i = 0; i < N; i++)
+        expect += (unsigned char)(i & 0xff);
+
+    MQ_CHECK(eof);                                      /* clean EOF, no hang */
+    MQ_CHECK_EQ_INT((long long)got, (long long)N);      /* ALL bytes, no trunc */
+    MQ_CHECK_EQ_INT((long long)sum, (long long)expect); /* checksum matches */
+
+    close(app_fd);
+    bulk_origin_down(&origin);
+    fixture_down(&f);
+}
+
+/* Case K — pre-auth queue: call tcp_open BEFORE auth, drains after auth + echoes. */
+static void
+test_client_open_preauth_queue(void)
+{
+    g_auth_fired = g_auth_ok = 0;
+    g_auth_err = MQ_AUTH_FAILED;
+
+    fixture_t f;
+    if (fixture_up(&f, "secret") != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    echo_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(echo_origin_up(&origin, f.base, &origin_port), 0);
+
+    /* Do NOT pump for auth yet — issue tcp_open while unauthed. */
+    MQ_CHECK_EQ_INT(mq_client_is_authed(f.client), 0);
+
+    int sp[2];
+    MQ_CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+    echo_set_nonblock(sp[0]);
+    echo_set_nonblock(sp[1]);
+    int app_fd = sp[0];
+    int local_fd = sp[1];
+
+    open_result_t res;
+    memset(&res, 0, sizeof(res));
+    uint8_t host[4];
+    v4_loopback(host);
+    mq_client_tcp_open(mq_client_tcp_open_core(f.client), host, 4, MQ_ADDR_IPV4,
+                       origin_port, local_fd, &res, on_tcp_open);
+
+    /* It must NOT have completed yet (queued, awaiting auth). */
+    MQ_CHECK_EQ_INT(res.fired, 0);
+
+    /* Now let auth + the drained open complete. */
+    pump_until(f.base, &res.fired, 6000);
+    MQ_CHECK(g_auth_ok);
+    MQ_CHECK(res.fired);
+    MQ_CHECK_EQ_INT(res.ok, 1);
+
+    MQ_CHECK_EQ_INT((int)write(app_fd, "ping", 4), 4);
+    char rx[16];
+    size_t got = 0;
+    uint64_t deadline = now_ms() + 4000;
+    while (got < 4 && now_ms() < deadline) {
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+        ssize_t n = recv(app_fd, rx + got, sizeof(rx) - got, 0);
+        if (n > 0) got += (size_t)n;
+    }
+    MQ_CHECK_EQ_INT((int)got, 4);
+    MQ_CHECK(memcmp(rx, "ping", 4) == 0);
+
+    close(app_fd);
+    echo_origin_down(&origin);
+    fixture_down(&f);
+}
+
+/* Case L — refused propagation: tcp_open to a closed port → cb ok=0 / REFUSED. */
+static void
+test_client_open_refused(void)
+{
+    g_auth_fired = g_auth_ok = 0;
+
+    fixture_t f;
+    if (fixture_up(&f, "secret") != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    int tmp = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    bind(tmp, (struct sockaddr *)&sa, sizeof(sa));
+    socklen_t sl = sizeof(sa);
+    getsockname(tmp, (struct sockaddr *)&sa, &sl);
+    uint16_t dead_port = ntohs(sa.sin_port);
+    close(tmp);
+
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+
+    int sp[2];
+    MQ_CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+    echo_set_nonblock(sp[0]);
+    echo_set_nonblock(sp[1]);
+    int app_fd = sp[0];
+    int local_fd = sp[1];
+
+    open_result_t res;
+    memset(&res, 0, sizeof(res));
+    uint8_t host[4];
+    v4_loopback(host);
+    mq_client_tcp_open(mq_client_tcp_open_core(f.client), host, 4, MQ_ADDR_IPV4,
+                       dead_port, local_fd, &res, on_tcp_open);
+
+    pump_until(f.base, &res.fired, 4000);
+    MQ_CHECK(res.fired);
+    MQ_CHECK_EQ_INT(res.ok, 0);
+    MQ_CHECK_EQ_INT((int)res.err, (int)MQ_TCP_CONN_REFUSED);
+
+    close(app_fd);
+    fixture_down(&f);
+}
+
+/* Case M — server-side coalesced request+payload: a client sends the
+ * CONNECT_TCP_REQUEST and its first upload bytes in ONE stream write, so the
+ * server pulls both into its header buffer in a single read. The trailing
+ * payload must reach the origin (the server's flow prebuffer), not be dropped.
+ * Asserts the echoed payload returns. */
+static void
+test_data_stream_coalesced_payload(void)
+{
+    g_auth_fired = g_auth_ok = 0;
+
+    fixture_t f;
+    if (fixture_up(&f, "secret") != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    echo_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(echo_origin_up(&origin, f.base, &origin_port), 0);
+
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+
+    mq_conn_t *conn = mq_client_conn(f.client);
+    MQ_CHECK(conn != NULL);
+
+    datastream_t d;
+    memset(&d, 0, sizeof(d));
+    mq_stream_t *s = mq_conn_open_stream(conn);
+    MQ_CHECK(s != NULL);
+    if (s) {
+        mq_stream_set_cbs(s, ds_readable, NULL, NULL, &d);
+
+        mq_connect_tcp_req_t req;
+        memset(&req, 0, sizeof(req));
+        req.flags = 0;
+        req.address_type = MQ_ADDR_IPV4;
+        uint32_t v4 = htonl(INADDR_LOOPBACK);
+        memcpy(req.host, &v4, 4);
+        req.host_len = 4;
+        req.port = origin_port;
+
+        /* Encode the request and append "ping" so they go out in one write — the
+         * server reads request+payload in a single buffer fill. */
+        uint8_t buf[512];
+        int n = mq_encode_connect_tcp_req(buf, sizeof(buf), &req);
+        MQ_CHECK(n > 0);
+        if (n > 0 && (size_t)n + 4 <= sizeof(buf)) {
+            memcpy(buf + n, "ping", 4);
+            (void)mq_stream_send(s, buf, (size_t)n + 4, 0);
+        }
+    }
+
+    pump_until(f.base, &d.payload_seen, 6000);
+    MQ_CHECK(d.resp_seen);
+    MQ_CHECK_EQ_INT((int)d.resp.status, (int)MQ_STATUS_OK);
+    MQ_CHECK(d.payload_seen); /* the coalesced "ping" reached the origin + echoed */
+
+    echo_origin_down(&origin);
+    fixture_down(&f);
+}
+
 static void
 test_client_server(void)
 {
@@ -881,6 +1218,11 @@ test_client_server(void)
     test_data_stream_teardown();
     test_data_stream_download_completion();
     test_data_stream_halfclose_nospin();
+    test_data_stream_coalesced_payload();
+    test_client_open_echo();
+    test_client_open_download();
+    test_client_open_preauth_queue();
+    test_client_open_refused();
 }
 
 MQ_TEST_MAIN(test_client_server())

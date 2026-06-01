@@ -57,6 +57,13 @@ void mq_flow_set_fd(mq_flow_t *flow, int fd);
 /* The flow's current B-side fd, or -1. */
 int mq_flow_fd(const mq_flow_t *flow);
 
+/* Inject `len` bytes the owner already pulled off the A-side stream BEFORE the
+ * relay started (e.g. payload that trailed a decoded response frame in the same
+ * read). The relay drains these toward B (the fd) ahead of any fresh stream
+ * reads, so they are not lost. Copies the data. Must be called before
+ * mq_flow_begin_relay. Returns 0 on success, -1 on bad state / OOM. */
+int mq_flow_prebuffer(mq_flow_t *flow, const void *data, size_t len);
+
 /* The flow's A-side stream, or NULL once detached/reaped. */
 mq_stream_t *mq_flow_stream(const mq_flow_t *flow);
 

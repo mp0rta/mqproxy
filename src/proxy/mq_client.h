@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 
+#include "ingress/mq_ingress.h"
 #include "transport/mq_conn.h"
 #include "transport/mq_engine.h"
 #include "wire/mq_wire.h"
@@ -46,6 +47,41 @@ int mq_client_is_authed(const mq_client_t *c);
 
 /* The underlying mq_conn (valid after mq_client_start, until close), or NULL. */
 mq_conn_t *mq_client_conn(const mq_client_t *c);
+
+/* ── TCP open (the ingress→core boundary, mq_ingress.h) ──────────────────────
+ *
+ * Open a proxied TCP connection to host:port on behalf of a local app socket
+ * (local_fd). Implements mq_tcp_open_fn: `core` is the mq_client_t* (see
+ * mq_client_tcp_open_core / mq_client_tcp_open_fn). Behaviour:
+ *
+ *   - If not yet authed, the request is QUEUED (bounded) and drained when auth
+ *     succeeds.
+ *   - When authed, a new bidi stream is opened carrying CONNECT_TCP_REQUEST;
+ *     the CONNECT_TCP_RESPONSE is buffered (bounded) and decoded.
+ *       · status OK    → cb(1, MQ_TCP_OK, user), then a relay binds the stream
+ *                        ⇄ local_fd (the client owns local_fd from here, closing
+ *                        it on relay completion / teardown).
+ *       · status ERROR → cb(0, error_code, user); the client closes the stream
+ *                        and CLOSES local_fd itself (ownership note below).
+ *
+ * local_fd ownership: the client takes ownership of local_fd the moment
+ * mq_client_tcp_open is invoked. On EVERY terminal outcome (success-then-relay
+ * completion, error response, malformed response, queue overflow, connection
+ * teardown) the client closes local_fd exactly once. The ingress must NOT close
+ * local_fd after calling tcp_open; it only writes its app-side reply (driven by
+ * the cb's ok flag) — on ok=0 the ingress sends its error reply on its OWN app
+ * socket, which is distinct from local_fd here in Phase 1 the ingress hands the
+ * very socket it will relay, so for ok=0 the client closing local_fd also
+ * terminates the app connection, which is the desired SOCKS/HTTP error
+ * behaviour. */
+void mq_client_tcp_open(void *core, const uint8_t *host, size_t host_len,
+                        mq_addr_type_t atype, uint16_t port, int local_fd, void *user,
+                        mq_tcp_open_cb cb);
+
+/* The function pointer + core pointer for the ingress (Task 14) to call without
+ * knowing the concrete client type. core is the mq_client_t*. */
+mq_tcp_open_fn mq_client_tcp_open_fn(void);
+void *mq_client_tcp_open_core(mq_client_t *c);
 
 /* Free the client. Does not close the connection on its own; callers tear down
  * the engine/paths which closes outstanding conns. Safe on NULL. */

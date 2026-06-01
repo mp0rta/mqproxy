@@ -34,6 +34,14 @@ struct mq_flow_s {
     int graceful;     /* stream finished/owes a FIN: do NOT RESET on reap */
     int fin_sent;     /* a FIN was already sent on the QUIC stream (idempotency) */
     int pending_reap; /* a direction hit EOF (simple-close): reap after this edge */
+    int a_fin_armed;  /* B (fd) source EOF'd: coalesce FIN onto the final A write */
+
+    /* Bytes pulled off the stream by the owner BEFORE the relay started (e.g. the
+     * download payload that trailed the CONNECT_TCP_RESPONSE in the same read).
+     * flow_a_read drains these FIRST so they reach B (the fd) and are not lost. */
+    unsigned char *pre;
+    size_t pre_len;
+    size_t pre_off;
 
     mq_flow_on_reap_fn on_reap;
     void *user;
@@ -99,6 +107,11 @@ mq_flow_reap(mq_flow_t *f)
     if (f->relay) {
         mq_relay_free(f->relay);
         f->relay = NULL;
+    }
+    if (f->pre) {
+        free(f->pre);
+        f->pre = NULL;
+        f->pre_len = f->pre_off = 0;
     }
 
     /* Unlink from the owner's list BEFORE on_reap: on_reap may free the owner
@@ -174,10 +187,12 @@ flow_relay_dir_eof(mq_relay_t *r, mq_relay_dir_t dir, void *user)
         flow_stop_fd_events(f);
         flow_send_fin(f);
     } else {
-        /* A (stream) -> B (fd) finished: stream FIN'd and A->B is flushed. Half-
-         * close the fd's write side so it sees EOF, stop the fd read events
-         * (closing both under simple-close). The stream is already FIN'd; mark
-         * graceful so reap will not RESET. */
+        /* A (stream) -> B (fd) finished: the stream's read side hit FIN and A->B
+         * is flushed. Half-close the fd's write side so the app sees EOF, stop
+         * the fd read events (closing both under simple-close), and FIN the
+         * stream's WRITE side so the bidi stream closes cleanly from this end
+         * (e.g. the client end of a download, which never sent data itself).
+         * flow_send_fin marks the node graceful so reap will not RESET. */
         if (f->fd >= 0) {
             shutdown(f->fd, SHUT_WR);
         }
@@ -209,6 +224,20 @@ flow_a_read(void *io, unsigned char *buf, size_t cap, int *eof, int *wb)
         *eof = 1;
         return 0;
     }
+    /* Drain owner-prebuffered stream bytes first (see mq_flow_t::pre). */
+    if (f->pre && f->pre_off < f->pre_len) {
+        size_t avail = f->pre_len - f->pre_off;
+        size_t take = avail < cap ? avail : cap;
+        memcpy(buf, f->pre + f->pre_off, take);
+        f->pre_off += take;
+        if (f->pre_off >= f->pre_len) {
+            free(f->pre);
+            f->pre = NULL;
+            f->pre_len = f->pre_off = 0;
+        }
+        return (long)take;
+    }
+
     int fin = 0;
     long n = mq_stream_recv(f->stream, buf, cap, &fin);
     if (n < 0) {
@@ -230,9 +259,18 @@ flow_a_write(void *io, const unsigned char *buf, size_t len, int *wb)
     if (!f->stream) {
         return -1;
     }
-    long n = mq_stream_send(f->stream, buf, len, 0);
+    /* If B's source has EOF'd, this B->A flush carries the stream's final bytes.
+     * Coalesce the FIN onto a write that xquic accepts IN FULL (n == len): xquic
+     * only commits the FIN with the data when the whole buffer is taken, so on a
+     * partial/blocked accept we send fin=0 and retry (the relay re-calls us). */
+    int want_fin = (f->a_fin_armed && len > 0) ? 1 : 0;
+    long n = mq_stream_send(f->stream, buf, len, want_fin);
     if (n < 0) {
         return -1;
+    }
+    if (want_fin && n == (long)len) {
+        f->fin_sent = 1; /* the FIN went out coalesced with the last data */
+        f->graceful = 1;
     }
     if (n == 0 && len > 0) {
         *wb = 1; /* flow-control blocked; resumes on stream on_writable */
@@ -252,6 +290,12 @@ flow_b_read(void *io, unsigned char *buf, size_t cap, int *eof, int *wb)
     ssize_t n = recv(f->fd, buf, cap, 0);
     if (n == 0) {
         *eof = 1;
+        /* B (fd) source is done: the remaining B->A bytes are the last data the
+         * stream will carry. Arm FIN coalescing so the final flow_a_write that
+         * drains them carries fin=1 (avoids a standalone zero-length FIN being
+         * attached at a flow-control-blocked offset, which truncates data still
+         * buffered in xquic — the demo always sends fin WITH the last bytes). */
+        f->a_fin_armed = 1;
         return 0;
     }
     if (n < 0) {
@@ -376,6 +420,28 @@ int
 mq_flow_fd(const mq_flow_t *f)
 {
     return f ? f->fd : -1;
+}
+
+int
+mq_flow_prebuffer(mq_flow_t *f, const void *data, size_t len)
+{
+    if (!f || f->relay) {
+        return -1; /* must be set before mq_flow_begin_relay */
+    }
+    if (len == 0) {
+        return 0;
+    }
+    unsigned char *p = malloc(len);
+    if (!p) {
+        return -1;
+    }
+    memcpy(p, data, len);
+    /* Replace any prior prebuffer (single-use at relay start). */
+    free(f->pre);
+    f->pre = p;
+    f->pre_len = len;
+    f->pre_off = 0;
+    return 0;
 }
 
 mq_stream_t *
