@@ -9,7 +9,8 @@ add_library(mqproxy STATIC
     src/util/mq_buf.c
     src/wire/mq_varint.c
     src/wire/mq_wire.c
-    src/proxy/mq_relay.c)
+    src/proxy/mq_relay.c
+    src/ingress/mq_socks5.c)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 enable_testing()
@@ -36,3 +37,8 @@ add_executable(test_relay tests/test_relay.c)
 target_link_libraries(test_relay mqproxy)
 target_include_directories(test_relay PRIVATE tests)
 add_test(NAME test_relay COMMAND test_relay)
+
+add_executable(test_socks5 tests/test_socks5.c)
+target_link_libraries(test_socks5 mqproxy)
+target_include_directories(test_socks5 PRIVATE tests)
+add_test(NAME test_socks5 COMMAND test_socks5)
