@@ -11,7 +11,8 @@ add_library(mqproxy STATIC
     src/wire/mq_wire.c
     src/proxy/mq_relay.c
     src/ingress/mq_socks5.c
-    src/ingress/mq_http_connect.c)
+    src/ingress/mq_http_connect.c
+    src/transport/mq_engine.c)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 enable_testing()
@@ -48,3 +49,21 @@ add_executable(test_http_connect tests/test_http_connect.c)
 target_link_libraries(test_http_connect mqproxy)
 target_include_directories(test_http_connect PRIVATE tests)
 add_test(NAME test_http_connect COMMAND test_http_connect)
+
+# ---- Integration tests (require xquic + libevent) ----
+if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
+    add_executable(test_engine_boot tests/integration/test_engine_boot.c)
+    target_link_libraries(test_engine_boot
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m)
+    target_include_directories(test_engine_boot PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    # libxquic.so is loaded at runtime from the xquic build dir; embed an
+    # rpath so ctest runs without LD_LIBRARY_PATH.
+    set_target_properties(test_engine_boot PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_engine_boot COMMAND test_engine_boot)
+endif()
