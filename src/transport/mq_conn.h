@@ -28,7 +28,7 @@
  *
  * The proxy aggregates throughput across multiple paths, so the receive
  * windows must cover the sum-of-paths bandwidth-delay product, not a single
- * path's. Targets: ~8MB advertised per-stream, ~16MB per-connection.
+ * path's. Targets: ≥8MB advertised per-stream, ≤16MB per-connection.
  *
  * xquic's HARD ceiling is XQC_MAX_RECV_WINDOW = 16MB (internal
  * src/transport/xqc_conn.h, not on the public include path). Raising the
@@ -40,15 +40,18 @@
  *   - max_stream_data_bidi_remote / _uni are ALWAYS XQC_MAX_RECV_WINDOW (16MB).
  *   - max_stream_data_bidi_local (the window WE advertise to the peer for the
  *     streams the peer opens to us — i.e. what gates inbound stream data) is:
- *         enable_stream_rate_limit == 0  ->  XQC_MAX_RECV_WINDOW (16MB)
+ *         enable_stream_rate_limit == 0  ->  XQC_MAX_RECV_WINDOW (16MB)  [DEFAULT]
  *         enable_stream_rate_limit == 1  ->  init_recv_window
  *   - conn-level max_data (when not interop / no recv_rate cap) is derived as
  *     max_streams * per-stream-window, i.e. far above 16MB; there is no public
  *     knob to pin it to exactly 16MB without recv_rate_bytes_per_sec, so
  *     MQ_CONN_WINDOW documents intent and bounds the static-assert ceiling.
  *
- * To realize an ~8MB advertised stream window we therefore set
- * enable_stream_rate_limit=1 and init_recv_window=MQ_STREAM_WINDOW. */
+ * We rely on xquic's DEFAULT (enable_stream_rate_limit == 0) which advertises
+ * max_stream_data_bidi_local = XQC_MAX_RECV_WINDOW = 16MB. This is ≥ the 8MB
+ * aggregate-BDP target and matches mqvpn's recipe (no rate-limit knob set).
+ * MQ_STREAM_WINDOW / MQ_CONN_WINDOW are documentary constants; the
+ * static_asserts guard that they stay within the xquic fork ceiling. */
 #define MQ_STREAM_WINDOW (8 * 1024 * 1024)
 #define MQ_CONN_WINDOW   (16 * 1024 * 1024)
 /* Mirrors XQC_MAX_RECV_WINDOW (internal xqc_conn.h). Keep in sync. */

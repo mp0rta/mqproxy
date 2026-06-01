@@ -384,12 +384,14 @@ mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server)
         s->max_path_id_grant_max_value = 128;
     }
 
-    /* Flow-control windows: realize an ~8MB advertised per-stream receive
-     * window. With enable_stream_rate_limit=1, xquic sets
-     * max_stream_data_bidi_local = init_recv_window (see mq_conn.h mapping
-     * comment). Without it, the advertised window defaults to 16MB. */
-    s->enable_stream_rate_limit = 1;
-    s->init_recv_window = MQ_STREAM_WINDOW;
+    /* Flow-control windows: rely on xquic's default (enable_stream_rate_limit
+     * == 0) which advertises max_stream_data_bidi_local = XQC_MAX_RECV_WINDOW
+     * = 16MB — larger than the 8MB aggregate-BDP target and consistent with
+     * mqvpn. Setting enable_stream_rate_limit=1 would pin the initial window
+     * to init_recv_window (8MB) for no benefit; recv_rate_bytes_per_sec stays
+     * 0 so there is no rate throttle either way. The MQ_STREAM_WINDOW /
+     * MQ_CONN_WINDOW constants are documentary and the static_asserts in
+     * mq_conn.h guard the fork ceiling. */
 }
 
 /* ── Client connect ─────────────────────────────────────────────────────── */
