@@ -15,6 +15,7 @@ add_library(mqproxy STATIC
     src/proxy/mq_server.c
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
+    src/ingress/mq_listener.c
     src/transport/mq_engine.c
     src/transport/mq_path.c
     src/transport/mq_conn.c
@@ -137,4 +138,17 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_client_server PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_client_server COMMAND test_client_server)
+
+    add_executable(test_socks5_listener tests/integration/test_socks5_listener.c)
+    target_link_libraries(test_socks5_listener
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m)
+    target_include_directories(test_socks5_listener PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_socks5_listener PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_socks5_listener COMMAND test_socks5_listener)
 endif()
