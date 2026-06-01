@@ -18,13 +18,8 @@ mq_relay_new(const mq_relay_cfg_t *cfg)
 {
     mq_relay_t *r = (mq_relay_t *)calloc(1, sizeof(*r));
     if (!r) return NULL;
+    /* calloc zeroed everything: buffers (r=w=0), a_eof/b_eof, done, error. */
     r->cfg = *cfg;
-    mq_buf_reset(&r->ab);
-    mq_buf_reset(&r->ba);
-    r->a_eof = 0;
-    r->b_eof = 0;
-    r->done = 0;
-    r->error = 0;
     return r;
 }
 
