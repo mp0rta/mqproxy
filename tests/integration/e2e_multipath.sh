@@ -116,6 +116,14 @@ cleanup() {
     # Restore lo to pristine state.
     tc qdisc del dev lo root 2>/dev/null
     wait 2>/dev/null
+    # KEEP_QLOG=1 preserves the two-path client/server qlogs for diagnosis.
+    if [ "${KEEP_QLOG:-0}" = "1" ] && [ -d "${QLOG_DIR}" ]; then
+        DEST="/tmp/mqproxy_qlog"
+        rm -rf "${DEST}"; mkdir -p "${DEST}"
+        cp "${QLOG_DIR}"/*.qlog "${DEST}/" 2>/dev/null
+        note "e2e_multipath: KEEP_QLOG -> ${DEST} ($(ls -la "${DEST}" 2>/dev/null | awk 'NR>1{print $9" "$5"B"}' | tr '\n' ' '))"
+        note "e2e_multipath: diagnose flow control: grep -aoE 'max_stream_data|stream_data_blocked|new_max_data' ${DEST}/client.qlog | sort | uniq -c"
+    fi
     rm -rf "${WORK}"
 }
 trap cleanup EXIT INT TERM
