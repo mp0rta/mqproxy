@@ -10,10 +10,13 @@
 #include "transport/mq_engine.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <event2/event.h>
 
@@ -27,6 +30,7 @@ struct mq_engine_s {
     xqc_engine_t *engine;
     struct event_base *base;
     int base_owned;          /* 1 if we created (and must free) base */
+    int is_server;           /* 1 for server-role engines */
     struct event *ev_engine; /* libevent timer driving main_logic */
 
     /* path-id -> fd map; -1 == unmapped */
@@ -35,6 +39,12 @@ struct mq_engine_s {
     /* Multipath readiness hook (set by mq_conn for the client conn). */
     mq_engine_mp_ready_fn mp_ready_fn;
     void *mp_ready_user;
+
+    /* qlog sink (Task 19). qlog_fd < 0 == disabled (default). The xquic qlog
+     * callback below writes rendered lines here when armed via
+     * mq_engine_enable_qlog. */
+    int qlog_fd;
+    char qlog_path[512];
 };
 
 /* ── engine callbacks ─────────────────────────────────────────────────── */
@@ -79,6 +89,29 @@ mq_engine_log_write(xqc_log_level_t lvl, const void *buf, size_t size,
     default: ml = MQ_LOG_DEBUG; break;
     }
     mq_log(ml, "[xquic] %.*s", (int)size, (const char *)buf);
+}
+
+/* xquic qlog event sink (Task 19). engine_user_data is the mq_engine_t* passed
+ * to xqc_engine_create. Writes the rendered qlog line + a newline to the armed
+ * qlog fd; a no-op until mq_engine_enable_qlog opens the file (fd < 0). Mirrors
+ * demo_client's xqc_demo_cli_write_qlog_file. The line carries `frames_processed`
+ * events whose func token is the lowercase parse function (e.g.
+ * xqc_parse_data_blocked_frame) — the 1-B blocked-frame instrument. */
+static void
+mq_engine_qlog_write(qlog_event_importance_t imp, const void *buf, size_t size,
+                     void *engine_user_data)
+{
+    (void)imp;
+    mq_engine_t *e = (mq_engine_t *)engine_user_data;
+    if (!e || e->qlog_fd < 0) {
+        return;
+    }
+    ssize_t w = write(e->qlog_fd, buf, size);
+    if (w < 0) {
+        return;
+    }
+    static const char nl = '\n';
+    (void)write(e->qlog_fd, &nl, 1);
 }
 
 /* Multipath send callback. Look up the UDP fd for path_id and sendto().
@@ -244,6 +277,8 @@ mq_engine_new_impl(int is_server, struct event_base *base, const char *cert_file
     for (int i = 0; i < MQ_ENGINE_MAX_PATHS; i++) {
         e->path_fd[i] = -1;
     }
+    e->is_server = is_server ? 1 : 0;
+    e->qlog_fd = -1; /* qlog disabled until mq_engine_enable_qlog */
 
     if (base) {
         e->base = base;
@@ -288,6 +323,10 @@ mq_engine_new_impl(int is_server, struct event_base *base, const char *cert_file
             {
                 .xqc_log_write_err = mq_engine_log_write,
                 .xqc_log_write_stat = mq_engine_log_write,
+                /* qlog event sink: a no-op until mq_engine_enable_qlog arms the
+                 * fd. Registered unconditionally so qlog can be enabled after
+                 * engine create without recreating the engine. */
+                .xqc_qlog_event_write = mq_engine_qlog_write,
             },
     };
 
@@ -316,6 +355,13 @@ mq_engine_new_impl(int is_server, struct event_base *base, const char *cert_file
         MQ_LOGE("mq_engine: xqc_engine_get_default_config failed");
         goto fail;
     }
+    /* qlog (Task 19): emit event-based qlog at EXTRA importance so the
+     * `frames_processed` events (incl. DATA_BLOCKED / STREAM_DATA_BLOCKED) reach
+     * the qlog sink. These are xquic's defaults; set them explicitly so the 1-B
+     * blocked-frame instrument does not silently break if the fork's defaults
+     * drift. The sink itself is a no-op until mq_engine_enable_qlog. */
+    config.cfg_log_event = 1;
+    config.cfg_qlog_importance = EVENT_IMPORTANCE_EXTRA;
 
     e->engine = xqc_engine_create(type, &config, &ssl_config, &engine_cbs, &tcbs, e);
     if (!e->engine) {
@@ -411,6 +457,37 @@ mq_engine_set_mp_ready_cb(mq_engine_t *e, mq_engine_mp_ready_fn fn, void *user)
     e->mp_ready_user = user;
 }
 
+int
+mq_engine_enable_qlog(mq_engine_t *e, const char *dir, const char **out_path)
+{
+    if (!e || !dir || dir[0] == '\0') {
+        return -1;
+    }
+    if (e->qlog_fd >= 0) {
+        /* Already armed; idempotent re-arm just returns the existing path. */
+        if (out_path) *out_path = e->qlog_path;
+        return 0;
+    }
+    int n = snprintf(e->qlog_path, sizeof(e->qlog_path), "%s/%s.qlog", dir,
+                     e->is_server ? "server" : "client");
+    if (n < 0 || (size_t)n >= sizeof(e->qlog_path)) {
+        MQ_LOGE("mq_engine: qlog path too long");
+        e->qlog_path[0] = '\0';
+        return -1;
+    }
+    int fd = open(e->qlog_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        MQ_LOGE("mq_engine: failed to open qlog file '%s': %s", e->qlog_path,
+                strerror(errno));
+        e->qlog_path[0] = '\0';
+        return -1;
+    }
+    e->qlog_fd = fd;
+    MQ_LOGI("mq_engine: qlog enabled -> %s", e->qlog_path);
+    if (out_path) *out_path = e->qlog_path;
+    return 0;
+}
+
 void
 mq_engine_free(mq_engine_t *e)
 {
@@ -426,6 +503,12 @@ mq_engine_free(mq_engine_t *e)
      * would double-free. */
     if (e->engine) {
         xqc_engine_destroy(e->engine);
+    }
+    /* Close the qlog fd AFTER engine destroy so any qlog lines emitted while the
+     * engine tears down its connections still land in the file. */
+    if (e->qlog_fd >= 0) {
+        close(e->qlog_fd);
+        e->qlog_fd = -1;
     }
     if (e->base_owned && e->base) {
         event_base_free(e->base);

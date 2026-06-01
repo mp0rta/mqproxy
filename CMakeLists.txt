@@ -184,6 +184,22 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_two_paths COMMAND test_two_paths)
 
+    add_executable(test_qlog_blocked tests/integration/test_qlog_blocked.c)
+    target_link_libraries(test_qlog_blocked
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m)
+    target_include_directories(test_qlog_blocked PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_qlog_blocked PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_qlog_blocked PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_qlog_blocked COMMAND test_qlog_blocked)
+
     # ---- mqproxy CLI (client/server binaries) ----
     # The static library target is also named `mqproxy`; give the executable a
     # distinct target name but emit it as the `mqproxy` binary.
@@ -210,4 +226,19 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     add_test(NAME test_cli_help
         COMMAND ${CMAKE_COMMAND} -E env
             sh ${CMAKE_SOURCE_DIR}/tests/test_cli_help.sh $<TARGET_FILE:mqproxy_cli>)
+
+    # ---- 1-B multipath aggregation benchmark (design §9.2) ----
+    # Self-contained bash benchmark the USER runs with sudo: it shapes two
+    # loopback paths with tc/netem, runs a single-path vs two-path bulk transfer
+    # through the proxy, and asserts >=1.5x aggregation + zero blocked frames in
+    # the client qlog. It REQUIRES NET_ADMIN (tc); without it the script exits 77
+    # so ctest marks it SKIPPED rather than FAILED. The mqproxy binary path and
+    # the test cert/key are passed via env so the script needs no build knowledge.
+    add_test(NAME e2e_multipath
+        COMMAND ${CMAKE_COMMAND} -E env
+            MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+            MQPROXY_CERT=${MQ_CERT_FILE}
+            MQPROXY_KEY=${MQ_KEY_FILE}
+            bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_multipath.sh)
+    set_tests_properties(e2e_multipath PROPERTIES SKIP_RETURN_CODE 77)
 endif()

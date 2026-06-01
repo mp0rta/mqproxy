@@ -61,6 +61,24 @@ void mq_engine_unregister_path_fd(mq_engine_t *e, uint64_t path_id);
 typedef void (*mq_engine_mp_ready_fn)(const xqc_cid_t *scid, void *user);
 void mq_engine_set_mp_ready_cb(mq_engine_t *e, mq_engine_mp_ready_fn fn, void *user);
 
+/* ── qlog (Task 19: multipath "not window-limited" instrument) ───────────────
+ *
+ * Enable xquic's qlog event sink on this engine, writing rendered qlog lines to
+ * "<dir>/<role>.qlog" (role = "client"/"server"). The engine is created with
+ * cfg_qlog_importance == EVENT_IMPORTANCE_EXTRA (xquic's default), so the qlog
+ * contains `frames_processed` events — including the lowercase parse-function
+ * tokens `xqc_parse_data_blocked_frame` / `xqc_parse_stream_data_blocked_frame`
+ * IF (and only if) the connection ever sends a DATA_BLOCKED / STREAM_DATA_BLOCKED
+ * frame (i.e. it was flow-control / window limited). On an unblocked transfer
+ * those tokens are absent, which is the 1-B "not window-limited" signal.
+ *
+ * The qlog callback is registered unconditionally at engine create; this call
+ * just opens the output file and arms the sink (fd < 0 == disabled, the default).
+ * Returns 0 on success, -1 on bad args / open failure. The file is closed by
+ * mq_engine_free. Returns the opened path via *out_path (borrowed, valid until
+ * mq_engine_free) when out_path != NULL. */
+int mq_engine_enable_qlog(mq_engine_t *e, const char *dir, const char **out_path);
+
 /* Destroy timer event, xqc engine, owned event_base (if any), and free. */
 void mq_engine_free(mq_engine_t *e);
 

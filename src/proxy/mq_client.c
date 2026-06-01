@@ -18,6 +18,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <event2/event.h>
+
 #include "proxy/mq_flow.h"
 #include "transport/mq_stream.h"
 #include "util/mq_log.h"
@@ -37,6 +39,14 @@
 /* Bound on pre-auth queued tcp_open requests. Beyond this we fail-fast new
  * opens (cb with CONN_REFUSED) rather than grow unboundedly. */
 #define MQ_CLIENT_QUEUE_MAX 256
+
+/* Extra (non-primary) local-bind IPs the CLI's --path args request. Each is
+ * brought up as its own MPQUIC path once the conn is multipath-ready. */
+#define MQ_CLIENT_MAX_PATHS 8
+/* Max length of a stored bind IP literal (v4/v6). */
+#define MQ_CLIENT_IP_MAX 64
+/* Poll interval (ms) for the mp-ready deferral timer. */
+#define MQ_CLIENT_MP_POLL_MS 50
 
 typedef struct mq_client_open_s mq_client_open_t;
 
@@ -108,7 +118,19 @@ struct mq_client_s {
 
     /* Active in-flight / relaying data streams. */
     mq_client_data_t *data_head;
+
+    /* Deferred extra paths (Task 19, CLI --path). Stored at mq_client_add_paths;
+     * added via mq_conn_add_path once the conn is multipath-ready. A recurring
+     * libevent timer (pending_paths > 0) polls mp-ready and adds them. */
+    char extra_paths[MQ_CLIENT_MAX_PATHS][MQ_CLIENT_IP_MAX];
+    size_t n_extra_paths;   /* total registered */
+    size_t added_paths;     /* how many have been brought up so far */
+    struct event *mp_timer; /* armed while paths remain to add */
 };
+
+/* Forward decl: the mp-ready deferral timer teardown is referenced from
+ * client_on_state (CLOSED) but defined below near the other path-add helpers. */
+static void client_mp_timer_stop(mq_client_t *c);
 
 /* ── in-flight data-stream nodes ─────────────────────────────────────────── */
 
@@ -468,6 +490,9 @@ client_on_state(mq_conn_t *conn, mq_conn_state_t st, void *user)
         c->conn = NULL;
         c->ctrl = NULL;
         c->closed = 1;
+        /* The conn is gone: no more paths can be added. Disarm the deferral
+         * timer so it does not dereference the freed conn. */
+        client_mp_timer_stop(c);
         /* If the connection died before auth settled, report failure (this also
          * fails any pre-auth queued opens). If auth already succeeded, the queue
          * is empty, but fail it defensively in case opens were queued in a race. */
@@ -588,6 +613,98 @@ mq_client_conn(const mq_client_t *c)
     return c ? c->conn : NULL;
 }
 
+/* ── Multipath: bring up deferred extra paths once mp-ready (Task 19) ───────── */
+
+/* Disarm + free the mp-ready deferral timer (idempotent). */
+static void
+client_mp_timer_stop(mq_client_t *c)
+{
+    if (c->mp_timer) {
+        event_free(c->mp_timer);
+        c->mp_timer = NULL;
+    }
+}
+
+/* Recurring timer: once the conn is multipath-ready, add every still-pending
+ * extra path (each on an ephemeral local UDP port), then disarm. Disarms early
+ * if the connection went away. */
+static void
+client_mp_timer_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void)fd;
+    (void)what;
+    mq_client_t *c = (mq_client_t *)arg;
+
+    if (c->closed || !c->conn) {
+        client_mp_timer_stop(c);
+        return;
+    }
+    if (!mq_conn_mp_ready(c->conn)) {
+        return; /* not ready yet; the persistent timer will fire again */
+    }
+
+    while (c->added_paths < c->n_extra_paths) {
+        const char *ip = c->extra_paths[c->added_paths];
+        int pid = mq_conn_add_path(c->conn, ip, /*ephemeral=*/0);
+        if (pid > 0) {
+            MQ_LOGI("mq_client: extra path up: bind %s -> path_id %d", ip, pid);
+        } else {
+            MQ_LOGW("mq_client: failed to add extra path bind %s (path_id rc=%d)", ip,
+                    pid);
+        }
+        c->added_paths++; /* advance regardless: do not spin on a bad bind */
+    }
+    /* All pending paths processed — disarm. */
+    client_mp_timer_stop(c);
+}
+
+/* Arm the recurring mp-ready timer if there is pending work and it is not yet
+ * armed. Safe to call repeatedly. */
+static void
+client_mp_timer_arm(mq_client_t *c)
+{
+    if (c->mp_timer || c->added_paths >= c->n_extra_paths) {
+        return;
+    }
+    struct event_base *base = mq_engine_base(c->eng);
+    if (!base) {
+        return;
+    }
+    c->mp_timer = event_new(base, -1, EV_PERSIST, client_mp_timer_cb, c);
+    if (!c->mp_timer) {
+        MQ_LOGE("mq_client: failed to create mp-ready timer");
+        return;
+    }
+    struct timeval tv = {.tv_sec = 0, .tv_usec = MQ_CLIENT_MP_POLL_MS * 1000};
+    event_add(c->mp_timer, &tv);
+}
+
+int
+mq_client_add_paths(mq_client_t *c, const char *const *ips, size_t n)
+{
+    if (!c || (n > 0 && !ips)) {
+        return -1;
+    }
+    size_t accepted = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!ips[i]) {
+            continue;
+        }
+        if (c->n_extra_paths >= MQ_CLIENT_MAX_PATHS) {
+            MQ_LOGW("mq_client: extra-path capacity %d reached; ignoring %s",
+                    MQ_CLIENT_MAX_PATHS, ips[i]);
+            break;
+        }
+        snprintf(c->extra_paths[c->n_extra_paths], MQ_CLIENT_IP_MAX, "%s", ips[i]);
+        c->n_extra_paths++;
+        accepted++;
+    }
+    /* Arm the deferral timer if the engine base is available (after
+     * mq_client_new it is). Harmless if there is no pending work. */
+    client_mp_timer_arm(c);
+    return (int)accepted;
+}
+
 /* Enqueue a pre-auth tcp_open. Returns 0 on success, -1 if the queue is full. */
 static int
 client_enqueue_open(mq_client_t *c, const uint8_t *host, size_t host_len,
@@ -668,6 +785,8 @@ mq_client_free(mq_client_t *c)
     if (!c) {
         return;
     }
+    /* Disarm the mp-ready deferral timer (no-op if already stopped). */
+    client_mp_timer_stop(c);
     /* Free any still-queued opens (no cb: the owner is tearing down). The active
      * data nodes are reaped via the conn CLOSED path before the engine frees the
      * conn; by the time mq_client_free runs they should be gone. Fail defensively

@@ -42,6 +42,21 @@ void mq_client_set_on_state(mq_client_t *c, mq_conn_on_state_fn fn, void *user);
 /* Initiate the connection to the server. Returns 0 on success, -1 on failure. */
 int mq_client_start(mq_client_t *c);
 
+/* ── Multipath: request extra paths (Task 19) ────────────────────────────────
+ *
+ * Register up to `n` extra local bind IPs to bring up as additional MPQUIC
+ * paths once the underlying connection becomes multipath-ready (xquic has fired
+ * ready_to_create_path_notify, i.e. cids are exchanged). The IP strings are
+ * copied. Because path creation can only happen after mp-ready, this DEFERS:
+ * after mq_client_start the client arms a short recurring libevent timer that
+ * polls mq_conn_mp_ready and calls mq_conn_add_path for each pending IP once
+ * ready (each on an ephemeral local UDP port), then disarms.
+ *
+ * Call after mq_client_new and before/after mq_client_start (the timer is armed
+ * on the engine's base, which must exist). Returns the number of IPs accepted
+ * (clamped to the internal max), or -1 on bad args. */
+int mq_client_add_paths(mq_client_t *c, const char *const *ips, size_t n);
+
 /* 1 once the server accepted auth, else 0. */
 int mq_client_is_authed(const mq_client_t *c);
 

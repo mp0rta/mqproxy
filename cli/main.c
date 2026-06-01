@@ -4,7 +4,7 @@
  *   mqproxy server --listen <udp ip:port> --token <t> [--cert <path> --key <path>]
  *   mqproxy client --server <udp ip:port> --token <t> --socks5 <tcp ip:port>
  *                  [--http-connect <tcp ip:port>] [--path <local ip>]...
- *                  [--client-id <id>]
+ *                  [--client-id <id>] [--qlog <dir>]
  *
  * Dispatch is on argv[1] (`client` / `server`). `--help`/`-h` at the top level
  * and per subcommand prints usage and exits 0. An unknown subcommand or a
@@ -81,6 +81,8 @@ usage_server(FILE *out)
                  "                      test cert when omitted.\n"
                  "  --key    <path>     TLS private key (PEM). Defaults to the bundled\n"
                  "                      test key when omitted.\n"
+                 "  --qlog   <dir>      Write xquic qlog (EXTRA importance) to "
+                 "<dir>/server.qlog.\n"
                  "  -h, --help          Show this help and exit.\n");
 }
 
@@ -101,11 +103,16 @@ usage_client(FILE *out)
                  "ingress.\n"
                  "  --path         <local ip>  Local IP to bind a path to (repeatable). "
                  "The\n"
-                 "                             first is the primary bind; extras are "
-                 "deferred\n"
-                 "                             to multipath support (Task 17).\n"
+                 "                             first is the primary bind; each extra "
+                 "becomes a\n"
+                 "                             second/third MPQUIC path once the "
+                 "connection is\n"
+                 "                             multipath-ready.\n"
                  "  --client-id    <id>        Client identifier sent at auth "
                  "(default: mqproxy).\n"
+                 "  --qlog         <dir>       Write xquic qlog (EXTRA importance) to "
+                 "<dir>/client.qlog\n"
+                 "                             (the 1-B blocked-frame instrument).\n"
                  "  -h, --help                 Show this help and exit.\n");
 }
 
@@ -197,13 +204,15 @@ cmd_server(int argc, char **argv)
     const char *token = NULL;
     const char *cert = NULL;
     const char *key = NULL;
+    const char *qlog_dir = NULL;
 
-    enum { OPT_LISTEN = 256, OPT_TOKEN, OPT_CERT, OPT_KEY };
+    enum { OPT_LISTEN = 256, OPT_TOKEN, OPT_CERT, OPT_KEY, OPT_QLOG };
     static const struct option longopts[] = {
         {"listen", required_argument, NULL, OPT_LISTEN},
         {"token", required_argument, NULL, OPT_TOKEN},
         {"cert", required_argument, NULL, OPT_CERT},
         {"key", required_argument, NULL, OPT_KEY},
+        {"qlog", required_argument, NULL, OPT_QLOG},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -216,6 +225,7 @@ cmd_server(int argc, char **argv)
         case OPT_TOKEN: token = optarg; break;
         case OPT_CERT: cert = optarg; break;
         case OPT_KEY: key = optarg; break;
+        case OPT_QLOG: qlog_dir = optarg; break;
         case 'h': usage_server(stdout); return 0;
         default: usage_server(stderr); return 2;
         }
@@ -264,6 +274,14 @@ cmd_server(int argc, char **argv)
         MQ_LOGE("failed to create server engine (cert=%s key=%s)", cert, key);
         goto out;
     }
+    if (qlog_dir) {
+        const char *qpath = NULL;
+        if (mq_engine_enable_qlog(eng, qlog_dir, &qpath) != 0) {
+            MQ_LOGE("failed to enable qlog in %s", qlog_dir);
+            goto out;
+        }
+        MQ_LOGI("server qlog -> %s", qpath);
+    }
     path = mq_path_open(eng, 0, listen_ip, listen_port);
     if (!path) {
         MQ_LOGE("failed to bind listen path %s:%u", listen_ip, listen_port);
@@ -308,6 +326,7 @@ cmd_client(int argc, char **argv)
     const char *socks5 = NULL;
     const char *http_connect = NULL;
     const char *client_id = "mqproxy";
+    const char *qlog_dir = NULL;
     const char *paths[MQ_MAX_EXTRA_PATHS];
     size_t npaths = 0;
 
@@ -318,6 +337,7 @@ cmd_client(int argc, char **argv)
         OPT_HTTP,
         OPT_PATH,
         OPT_CLIENT_ID,
+        OPT_QLOG,
     };
     static const struct option longopts[] = {
         {"server", required_argument, NULL, OPT_SERVER},
@@ -326,6 +346,7 @@ cmd_client(int argc, char **argv)
         {"http-connect", required_argument, NULL, OPT_HTTP},
         {"path", required_argument, NULL, OPT_PATH},
         {"client-id", required_argument, NULL, OPT_CLIENT_ID},
+        {"qlog", required_argument, NULL, OPT_QLOG},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -347,6 +368,7 @@ cmd_client(int argc, char **argv)
             }
             break;
         case OPT_CLIENT_ID: client_id = optarg; break;
+        case OPT_QLOG: qlog_dir = optarg; break;
         case 'h': usage_client(stdout); return 0;
         default: usage_client(stderr); return 2;
         }
@@ -390,13 +412,11 @@ cmd_client(int argc, char **argv)
     }
 
     /* The primary local bind for the client path. If --path was given, the
-     * first one is the primary bind; extras are deferred to Task 17 (multipath
-     * add). Otherwise bind to the unspecified IPv4 address with an ephemeral
-     * port. */
+     * first one is the primary bind; each extra --path is brought up as an
+     * additional MPQUIC path once the connection is multipath-ready (wired
+     * below via mq_client_add_paths). Otherwise bind the unspecified IPv4
+     * address with an ephemeral port. */
     const char *primary_ip = (npaths > 0) ? paths[0] : "0.0.0.0";
-    for (size_t i = 1; i < npaths; i++) {
-        MQ_LOGW("multipath not yet wired (Task 17): ignoring extra --path %s", paths[i]);
-    }
 
     int rc = 1;
     struct event_base *base = NULL;
@@ -417,6 +437,14 @@ cmd_client(int argc, char **argv)
         MQ_LOGE("failed to create client engine");
         goto out;
     }
+    if (qlog_dir) {
+        const char *qpath = NULL;
+        if (mq_engine_enable_qlog(eng, qlog_dir, &qpath) != 0) {
+            MQ_LOGE("failed to enable qlog in %s", qlog_dir);
+            goto out;
+        }
+        MQ_LOGI("client qlog -> %s", qpath);
+    }
     path = mq_path_open(eng, 0, primary_ip, 0);
     if (!path) {
         MQ_LOGE("failed to bind primary path %s", primary_ip);
@@ -432,6 +460,18 @@ cmd_client(int argc, char **argv)
     if (mq_client_start(client) != 0) {
         MQ_LOGE("failed to start client connection to %s:%u", server_ip, server_port);
         goto out;
+    }
+
+    /* Bring up each extra --path (paths[1..]) as an additional MPQUIC path once
+     * the connection is multipath-ready (deferred internally via mq_conn_add_path).
+     * paths[0] is the primary bind handled above. */
+    if (npaths > 1) {
+        int added = mq_client_add_paths(client, &paths[1], npaths - 1);
+        if (added < 0) {
+            MQ_LOGE("failed to register extra paths");
+            goto out;
+        }
+        MQ_LOGI("registered %d extra multipath bind(s) (added once mp-ready)", added);
     }
 
     mq_tcp_open_fn open_fn = mq_client_tcp_open_fn();
@@ -460,6 +500,17 @@ cmd_client(int argc, char **argv)
             http_connect ? http_ip : "", http_connect ? "" : "", primary_ip);
     mq_engine_run(eng);
     rc = 0;
+
+    /* The loop has broken (SIGINT/SIGTERM) but the conn is still alive (the
+     * engine has not been freed yet). Dump per-path byte counters at INFO so
+     * external benchmarks (1-B / e2e_multipath.sh) can confirm both paths
+     * carried traffic. Safe on a closed/NULL conn (mq_conn_dump_stats guards). */
+    {
+        mq_conn_t *dump_conn = mq_client_conn(client);
+        if (dump_conn) {
+            mq_conn_dump_stats(dump_conn);
+        }
+    }
 
 out:
     /* Teardown order — verified against the in-flight callback graph (an earlier
