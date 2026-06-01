@@ -14,8 +14,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "transport/mq_path.h"
 #include "transport/mq_stream_internal.h"
 #include "util/mq_log.h"
+
+/* Max extra (non-primary) paths a single conn may add. The engine's path-id
+ * map is 8 slots wide (path_id 0 is the primary), so 7 extra paths max; cap
+ * lower here — the proxy adds one secondary path in Phase 1. */
+#define MQ_CONN_MAX_EXTRA_PATHS 7
 
 /* Per-engine ALP registration context. Owns the new-conn / new-stream hooks
  * and is freed when the engine is destroyed (we keep it reachable via the
@@ -60,6 +66,14 @@ struct mq_conn_s {
     void *on_state_user;
 
     void *owner;
+
+    /* Multipath: set once xquic fires ready_to_create_path_notify. */
+    int mp_ready;
+
+    /* Extra (non-primary) paths added via mq_conn_add_path, owned here and
+     * freed on conn teardown. */
+    mq_path_t *extra_paths[MQ_CONN_MAX_EXTRA_PATHS];
+    int n_extra_paths;
 };
 
 static mq_alpn_ctx_t *mq_conn_actx(void *conn_user_data);
@@ -143,6 +157,12 @@ mq_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_us
      * whose create/handshake already refreshed the slot. */
     if (c->on_state) {
         c->on_state(c, MQ_CONN_CLOSED, c->on_state_user);
+    }
+    /* Release any secondary paths this conn owns (unregisters the fd from the
+     * engine map, frees the read event + socket). */
+    for (int i = 0; i < c->n_extra_paths; i++) {
+        mq_path_close(c->extra_paths[i]);
+        c->extra_paths[i] = NULL;
     }
     free(c);
     return 0;
@@ -250,6 +270,128 @@ mq_conn_register_alpn(mq_engine_t *eng, const char *alpn, mq_conn_on_new_fn on_n
     return 0;
 }
 
+/* ── Multipath ──────────────────────────────────────────────────────────── */
+
+/* Engine mp-ready hook: xquic signalled this conn can create a path. The user
+ * pointer is the client mq_conn registered in mq_conn_connect. */
+static void
+mq_conn_on_mp_ready(const xqc_cid_t *scid, void *user)
+{
+    (void)scid;
+    mq_conn_t *c = (mq_conn_t *)user;
+    if (c) {
+        c->mp_ready = 1;
+    }
+}
+
+int
+mq_conn_mp_ready(const mq_conn_t *c)
+{
+    return c ? c->mp_ready : 0;
+}
+
+int
+mq_conn_add_path(mq_conn_t *c, const char *local_ip, uint16_t local_port)
+{
+    if (!c || !c->have_cid || !local_ip) {
+        return -1;
+    }
+    if (c->n_extra_paths >= MQ_CONN_MAX_EXTRA_PATHS) {
+        MQ_LOGW("mq_conn: add_path: extra-path slots exhausted");
+        return -1;
+    }
+    xqc_engine_t *xeng = mq_engine_xqc(c->eng);
+    if (!xeng) {
+        return -1;
+    }
+
+    /* 1. Ask xquic to allocate a new path-id (needs a spare peer cid; that is
+     *    the ready_to_create_path precondition). path_status 0 == AVAILABLE
+     *    (xquic.h: 1==STANDBY, other==AVAILABLE). */
+    uint64_t new_path_id = 0;
+    xqc_int_t rc = xqc_conn_create_path(xeng, &c->cid, &new_path_id, /*AVAILABLE=*/0);
+    if (rc != XQC_OK) {
+        MQ_LOGW("mq_conn: xqc_conn_create_path failed: %d (mp_ready=%d)", (int)rc,
+                c->mp_ready);
+        return -1;
+    }
+
+    /* 2. Bind a UDP socket for the new path and register path_id->fd so the
+     *    engine's send callback can route packets for it. */
+    mq_path_t *p = mq_path_open(c->eng, new_path_id, local_ip, local_port);
+    if (!p) {
+        MQ_LOGE("mq_conn: add_path: mq_path_open(path %llu) failed",
+                (unsigned long long)new_path_id);
+        /* Best-effort: tear the half-created xquic path back down so it does
+         * not linger waiting on a socket that will never exist. */
+        xqc_conn_close_path(xeng, &c->cid, new_path_id);
+        return -1;
+    }
+    /* Datagrams arriving on this path feed packet_process with the engine as
+     * conn_user_data (the default mq_path sets), which the send/accept path
+     * recovers — matches the primary path. */
+
+    /* 3. Mark the path available so the peer may schedule traffic on it once
+     *    validation completes. */
+    if (xqc_conn_mark_path_available(xeng, &c->cid, new_path_id) != XQC_OK) {
+        MQ_LOGW("mq_conn: mark_path_available(path %llu) failed",
+                (unsigned long long)new_path_id);
+        /* Non-fatal: the path was created + socket bound; validation may still
+         * proceed. Keep the path so its socket stays alive. */
+    }
+
+    c->extra_paths[c->n_extra_paths++] = p;
+    return (int)new_path_id;
+}
+
+int
+mq_conn_path_state(const mq_conn_t *c, uint64_t path_id)
+{
+    if (!c || !c->have_cid) {
+        return -1;
+    }
+    xqc_engine_t *xeng = mq_engine_xqc(c->eng);
+    if (!xeng) {
+        return -1;
+    }
+    /* cid is const-correct read-only here; xqc_conn_get_stats takes a const
+     * cid* and returns a snapshot with a heap-allocated paths_info we free. */
+    xqc_conn_stats_t st = xqc_conn_get_stats(xeng, &c->cid);
+    int state = -1;
+    for (uint32_t i = 0; st.paths_info && i < st.paths_info_count; i++) {
+        if (st.paths_info[i].path_id == path_id) {
+            state = (int)st.paths_info[i].path_state;
+            break;
+        }
+    }
+    free(st.paths_info);
+    return state;
+}
+
+void
+mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server)
+{
+    if (!s) {
+        return;
+    }
+    /* Multipath (match mqvpn's recipe). enable_multipath + mp_ping_on on both
+     * sides; init_max_path_id left at the xquic default (8). The server grants
+     * a larger path-id ceiling on PATHS_BLOCKED since the client is the active
+     * path creator (draft-21 §3.2.1 ¶7). */
+    s->enable_multipath = 1;
+    s->mp_ping_on = 1;
+    if (is_server) {
+        s->max_path_id_grant_max_value = 128;
+    }
+
+    /* Flow-control windows: realize an ~8MB advertised per-stream receive
+     * window. With enable_stream_rate_limit=1, xquic sets
+     * max_stream_data_bidi_local = init_recv_window (see mq_conn.h mapping
+     * comment). Without it, the advertised window defaults to 16MB. */
+    s->enable_stream_rate_limit = 1;
+    s->init_recv_window = MQ_STREAM_WINDOW;
+}
+
 /* ── Client connect ─────────────────────────────────────────────────────── */
 
 mq_conn_t *
@@ -277,6 +419,11 @@ mq_conn_connect(mq_engine_t *eng, const struct sockaddr *peer, socklen_t peerlen
     c->eng = eng;
     c->is_server = 0;
     c->owner = owner;
+
+    /* Route xquic's ready_to_create_path_notify (delivered to the engine) to
+     * this conn so mq_conn_mp_ready flips once paths can be created. One conn
+     * per client engine, so a single engine slot suffices. */
+    mq_engine_set_mp_ready_cb(eng, mq_conn_on_mp_ready, c);
 
     xqc_conn_ssl_config_t conn_ssl;
     memset(&conn_ssl, 0, sizeof(conn_ssl));

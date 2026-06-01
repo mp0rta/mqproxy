@@ -31,6 +31,10 @@ struct mq_engine_s {
 
     /* path-id -> fd map; -1 == unmapped */
     int path_fd[MQ_ENGINE_MAX_PATHS];
+
+    /* Multipath readiness hook (set by mq_conn for the client conn). */
+    mq_engine_mp_ready_fn mp_ready_fn;
+    void *mp_ready_user;
 };
 
 /* ── engine callbacks ─────────────────────────────────────────────────── */
@@ -95,8 +99,18 @@ mq_engine_write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t siz
 
     int fd = e->path_fd[path_id];
     if (fd < 0) {
-        MQ_LOGW("mq_engine: send on unmapped path_id %llu", (unsigned long long)path_id);
-        return XQC_SOCKET_ERROR;
+        /* A path's dedicated socket is registered (mq_path_open) only AFTER
+         * xqc_conn_create_path returns its path_id, but xquic may queue the
+         * first PATH_CHALLENGE on the new path before that. Fall back to the
+         * primary path's socket (path_id 0) so the challenge still reaches the
+         * peer via the primary 4-tuple — mirrors mqvpn's get_fd_for_path
+         * fallback. Once the dedicated fd is mapped, sends route to it. */
+        fd = e->path_fd[XQC_INITIAL_PATH_ID];
+        if (fd < 0) {
+            MQ_LOGW("mq_engine: send on unmapped path_id %llu (no primary fallback)",
+                    (unsigned long long)path_id);
+            return XQC_SOCKET_ERROR;
+        }
     }
 
     ssize_t res;
@@ -150,6 +164,19 @@ mq_engine_server_refuse(xqc_engine_t *engine, xqc_connection_t *conn,
     (void)conn;
     (void)cid;
     (void)user_data;
+}
+
+/* Multipath ready-to-create-path notify. xquic fires this once cids are
+ * exchanged (precondition for xqc_conn_create_path). conn_user_data is the
+ * connection's transport user_data == the mq_engine (see mq_conn's user_data
+ * scheme). Route to the registered mp_ready hook so mq_conn can flip its flag. */
+static void
+mq_engine_ready_to_create_path(const xqc_cid_t *scid, void *conn_user_data)
+{
+    mq_engine_t *e = (mq_engine_t *)conn_user_data;
+    if (e && e->mp_ready_fn) {
+        e->mp_ready_fn(scid, e->mp_ready_user);
+    }
 }
 
 /* CID update notify (REQUIRED for both client and server). The mq_conn keys
@@ -268,6 +295,9 @@ mq_engine_new_impl(int is_server, struct event_base *base, const char *cert_file
         .write_socket = mq_engine_write_socket,
         .write_socket_ex = mq_engine_write_socket_ex,
         .conn_update_cid_notify = mq_engine_conn_update_cid,
+        /* Multipath: precondition signal for xqc_conn_create_path. Harmless on
+         * a server engine (the proxy creates paths from the client side). */
+        .ready_to_create_path_notify = mq_engine_ready_to_create_path,
         /* Server-only: accept/refuse and the pre-accept send path. Harmless
          * to register on a client engine (never invoked). */
         .server_accept = mq_engine_server_accept,
@@ -369,6 +399,16 @@ mq_engine_unregister_path_fd(mq_engine_t *e, uint64_t path_id)
         return;
     }
     e->path_fd[path_id] = -1;
+}
+
+void
+mq_engine_set_mp_ready_cb(mq_engine_t *e, mq_engine_mp_ready_fn fn, void *user)
+{
+    if (!e) {
+        return;
+    }
+    e->mp_ready_fn = fn;
+    e->mp_ready_user = user;
 }
 
 void

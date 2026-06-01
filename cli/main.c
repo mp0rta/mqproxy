@@ -45,10 +45,9 @@
 #  define TEST_KEY_FILE ""
 #endif
 
-/* Internal flow-control windows. Task 17 will apply these via the conn
- * settings; for now they are documented constants only (no --*-window flags). */
-#define MQ_STREAM_WINDOW (8u * 1024u * 1024u)  /* 8 MiB per-stream window */
-#define MQ_CONN_WINDOW   (16u * 1024u * 1024u) /* 16 MiB per-conn window */
+/* Flow-control windows (MQ_STREAM_WINDOW / MQ_CONN_WINDOW) are defined in
+ * transport/mq_conn.h and applied by mq_client_new / mq_server_new via
+ * mq_conn_apply_mp_settings — no CLI window flags in Phase 1. */
 
 #define MQ_MAX_EXTRA_PATHS 8
 
@@ -423,10 +422,8 @@ cmd_client(int argc, char **argv)
         MQ_LOGE("failed to bind primary path %s", primary_ip);
         goto out;
     }
-    /* TODO(Task 17): apply MQ_STREAM_WINDOW / MQ_CONN_WINDOW via conn settings.
-     * mq_client_new manages its own settings internally for Phase 1. */
-    (void)MQ_STREAM_WINDOW;
-    (void)MQ_CONN_WINDOW;
+    /* Window + multipath conn settings are applied inside mq_client_new
+     * (mq_conn_apply_mp_settings). */
     client = mq_client_new(eng, server_ip, server_port, client_id, token);
     if (!client) {
         MQ_LOGE("failed to create client");

@@ -24,6 +24,46 @@
 #include "transport/mq_engine.h"
 #include "transport/mq_stream.h"
 
+/* ── Flow-control window sizing (aggregate-BDP target) ──────────────────────
+ *
+ * The proxy aggregates throughput across multiple paths, so the receive
+ * windows must cover the sum-of-paths bandwidth-delay product, not a single
+ * path's. Targets: ~8MB advertised per-stream, ~16MB per-connection.
+ *
+ * xquic's HARD ceiling is XQC_MAX_RECV_WINDOW = 16MB (internal
+ * src/transport/xqc_conn.h, not on the public include path). Raising the
+ * window above it requires a fork patch — the static_assert below guards that.
+ *
+ * HOW THESE MAP ONTO xquic (see xqc_conn.c xqc_conn_create_settings /
+ * local_settings derivation, the `else`/`if (enable_stream_rate_limit)`
+ * blocks):
+ *   - max_stream_data_bidi_remote / _uni are ALWAYS XQC_MAX_RECV_WINDOW (16MB).
+ *   - max_stream_data_bidi_local (the window WE advertise to the peer for the
+ *     streams the peer opens to us — i.e. what gates inbound stream data) is:
+ *         enable_stream_rate_limit == 0  ->  XQC_MAX_RECV_WINDOW (16MB)
+ *         enable_stream_rate_limit == 1  ->  init_recv_window
+ *   - conn-level max_data (when not interop / no recv_rate cap) is derived as
+ *     max_streams * per-stream-window, i.e. far above 16MB; there is no public
+ *     knob to pin it to exactly 16MB without recv_rate_bytes_per_sec, so
+ *     MQ_CONN_WINDOW documents intent and bounds the static-assert ceiling.
+ *
+ * To realize an ~8MB advertised stream window we therefore set
+ * enable_stream_rate_limit=1 and init_recv_window=MQ_STREAM_WINDOW. */
+#define MQ_STREAM_WINDOW (8 * 1024 * 1024)
+#define MQ_CONN_WINDOW   (16 * 1024 * 1024)
+/* Mirrors XQC_MAX_RECV_WINDOW (internal xqc_conn.h). Keep in sync. */
+#define MQ_XQUIC_MAX_RECV_WINDOW (16 * 1024 * 1024)
+_Static_assert(MQ_CONN_WINDOW <= MQ_XQUIC_MAX_RECV_WINDOW,
+               "window exceeds xquic ceiling; raising it needs a fork patch");
+_Static_assert(MQ_STREAM_WINDOW <= MQ_XQUIC_MAX_RECV_WINDOW,
+               "stream window exceeds xquic ceiling; raising it needs a fork patch");
+
+/* Apply the proxy's multipath + flow-control window settings to a freshly
+ * memset() xqc_conn_settings_t. `is_server` selects the server-only
+ * PATHS_BLOCKED auto-grant (max_path_id_grant_max_value). Call after setting
+ * proto_version / cc / pacing etc. */
+void mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server);
+
 typedef struct mq_conn_s mq_conn_t;
 
 /* Connection lifecycle state reported to the owner. */
@@ -70,6 +110,30 @@ void mq_conn_set_user(mq_conn_t *c, void *owner);
 /* Client: open a new locally-initiated bidirectional stream. Returns a new
  * mq_stream or NULL on failure. */
 mq_stream_t *mq_conn_open_stream(mq_conn_t *c);
+
+/* ── Multipath: add a second (or further) path ──────────────────────────────
+ *
+ * mq_conn_mp_ready: 1 once xquic has fired ready_to_create_path_notify for
+ * this connection (cids exchanged) — i.e. mq_conn_add_path can now succeed.
+ * Returns 0 before that (or on NULL). Client conns only. */
+int mq_conn_mp_ready(const mq_conn_t *c);
+
+/* Create a NEW MPQUIC path bound to local_ip:local_port (port 0 == ephemeral),
+ * register its UDP socket in the engine's path-id->fd map, and mark it
+ * available so the peer may schedule traffic on it. The new mq_path is owned by
+ * the conn and freed on teardown.
+ *
+ * MUST be called after mq_conn_mp_ready(c) returns 1 (otherwise xquic has no
+ * available path-id and the call fails). Returns the new path_id (> 0) on
+ * success, or -1 on failure (not ready / out of path slots / bind failure).
+ * Client conns only. */
+int mq_conn_add_path(mq_conn_t *c, const char *local_ip, uint16_t local_port);
+
+/* Current xquic path-state for path_id, by polling xqc_conn_get_stats.
+ *   2 == XQC_PATH_STATE_ACTIVE (validated, usable) — the value of interest.
+ * Returns -1 if the conn/path is unknown. (XQC_PATH_STATE_ACTIVE lives in the
+ * private xqc_multipath.h, so the literal 2 mirrors mqvpn's usage.) */
+int mq_conn_path_state(const mq_conn_t *c, uint64_t path_id);
 
 /* Send CONNECTION_CLOSE. The mq_conn is freed later via conn_close_notify. */
 void mq_conn_close(mq_conn_t *c);

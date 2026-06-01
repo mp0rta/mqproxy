@@ -52,6 +52,15 @@ struct event_base *mq_engine_base(mq_engine_t *e);
 int mq_engine_register_path_fd(mq_engine_t *e, uint64_t path_id, int fd);
 void mq_engine_unregister_path_fd(mq_engine_t *e, uint64_t path_id);
 
+/* Multipath readiness hook. xquic fires ready_to_create_path_notify on a
+ * connection once cids have been exchanged (the precondition for
+ * xqc_conn_create_path). The engine routes that to `fn(scid, user)`. mq_conn
+ * registers this to flip its per-conn mp_ready flag. One conn per client
+ * engine in the proxy, so a single slot suffices. `scid` is the connection's
+ * source cid (copied out by xquic; valid only for the callback duration). */
+typedef void (*mq_engine_mp_ready_fn)(const xqc_cid_t *scid, void *user);
+void mq_engine_set_mp_ready_cb(mq_engine_t *e, mq_engine_mp_ready_fn fn, void *user);
+
 /* Destroy timer event, xqc engine, owned event_base (if any), and free. */
 void mq_engine_free(mq_engine_t *e);
 

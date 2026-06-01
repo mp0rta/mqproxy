@@ -667,6 +667,18 @@ mq_server_new(mq_engine_t *eng, const char *auth_token)
         free(s);
         return NULL;
     }
+
+    /* Apply multipath + aggregate-BDP flow-control windows to every accepted
+     * connection. The server is a pure responder (the client creates paths),
+     * but it must advertise enable_multipath + the larger path-id grant so the
+     * client's paths can be created and validated. */
+    xqc_conn_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.proto_version = XQC_VERSION_V1;
+    settings.pacing_on = 1;
+    mq_conn_apply_mp_settings(&settings, /*is_server=*/1);
+    xqc_server_set_conn_settings(mq_engine_xqc(eng), &settings);
+
     return s;
 }
 

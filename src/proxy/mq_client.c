@@ -563,6 +563,8 @@ mq_client_start(mq_client_t *c)
     settings.proto_version = XQC_VERSION_V1;
     settings.pacing_on = 1;
     settings.max_pkt_out_size = 1200;
+    /* Multipath + aggregate-BDP flow-control windows (see mq_conn.h). */
+    mq_conn_apply_mp_settings(&settings, /*is_server=*/0);
 
     c->conn = mq_conn_connect(c->eng, (struct sockaddr *)&sa, sizeof(sa), MQ_CLIENT_ALPN,
                               &settings, c);
