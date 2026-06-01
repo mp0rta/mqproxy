@@ -645,8 +645,11 @@ client_mp_timer_cb(evutil_socket_t fd, short what, void *arg)
 
     while (c->added_paths < c->n_extra_paths) {
         const char *ip = c->extra_paths[c->added_paths];
-        int pid = mq_conn_add_path(c->conn, ip, /*ephemeral=*/0);
-        if (pid > 0) {
+        int pid = mq_conn_add_path(c->conn, ip, /*local_port=0 -> ephemeral*/ 0);
+        /* mq_conn_add_path returns the new path_id (>= 0) on success, or the
+         * documented failure sentinel -1. Treat any non-negative id as success
+         * so a path_id of 0 is not mis-logged as a failure. */
+        if (pid >= 0) {
             MQ_LOGI("mq_client: extra path up: bind %s -> path_id %d", ip, pid);
         } else {
             MQ_LOGW("mq_client: failed to add extra path bind %s (path_id rc=%d)", ip,

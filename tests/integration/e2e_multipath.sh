@@ -3,8 +3,9 @@
 # e2e_multipath.sh — Phase 1 milestone 1-B: multipath aggregation benchmark.
 #
 # WHAT THIS PROVES (design §9.2):
-#   Two shaped loopback paths, each ~RATE with ~DELAY one-way latency, carry a
-#   bulk TCP download through the mqproxy SOCKS5 ingress. We measure throughput
+#   Two shaped loopback paths, each ~RATE with ~DELAY netem latency in BOTH
+#   directions (RTT ~= 2*DELAY), carry a bulk TCP download through the mqproxy
+#   SOCKS5 ingress. We measure throughput
 #   over ONE path vs TWO paths and assert the 1-B exit criteria:
 #     1. aggregate (2-path) throughput >= 1.5x single-path  (the concrete floor)
 #     2. ZERO flow-control blocking: the client qlog contains no
@@ -25,7 +26,8 @@
 #
 # TUNABLE ENV VARS (defaults in parens):
 #   RATE   (250mbit)  per-path rate cap applied with tbf.
-#   DELAY  (25ms)     per-path one-way netem delay (RTT ~= 2*DELAY).
+#   DELAY  (25ms)     per-path netem delay applied to EACH direction
+#                     (upstream + download), so the path RTT ~= 2*DELAY.
 #   SIZE   (64)       bulk file size in MB.
 #   MQPROXY_BIN       path to the `mqproxy` binary (default: ./build/mqproxy).
 #   MQPROXY_CERT/KEY  TLS cert/key for the server (default: tests/certs/test.*).
@@ -33,12 +35,21 @@
 # tc SHAPING APPROACH (documented):
 #   We attach an HTB root qdisc to `lo`, create one HTB class per path with a
 #   ceil of RATE, hang a netem (delay DELAY) leaf under each class, and steer
-#   traffic into the right class with u32 filters matching the CLIENT SOURCE IP:
-#       127.0.0.2 -> class 1:10 (path A),  127.0.0.3 -> class 1:11 (path B).
+#   traffic into the right class with u32 filters that match a path BY ITS
+#   CLIENT IP in EITHER position so BOTH directions of the leg are shaped:
+#       upstream  (client->server): ip src 127.0.0.2 -> class 1:10 (path A)
+#       download  (server->client): ip dst 127.0.0.2 -> class 1:10 (path A)
+#       ... and likewise 127.0.0.3 (src OR dst) -> class 1:11 (path B).
+#   This matters because the benchmark measures speed_download (server->client,
+#   src=127.0.0.1): with ONLY the src filters, the download would fall into the
+#   unshaped default class (10gbit) and netem would delay one direction only,
+#   making the >=1.5x aggregation assertion measure an unshaped pipe. Matching
+#   dst too puts each path's download into the same rate+delay class as its
+#   upstream, so the leg is shaped symmetrically (RATE each way, RTT ~= 2*DELAY).
 #   The server listens on 127.0.0.1; each client path binds a distinct source IP
-#   in 127.0.0.0/8 (all local), so egress from each path hits its own shaped
-#   class. Shaping `lo` affects ALL loopback traffic, so the trap restores `lo`
-#   to its pristine (qdisc-less) state on EXIT.
+#   in 127.0.0.0/8 (all local), so each path's traffic hits its own shaped class
+#   in both directions. Shaping `lo` affects ALL loopback traffic, so the trap
+#   restores `lo` to its pristine (qdisc-less) state on EXIT.
 #
 set -u
 
@@ -118,14 +129,25 @@ setup_tc() {
     tc class add dev lo parent 1: classid 1:1  htb rate 10gbit ceil 10gbit
     tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}"
     tc class add dev lo parent 1: classid 1:11 htb rate "${RATE}" ceil "${RATE}"
-    # netem delay leaf under each shaped class (one-way DELAY each -> RTT ~2*DELAY).
+    # netem delay leaf under each shaped class. Because BOTH directions of a
+    # path are steered into its class (see filters below), each packet of the
+    # leg traverses this DELAY once per direction -> path RTT ~= 2*DELAY.
     tc qdisc add dev lo parent 1:10 handle 10: netem delay "${DELAY}"
     tc qdisc add dev lo parent 1:11 handle 11: netem delay "${DELAY}"
-    # Steer by CLIENT SOURCE IP into the matching shaped class.
+    # Steer BOTH directions of each path into its shaped class: match the path's
+    # client IP as the SOURCE (upstream client->server) AND as the DESTINATION
+    # (download server->client, which has src=127.0.0.1). Without the dst match
+    # the measured download would escape into the unshaped default class.
+    # Path A (127.0.0.2) -> 1:10
     tc filter add dev lo protocol ip parent 1: prio 1 u32 \
         match ip src "${PATH_A_IP}/32" flowid 1:10
     tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+        match ip dst "${PATH_A_IP}/32" flowid 1:10
+    # Path B (127.0.0.3) -> 1:11
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 \
         match ip src "${PATH_B_IP}/32" flowid 1:11
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+        match ip dst "${PATH_B_IP}/32" flowid 1:11
     note "e2e_multipath: tc shaping applied to lo (RATE=${RATE} DELAY=${DELAY} each path)"
 }
 
