@@ -101,8 +101,12 @@ mq_http_connect_parse(const uint8_t *buf, size_t len, mq_http_target_t *out,
 
     if (host_len == 0) return MQ_HTTP_BAD;
 
-    /* Bracketed IPv6 literal: [ ... ] */
-    if (host[0] == '[' && host[host_len - 1] == ']') {
+    /* Bracketed IPv6 literal: [ ... ]
+       If the host begins with '[', it MUST end with ']'; otherwise it is a
+       malformed authority (unclosed bracket) and we reject it immediately.
+       We also reject if the bracketed inner text is not a valid IPv6 address. */
+    if (host[0] == '[') {
+        if (host[host_len - 1] != ']') return MQ_HTTP_BAD;
         size_t inner_len = host_len - 2;
         if (inner_len == 0 || inner_len > 45) return MQ_HTTP_BAD;
         char tmp[46];
