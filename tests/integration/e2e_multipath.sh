@@ -98,6 +98,21 @@ if [ ! -x "${MQPROXY_BIN}" ]; then
     exit 1
 fi
 
+# Throughput is meaningless on an AddressSanitizer build (2-3x slowdown crushes
+# the userspace relay drain → the receive window fills → STREAM_DATA_BLOCKED →
+# artificially low, window-limited throughput). Require a RELEASE binary linked
+# against a RELEASE xquic for the 1-B aggregation numbers to mean anything.
+if ldd "${MQPROXY_BIN}" 2>/dev/null | grep -qi 'libasan'; then
+    note "e2e_multipath: WARNING: ${MQPROXY_BIN} is AddressSanitizer-instrumented."
+    note "  Throughput will be ASan-crippled and the >=1.5x assertion is NOT meaningful."
+    note "  Build a release binary + release xquic and re-run, e.g.:"
+    note "    bash scripts/build-xquic.sh   # release xquic (XQC_ENABLE_EVENT_LOG=ON)"
+    note "    cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \\"
+    note "          -DXQUIC_BUILD_DIR=\$PWD/third_party/xquic/build && cmake --build build-release"
+    note "    sudo env MQPROXY_BIN=\$PWD/build-release/mqproxy $0"
+    note "  Continuing anyway (numbers are diagnostic-only)..."
+fi
+
 # ── workspace + cleanup ───────────────────────────────────────────────────────
 WORK="$(mktemp -d /tmp/mqproxy_e2e_multipath.XXXXXX)"
 QLOG_DIR="${WORK}/qlog"
