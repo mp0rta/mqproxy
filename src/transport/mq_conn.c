@@ -451,6 +451,16 @@ mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server)
         s->max_path_id_grant_max_value = 128;
     }
 
+    /* Congestion control: BBR2 (match mqvpn's default). Without this,
+     * cong_ctrl_callback stays NULL and the sender is effectively un-throttled
+     * — on a real rate-limited/lossy path that overflows the queue, triggers a
+     * loss/PTO retransmit storm, and collapses throughput to ~KB/s. It is
+     * INVISIBLE on clean loopback or under ASan (the sanitizer's slowdown keeps
+     * the send rate below the link rate), which is why it only surfaced in the
+     * shaped 1-B benchmark. Applies to both sides; the download sender (server)
+     * needs it most. */
+    s->cong_ctrl_callback = xqc_bbr2_cb;
+
     /* Flow-control windows: rely on xquic's default (enable_stream_rate_limit
      * == 0) which advertises max_stream_data_bidi_local = XQC_MAX_RECV_WINDOW
      * = 16MB — larger than the 8MB aggregate-BDP target and consistent with
