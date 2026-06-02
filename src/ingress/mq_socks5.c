@@ -50,8 +50,8 @@ parse_request(const uint8_t *buf, size_t len, size_t *consumed, mq_socks5_req_t 
     if (len < 4) return MQ_SOCKS5_NEED_MORE;
     if (buf[0] != SOCKS5_VER) return MQ_SOCKS5_ERROR;
     if (buf[1] != SOCKS5_CMD_CONNECT)
-        return MQ_SOCKS5_UNSUPPORTED; /* caller replies 0x07 cmd-not-supported */
-    /* buf[2] RSV ignored */
+        return MQ_SOCKS5_UNSUPPORTED_CMD; /* BIND/UDP-ASSOCIATE => REP 0x07 */
+    /* buf[2] RSV ignored (RFC 1928 says 0x00, but be permissive on receive) */
 
     uint8_t atype = buf[3];
     size_t addr_off = 4;
@@ -75,7 +75,7 @@ parse_request(const uint8_t *buf, size_t len, size_t *consumed, mq_socks5_req_t 
         mapped = MQ_ADDR_DOMAIN;
         break;
     }
-    default: return MQ_SOCKS5_UNSUPPORTED; /* 0x08 addr-type-not-supported */
+    default: return MQ_SOCKS5_UNSUPPORTED_ATYP; /* unknown ATYP => REP 0x08 */
     }
 
     size_t total = addr_off + addr_len + 2; /* +2 for port */

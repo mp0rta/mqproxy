@@ -314,7 +314,7 @@ test_socks5_unsupported(struct event_base *base)
     size_t got = pump_read(base, c, creply, 10, 1000);
     MQ_CHECK_EQ_INT(got, 10);
     MQ_CHECK_EQ_INT(creply[0], 0x05);
-    MQ_CHECK(creply[1] != 0x00); /* a reject REP */
+    MQ_CHECK_EQ_INT(creply[1], 0x07); /* REP 0x07: command not supported (BIND) */
 
     /* No tcp_open call, and the listener closes the accepted fd. */
     MQ_CHECK_EQ_INT(m.called, 0);

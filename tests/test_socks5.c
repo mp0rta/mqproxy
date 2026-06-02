@@ -181,7 +181,7 @@ test_request_cmd_unsupported(void)
     mq_socks5_req_t out;
     memset(&out, 0, sizeof out);
     mq_socks5_status_t st = do_request(REQ_CMD_BIND, sizeof REQ_CMD_BIND, &out);
-    MQ_CHECK_EQ_INT(st, MQ_SOCKS5_UNSUPPORTED);
+    MQ_CHECK_EQ_INT(st, MQ_SOCKS5_UNSUPPORTED_CMD);
 }
 
 static void
@@ -190,7 +190,7 @@ test_request_bad_atyp(void)
     mq_socks5_req_t out;
     memset(&out, 0, sizeof out);
     mq_socks5_status_t st = do_request(REQ_BAD_ATYP, sizeof REQ_BAD_ATYP, &out);
-    MQ_CHECK_EQ_INT(st, MQ_SOCKS5_UNSUPPORTED);
+    MQ_CHECK_EQ_INT(st, MQ_SOCKS5_UNSUPPORTED_ATYP);
 }
 
 static void

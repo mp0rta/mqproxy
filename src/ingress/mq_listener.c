@@ -176,19 +176,20 @@ drive_socks5(struct mq_conn_state *c)
         }
 
         case MQ_SOCKS5_UNSUPPORTED: {
-            /* Reject with command-not-supported (general failure REP) and close.
-             * If we are still in the greeting phase, an UNSUPPORTED means no
-             * acceptable auth method => send method reply 0xFF. */
-            if (c->s5.phase == 0) {
-                uint8_t mr[2];
-                size_t n = mq_socks5_build_method_reply(mr, /*accepted=*/0);
-                (void)send(c->fd, mr, n, MSG_NOSIGNAL);
-            } else {
-                uint8_t cr[10];
-                size_t n = mq_socks5_build_connect_reply(
-                    cr, mq_socks5_reply_code(MQ_TCP_CONN_REFUSED));
-                (void)send(c->fd, cr, n, MSG_NOSIGNAL);
-            }
+            /* Greeting phase: no acceptable auth method => method reply 0xFF
+             * (NO ACCEPTABLE METHODS), per RFC 1928. */
+            uint8_t mr[2];
+            size_t n = mq_socks5_build_method_reply(mr, /*accepted=*/0);
+            (void)send(c->fd, mr, n, MSG_NOSIGNAL);
+            return MQ_DRIVE_CLOSE;
+        }
+
+        case MQ_SOCKS5_UNSUPPORTED_CMD:    /* REP 0x07: command not supported */
+        case MQ_SOCKS5_UNSUPPORTED_ATYP: { /* REP 0x08: address type not supported */
+            uint8_t cr[10];
+            uint8_t rep = (st == MQ_SOCKS5_UNSUPPORTED_CMD) ? 0x07 : 0x08;
+            size_t n = mq_socks5_build_connect_reply(cr, rep);
+            (void)send(c->fd, cr, n, MSG_NOSIGNAL);
             return MQ_DRIVE_CLOSE;
         }
 
