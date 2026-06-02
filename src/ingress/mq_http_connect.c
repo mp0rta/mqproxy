@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 #include "ingress/mq_http_connect.h"
 #include <arpa/inet.h>
 #include <string.h>

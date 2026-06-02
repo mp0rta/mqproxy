@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* test_two_paths.c — Task 17: a SECOND MPQUIC path comes up.
  *
  * Brings up an AUTHED client+server over loopback (single libevent base, one

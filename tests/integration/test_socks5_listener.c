@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* test_socks5_listener.c — Task 14 integration test for the ingress listeners.
  *
  * Drives the SOCKS5 (and a smoke-test of the HTTP CONNECT) accept loop with a

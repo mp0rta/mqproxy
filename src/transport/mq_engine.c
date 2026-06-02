@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_engine.c — xquic engine + libevent event loop.
  *
  * Integration pattern mirrors third_party/xquic/demo/demo_client.c and

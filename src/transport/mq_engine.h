@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_engine.h — xquic engine + libevent event loop (transport only).
  *
  * mq_engine owns an xqc_engine_t and a libevent event_base, wiring xquic's

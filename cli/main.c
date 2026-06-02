@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* main.c — the `mqproxy` CLI: client and server subcommands.
  *
  * Usage:

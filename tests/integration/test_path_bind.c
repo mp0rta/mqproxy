@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* test_path_bind.c — Task 9 smoke test.
  *
  * Opens an mq_path on 127.0.0.1:0 against a client-mode engine, checks the fd

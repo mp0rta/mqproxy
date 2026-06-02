@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_conn.h — wrapper around one raw MPQUIC (xqc_connection_t) connection.
  *
  * mq_conn ties an xquic connection (identified by its scid) to an owner. It

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_server.c — proxy server + control-stream AUTH handshake.
  *
  * Per accepted connection: an mq_srv_conn state struct is allocated in

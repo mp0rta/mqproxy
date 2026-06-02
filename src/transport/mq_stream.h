@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_stream.h — wrapper around one raw MPQUIC (xqc_stream_t) stream.
  *
  * An mq_stream owns the application-side view of a single bidirectional QUIC

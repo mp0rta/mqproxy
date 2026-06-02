@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_path.c — per-path UDP socket bound to a local address (one MPQUIC path).
  *
  * Recv path mirrors mqvpn's single-threaded libevent integration of the same

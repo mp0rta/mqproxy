@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 #ifndef MQ_SOCKS5_H
 #define MQ_SOCKS5_H
 #include "wire/mq_wire.h"

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_conn.c — raw MPQUIC connection wrapper + ALP callback tables.
  *
  * See mq_conn.h for the user_data scheme. In short:

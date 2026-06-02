@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_client.c — proxy client + control-stream AUTH handshake.
  *
  * Flow:

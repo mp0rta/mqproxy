@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_flow.h — shared QUIC-stream ⇄ TCP-fd relay glue.
  *
  * A "flow" binds one bidirectional QUIC stream (the A side, driven via

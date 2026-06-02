@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* test_conn_handshake.c — Task 10 integration test.
  *
  * Drives a real loopback MPQUIC handshake between two engines sharing one

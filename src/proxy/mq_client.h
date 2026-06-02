@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_client.h — proxy client: connects to an mqproxy server and performs the
  * control-stream AUTH handshake.
  *

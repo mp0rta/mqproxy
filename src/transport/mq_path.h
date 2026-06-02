@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_path.h — one UDP socket bound to a local address, registered as one
  * MPQUIC path.
  *

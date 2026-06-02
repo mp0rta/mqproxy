@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* test_e2e_single_path.c — Task 16: the 1-A end-to-end milestone.
  *
  * Drives the FULL ingress→origin path with REAL client sockets over a SINGLE

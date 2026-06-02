@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_stream.c — raw MPQUIC stream wrapper.
  *
  * mq_stream stores an xqc_stream_t and registers itself as that stream's

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_listener.c — shared ingress TCP accept loop for SOCKS5 + HTTP CONNECT.
  *
  * One generic listener type backs both protocols. The protocol-specific logic

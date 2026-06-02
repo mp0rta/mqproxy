@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_listener.h — ingress TCP accept listeners (SOCKS5 / HTTP CONNECT).
  *
  * A listener binds+listens a non-blocking TCP socket on bind_ip:port and runs

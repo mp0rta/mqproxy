@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* test_qlog_blocked.c — Task 19: validate the qlog "not window-limited" instrument.
  *
  * The 1-B multipath aggregation benchmark (e2e_multipath.sh) proves aggregation

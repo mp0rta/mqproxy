@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 #include "proxy/mq_relay.h"
 #include "mqtest.h"
 #include <string.h>

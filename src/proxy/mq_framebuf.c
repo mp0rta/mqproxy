@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_framebuf.c — see mq_framebuf.h. */
 #include "proxy/mq_framebuf.h"
 

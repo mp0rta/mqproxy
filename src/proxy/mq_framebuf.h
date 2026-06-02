@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_framebuf.h — bounded frame-accumulation buffer for control/header decode.
  *
  * The proxy client and server each need to pull bytes off a freshly-opened

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* test_engine_boot.c — Task 8 integration test.
  *
  * Proves that mq_engine boots a client-mode xquic engine wired to a libevent

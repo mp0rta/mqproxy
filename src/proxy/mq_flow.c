@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_flow.c — shared QUIC-stream ⇄ TCP-fd relay glue. See mq_flow.h. */
 #include "proxy/mq_flow.h"
 

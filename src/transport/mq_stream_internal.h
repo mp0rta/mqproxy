@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_stream_internal.h — definitions shared between mq_stream.c and mq_conn.c.
  *
  * Not part of the public transport API. mq_conn needs to construct/wrap

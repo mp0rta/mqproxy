@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* test_client_server.c — Task 11 integration test: control-stream AUTH.
  *
  * Two engines (server with cert/key + client) share one libevent base on

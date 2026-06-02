@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* mq_server.h — proxy server: accepts mqproxy connections and authenticates
  * each on its control stream.
  *
