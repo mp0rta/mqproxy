@@ -160,29 +160,36 @@ drive_socks5(struct mq_conn_state *c)
             /* Hand off: the core owns the fd from here. The success/error reply
              * is written by socks5_open_result on the (still-open) fd. Drop our
              * read interest first — the core (relay) now drives the fd, and
-             * open_fn's result cb may fire asynchronously (later turn). */
+             * open_fn's result cb may fire asynchronously (later turn).
+             *
+             * Bytes the app pipelined after the request (already in rxbuf, past
+             * `consumed`) are handed to the core as a prebuffer so they reach the
+             * origin and are not dropped. */
             c->handed_off = 1;
             int fd = c->fd;
+            const uint8_t *prebuf = c->rxbuf + consumed;
+            size_t prebuf_len = c->rxlen - consumed;
             conn_detach_read(c);
-            l->open_fn(l->core, req.host, req.host_len, req.atype, req.port, fd, c,
-                       socks5_open_result);
+            l->open_fn(l->core, req.host, req.host_len, req.atype, req.port, fd, prebuf,
+                       prebuf_len, c, socks5_open_result);
             return MQ_DRIVE_HANDOFF;
         }
 
         case MQ_SOCKS5_UNSUPPORTED: {
-            /* Reject with command-not-supported (general failure REP) and close.
-             * If we are still in the greeting phase, an UNSUPPORTED means no
-             * acceptable auth method => send method reply 0xFF. */
-            if (c->s5.phase == 0) {
-                uint8_t mr[2];
-                size_t n = mq_socks5_build_method_reply(mr, /*accepted=*/0);
-                (void)send(c->fd, mr, n, MSG_NOSIGNAL);
-            } else {
-                uint8_t cr[10];
-                size_t n = mq_socks5_build_connect_reply(
-                    cr, mq_socks5_reply_code(MQ_TCP_CONN_REFUSED));
-                (void)send(c->fd, cr, n, MSG_NOSIGNAL);
-            }
+            /* Greeting phase: no acceptable auth method => method reply 0xFF
+             * (NO ACCEPTABLE METHODS), per RFC 1928. */
+            uint8_t mr[2];
+            size_t n = mq_socks5_build_method_reply(mr, /*accepted=*/0);
+            (void)send(c->fd, mr, n, MSG_NOSIGNAL);
+            return MQ_DRIVE_CLOSE;
+        }
+
+        case MQ_SOCKS5_UNSUPPORTED_CMD:    /* REP 0x07: command not supported */
+        case MQ_SOCKS5_UNSUPPORTED_ATYP: { /* REP 0x08: address type not supported */
+            uint8_t cr[10];
+            uint8_t rep = (st == MQ_SOCKS5_UNSUPPORTED_CMD) ? 0x07 : 0x08;
+            size_t n = mq_socks5_build_connect_reply(cr, rep);
+            (void)send(c->fd, cr, n, MSG_NOSIGNAL);
             return MQ_DRIVE_CLOSE;
         }
 
@@ -210,9 +217,14 @@ drive_http(struct mq_conn_state *c)
     case MQ_HTTP_CONNECT_DONE: {
         int fd = c->fd;
         c->handed_off = 1;
+        /* Bytes the app pipelined after the CONNECT head (already in rxbuf, past
+         * header_len) are handed to the core as a prebuffer so they reach the
+         * origin and are not dropped. */
+        const uint8_t *prebuf = c->rxbuf + header_len;
+        size_t prebuf_len = c->rxlen - header_len;
         conn_detach_read(c);
-        l->open_fn(l->core, tgt.host, tgt.host_len, tgt.atype, tgt.port, fd, c,
-                   http_open_result);
+        l->open_fn(l->core, tgt.host, tgt.host_len, tgt.atype, tgt.port, fd, prebuf,
+                   prebuf_len, c, http_open_result);
         return MQ_DRIVE_HANDOFF;
     }
 

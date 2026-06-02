@@ -48,6 +48,8 @@ struct mock_open {
     size_t host_len;
     mq_addr_type_t atype;
     uint16_t port;
+    uint8_t prebuf[512]; /* bytes coalesced with the request head */
+    size_t prebuf_len;
     /* echo plumbing */
     int local_fd;
     struct event *echo_ev;
@@ -82,7 +84,8 @@ mock_echo_cb(evutil_socket_t fd, short what, void *user)
 
 static void
 mock_tcp_open(void *core, const uint8_t *host, size_t host_len, mq_addr_type_t atype,
-              uint16_t port, int local_fd, void *user, mq_tcp_open_cb cb)
+              uint16_t port, int local_fd, const uint8_t *prebuf, size_t prebuf_len,
+              void *user, mq_tcp_open_cb cb)
 {
     struct mock_open *m = (struct mock_open *)core;
     m->called++;
@@ -91,6 +94,8 @@ mock_tcp_open(void *core, const uint8_t *host, size_t host_len, mq_addr_type_t a
     m->atype = atype;
     m->port = port;
     m->local_fd = local_fd;
+    m->prebuf_len = prebuf_len < sizeof(m->prebuf) ? prebuf_len : sizeof(m->prebuf);
+    if (m->prebuf_len > 0 && prebuf) memcpy(m->prebuf, prebuf, m->prebuf_len);
 
     if (!m->forced_ok) {
         /* Fail path: fire cb(0) so the listener writes its error reply on
@@ -309,7 +314,7 @@ test_socks5_unsupported(struct event_base *base)
     size_t got = pump_read(base, c, creply, 10, 1000);
     MQ_CHECK_EQ_INT(got, 10);
     MQ_CHECK_EQ_INT(creply[0], 0x05);
-    MQ_CHECK(creply[1] != 0x00); /* a reject REP */
+    MQ_CHECK_EQ_INT(creply[1], 0x07); /* REP 0x07: command not supported (BIND) */
 
     /* No tcp_open call, and the listener closes the accepted fd. */
     MQ_CHECK_EQ_INT(m.called, 0);
@@ -401,6 +406,119 @@ test_http_connect_smoke(struct event_base *base)
     mq_listener_free(l);
 }
 
+/* ── Scenario 5: SOCKS5 request coalesced with early payload ─────────────────
+ * The CONNECT request and the app's first upload bytes arrive in ONE send, so
+ * the listener reads them in a single recv. The trailing bytes must be handed to
+ * open_fn as the prebuffer (not dropped). */
+static void
+test_socks5_pipelined_prebuf(struct event_base *base)
+{
+    struct mock_open m;
+    memset(&m, 0, sizeof(m));
+    m.base = base;
+    m.forced_ok = 1;
+    m.local_fd = -1;
+
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    uint16_t port = mq_listener_local_port(l);
+
+    int c = dial(port);
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        mq_listener_free(l);
+        return;
+    }
+
+    uint8_t greeting[] = {0x05, 0x01, 0x00};
+    send_all(c, greeting, sizeof(greeting));
+    uint8_t mreply[2] = {0};
+    MQ_CHECK_EQ_INT(pump_read(base, c, mreply, 2, 1000), 2);
+
+    /* CONNECT to example.com:443 (domain) immediately followed by "ping", in one
+     * send so the listener reads request+payload together. */
+    const char host[] = "example.com";
+    const uint8_t early[] = "ping";
+    uint8_t req[4 + 1 + 11 + 2 + 4];
+    size_t i = 0;
+    req[i++] = 0x05;
+    req[i++] = 0x01;
+    req[i++] = 0x00;
+    req[i++] = 0x03;
+    req[i++] = (uint8_t)(sizeof(host) - 1);
+    memcpy(req + i, host, sizeof(host) - 1);
+    i += sizeof(host) - 1;
+    req[i++] = (uint8_t)(443 >> 8);
+    req[i++] = (uint8_t)(443 & 0xff);
+    memcpy(req + i, early, sizeof(early) - 1);
+    i += sizeof(early) - 1;
+    send_all(c, req, i);
+
+    /* Drain the success reply so the pump runs the drive. */
+    uint8_t creply[10] = {0};
+    MQ_CHECK_EQ_INT(pump_read(base, c, creply, 10, 1000), 10);
+
+    MQ_CHECK_EQ_INT(m.called, 1);
+    MQ_CHECK_EQ_INT(m.prebuf_len, sizeof(early) - 1);
+    MQ_CHECK_MEM(m.prebuf, early, sizeof(early) - 1);
+
+    close(c);
+    uint64_t deadline = now_ms() + 500;
+    while (m.local_fd >= 0 && now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    mq_listener_free(l);
+}
+
+/* ── Scenario 6: HTTP CONNECT head coalesced with early payload ──────────── */
+static void
+test_http_pipelined_prebuf(struct event_base *base)
+{
+    struct mock_open m;
+    memset(&m, 0, sizeof(m));
+    m.base = base;
+    m.forced_ok = 1;
+    m.local_fd = -1;
+
+    mq_listener_t *l =
+        mq_http_connect_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    uint16_t port = mq_listener_local_port(l);
+
+    int c = dial(port);
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        mq_listener_free(l);
+        return;
+    }
+
+    const char head[] =
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+    const uint8_t early[] = "ping";
+    uint8_t buf[256];
+    size_t hn = strlen(head);
+    memcpy(buf, head, hn);
+    memcpy(buf + hn, early, sizeof(early) - 1);
+    send_all(c, buf, hn + sizeof(early) - 1);
+
+    uint8_t status[12] = {0};
+    MQ_CHECK(pump_read(base, c, status, 12, 1000) >= 12);
+    MQ_CHECK_MEM(status, "HTTP/1.1 200", 12);
+
+    MQ_CHECK_EQ_INT(m.called, 1);
+    MQ_CHECK_EQ_INT(m.prebuf_len, sizeof(early) - 1);
+    MQ_CHECK_MEM(m.prebuf, early, sizeof(early) - 1);
+
+    close(c);
+    uint64_t deadline = now_ms() + 500;
+    while (m.local_fd >= 0 && now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    mq_listener_free(l);
+}
+
 static void
 run_all(void)
 {
@@ -412,6 +530,8 @@ run_all(void)
     test_socks5_unsupported(base);
     test_socks5_malformed(base);
     test_http_connect_smoke(base);
+    test_socks5_pipelined_prebuf(base);
+    test_http_pipelined_prebuf(base);
 
     event_base_free(base);
 }

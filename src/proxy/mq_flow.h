@@ -60,6 +60,14 @@ mq_flow_t *mq_flow_new(mq_flow_t **list_head, struct event_base *base,
  * mq_flow_begin_relay. Returns 0 on success, -1 on bad state / OOM. */
 int mq_flow_prebuffer(mq_flow_t *flow, const void *data, size_t len);
 
+/* Symmetric to mq_flow_prebuffer but for the B side: inject `len` bytes the
+ * owner already pulled off the B-side fd BEFORE the relay started (e.g. app
+ * bytes the ingress read coalesced with the SOCKS5/HTTP CONNECT request). The
+ * relay drains these toward A (the stream) ahead of any fresh fd reads, so they
+ * are not lost. Copies the data. Must be called before mq_flow_begin_relay.
+ * Returns 0 on success, -1 on bad state / OOM. */
+int mq_flow_prebuffer_b(mq_flow_t *flow, const void *data, size_t len);
+
 /* Enter the relaying phase: build the relay, register a persistent EV_READ and
  * an on-demand EV_WRITE on the fd, re-wire the stream callbacks to drive the
  * relay edges, and pump both directions once (forwarding any bytes already

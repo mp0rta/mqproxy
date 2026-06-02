@@ -30,10 +30,11 @@
 #   SKIP_RETURN_CODE 77 so it reports SKIPPED, not FAILED.
 #
 # TUNABLE ENV VARS (defaults in parens):
-#   RATE   (250mbit)  per-path rate cap applied with tbf.
+#   RATE   (100mbit)  per-path rate cap, applied with an HTB class (+ a small
+#                     quantum) under which a netem leaf adds delay/limit.
 #   DELAY  (25ms)     per-path netem delay applied to EACH direction
 #                     (upstream + download), so the path RTT ~= 2*DELAY.
-#   SIZE   (64)       bulk file size in MB.
+#   SIZE   (128)      bulk file size in MB.
 #   MQPROXY_BIN       path to the `mqproxy` binary (default: ./build/mqproxy).
 #   MQPROXY_CERT/KEY  TLS cert/key for the server (default: tests/certs/test.*).
 #

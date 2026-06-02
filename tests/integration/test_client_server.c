@@ -936,7 +936,7 @@ test_client_open_echo(void)
     uint8_t host[4];
     v4_loopback(host);
     mq_client_tcp_open(mq_client_tcp_open_core(f.client), host, 4, MQ_ADDR_IPV4,
-                       origin_port, local_fd, &res, on_tcp_open);
+                       origin_port, local_fd, NULL, 0, &res, on_tcp_open);
 
     pump_until(f.base, &res.fired, 4000);
     MQ_CHECK(res.fired);
@@ -996,7 +996,7 @@ test_client_open_download(void)
     uint8_t host[4];
     v4_loopback(host);
     mq_client_tcp_open(mq_client_tcp_open_core(f.client), host, 4, MQ_ADDR_IPV4,
-                       origin_port, local_fd, &res, on_tcp_open);
+                       origin_port, local_fd, NULL, 0, &res, on_tcp_open);
 
     pump_until(f.base, &res.fired, 4000);
     MQ_CHECK(res.fired);
@@ -1070,7 +1070,7 @@ test_client_open_preauth_queue(void)
     uint8_t host[4];
     v4_loopback(host);
     mq_client_tcp_open(mq_client_tcp_open_core(f.client), host, 4, MQ_ADDR_IPV4,
-                       origin_port, local_fd, &res, on_tcp_open);
+                       origin_port, local_fd, NULL, 0, &res, on_tcp_open);
 
     /* It must NOT have completed yet (queued, awaiting auth). */
     MQ_CHECK_EQ_INT(res.fired, 0);
@@ -1137,7 +1137,7 @@ test_client_open_refused(void)
     uint8_t host[4];
     v4_loopback(host);
     mq_client_tcp_open(mq_client_tcp_open_core(f.client), host, 4, MQ_ADDR_IPV4,
-                       dead_port, local_fd, &res, on_tcp_open);
+                       dead_port, local_fd, NULL, 0, &res, on_tcp_open);
 
     pump_until(f.base, &res.fired, 4000);
     MQ_CHECK(res.fired);

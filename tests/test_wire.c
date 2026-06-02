@@ -135,6 +135,8 @@ test_connect_tcp_resp_roundtrip(void)
     connect_tcp_resp_roundtrip(MQ_STATUS_OK, MQ_TCP_OK, "connected");
     connect_tcp_resp_roundtrip(MQ_STATUS_ERROR, MQ_TCP_DNS_FAILED, "dns lookup failed");
     connect_tcp_resp_roundtrip(MQ_STATUS_ERROR, MQ_TCP_CONN_REFUSED, "refused");
+    connect_tcp_resp_roundtrip(MQ_STATUS_ERROR, MQ_TCP_TIMEOUT, "timed out");
+    connect_tcp_resp_roundtrip(MQ_STATUS_ERROR, MQ_TCP_POLICY_DENIED, "denied by policy");
 }
 
 /* ---- Malformed: truncation ---- */

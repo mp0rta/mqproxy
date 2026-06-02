@@ -654,6 +654,145 @@ test_http_echo(void)
     fixture_down(&f);
 }
 
+/* ── Case 5: SOCKS5 pipelined early payload (coalesced with the request) ─────
+ * The app sends its first upload bytes in the SAME write as the SOCKS5 CONNECT
+ * request, so the listener pulls request+payload into a single recv. Those
+ * trailing bytes must survive the listener→client handoff and reach the origin,
+ * which echoes them back. Regression test for the ingress dropping bytes that
+ * arrive in the same read as the request head. */
+static void
+test_socks5_pipelined_payload(void)
+{
+    fixture_t f;
+    if (fixture_up(&f) != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    echo_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(echo_origin_up(&origin, f.base, &origin_port), 0);
+
+    int c = dial_nb(mq_listener_local_port(f.socks5));
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        echo_origin_down(&origin);
+        fixture_down(&f);
+        return;
+    }
+
+    MQ_CHECK_EQ_INT(socks5_greet(f.base, c), 0);
+
+    /* CONNECT request (IPv4 origin) immediately followed by early payload, in
+     * ONE send so the listener reads both in a single recv. */
+    const char early[] = "EARLY-PIPELINED-BYTES";
+    const size_t elen = sizeof(early) - 1;
+    uint8_t buf[10 + 64];
+    size_t i = 0;
+    buf[i++] = 0x05; /* VER */
+    buf[i++] = 0x01; /* CMD CONNECT */
+    buf[i++] = 0x00; /* RSV */
+    buf[i++] = 0x01; /* ATYP IPv4 */
+    uint32_t v4 = htonl(INADDR_LOOPBACK);
+    memcpy(buf + i, &v4, 4);
+    i += 4;
+    buf[i++] = (uint8_t)(origin_port >> 8);
+    buf[i++] = (uint8_t)(origin_port & 0xff);
+    memcpy(buf + i, early, elen);
+    i += elen;
+    MQ_CHECK_EQ_INT(send_all_nb(f.base, c, buf, i, 2000), 0);
+
+    /* SOCKS5 CONNECT reply first. */
+    uint8_t reply[10] = {0};
+    MQ_CHECK_EQ_INT((int)recv_exact(f.base, c, reply, 10, 8000), 10);
+    MQ_CHECK_EQ_INT(reply[0], 0x05);
+    MQ_CHECK_EQ_INT(reply[1], 0x00);
+
+    /* The early bytes must echo back byte-exact (proves they were not dropped at
+     * the ingress handoff). */
+    uint8_t back[64] = {0};
+    size_t got = recv_exact(f.base, c, back, elen, 8000);
+    MQ_CHECK_EQ_INT((long long)got, (long long)elen);
+    MQ_CHECK(memcmp(early, back, elen) == 0);
+
+    close(c);
+    echo_origin_down(&origin);
+    fixture_down(&f);
+}
+
+/* ── Case 6: HTTP CONNECT pipelined early payload (coalesced with the head) ───
+ * Same as Case 5 but through the HTTP CONNECT listener: the CONNECT head and the
+ * first tunnel bytes arrive in one read; the trailing bytes must reach the
+ * origin and echo back. */
+static void
+test_http_pipelined_payload(void)
+{
+    fixture_t f;
+    if (fixture_up(&f) != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    echo_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(echo_origin_up(&origin, f.base, &origin_port), 0);
+
+    int c = dial_nb(mq_listener_local_port(f.http));
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        echo_origin_down(&origin);
+        fixture_down(&f);
+        return;
+    }
+
+    /* CONNECT head + early payload in ONE send. */
+    const char early[] = "EARLY-HTTP-BYTES";
+    const size_t elen = sizeof(early) - 1;
+    char buf[256];
+    int hn = snprintf(buf, sizeof(buf),
+                      "CONNECT 127.0.0.1:%u HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n\r\n",
+                      (unsigned)origin_port, (unsigned)origin_port);
+    MQ_CHECK(hn > 0 && (size_t)hn + elen <= sizeof(buf));
+    memcpy(buf + hn, early, elen);
+    MQ_CHECK_EQ_INT(send_all_nb(f.base, c, (const uint8_t *)buf, (size_t)hn + elen, 2000),
+                    0);
+
+    /* Consume the 200 status line + headers up to the blank line. */
+    uint8_t status[12] = {0};
+    MQ_CHECK_EQ_INT((int)recv_exact(f.base, c, status, 12, 8000), 12);
+    MQ_CHECK_MEM(status, "HTTP/1.1 200", 12);
+    uint8_t hdr[256];
+    size_t hlen = 0;
+    uint64_t deadline = now_ms() + 4000;
+    int done = 0;
+    while (!done && now_ms() < deadline) {
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+        while (hlen < sizeof(hdr)) {
+            ssize_t n = recv(c, hdr + hlen, 1, 0);
+            if (n == 1) {
+                hlen++;
+                if (hlen >= 4 && memcmp(hdr + hlen - 4, "\r\n\r\n", 4) == 0) {
+                    done = 1;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    MQ_CHECK(done);
+
+    /* The early tunnel bytes must echo back byte-exact. */
+    uint8_t back[64] = {0};
+    size_t got = recv_exact(f.base, c, back, elen, 8000);
+    MQ_CHECK_EQ_INT((long long)got, (long long)elen);
+    MQ_CHECK(memcmp(early, back, elen) == 0);
+
+    close(c);
+    echo_origin_down(&origin);
+    fixture_down(&f);
+}
+
 /* ── Case 4a: SOCKS5 error mapping → REP 0x05 (connection refused) ───────── */
 static void
 test_socks5_refused(void)
@@ -724,6 +863,8 @@ test_e2e_single_path(void)
     test_socks5_download();
     test_socks5_echo();
     test_http_echo();
+    test_socks5_pipelined_payload();
+    test_http_pipelined_payload();
     test_socks5_refused();
     test_http_refused();
 }

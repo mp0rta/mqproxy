@@ -8,12 +8,16 @@
 #include <stdint.h>
 
 typedef enum {
-    MQ_SOCKS5_NEED_MORE,     /* incomplete; feed more bytes */
-    MQ_SOCKS5_GREETING_DONE, /* parsed greeting; caller should send method reply */
-    MQ_SOCKS5_REQUEST_DONE,  /* parsed a CONNECT request; out fields valid */
-    MQ_SOCKS5_UNSUPPORTED, /* version/method/cmd/atyp not supported; caller replies error
-                            */
-    MQ_SOCKS5_ERROR        /* malformed */
+    MQ_SOCKS5_NEED_MORE,       /* incomplete; feed more bytes */
+    MQ_SOCKS5_GREETING_DONE,   /* parsed greeting; caller should send method reply */
+    MQ_SOCKS5_REQUEST_DONE,    /* parsed a CONNECT request; out fields valid */
+    MQ_SOCKS5_UNSUPPORTED,     /* greeting: no acceptable auth method; caller sends method
+                                  reply 0xFF (NO ACCEPTABLE METHODS) */
+    MQ_SOCKS5_UNSUPPORTED_CMD, /* request CMD not CONNECT; caller replies REP 0x07
+                                  (command not supported), RFC 1928 §6 */
+    MQ_SOCKS5_UNSUPPORTED_ATYP, /* request ATYP not supported; caller replies REP 0x08
+                                   (address type not supported), RFC 1928 §6 */
+    MQ_SOCKS5_ERROR             /* malformed */
 } mq_socks5_status_t;
 
 typedef struct {
