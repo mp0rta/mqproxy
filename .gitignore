@@ -1,0 +1,13 @@
+# Claude Code local (personal) settings — never commit
+.claude/settings.local.json
+.claude/worktrees/
+
+# Scratch / reference clones — never commit
+tmp/
+
+# Build artifacts
+build/
+build-*/
+build_*/
+*.o
+*.d
