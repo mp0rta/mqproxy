@@ -160,12 +160,18 @@ drive_socks5(struct mq_conn_state *c)
             /* Hand off: the core owns the fd from here. The success/error reply
              * is written by socks5_open_result on the (still-open) fd. Drop our
              * read interest first — the core (relay) now drives the fd, and
-             * open_fn's result cb may fire asynchronously (later turn). */
+             * open_fn's result cb may fire asynchronously (later turn).
+             *
+             * Bytes the app pipelined after the request (already in rxbuf, past
+             * `consumed`) are handed to the core as a prebuffer so they reach the
+             * origin and are not dropped. */
             c->handed_off = 1;
             int fd = c->fd;
+            const uint8_t *prebuf = c->rxbuf + consumed;
+            size_t prebuf_len = c->rxlen - consumed;
             conn_detach_read(c);
-            l->open_fn(l->core, req.host, req.host_len, req.atype, req.port, fd, c,
-                       socks5_open_result);
+            l->open_fn(l->core, req.host, req.host_len, req.atype, req.port, fd, prebuf,
+                       prebuf_len, c, socks5_open_result);
             return MQ_DRIVE_HANDOFF;
         }
 
@@ -210,9 +216,14 @@ drive_http(struct mq_conn_state *c)
     case MQ_HTTP_CONNECT_DONE: {
         int fd = c->fd;
         c->handed_off = 1;
+        /* Bytes the app pipelined after the CONNECT head (already in rxbuf, past
+         * header_len) are handed to the core as a prebuffer so they reach the
+         * origin and are not dropped. */
+        const uint8_t *prebuf = c->rxbuf + header_len;
+        size_t prebuf_len = c->rxlen - header_len;
         conn_detach_read(c);
-        l->open_fn(l->core, tgt.host, tgt.host_len, tgt.atype, tgt.port, fd, c,
-                   http_open_result);
+        l->open_fn(l->core, tgt.host, tgt.host_len, tgt.atype, tgt.port, fd, prebuf,
+                   prebuf_len, c, http_open_result);
         return MQ_DRIVE_HANDOFF;
     }
 

@@ -91,9 +91,15 @@ mq_conn_t *mq_client_conn(const mq_client_t *c);
  * socket, which is distinct from local_fd here in Phase 1 the ingress hands the
  * very socket it will relay, so for ok=0 the client closing local_fd also
  * terminates the app connection, which is the desired SOCKS/HTTP error
- * behaviour. */
+ * behaviour.
+ *
+ * prebuf/prebuf_len carry app bytes the ingress already read off local_fd
+ * coalesced with the request head (see mq_tcp_open_fn). They are copied and
+ * relayed to the origin ahead of any fresh local_fd reads; prebuf is borrowed
+ * for the call only. prebuf_len may be 0. */
 void mq_client_tcp_open(void *core, const uint8_t *host, size_t host_len,
-                        mq_addr_type_t atype, uint16_t port, int local_fd, void *user,
+                        mq_addr_type_t atype, uint16_t port, int local_fd,
+                        const uint8_t *prebuf, size_t prebuf_len, void *user,
                         mq_tcp_open_cb cb);
 
 /* The function pointer + core pointer for the ingress (Task 14) to call without

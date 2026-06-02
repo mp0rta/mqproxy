@@ -58,6 +58,10 @@ struct mq_client_open_s {
     mq_addr_type_t atype;
     uint16_t port;
     int local_fd;
+    /* App bytes the ingress read coalesced with the request head (owned copy,
+     * freed on drain/fail); replayed into the flow's B-side prebuffer. */
+    uint8_t *early;
+    size_t early_len;
     void *user;
     mq_tcp_open_cb cb;
     mq_client_open_t *next;
@@ -77,6 +81,11 @@ struct mq_client_data_s {
     int local_fd;        /* app socket; handed to the flow on relay start */
     int reaped;
     int resp_done; /* the response was decoded + cb fired */
+
+    /* App bytes the ingress read coalesced with the request head (owned copy,
+     * freed once injected into the flow's B-side prebuffer or on reap). */
+    uint8_t *early;
+    size_t early_len;
 
     void *user;
     mq_tcp_open_cb cb;
@@ -173,6 +182,9 @@ client_data_reap(mq_client_data_t *d)
             d->local_fd = -1;
         }
     }
+    free(d->early);
+    d->early = NULL;
+    d->early_len = 0;
     client_data_unlink(d);
     free(d);
 }
@@ -266,6 +278,21 @@ client_data_header_readable(mq_stream_t *s, void *user)
         }
     }
 
+    /* Symmetric uplink case: app bytes the ingress read coalesced with the
+     * SOCKS5/HTTP CONNECT request. Hand them to the flow's B-side prebuffer so
+     * they reach the origin ahead of fresh local_fd reads (else the first upload
+     * bytes — e.g. a TLS ClientHello — are silently dropped). */
+    if (d->early_len > 0) {
+        if (mq_flow_prebuffer_b(d->flow, d->early, d->early_len) != 0) {
+            MQ_LOGE("mq_client: B-side prebuffer failed");
+            client_data_reap(d);
+            return;
+        }
+        free(d->early);
+        d->early = NULL;
+        d->early_len = 0;
+    }
+
     if (mq_flow_begin_relay(d->flow) != 0) {
         MQ_LOGE("mq_client: begin relay failed");
         client_data_reap(d);
@@ -287,11 +314,13 @@ client_data_header_closed(mq_stream_t *s, void *user)
 /* Issue an authed tcp_open: open a data stream, send CONNECT_TCP_REQUEST, and
  * buffer the response. local_fd ownership transfers to the new node (closed on
  * any terminal outcome). On a synchronous failure the cb fires and local_fd is
- * closed here. */
+ * closed here. early/early_len are app bytes that arrived coalesced with the
+ * request head; they are copied and replayed into the flow's B-side prebuffer
+ * once the relay starts (borrowed for the duration of this call). */
 static void
 client_issue_open(mq_client_t *c, const uint8_t *host, size_t host_len,
-                  mq_addr_type_t atype, uint16_t port, int local_fd, void *user,
-                  mq_tcp_open_cb cb)
+                  mq_addr_type_t atype, uint16_t port, int local_fd, const uint8_t *early,
+                  size_t early_len, void *user, mq_tcp_open_cb cb)
 {
     mq_stream_t *s = mq_conn_open_stream(c->conn);
     if (!s) {
@@ -314,6 +343,19 @@ client_issue_open(mq_client_t *c, const uint8_t *host, size_t host_len,
     d->local_fd = local_fd;
     d->user = user;
     d->cb = cb;
+    if (early_len > 0 && early) {
+        d->early = malloc(early_len);
+        if (!d->early) {
+            MQ_LOGE("mq_client: OOM copying coalesced bytes");
+            mq_stream_close(s);
+            free(d);
+            if (cb) cb(0, MQ_TCP_CONN_REFUSED, user);
+            if (local_fd >= 0) close(local_fd);
+            return;
+        }
+        memcpy(d->early, early, early_len);
+        d->early_len = early_len;
+    }
     d->next = c->data_head;
     c->data_head = d;
 
@@ -353,7 +395,8 @@ client_drain_queue(mq_client_t *c)
     while (q) {
         mq_client_open_t *next = q->next;
         client_issue_open(c, q->host, q->host_len, q->atype, q->port, q->local_fd,
-                          q->user, q->cb);
+                          q->early, q->early_len, q->user, q->cb);
+        free(q->early);
         free(q);
         q = next;
     }
@@ -370,6 +413,7 @@ client_fail_queue(mq_client_t *c, mq_tcp_err_t err)
         mq_client_open_t *next = q->next;
         if (q->cb) q->cb(0, err, q->user);
         if (q->local_fd >= 0) close(q->local_fd);
+        free(q->early);
         free(q);
         q = next;
     }
@@ -682,8 +726,8 @@ mq_client_add_paths(mq_client_t *c, const char *const *ips, size_t n)
 /* Enqueue a pre-auth tcp_open. Returns 0 on success, -1 if the queue is full. */
 static int
 client_enqueue_open(mq_client_t *c, const uint8_t *host, size_t host_len,
-                    mq_addr_type_t atype, uint16_t port, int local_fd, void *user,
-                    mq_tcp_open_cb cb)
+                    mq_addr_type_t atype, uint16_t port, int local_fd,
+                    const uint8_t *early, size_t early_len, void *user, mq_tcp_open_cb cb)
 {
     if (c->queue_len >= MQ_CLIENT_QUEUE_MAX) {
         return -1;
@@ -691,6 +735,15 @@ client_enqueue_open(mq_client_t *c, const uint8_t *host, size_t host_len,
     mq_client_open_t *q = calloc(1, sizeof(*q));
     if (!q) {
         return -1;
+    }
+    if (early_len > 0 && early) {
+        q->early = malloc(early_len);
+        if (!q->early) {
+            free(q);
+            return -1;
+        }
+        memcpy(q->early, early, early_len);
+        q->early_len = early_len;
     }
     if (host_len > MQ_MAX_HOST) host_len = MQ_MAX_HOST;
     memcpy(q->host, host, host_len);
@@ -713,7 +766,8 @@ client_enqueue_open(mq_client_t *c, const uint8_t *host, size_t host_len,
 
 void
 mq_client_tcp_open(void *core, const uint8_t *host, size_t host_len, mq_addr_type_t atype,
-                   uint16_t port, int local_fd, void *user, mq_tcp_open_cb cb)
+                   uint16_t port, int local_fd, const uint8_t *prebuf, size_t prebuf_len,
+                   void *user, mq_tcp_open_cb cb)
 {
     mq_client_t *c = (mq_client_t *)core;
     if (!c || !host) {
@@ -729,8 +783,8 @@ mq_client_tcp_open(void *core, const uint8_t *host, size_t host_len, mq_addr_typ
     }
     /* Not yet authed: queue for replay on auth success. */
     if (!c->authed) {
-        if (client_enqueue_open(c, host, host_len, atype, port, local_fd, user, cb) !=
-            0) {
+        if (client_enqueue_open(c, host, host_len, atype, port, local_fd, prebuf,
+                                prebuf_len, user, cb) != 0) {
             MQ_LOGW("mq_client: tcp_open queue full, rejecting");
             if (cb) cb(0, MQ_TCP_CONN_REFUSED, user);
             if (local_fd >= 0) close(local_fd);
@@ -738,7 +792,8 @@ mq_client_tcp_open(void *core, const uint8_t *host, size_t host_len, mq_addr_typ
         return;
     }
     /* Authed: issue immediately. */
-    client_issue_open(c, host, host_len, atype, port, local_fd, user, cb);
+    client_issue_open(c, host, host_len, atype, port, local_fd, prebuf, prebuf_len, user,
+                      cb);
 }
 
 mq_tcp_open_fn

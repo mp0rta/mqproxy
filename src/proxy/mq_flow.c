@@ -46,6 +46,14 @@ struct mq_flow_s {
     size_t pre_len;
     size_t pre_off;
 
+    /* Symmetric B-side prebuffer: bytes pulled off the fd by the owner BEFORE the
+     * relay started (e.g. app bytes the ingress read coalesced with the
+     * SOCKS5/HTTP CONNECT request). flow_b_read drains these FIRST so they reach
+     * A (the stream) and are not lost. */
+    unsigned char *pre_b;
+    size_t pre_b_len;
+    size_t pre_b_off;
+
     mq_flow_on_reap_fn on_reap;
     void *user;
 
@@ -107,6 +115,11 @@ mq_flow_reap(mq_flow_t *f)
         free(f->pre);
         f->pre = NULL;
         f->pre_len = f->pre_off = 0;
+    }
+    if (f->pre_b) {
+        free(f->pre_b);
+        f->pre_b = NULL;
+        f->pre_b_len = f->pre_b_off = 0;
     }
 
     /* Unlink from the owner's list BEFORE on_reap: on_reap may free the owner
@@ -282,6 +295,19 @@ flow_b_read(void *io, unsigned char *buf, size_t cap, int *eof, int *wb)
         *eof = 1;
         return 0;
     }
+    /* Drain owner-prebuffered fd bytes first (see mq_flow_t::pre_b). */
+    if (f->pre_b && f->pre_b_off < f->pre_b_len) {
+        size_t avail = f->pre_b_len - f->pre_b_off;
+        size_t take = avail < cap ? avail : cap;
+        memcpy(buf, f->pre_b + f->pre_b_off, take);
+        f->pre_b_off += take;
+        if (f->pre_b_off >= f->pre_b_len) {
+            free(f->pre_b);
+            f->pre_b = NULL;
+            f->pre_b_len = f->pre_b_off = 0;
+        }
+        return (long)take;
+    }
     ssize_t n = recv(f->fd, buf, cap, 0);
     if (n == 0) {
         *eof = 1;
@@ -422,6 +448,28 @@ mq_flow_prebuffer(mq_flow_t *f, const void *data, size_t len)
     f->pre = p;
     f->pre_len = len;
     f->pre_off = 0;
+    return 0;
+}
+
+int
+mq_flow_prebuffer_b(mq_flow_t *f, const void *data, size_t len)
+{
+    if (!f || f->relay) {
+        return -1; /* must be set before mq_flow_begin_relay */
+    }
+    if (len == 0) {
+        return 0;
+    }
+    unsigned char *p = malloc(len);
+    if (!p) {
+        return -1;
+    }
+    memcpy(p, data, len);
+    /* Replace any prior prebuffer (single-use at relay start). */
+    free(f->pre_b);
+    f->pre_b = p;
+    f->pre_b_len = len;
+    f->pre_b_off = 0;
     return 0;
 }
 
