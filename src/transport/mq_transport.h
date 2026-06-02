@@ -61,6 +61,13 @@ mq_transport_t *mq_transport_new_server(const mq_transport_callbacks_t *cbs, voi
 
 void mq_transport_free(mq_transport_t *t);
 
+/* Install (or replace) the transport's callbacks and opaque user pointer after
+ * construction. cbs is copied (NULL == zeroed). Used by the runtime, which is
+ * created after the transport and must register itself as the callback user.
+ * Additive; production paths construct callbacks at mq_transport_new time. */
+void mq_transport_set_callbacks(mq_transport_t *t, const mq_transport_callbacks_t *cbs,
+                                void *user);
+
 /* Input: hand the core one UDP packet read from a path socket. path is the
  * receiving socket's xquic path-id (primary == 0). local is the receiving
  * socket's bind address; xquic identifies the path by the (local,peer) 4-tuple,

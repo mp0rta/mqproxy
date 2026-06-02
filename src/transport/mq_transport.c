@@ -374,6 +374,21 @@ mq_transport_free(mq_transport_t *t)
     free(t);
 }
 
+void
+mq_transport_set_callbacks(mq_transport_t *t, const mq_transport_callbacks_t *cbs,
+                           void *user)
+{
+    if (!t) {
+        return;
+    }
+    if (cbs) {
+        t->cbs = *cbs;
+    } else {
+        memset(&t->cbs, 0, sizeof(t->cbs));
+    }
+    t->user = user;
+}
+
 int
 mq_transport_on_udp_recv(mq_transport_t *t, uint64_t path, const uint8_t *pkt, size_t len,
                          const struct sockaddr *local, socklen_t locallen,

@@ -21,7 +21,8 @@ add_library(mqproxy STATIC
     src/transport/mq_path.c
     src/transport/mq_conn.c
     src/transport/mq_stream.c
-    src/transport/mq_transport.c)
+    src/transport/mq_transport.c
+    src/runtime/mq_runtime_libevent.c)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 enable_testing()
