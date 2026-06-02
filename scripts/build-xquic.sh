@@ -74,9 +74,13 @@ fi
 # ---------- 1. BoringSSL ----------
 
 # BoringSSL is not a git submodule of xquic; clone it if absent (mirrors mqvpn).
+# Pin the same commit the CI (.github/workflows/ci.yml) and mqvpn use, so local
+# and CI builds are reproducible against an identical BoringSSL (HEAD can break).
+BSSL_COMMIT="9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c"
 if [ ! -f "$BSSL_DIR/CMakeLists.txt" ]; then
-    echo "=== Cloning BoringSSL ==="
+    echo "=== Cloning BoringSSL (pinned $BSSL_COMMIT) ==="
     git clone https://github.com/google/boringssl.git "$BSSL_DIR"
+    git -C "$BSSL_DIR" checkout "$BSSL_COMMIT"
 fi
 
 echo "=== Building BoringSSL ==="
