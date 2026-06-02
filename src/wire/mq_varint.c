@@ -3,25 +3,22 @@
 
 #include "mq_varint.h"
 
-int mq_varint_len(uint64_t v)
+int
+mq_varint_len(uint64_t v)
 {
-    if (v <= 0x3FU)
-        return 1;
-    if (v <= 0x3FFFU)
-        return 2;
-    if (v <= 0x3FFFFFFFU)
-        return 4;
+    if (v <= 0x3FU) return 1;
+    if (v <= 0x3FFFU) return 2;
+    if (v <= 0x3FFFFFFFU) return 4;
     return 8;
 }
 
-int mq_varint_encode(uint8_t *buf, size_t cap, uint64_t v)
+int
+mq_varint_encode(uint8_t *buf, size_t cap, uint64_t v)
 {
-    if (v > 0x3FFFFFFFFFFFFFFFULL)
-        return -1;
+    if (v > 0x3FFFFFFFFFFFFFFFULL) return -1;
 
     int n = mq_varint_len(v);
-    if ((size_t)n > cap)
-        return -1;
+    if ((size_t)n > cap) return -1;
 
     switch (n) {
     case 1:
@@ -51,16 +48,15 @@ int mq_varint_encode(uint8_t *buf, size_t cap, uint64_t v)
     return n;
 }
 
-int mq_varint_decode(const uint8_t *buf, size_t len, uint64_t *out)
+int
+mq_varint_decode(const uint8_t *buf, size_t len, uint64_t *out)
 {
-    if (len == 0)
-        return -1;
+    if (len == 0) return -1;
 
     int prefix = (buf[0] >> 6) & 0x03;
     int n = 1 << prefix; /* 1, 2, 4, or 8 */
 
-    if ((size_t)n > len)
-        return -1;
+    if ((size_t)n > len) return -1;
 
     uint64_t v = (uint64_t)(buf[0] & 0x3F);
     for (int i = 1; i < n; i++) {

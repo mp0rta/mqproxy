@@ -35,8 +35,8 @@ typedef struct {
     int read_wb_every;
     int read_calls;
     int no_eof;
-    int read_err;            /* error on the read_err-th read call (1 = first) */
-    int read_eof_with_data;  /* deliver final bytes AND *eof=1 in one call */
+    int read_err;           /* error on the read_err-th read call (1 = first) */
+    int read_eof_with_data; /* deliver final bytes AND *eof=1 in one call */
 
     unsigned char out[1024];
     size_t out_len;
@@ -293,8 +293,8 @@ test_read_hard_error(void)
     static const unsigned char a_in[] = "abcdefghij"; /* 10 bytes */
     a.in = a_in;
     a.in_len = 10;
-    a.read_chunk = 4;  /* first read delivers 4 bytes... */
-    a.read_err = 2;    /* ...second read returns a hard error */
+    a.read_chunk = 4; /* first read delivers 4 bytes... */
+    a.read_err = 2;   /* ...second read returns a hard error */
     b.write_budget = 1024;
 
     mq_relay_t *r = make_relay(&a, &b);
@@ -328,8 +328,8 @@ test_read_would_block_chunked(void)
     static const unsigned char a_in[] = "the quick brown fox jumps"; /* 25 bytes */
     a.in = a_in;
     a.in_len = 25;
-    a.read_chunk = 3;     /* small chunks */
-    a.read_wb_every = 3;  /* every 3rd read would-blocks (no bytes now) */
+    a.read_chunk = 3;    /* small chunks */
+    a.read_wb_every = 3; /* every 3rd read would-blocks (no bytes now) */
     b.write_budget = 1024;
     a.write_budget = 1024;
     /* B's source is empty: it EOFs immediately, so the B->A direction can
@@ -341,8 +341,8 @@ test_read_would_block_chunked(void)
 
     /* One readable edge pumps until the source would-blocks (no EOF yet). */
     mq_relay_on_a_readable(r);
-    MQ_CHECK(b.out_len < 25);          /* would-block stopped us short */
-    MQ_CHECK_EQ_INT(g_done_count, 0);  /* not done: A not at EOF */
+    MQ_CHECK(b.out_len < 25);         /* would-block stopped us short */
+    MQ_CHECK_EQ_INT(g_done_count, 0); /* not done: A not at EOF */
     MQ_CHECK_MEM(b.out, a_in, b.out_len);
 
     /* Follow-up readable edges after the would-block: keep draining the source.
