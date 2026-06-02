@@ -5,6 +5,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# gitleaks-action lists the PR's commits on pull_request events; the default
+# GITHUB_TOKEN on this repo is contents:read only, so that call 403s
+# ("Resource not accessible by integration"). Grant least-privilege read.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   scan:
     runs-on: ubuntu-latest
