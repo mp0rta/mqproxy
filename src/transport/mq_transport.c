@@ -376,16 +376,20 @@ mq_transport_free(mq_transport_t *t)
 
 int
 mq_transport_on_udp_recv(mq_transport_t *t, uint64_t path, const uint8_t *pkt, size_t len,
+                         const struct sockaddr *local, socklen_t locallen,
                          const struct sockaddr *peer, socklen_t peerlen)
 {
-    /* Chunk 5 wires this to xqc_engine_packet_process; minimal stub for now. */
-    (void)t;
+    if (!t || !t->engine) {
+        return -1;
+    }
+    /* xquic derives the path from the (local,peer) 4-tuple; the path-id arg is
+     * not needed here (it identifies the receiving socket on the runtime side). */
     (void)path;
-    (void)pkt;
-    (void)len;
-    (void)peer;
-    (void)peerlen;
-    return 0;
+    xqc_usec_t now = mq_tr_now_us();
+    xqc_int_t rc = xqc_engine_packet_process(t->engine, pkt, len, local, locallen, peer,
+                                             peerlen, now, t);
+    xqc_engine_finish_recv(t->engine);
+    return (int)rc;
 }
 
 void
@@ -397,9 +401,15 @@ mq_transport_tick(mq_transport_t *t)
 int
 mq_transport_next_timeout_ms(mq_transport_t *t)
 {
-    /* Real deadline tracking lands in Chunk 4. */
-    (void)t;
-    return -1;
+    if (!t || !t->have_deadline) {
+        return -1;
+    }
+    int64_t now = (int64_t)mq_tr_now_us();
+    int64_t d = (int64_t)t->next_deadline_us - now;
+    if (d < 0) {
+        d = 0;
+    }
+    return (int)(d / 1000);
 }
 
 xqc_engine_t *

@@ -164,10 +164,20 @@ fab_close_path_socket(uint64_t path, void *user)
 static int
 fabric_drain(fabric_queue_t *q, mq_transport_t *dst)
 {
+    /* xqc_engine_packet_process needs a non-NULL local (bind) address — it keys
+     * the path on the (local,peer) 4-tuple. The fabric has no real socket, so
+     * synthesise a loopback local addr; it just has to be a valid sockaddr. */
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_port = htons(0);
+
     int consumed = 0;
     for (size_t i = 0; i < q->count; i++) {
         fabric_pkt_t *p = &q->pkts[i];
         int r = mq_transport_on_udp_recv(dst, p->path, p->buf, p->len,
+                                         (struct sockaddr *)&local, sizeof(local),
                                          (struct sockaddr *)&p->peer, p->peerlen);
         if (r > 0) consumed++;
     }

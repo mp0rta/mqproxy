@@ -62,9 +62,12 @@ mq_transport_t *mq_transport_new_server(const mq_transport_callbacks_t *cbs, voi
 void mq_transport_free(mq_transport_t *t);
 
 /* Input: hand the core one UDP packet read from a path socket. path is the
- * receiving socket's xquic path-id (primary == 0). */
+ * receiving socket's xquic path-id (primary == 0). local is the receiving
+ * socket's bind address; xquic identifies the path by the (local,peer) 4-tuple,
+ * so both are required by xqc_engine_packet_process. */
 int mq_transport_on_udp_recv(mq_transport_t *t, uint64_t path, const uint8_t *pkt,
-                             size_t len, const struct sockaddr *peer, socklen_t peerlen);
+                             size_t len, const struct sockaddr *local, socklen_t locallen,
+                             const struct sockaddr *peer, socklen_t peerlen);
 
 /* Advance the engine (= xqc_engine_main_logic). The runtime calls this after a
  * recv or when its timer fires. */
