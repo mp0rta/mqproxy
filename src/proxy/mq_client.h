@@ -19,8 +19,9 @@
 #include <stdint.h>
 
 #include "ingress/mq_ingress.h"
+#include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h"
-#include "transport/mq_engine.h"
+#include "transport/mq_transport.h"
 #include "wire/mq_wire.h"
 
 typedef struct mq_client_s mq_client_t;
@@ -31,9 +32,12 @@ typedef struct mq_client_s mq_client_t;
 typedef void (*mq_client_on_auth_fn)(int ok, mq_auth_err_t err, void *user);
 
 /* Create a client targeting server_ip:server_port, authenticating as client_id
- * with auth_token. The strings are copied. Returns NULL on bad args / OOM. */
-mq_client_t *mq_client_new(mq_engine_t *eng, const char *server_ip, uint16_t server_port,
-                           const char *client_id, const char *auth_token);
+ * with auth_token. `t` is the sans-io transport (xquic/streams/conn); `rt` is
+ * the runtime that owns the libevent base used for flow relays + the mp-ready
+ * poll timer. The strings are copied. Returns NULL on bad args / OOM. */
+mq_client_t *mq_client_new(mq_transport_t *t, mq_runtime_t *rt, const char *server_ip,
+                           uint16_t server_port, const char *client_id,
+                           const char *auth_token);
 
 /* Register the auth-result callback (call before mq_client_start). */
 void mq_client_set_on_auth(mq_client_t *c, mq_client_on_auth_fn fn, void *user);
@@ -56,7 +60,7 @@ int mq_client_start(mq_client_t *c);
  * ready (each on an ephemeral local UDP port), then disarms.
  *
  * Call after mq_client_new and before/after mq_client_start (the timer is armed
- * on the engine's base, which must exist). Returns the number of IPs accepted
+ * on the runtime's base, which must exist). Returns the number of IPs accepted
  * (clamped to the internal max), or -1 on bad args. */
 int mq_client_add_paths(mq_client_t *c, const char *const *ips, size_t n);
 

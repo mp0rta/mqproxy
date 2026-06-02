@@ -9,12 +9,12 @@
  * recover the mq_conn from xquic's per-connection app-proto user_data and
  * surface lifecycle + new-stream events to the owner.
  *
- * USER_DATA SCHEME (see mq_engine's send callback):
- *   - transport user_data  = the mq_engine_t* (so write_socket[_ex] recovers
- *                            the engine by casting conn_user_data).
+ * USER_DATA SCHEME (see mq_transport's send callback):
+ *   - transport user_data  = the mq_transport_t* (so write_socket[_ex] recovers
+ *                            the transport by casting conn_user_data).
  *   - app-proto user_data  = the mq_conn_t* (so the ALP conn/stream callbacks
  *                            recover the mq_conn).
- * The engine pointer is also stashed via xqc_engine_set_priv_ctx so the ALP
+ * The transport pointer is also stashed via xqc_engine_set_priv_ctx so the ALP
  * conn_create_notify can locate the per-engine registration context.
  */
 #ifndef MQ_TRANSPORT_MQ_CONN_H
@@ -24,8 +24,8 @@
 
 #include <xquic/xquic.h>
 
-#include "transport/mq_engine.h"
 #include "transport/mq_stream.h"
+#include "transport/mq_transport.h"
 
 /* ── Flow-control window sizing (aggregate-BDP target) ──────────────────────
  *
@@ -93,14 +93,14 @@ typedef void (*mq_stream_on_new_fn)(mq_stream_t *s, void *user);
  * on_new_stream / user describe how accepted connections and peer-initiated
  * streams are surfaced (server side); pass NULL on a pure client.
  * Returns 0 on success, -1 on failure. */
-int mq_conn_register_alpn(mq_engine_t *eng, const char *alpn,
+int mq_conn_register_alpn(mq_transport_t *t, const char *alpn,
                           mq_conn_on_new_fn on_new_conn,
                           mq_stream_on_new_fn on_new_stream, void *user);
 
 /* Client: initiate a connection to `peer` using `alpn` and `settings`.
  * `owner` is opaque caller context (retrievable via mq_conn_user). Returns a
  * new mq_conn (state callbacks fire later) or NULL on failure. */
-mq_conn_t *mq_conn_connect(mq_engine_t *eng, const struct sockaddr *peer,
+mq_conn_t *mq_conn_connect(mq_transport_t *t, const struct sockaddr *peer,
                            socklen_t peerlen, const char *alpn,
                            const xqc_conn_settings_t *settings, void *owner);
 
@@ -125,9 +125,9 @@ mq_stream_t *mq_conn_open_stream(mq_conn_t *c);
 int mq_conn_mp_ready(const mq_conn_t *c);
 
 /* Create a NEW MPQUIC path bound to local_ip:local_port (port 0 == ephemeral),
- * register its UDP socket in the engine's path-id->fd map, and mark it
- * available so the peer may schedule traffic on it. The new mq_path is owned by
- * the conn and freed on teardown.
+ * open its UDP socket via the transport's open_path_socket callback, and mark it
+ * available so the peer may schedule traffic on it. The new path-id is recorded
+ * by the conn and torn down (close_path_socket) on conn teardown.
  *
  * MUST be called after mq_conn_mp_ready(c) returns 1 (otherwise xquic has no
  * available path-id and the call fails). Returns the new path_id (> 0) on

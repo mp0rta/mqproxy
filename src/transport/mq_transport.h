@@ -9,9 +9,9 @@
  * own timer), and receives outbound packets / path socket lifecycle requests
  * through the mq_transport_callbacks_t hooks.
  *
- * In Chunk 1 this is a thin shell that holds an mq_engine_t and delegates to
- * it; the callbacks are stored but not yet wired (Chunk 3/6). Later chunks
- * grow it into the real sans-io core. Nothing in production calls it yet.
+ * The core owns its xqc_engine directly (no mq_engine, no libevent); the
+ * runtime installs the callbacks (send_udp / open_path_socket /
+ * close_path_socket) and drives the engine via tick + next_timeout_ms.
  */
 #ifndef MQ_TRANSPORT_MQ_TRANSPORT_H
 #define MQ_TRANSPORT_MQ_TRANSPORT_H
@@ -86,6 +86,17 @@ int mq_transport_next_timeout_ms(mq_transport_t *t);
 
 /* Accessor for the underlying xquic engine (used by mq_conn / cli). */
 xqc_engine_t *mq_transport_xqc(mq_transport_t *t);
+
+/* Request that the caller open a socket for an additional path (the xquic path-id
+ * is passed in; mq_conn obtained it from xqc_conn_create_path). Invokes the
+ * runtime's open_path_socket callback. Returns its result, or -1 if no callback
+ * is installed. */
+int mq_transport_open_path(mq_transport_t *t, uint64_t path, const char *local_ip,
+                           uint16_t port);
+
+/* Request that the caller close an additional path's socket. Invokes the
+ * runtime's close_path_socket callback (no-op if none is installed). */
+void mq_transport_close_path(mq_transport_t *t, uint64_t path);
 
 /* Multipath readiness hook: invoked once cids are exchanged on a connection
  * (the precondition for xqc_conn_create_path). scid is copied out by xquic and

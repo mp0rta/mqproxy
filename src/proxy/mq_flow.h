@@ -33,8 +33,9 @@
 
 #include <stddef.h>
 
-#include "transport/mq_engine.h"
 #include "transport/mq_stream.h"
+
+struct event_base;
 
 typedef struct mq_flow_s mq_flow_t;
 

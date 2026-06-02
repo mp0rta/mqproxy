@@ -13,7 +13,7 @@
  * and per subcommand prints usage and exits 0. An unknown subcommand or a
  * missing required flag prints usage to stderr and exits non-zero.
  *
- * This binary wires the transport (mq_engine + mq_path), the proxy core
+ * This binary wires the transport (mq_transport + mq_runtime), the proxy core
  * (mq_client / mq_server), and the ingress listeners (SOCKS5 / HTTP CONNECT)
  * into runnable processes, then runs the libevent loop until SIGINT/SIGTERM.
  */
@@ -34,8 +34,8 @@
 #include "ingress/mq_listener.h"
 #include "proxy/mq_client.h"
 #include "proxy/mq_server.h"
-#include "transport/mq_engine.h"
-#include "transport/mq_path.h"
+#include "runtime/mq_runtime_libevent.h"
+#include "transport/mq_transport.h"
 #include "util/mq_log.h"
 
 /* Default cert/key for the server when --cert/--key are omitted, taken from the
@@ -166,26 +166,26 @@ parse_ip_port(const char *s, char *ip_out, size_t ip_cap, uint16_t *port_out)
     return 0;
 }
 
-/* ── shutdown wiring (SIGINT/SIGTERM → mq_engine_stop) ───────────────────────*/
+/* ── shutdown wiring (SIGINT/SIGTERM → mq_runtime_stop) ──────────────────────*/
 
 static void
 on_signal(evutil_socket_t sig, short what, void *user)
 {
     (void)sig;
     (void)what;
-    mq_engine_t *eng = (mq_engine_t *)user;
+    mq_runtime_t *rt = (mq_runtime_t *)user;
     MQ_LOGI("signal received, shutting down");
-    mq_engine_stop(eng);
+    mq_runtime_stop(rt);
 }
 
 /* Install SIGINT + SIGTERM handlers that break the loop. The returned events
  * must be freed by the caller after the loop exits. Returns 0 on success. */
 static int
-install_signal_handlers(struct event_base *base, mq_engine_t *eng, struct event **out_int,
+install_signal_handlers(struct event_base *base, mq_runtime_t *rt, struct event **out_int,
                         struct event **out_term)
 {
-    struct event *sint = evsignal_new(base, SIGINT, on_signal, eng);
-    struct event *sterm = evsignal_new(base, SIGTERM, on_signal, eng);
+    struct event *sint = evsignal_new(base, SIGINT, on_signal, rt);
+    struct event *sterm = evsignal_new(base, SIGTERM, on_signal, rt);
     if (!sint || !sterm) {
         if (sint) event_free(sint);
         if (sterm) event_free(sterm);
@@ -262,8 +262,8 @@ cmd_server(int argc, char **argv)
 
     int rc = 1;
     struct event_base *base = NULL;
-    mq_engine_t *eng = NULL;
-    mq_path_t *path = NULL;
+    mq_transport_t *transport = NULL;
+    mq_runtime_t *rt = NULL;
     mq_server_t *server = NULL;
     struct event *sint = NULL, *sterm = NULL;
 
@@ -272,48 +272,62 @@ cmd_server(int argc, char **argv)
         MQ_LOGE("failed to create event base");
         goto out;
     }
-    eng = mq_engine_new_server(base, cert, key);
-    if (!eng) {
-        MQ_LOGE("failed to create server engine (cert=%s key=%s)", cert, key);
+    /* The runtime installs its callbacks onto the transport, so pass NULL cbs to
+     * mq_transport_new_server. */
+    transport = mq_transport_new_server(/*cbs=*/NULL, /*user=*/NULL, cert, key);
+    if (!transport) {
+        MQ_LOGE("failed to create server transport (cert=%s key=%s)", cert, key);
         goto out;
     }
     if (qlog_dir) {
         const char *qpath = NULL;
-        if (mq_engine_enable_qlog(eng, qlog_dir, &qpath) != 0) {
+        if (mq_transport_enable_qlog(transport, qlog_dir, &qpath) != 0) {
             MQ_LOGE("failed to enable qlog in %s", qlog_dir);
             goto out;
         }
         MQ_LOGI("server qlog -> %s", qpath);
     }
-    path = mq_path_open(eng, 0, listen_ip, listen_port);
-    if (!path) {
+    rt = mq_runtime_new(transport, base);
+    if (!rt) {
+        MQ_LOGE("failed to create runtime");
+        goto out;
+    }
+    if (mq_runtime_open_udp_path(rt, listen_ip, listen_port) != 0) {
         MQ_LOGE("failed to bind listen path %s:%u", listen_ip, listen_port);
         goto out;
     }
-    server = mq_server_new(eng, token);
+    server = mq_server_new(transport, rt, token);
     if (!server) {
         MQ_LOGE("failed to create server");
         goto out;
     }
-    if (install_signal_handlers(base, eng, &sint, &sterm) != 0) {
+    if (install_signal_handlers(base, rt, &sint, &sterm) != 0) {
         MQ_LOGE("failed to install signal handlers");
         goto out;
     }
 
     MQ_LOGI("mqproxy server listening on %s:%u", listen_ip, listen_port);
-    mq_engine_run(eng);
+    mq_runtime_run(rt);
     rc = 0;
 
 out:
     /* Teardown order (see cmd_client for the rationale): the server's per-conn
-     * state is touched by conn-close callbacks fired while the engine tears down
-     * its connections, so the engine must be freed BEFORE the server. Order:
-     * signal events -> path -> engine (fires conn-close into the live server) ->
-     * server -> base. */
+     * state + the runtime are both touched by conn-close callbacks fired while
+     * the engine tears down its connections (inside mq_transport_free):
+     *   - the transport's send_udp callback (the runtime, as cbs.user) may be
+     *     invoked for a final CONNECTION_CLOSE — so the RUNTIME must outlive
+     *     mq_transport_free;
+     *   - conn-close fires the server's on_state(CLOSED) which reaps flows and
+     *     reads mq_runtime_base(rt) — so the SERVER and the RUNTIME must both be
+     *     alive during mq_transport_free.
+     * Therefore free the TRANSPORT first (engine destroy, callbacks land on the
+     * live runtime + server), then the runtime (closes sockets/timer; does not
+     * free base), then the server. The CLI owns base, so it frees it last.
+     * Order: signal events -> transport -> runtime -> server -> base. */
     if (sint) event_free(sint);
     if (sterm) event_free(sterm);
-    if (path) mq_path_close(path);
-    if (eng) mq_engine_free(eng);
+    if (transport) mq_transport_free(transport);
+    if (rt) mq_runtime_free(rt);
     if (server) mq_server_free(server);
     if (base) event_base_free(base);
     return rc;
@@ -423,8 +437,8 @@ cmd_client(int argc, char **argv)
 
     int rc = 1;
     struct event_base *base = NULL;
-    mq_engine_t *eng = NULL;
-    mq_path_t *path = NULL;
+    mq_transport_t *transport = NULL;
+    mq_runtime_t *rt = NULL;
     mq_client_t *client = NULL;
     mq_listener_t *socks5_l = NULL;
     mq_listener_t *http_l = NULL;
@@ -435,27 +449,33 @@ cmd_client(int argc, char **argv)
         MQ_LOGE("failed to create event base");
         goto out;
     }
-    eng = mq_engine_new(0, base);
-    if (!eng) {
-        MQ_LOGE("failed to create client engine");
+    /* The runtime installs its callbacks onto the transport, so pass NULL cbs to
+     * mq_transport_new. */
+    transport = mq_transport_new(/*is_server=*/0, /*cbs=*/NULL, /*user=*/NULL);
+    if (!transport) {
+        MQ_LOGE("failed to create client transport");
         goto out;
     }
     if (qlog_dir) {
         const char *qpath = NULL;
-        if (mq_engine_enable_qlog(eng, qlog_dir, &qpath) != 0) {
+        if (mq_transport_enable_qlog(transport, qlog_dir, &qpath) != 0) {
             MQ_LOGE("failed to enable qlog in %s", qlog_dir);
             goto out;
         }
         MQ_LOGI("client qlog -> %s", qpath);
     }
-    path = mq_path_open(eng, 0, primary_ip, 0);
-    if (!path) {
+    rt = mq_runtime_new(transport, base);
+    if (!rt) {
+        MQ_LOGE("failed to create runtime");
+        goto out;
+    }
+    if (mq_runtime_open_udp_path(rt, primary_ip, 0) != 0) {
         MQ_LOGE("failed to bind primary path %s", primary_ip);
         goto out;
     }
     /* Window + multipath conn settings are applied inside mq_client_new
      * (mq_conn_apply_mp_settings). */
-    client = mq_client_new(eng, server_ip, server_port, client_id, token);
+    client = mq_client_new(transport, rt, server_ip, server_port, client_id, token);
     if (!client) {
         MQ_LOGE("failed to create client");
         goto out;
@@ -493,7 +513,7 @@ cmd_client(int argc, char **argv)
             goto out;
         }
     }
-    if (install_signal_handlers(base, eng, &sint, &sterm) != 0) {
+    if (install_signal_handlers(base, rt, &sint, &sterm) != 0) {
         MQ_LOGE("failed to install signal handlers");
         goto out;
     }
@@ -501,7 +521,7 @@ cmd_client(int argc, char **argv)
     MQ_LOGI("mqproxy client: server=%s:%u socks5=%s:%u%s%s%s (bind %s)", server_ip,
             server_port, socks5_ip, socks5_port, http_connect ? " http-connect=" : "",
             http_connect ? http_ip : "", http_connect ? "" : "", primary_ip);
-    mq_engine_run(eng);
+    mq_runtime_run(rt);
     rc = 0;
 
     /* The loop has broken (SIGINT/SIGTERM) but the conn is still alive (the
@@ -520,22 +540,24 @@ out:
      * "free client first" ordering tripped a heap-use-after-free under ASan):
      *
      *   - The client registers client_on_state() on its mq_conn. That callback
-     *     is invoked DURING mq_engine_free (conn destroy -> close-notify), and on
-     *     MQ_CONN_CLOSED it (a) touches the mq_client and (b) FAILS every
+     *     is invoked DURING mq_transport_free (conn destroy -> close-notify), and
+     *     on MQ_CONN_CLOSED it (a) touches the mq_client and (b) FAILS every
      *     in-flight tcp_open, firing each open-result cb. Those cbs write the
      *     SOCKS5/HTTP reject reply onto the listener's per-conn state.
      *   - Therefore BOTH the client AND the listeners must still be alive while
-     *     the engine is torn down. The engine must be freed FIRST so its
+     *     the transport is torn down. The transport must be freed FIRST so its
      *     callbacks land on live objects.
+     *   - The transport's send_udp callback (the runtime, as cbs.user) may also
+     *     fire during engine destroy (final CONNECTION_CLOSE), so the runtime
+     *     must outlive mq_transport_free too.
      *
-     * Order: signal events -> path (unregister fd) -> engine (fires all
-     * conn-close + in-flight-open callbacks into the live client/listeners) ->
-     * client -> listeners -> base. (Matches the integration fixture, which frees
-     * paths+engine before the client/server for the same reason.) */
+     * Order: signal events -> transport (fires all conn-close + in-flight-open
+     * callbacks into the live runtime/client/listeners) -> runtime (closes
+     * sockets/timer; does not free base) -> client -> listeners -> base. */
     if (sint) event_free(sint);
     if (sterm) event_free(sterm);
-    if (path) mq_path_close(path);
-    if (eng) mq_engine_free(eng);
+    if (transport) mq_transport_free(transport);
+    if (rt) mq_runtime_free(rt);
     if (client) mq_client_free(client);
     if (socks5_l) mq_listener_free(socks5_l);
     if (http_l) mq_listener_free(http_l);

@@ -97,7 +97,8 @@ struct mq_client_data_s {
 typedef struct mq_client_data_s mq_client_data_t;
 
 struct mq_client_s {
-    mq_engine_t *eng;
+    mq_transport_t *transport;
+    mq_runtime_t *rt;
     char server_ip[64];
     uint16_t server_port;
 
@@ -253,7 +254,7 @@ client_data_header_readable(mq_stream_t *s, void *user)
      * then start the relay binding the stream ⇄ local_fd. */
     client_data_report(d, 1, MQ_TCP_OK);
 
-    struct event_base *base = mq_engine_base(d->cli->eng);
+    struct event_base *base = mq_runtime_base(d->cli->rt);
     d->flow = mq_flow_new(&d->flow, base, d->stream, d->local_fd, client_flow_on_reap, d);
     if (!d->flow) {
         MQ_LOGE("mq_client: flow alloc failed");
@@ -531,17 +532,18 @@ forward:
 }
 
 mq_client_t *
-mq_client_new(mq_engine_t *eng, const char *server_ip, uint16_t server_port,
-              const char *client_id, const char *auth_token)
+mq_client_new(mq_transport_t *t, mq_runtime_t *rt, const char *server_ip,
+              uint16_t server_port, const char *client_id, const char *auth_token)
 {
-    if (!eng || !server_ip || !client_id || !auth_token) {
+    if (!t || !rt || !server_ip || !client_id || !auth_token) {
         return NULL;
     }
     mq_client_t *c = calloc(1, sizeof(*c));
     if (!c) {
         return NULL;
     }
-    c->eng = eng;
+    c->transport = t;
+    c->rt = rt;
     c->server_port = server_port;
     snprintf(c->server_ip, sizeof(c->server_ip), "%s", server_ip);
 
@@ -584,7 +586,7 @@ mq_client_start(mq_client_t *c)
     /* Register the client ALPN (no server-side hooks). Idempotency: registering
      * twice on one engine is not supported, so this assumes one client per
      * engine, which matches the proxy's usage. */
-    if (mq_conn_register_alpn(c->eng, MQ_CLIENT_ALPN, NULL, NULL, NULL) != 0) {
+    if (mq_conn_register_alpn(c->transport, MQ_CLIENT_ALPN, NULL, NULL, NULL) != 0) {
         MQ_LOGE("mq_client: register_alpn failed");
         return -1;
     }
@@ -606,8 +608,8 @@ mq_client_start(mq_client_t *c)
     /* Multipath + aggregate-BDP flow-control windows (see mq_conn.h). */
     mq_conn_apply_mp_settings(&settings, /*is_server=*/0);
 
-    c->conn = mq_conn_connect(c->eng, (struct sockaddr *)&sa, sizeof(sa), MQ_CLIENT_ALPN,
-                              &settings, c);
+    c->conn = mq_conn_connect(c->transport, (struct sockaddr *)&sa, sizeof(sa),
+                              MQ_CLIENT_ALPN, &settings, c);
     if (!c->conn) {
         MQ_LOGE("mq_client: connect failed");
         return -1;
@@ -684,7 +686,7 @@ client_mp_timer_arm(mq_client_t *c)
     if (c->mp_timer || c->added_paths >= c->n_extra_paths) {
         return;
     }
-    struct event_base *base = mq_engine_base(c->eng);
+    struct event_base *base = mq_runtime_base(c->rt);
     if (!base) {
         return;
     }
@@ -717,7 +719,7 @@ mq_client_add_paths(mq_client_t *c, const char *const *ips, size_t n)
         c->n_extra_paths++;
         accepted++;
     }
-    /* Arm the deferral timer if the engine base is available (after
+    /* Arm the deferral timer if the runtime base is available (after
      * mq_client_new it is). Harmless if there is no pending work. */
     client_mp_timer_arm(c);
     return (int)accepted;

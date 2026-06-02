@@ -32,9 +32,10 @@
 
 #include "proxy/mq_flow.h"
 #include "proxy/mq_framebuf.h"
+#include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h"
-#include "transport/mq_engine.h"
 #include "transport/mq_stream.h"
+#include "transport/mq_transport.h"
 #include "util/mq_log.h"
 #include "wire/mq_wire.h"
 
@@ -92,7 +93,8 @@ struct mq_srv_data_s {
 };
 
 struct mq_server_s {
-    mq_engine_t *eng;
+    mq_transport_t *transport;
+    mq_runtime_t *rt;
     char auth_token[256];
     size_t auth_token_len;
     unsigned auth_attempts;
@@ -325,7 +327,7 @@ static void
 srv_data_begin_relay(mq_srv_data_t *d)
 {
     mq_server_t *srv = d->sc->server;
-    struct event_base *base = mq_engine_base(srv->eng);
+    struct event_base *base = mq_runtime_base(srv->rt);
 
     d->flow = mq_flow_new(&d->flow, base, d->stream, d->fd, srv_flow_on_reap, d);
     if (!d->flow) {
@@ -488,7 +490,7 @@ srv_data_dial(mq_srv_data_t *d, const mq_connect_tcp_req_t *req)
         return;
     }
     /* In progress: watch for writability to learn the outcome. */
-    struct event_base *base = mq_engine_base(d->sc->server->eng);
+    struct event_base *base = mq_runtime_base(d->sc->server->rt);
     d->connect_ev = event_new(base, fd, EV_WRITE, srv_connect_done_cb, d);
     if (!d->connect_ev) {
         srv_data_fail(d, MQ_TCP_CONN_REFUSED);
@@ -628,21 +630,22 @@ srv_on_new_stream(mq_stream_t *s, void *user)
 }
 
 mq_server_t *
-mq_server_new(mq_engine_t *eng, const char *auth_token)
+mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token)
 {
-    if (!eng || !auth_token) {
+    if (!t || !rt || !auth_token) {
         return NULL;
     }
     mq_server_t *s = calloc(1, sizeof(*s));
     if (!s) {
         return NULL;
     }
-    s->eng = eng;
+    s->transport = t;
+    s->rt = rt;
     snprintf(s->auth_token, sizeof(s->auth_token), "%s", auth_token);
     s->auth_token_len = strnlen(s->auth_token, sizeof(s->auth_token));
 
-    if (mq_conn_register_alpn(eng, MQ_SERVER_ALPN, srv_on_new_conn, srv_on_new_stream,
-                              s) != 0) {
+    if (mq_conn_register_alpn(t, MQ_SERVER_ALPN, srv_on_new_conn, srv_on_new_stream, s) !=
+        0) {
         MQ_LOGE("mq_server: register_alpn failed");
         free(s);
         return NULL;
@@ -657,7 +660,7 @@ mq_server_new(mq_engine_t *eng, const char *auth_token)
     settings.proto_version = XQC_VERSION_V1;
     settings.pacing_on = 1;
     mq_conn_apply_mp_settings(&settings, /*is_server=*/1);
-    xqc_server_set_conn_settings(mq_engine_xqc(eng), &settings);
+    xqc_server_set_conn_settings(mq_transport_xqc(t), &settings);
 
     return s;
 }

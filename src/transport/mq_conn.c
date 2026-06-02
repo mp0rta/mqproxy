@@ -4,8 +4,8 @@
 /* mq_conn.c — raw MPQUIC connection wrapper + ALP callback tables.
  *
  * See mq_conn.h for the user_data scheme. In short:
- *   - transport user_data = mq_engine_t*  (engine recovers it for sends)
- *   - app-proto user_data = mq_conn_t*    (ALP callbacks recover the conn)
+ *   - transport user_data = mq_transport_t*  (transport recovers it for sends)
+ *   - app-proto user_data = mq_conn_t*        (ALP callbacks recover the conn)
  *
  * The per-engine ALP registration context (mq_alpn_ctx_t) is stashed via
  * xqc_engine_set_priv_ctx so the ALP conn_create_notify can find the owner's
@@ -17,11 +17,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "transport/mq_path.h"
 #include "transport/mq_stream_internal.h"
 #include "util/mq_log.h"
 
-/* Max extra (non-primary) paths a single conn may add. The engine's path-id
+/* Max extra (non-primary) paths a single conn may add. The runtime's path
  * map is 8 slots wide (path_id 0 is the primary), so 7 extra paths max; cap
  * lower here — the proxy adds one secondary path in Phase 1. */
 #define MQ_CONN_MAX_EXTRA_PATHS 7
@@ -60,7 +59,7 @@ typedef struct mq_alpn_ctx_s {
 } mq_alpn_ctx_t;
 
 struct mq_conn_s {
-    mq_engine_t *eng;
+    mq_transport_t *transport;
     xqc_cid_t cid;
     int have_cid;
     int is_server;
@@ -73,9 +72,10 @@ struct mq_conn_s {
     /* Multipath: set once xquic fires ready_to_create_path_notify. */
     int mp_ready;
 
-    /* Extra (non-primary) paths added via mq_conn_add_path, owned here and
-     * freed on conn teardown. */
-    mq_path_t *extra_paths[MQ_CONN_MAX_EXTRA_PATHS];
+    /* Extra (non-primary) path-ids added via mq_conn_add_path. Their sockets
+     * live in the runtime; they are torn down (mq_transport_close_path) on
+     * conn teardown. */
+    uint64_t extra_path_ids[MQ_CONN_MAX_EXTRA_PATHS];
     int n_extra_paths;
 };
 
@@ -83,7 +83,7 @@ static mq_alpn_ctx_t *mq_conn_actx(void *conn_user_data);
 
 /* ── ALP connection callbacks ───────────────────────────────────────────── */
 
-/* conn_create_notify: conn_user_data is the engine (transport user_data);
+/* conn_create_notify: conn_user_data is the transport (transport user_data);
  * conn_proto_data is the app-proto user_data — non-NULL for a client conn we
  * already created in mq_conn_connect, NULL for a server-accepted conn. */
 static int
@@ -91,15 +91,15 @@ mq_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_u
                       void *conn_proto_data)
 {
     (void)conn_proto_data;
-    mq_engine_t *eng = (mq_engine_t *)conn_user_data;
-    mq_alpn_ctx_t *actx = (mq_alpn_ctx_t *)xqc_engine_get_priv_ctx(mq_engine_xqc(eng));
+    mq_transport_t *t = (mq_transport_t *)conn_user_data;
+    mq_alpn_ctx_t *actx = (mq_alpn_ctx_t *)xqc_engine_get_priv_ctx(mq_transport_xqc(t));
 
     /* Client side: adopt the mq_conn the caller pre-allocated in
      * mq_conn_connect, binding it as the connection's alp user_data. */
     if (actx && actx->pending_client_conn) {
         mq_conn_t *c = actx->pending_client_conn;
         actx->pending_client_conn = NULL;
-        c->eng = eng;
+        c->transport = t;
         memcpy(&c->cid, (const void *)cid, sizeof(c->cid));
         c->have_cid = 1;
         xqc_conn_set_alp_user_data(conn, c);
@@ -111,7 +111,7 @@ mq_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_u
     if (!c) {
         return -1;
     }
-    c->eng = eng;
+    c->transport = t;
     c->is_server = 1;
     /* cid may be misaligned inside xquic internals; copy bytewise. */
     memcpy(&c->cid, (const void *)cid, sizeof(c->cid));
@@ -129,15 +129,15 @@ mq_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_u
 }
 
 /* Recover the per-engine ALP ctx from a conn-level callback (which receives the
- * engine as conn_user_data). */
+ * transport as conn_user_data). */
 static mq_alpn_ctx_t *
 mq_conn_actx(void *conn_user_data)
 {
-    mq_engine_t *eng = (mq_engine_t *)conn_user_data;
-    if (!eng) {
+    mq_transport_t *t = (mq_transport_t *)conn_user_data;
+    if (!t) {
         return NULL;
     }
-    return (mq_alpn_ctx_t *)xqc_engine_get_priv_ctx(mq_engine_xqc(eng));
+    return (mq_alpn_ctx_t *)xqc_engine_get_priv_ctx(mq_transport_xqc(t));
 }
 
 static int
@@ -161,11 +161,10 @@ mq_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_us
     if (c->on_state) {
         c->on_state(c, MQ_CONN_CLOSED, c->on_state_user);
     }
-    /* Release any secondary paths this conn owns (unregisters the fd from the
-     * engine map, frees the read event + socket). */
+    /* Release any secondary paths this conn owns (the runtime frees the read
+     * event + socket via close_path_socket). */
     for (int i = 0; i < c->n_extra_paths; i++) {
-        mq_path_close(c->extra_paths[i]);
-        c->extra_paths[i] = NULL;
+        mq_transport_close_path(c->transport, c->extra_path_ids[i]);
     }
     free(c);
     return 0;
@@ -204,17 +203,17 @@ mq_conn_stream_create_notify(xqc_stream_t *stream, void *strm_user_data)
     }
 
     /* Peer-initiated stream: wrap it and surface to the owner. The
-     * connection's transport user_data is the mq_engine; from it we reach the
+     * connection's transport user_data is the mq_transport; from it we reach the
      * per-engine ALP registration ctx (and its on_new_stream hook). The owning
-     * mq_conn is the engine's active server conn (see active_server_conn). */
-    mq_engine_t *eng = (mq_engine_t *)xqc_get_conn_user_data_by_stream(stream);
+     * mq_conn is the transport's active server conn (see active_server_conn). */
+    mq_transport_t *t = (mq_transport_t *)xqc_get_conn_user_data_by_stream(stream);
     mq_stream_t *s = mq_stream_wrap(stream);
     if (!s) {
         return -1;
     }
-    if (eng) {
+    if (t) {
         mq_alpn_ctx_t *actx =
-            (mq_alpn_ctx_t *)xqc_engine_get_priv_ctx(mq_engine_xqc(eng));
+            (mq_alpn_ctx_t *)xqc_engine_get_priv_ctx(mq_transport_xqc(t));
         if (actx) {
             mq_stream_set_conn(s, actx->active_server_conn);
         }
@@ -228,13 +227,13 @@ mq_conn_stream_create_notify(xqc_stream_t *stream, void *strm_user_data)
 /* ── ALP registration ───────────────────────────────────────────────────── */
 
 int
-mq_conn_register_alpn(mq_engine_t *eng, const char *alpn, mq_conn_on_new_fn on_new_conn,
+mq_conn_register_alpn(mq_transport_t *t, const char *alpn, mq_conn_on_new_fn on_new_conn,
                       mq_stream_on_new_fn on_new_stream, void *user)
 {
-    if (!eng || !alpn) {
+    if (!t || !alpn) {
         return -1;
     }
-    xqc_engine_t *xeng = mq_engine_xqc(eng);
+    xqc_engine_t *xeng = mq_transport_xqc(t);
     if (!xeng) {
         return -1;
     }
@@ -303,7 +302,7 @@ mq_conn_add_path(mq_conn_t *c, const char *local_ip, uint16_t local_port)
         MQ_LOGW("mq_conn: add_path: extra-path slots exhausted");
         return -1;
     }
-    xqc_engine_t *xeng = mq_engine_xqc(c->eng);
+    xqc_engine_t *xeng = mq_transport_xqc(c->transport);
     if (!xeng) {
         return -1;
     }
@@ -319,20 +318,16 @@ mq_conn_add_path(mq_conn_t *c, const char *local_ip, uint16_t local_port)
         return -1;
     }
 
-    /* 2. Bind a UDP socket for the new path and register path_id->fd so the
-     *    engine's send callback can route packets for it. */
-    mq_path_t *p = mq_path_open(c->eng, new_path_id, local_ip, local_port);
-    if (!p) {
-        MQ_LOGE("mq_conn: add_path: mq_path_open(path %llu) failed",
+    /* 2. Ask the runtime (via the transport) to open a UDP socket for the new
+     *    path-id and arm its recv-drain so packets for it can be routed. */
+    if (mq_transport_open_path(c->transport, new_path_id, local_ip, local_port) != 0) {
+        MQ_LOGE("mq_conn: add_path: open_path_socket(path %llu) failed",
                 (unsigned long long)new_path_id);
         /* Best-effort: tear the half-created xquic path back down so it does
          * not linger waiting on a socket that will never exist. */
         xqc_conn_close_path(xeng, &c->cid, new_path_id);
         return -1;
     }
-    /* Datagrams arriving on this path feed packet_process with the engine as
-     * conn_user_data (the default mq_path sets), which the send/accept path
-     * recovers — matches the primary path. */
 
     /* 3. Mark the path available so the peer may schedule traffic on it once
      *    validation completes. */
@@ -343,7 +338,7 @@ mq_conn_add_path(mq_conn_t *c, const char *local_ip, uint16_t local_port)
          * proceed. Keep the path so its socket stays alive. */
     }
 
-    c->extra_paths[c->n_extra_paths++] = p;
+    c->extra_path_ids[c->n_extra_paths++] = new_path_id;
     return (int)new_path_id;
 }
 
@@ -360,7 +355,7 @@ mq_conn_stats_snapshot(const mq_conn_t *c, xqc_conn_stats_t *out)
     if (!c || !c->have_cid) {
         return -1;
     }
-    xqc_engine_t *xeng = mq_engine_xqc(c->eng);
+    xqc_engine_t *xeng = mq_transport_xqc(c->transport);
     if (!xeng) {
         return -1;
     }
@@ -486,13 +481,13 @@ mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server)
 /* ── Client connect ─────────────────────────────────────────────────────── */
 
 mq_conn_t *
-mq_conn_connect(mq_engine_t *eng, const struct sockaddr *peer, socklen_t peerlen,
+mq_conn_connect(mq_transport_t *t, const struct sockaddr *peer, socklen_t peerlen,
                 const char *alpn, const xqc_conn_settings_t *settings, void *owner)
 {
-    if (!eng || !peer || !alpn || !settings) {
+    if (!t || !peer || !alpn || !settings) {
         return NULL;
     }
-    xqc_engine_t *xeng = mq_engine_xqc(eng);
+    xqc_engine_t *xeng = mq_transport_xqc(t);
     if (!xeng) {
         return NULL;
     }
@@ -507,29 +502,29 @@ mq_conn_connect(mq_engine_t *eng, const struct sockaddr *peer, socklen_t peerlen
     if (!c) {
         return NULL;
     }
-    c->eng = eng;
+    c->transport = t;
     c->is_server = 0;
     c->owner = owner;
 
-    /* Route xquic's ready_to_create_path_notify (delivered to the engine) to
+    /* Route xquic's ready_to_create_path_notify (delivered to the transport) to
      * this conn so mq_conn_mp_ready flips once paths can be created. One conn
-     * per client engine, so a single engine slot suffices. */
-    mq_engine_set_mp_ready_cb(eng, mq_conn_on_mp_ready, c);
+     * per client transport, so a single slot suffices. */
+    mq_transport_set_mp_ready_cb(t, mq_conn_on_mp_ready, c);
 
     xqc_conn_ssl_config_t conn_ssl;
     memset(&conn_ssl, 0, sizeof(conn_ssl));
 
     /* Hand the mq_conn to the imminent conn_create_notify (fired synchronously
      * inside xqc_connect) which binds it as the connection's alp user_data.
-     * The transport user_data is the engine so the send callback can recover
-     * it. */
+     * The transport user_data is the mq_transport so the send callback can
+     * recover it. */
     actx->pending_client_conn = c;
 
     /* server_host is the TLS SNI; xquic dereferences it unconditionally
      * (strlen), so it must be non-NULL even on loopback. */
     const xqc_cid_t *cid =
         xqc_connect(xeng, settings, NULL, 0, "mqproxy", /*no_crypto_flag=*/0, &conn_ssl,
-                    peer, peerlen, alpn, /*transport user_data=*/eng);
+                    peer, peerlen, alpn, /*transport user_data=*/t);
     if (!cid) {
         MQ_LOGE("mq_conn: xqc_connect failed");
         actx->pending_client_conn = NULL;
@@ -588,7 +583,8 @@ mq_conn_open_stream(mq_conn_t *c)
     if (!s) {
         return NULL;
     }
-    xqc_stream_t *xs = xqc_stream_create(mq_engine_xqc(c->eng), &c->cid, NULL, s);
+    xqc_stream_t *xs =
+        xqc_stream_create(mq_transport_xqc(c->transport), &c->cid, NULL, s);
     if (!xs) {
         MQ_LOGW("mq_conn: xqc_stream_create failed");
         mq_stream_free(s);
@@ -606,5 +602,5 @@ mq_conn_close(mq_conn_t *c)
     if (!c || !c->have_cid) {
         return;
     }
-    xqc_conn_close(mq_engine_xqc(c->eng), &c->cid);
+    xqc_conn_close(mq_transport_xqc(c->transport), &c->cid);
 }

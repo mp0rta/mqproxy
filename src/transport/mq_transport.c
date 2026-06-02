@@ -433,6 +433,25 @@ mq_transport_xqc(mq_transport_t *t)
     return t ? t->engine : NULL;
 }
 
+int
+mq_transport_open_path(mq_transport_t *t, uint64_t path, const char *local_ip,
+                       uint16_t port)
+{
+    if (!t || !t->cbs.open_path_socket) {
+        return -1;
+    }
+    return t->cbs.open_path_socket(path, local_ip, port, t->user);
+}
+
+void
+mq_transport_close_path(mq_transport_t *t, uint64_t path)
+{
+    if (!t || !t->cbs.close_path_socket) {
+        return;
+    }
+    t->cbs.close_path_socket(path, t->user);
+}
+
 void
 mq_transport_set_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn, void *user)
 {
