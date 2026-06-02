@@ -464,6 +464,15 @@ mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server)
      * needs it most. */
     s->cong_ctrl_callback = xqc_bbr2_cb;
 
+    /* Scheduler: minRTT. A single proxied flow is ONE QUIC stream, so we want
+     * its packets spread across paths by RTT (within-stream multipath) to
+     * aggregate bandwidth. minRTT does that; WLB (xqc_wlb_scheduler_cb) instead
+     * PINS inner flows to paths — right for mqvpn's per-datagram flows, wrong
+     * here (it would confine the single stream to one path = no aggregation).
+     * minRTT is also xquic's current default, but pin it explicitly so a fork
+     * default change can't silently regress 1-B aggregation. */
+    s->scheduler_callback = xqc_minrtt_scheduler_cb;
+
     /* Flow-control windows: rely on xquic's default (enable_stream_rate_limit
      * == 0) which advertises max_stream_data_bidi_local = XQC_MAX_RECV_WINDOW
      * = 16MB — larger than the 8MB aggregate-BDP target and consistent with
