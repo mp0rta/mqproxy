@@ -292,6 +292,14 @@ SINGLE_BPS="$(run_transfer)"
 stop_client
 note "e2e_multipath: single-path speed = ${SINGLE_BPS} bytes/s"
 
+# Preserve the SINGLE-path qlog for diagnosis before the 2-path run overwrites
+# client.qlog / appends to server.qlog. (server.qlog is continuous — the server
+# isn't restarted — so snapshot it here to capture just the single-path phase.)
+if [ "${QLOG_ON}" -eq 1 ]; then
+    cp -f "${QLOG_DIR}/client.qlog" "${QLOG_DIR}/client-single.qlog" 2>/dev/null || true
+    cp -f "${QLOG_DIR}/server.qlog" "${QLOG_DIR}/server-single.qlog" 2>/dev/null || true
+fi
+
 # Fresh qlog for the two-path run (the assertions read the two-path client qlog).
 rm -f "${QLOG_DIR}/client.qlog"
 
