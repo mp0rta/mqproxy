@@ -66,7 +66,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         xquic
         ${EVENT_CORE_LIB}
         ${EVENT_EXTRA_LIB}
-        pthread dl m)
+        pthread dl m stdc++)
     target_include_directories(test_engine_boot PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     # libxquic.so is loaded at runtime from the xquic build dir; embed an
@@ -81,7 +81,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         xquic
         ${EVENT_CORE_LIB}
         ${EVENT_EXTRA_LIB}
-        pthread dl m)
+        pthread dl m stdc++)
     target_include_directories(test_path_bind PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     set_target_properties(test_path_bind PROPERTIES
@@ -114,7 +114,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         xquic
         ${EVENT_CORE_LIB}
         ${EVENT_EXTRA_LIB}
-        pthread dl m)
+        pthread dl m stdc++)
     target_include_directories(test_conn_handshake PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     target_compile_definitions(test_conn_handshake PRIVATE
@@ -130,7 +130,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         xquic
         ${EVENT_CORE_LIB}
         ${EVENT_EXTRA_LIB}
-        pthread dl m)
+        pthread dl m stdc++)
     target_include_directories(test_client_server PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     target_compile_definitions(test_client_server PRIVATE
@@ -146,7 +146,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         xquic
         ${EVENT_CORE_LIB}
         ${EVENT_EXTRA_LIB}
-        pthread dl m)
+        pthread dl m stdc++)
     target_include_directories(test_socks5_listener PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     set_target_properties(test_socks5_listener PROPERTIES
@@ -159,7 +159,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         xquic
         ${EVENT_CORE_LIB}
         ${EVENT_EXTRA_LIB}
-        pthread dl m)
+        pthread dl m stdc++)
     target_include_directories(test_e2e_single_path PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     target_compile_definitions(test_e2e_single_path PRIVATE
@@ -175,7 +175,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         xquic
         ${EVENT_CORE_LIB}
         ${EVENT_EXTRA_LIB}
-        pthread dl m)
+        pthread dl m stdc++)
     target_include_directories(test_two_paths PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     target_compile_definitions(test_two_paths PRIVATE
@@ -191,7 +191,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         xquic
         ${EVENT_CORE_LIB}
         ${EVENT_EXTRA_LIB}
-        pthread dl m)
+        pthread dl m stdc++)
     target_include_directories(test_qlog_blocked PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     target_compile_definitions(test_qlog_blocked PRIVATE
@@ -211,7 +211,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         xquic
         ${EVENT_CORE_LIB}
         ${EVENT_EXTRA_LIB}
-        pthread dl m)
+        pthread dl m stdc++)
     target_include_directories(mqproxy_cli PRIVATE src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     # Default cert/key for `server` come from the bundled test cert (so the
