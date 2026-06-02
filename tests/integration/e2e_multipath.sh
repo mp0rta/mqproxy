@@ -148,15 +148,23 @@ setup_tc() {
     tc qdisc del dev lo root 2>/dev/null || true
     # HTB root; default class 1:1 (unshaped-ish, high ceil) for everything else
     # (e.g. the origin <-> server localhost leg and control traffic).
+    # quantum = 1 MTU on the shaped classes: HTB otherwise derives a huge
+    # quantum at hundreds of mbit (the "quantum of class is big" warning) and
+    # dequeues in large bursts that overflow the netem leaf and cause spurious
+    # packet LOSS. With BBR2 (which paces to bandwidth/RTT, not loss) that loss
+    # triggers a retransmit + STREAM_DATA_BLOCKED storm that collapses goodput.
+    # A 1514-byte quantum makes HTB meter packet-by-packet -> smooth, lossless.
     tc qdisc add dev lo root handle 1: htb default 1
     tc class add dev lo parent 1: classid 1:1  htb rate 10gbit ceil 10gbit
-    tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}"
-    tc class add dev lo parent 1: classid 1:11 htb rate "${RATE}" ceil "${RATE}"
-    # netem delay leaf under each shaped class. Because BOTH directions of a
-    # path are steered into its class (see filters below), each packet of the
-    # leg traverses this DELAY once per direction -> path RTT ~= 2*DELAY.
-    tc qdisc add dev lo parent 1:10 handle 10: netem delay "${DELAY}"
-    tc qdisc add dev lo parent 1:11 handle 11: netem delay "${DELAY}"
+    tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}" quantum 1514
+    tc class add dev lo parent 1: classid 1:11 htb rate "${RATE}" ceil "${RATE}" quantum 1514
+    # netem delay leaf under each shaped class, with a large limit so it queues
+    # (adds delay) rather than DROPS when the HTB rate gate briefly backs up —
+    # the shaper should be lossless; BBR2 finds the rate from the HTB ceil.
+    # Because BOTH directions of a path are steered into its class (filters
+    # below), each packet traverses this DELAY once per direction -> RTT ~= 2*DELAY.
+    tc qdisc add dev lo parent 1:10 handle 10: netem delay "${DELAY}" limit 20000
+    tc qdisc add dev lo parent 1:11 handle 11: netem delay "${DELAY}" limit 20000
     # Steer BOTH directions of each path into its shaped class: match the path's
     # client IP as the SOURCE (upstream client->server) AND as the DESTINATION
     # (download server->client, which has src=127.0.0.1). Without the dst match
