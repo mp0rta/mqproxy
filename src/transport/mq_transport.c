@@ -284,6 +284,17 @@ mq_transport_new_impl(int is_server, const char *cert_file, const char *key_file
 
     xqc_engine_callback_t engine_cbs = {
         .set_event_timer = mq_transport_set_event_timer,
+        /* Inject OUR clock as xquic's time source so the engine's internal now
+         * (used for RTT/PTO/scheduling and to compute set_event_timer's
+         * wake_after) is the SAME function we use for the recv timestamp passed
+         * to packet_process and for the deadline math. Without this, xquic falls
+         * back to its own xqc_now and the two clocks only agree by coincidence
+         * (both gettimeofday today) — a future xquic default change or an
+         * injected monotonic/BOOTTIME clock would silently desync them, corrupting
+         * RTT samples. One clock, one source of truth (also the single mock-clock
+         * swap point for deterministic tests). */
+        .realtime_ts = mq_tr_now_us,
+        .monotonic_ts = mq_tr_now_us,
         .log_callbacks =
             {
                 .xqc_log_write_err = mq_transport_log_write,
@@ -427,8 +438,8 @@ mq_transport_tick(mq_transport_t *t)
     xqc_engine_main_logic(t->engine);
 }
 
-int
-mq_transport_next_timeout_ms(mq_transport_t *t)
+int64_t
+mq_transport_next_timeout_us(mq_transport_t *t)
 {
     if (!t || !t->have_deadline) {
         return -1;
@@ -438,7 +449,17 @@ mq_transport_next_timeout_ms(mq_transport_t *t)
     if (d < 0) {
         d = 0;
     }
-    return (int)(d / 1000);
+    return d;
+}
+
+int
+mq_transport_next_timeout_ms(mq_transport_t *t)
+{
+    int64_t us = mq_transport_next_timeout_us(t);
+    if (us < 0) {
+        return -1;
+    }
+    return (int)(us / 1000);
 }
 
 xqc_engine_t *

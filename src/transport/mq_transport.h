@@ -89,8 +89,18 @@ int mq_transport_on_udp_recv(mq_transport_t *t, uint64_t path, const uint8_t *pk
  * recv or when its timer fires. */
 void mq_transport_tick(mq_transport_t *t);
 
+/* Microseconds until the core next wants to be ticked; -1 == not needed for
+ * now. The libevent runtime arms its timer from THIS variant (not the ms one)
+ * so sub-millisecond deadlines — notably xquic's pacing timers (~tens of µs at
+ * 100mbit) — keep their precision. Truncating them to ms (→0) collapses pacing
+ * to immediate fires, bursting the send and tripping congestion-control backoff
+ * at a shaped path. The old mq_engine armed its libevent timer with µs precision
+ * (tv_usec = wake_after % 1e6); this preserves that. */
+int64_t mq_transport_next_timeout_us(mq_transport_t *t);
+
 /* Milliseconds until the core next wants to be ticked; -1 == not needed for
- * now. The runtime arms its own timer from this. */
+ * now. Lossy portable form (floors sub-ms to 0) for ms-granular pollers /
+ * get_interest; the libevent runtime uses the _us variant for pacing precision. */
 int mq_transport_next_timeout_ms(mq_transport_t *t);
 
 /* Accessor for the underlying xquic engine (used by mq_conn / cli). */

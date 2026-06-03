@@ -65,19 +65,21 @@ typedef struct {
     uint64_t path;
 } rt_path_ctx_t;
 
-/* (Re)arm the engine timer from the transport's next-timeout. ms < 0 -> the
- * core wants no wake right now (don't arm). Mirrors mq_engine's timer idiom but
- * driven by polling next_timeout_ms instead of set_event_timer. */
+/* (Re)arm the engine timer from the transport's next-timeout. us < 0 -> the
+ * core wants no wake right now (don't arm). Uses MICROSECOND precision (not the
+ * ms variant) so xquic pacing timers keep their sub-ms spacing — flooring to ms
+ * (→0) collapses pacing to immediate fires, bursting the send and tripping CC
+ * backoff on a shaped path. Mirrors the old mq_engine set_event_timer precision. */
 static void
 rt_rearm_timer(mq_runtime_t *rt)
 {
-    int ms = mq_transport_next_timeout_ms(rt->t);
-    if (ms < 0) {
+    int64_t us = mq_transport_next_timeout_us(rt->t);
+    if (us < 0) {
         return;
     }
     struct timeval tv;
-    tv.tv_sec = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
+    tv.tv_sec = (time_t)(us / 1000000);
+    tv.tv_usec = (suseconds_t)(us % 1000000);
     event_add(rt->timer_ev, &tv);
 }
 
