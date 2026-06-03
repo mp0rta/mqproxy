@@ -17,6 +17,7 @@ add_library(mqproxy STATIC
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
     src/ingress/mq_listener.c
+    src/gateway/mq_http1.c
     src/transport/mq_conn.c
     src/transport/mq_h3.c
     src/transport/mq_stream.c
@@ -58,6 +59,11 @@ add_executable(test_http_connect tests/test_http_connect.c)
 target_link_libraries(test_http_connect mqproxy)
 target_include_directories(test_http_connect PRIVATE tests)
 add_test(NAME test_http_connect COMMAND test_http_connect)
+
+add_executable(test_http1 tests/test_http1.c)
+target_link_libraries(test_http1 mqproxy)
+target_include_directories(test_http1 PRIVATE tests)
+add_test(NAME test_http1 COMMAND test_http1)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
