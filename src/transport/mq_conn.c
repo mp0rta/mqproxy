@@ -277,7 +277,9 @@ mq_conn_register_alpn(mq_transport_t *t, const char *alpn, mq_conn_on_new_fn on_
 /* Engine mp-ready hook: xquic signalled that the conn identified by scid can
  * create a path. The user pointer is the client mq_conn registered in
  * mq_conn_connect. The notification is broadcast to every subscriber on the
- * transport, so filter by scid (cid_len + cid_buf) and only flip OUR conn. */
+ * transport, so filter by scid (cid_len + cid_buf) and only flip OUR conn.
+ * scid points at an aligned copy made by the transport dispatch point (xquic
+ * may hand it an unaligned cid pointer), so plain member access is safe here. */
 static void
 mq_conn_on_mp_ready(const xqc_cid_t *scid, void *user)
 {

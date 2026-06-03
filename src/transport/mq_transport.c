@@ -200,11 +200,15 @@ static void
 mq_transport_ready_to_create_path(const xqc_cid_t *scid, void *conn_user_data)
 {
     mq_transport_t *t = (mq_transport_t *)conn_user_data;
-    if (!t) {
+    if (!t || !scid) {
         return;
     }
+    /* xquic may hand an unaligned scid pointer; copy into an aligned local once
+     * here so every subscriber can read its members via plain field access. */
+    xqc_cid_t aligned;
+    memcpy(&aligned, scid, sizeof(aligned));
     for (int i = 0; i < t->n_mp_ready_subs; i++) {
-        t->mp_ready_subs[i].fn(scid, t->mp_ready_subs[i].user);
+        t->mp_ready_subs[i].fn(&aligned, t->mp_ready_subs[i].user);
     }
 }
 
