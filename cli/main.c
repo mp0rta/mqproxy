@@ -5,9 +5,15 @@
  *
  * Usage:
  *   mqproxy server --listen <udp ip:port> --token <t> [--cert <path> --key <path>]
- *   mqproxy client --server <udp ip:port> --token <t> --socks5 <tcp ip:port>
- *                  [--http-connect <tcp ip:port>] [--path <local ip>]...
+ *   mqproxy client --server <udp ip:port> --token <t>
+ *                  [--socks5 <tcp ip:port>] [--http-connect <tcp ip:port>]
+ *                  [--gateway <tcp ip:port>] [--path <local ip>]...
  *                  [--client-id <id>] [--qlog <dir>]
+ *
+ *   The client needs at least one ingress: --socks5, --http-connect, or
+ *   --gateway. --socks5 / --http-connect drive the TCP-proxy core (mq_client);
+ *   --gateway runs the independent HTTP-gateway fetch ingress (mq_gw_client over
+ *   its own H3 tunnel) and may be used on its own.
  *
  * Dispatch is on argv[1] (`client` / `server`). `--help`/`-h` at the top level
  * and per subcommand prints usage and exits 0. An unknown subcommand or a
@@ -31,10 +37,13 @@
 
 #include <event2/event.h>
 
+#include "gateway/mq_fetch_listener.h"
+#include "gateway/mq_gw_client.h"
 #include "ingress/mq_listener.h"
 #include "proxy/mq_client.h"
 #include "proxy/mq_server.h"
 #include "runtime/mq_runtime_libevent.h"
+#include "transport/mq_h3.h"
 #include "transport/mq_transport.h"
 #include "util/mq_log.h"
 
@@ -94,33 +103,43 @@ usage_server(FILE *out)
 static void
 usage_client(FILE *out)
 {
-    fprintf(out, "Usage: mqproxy client --server <ip:port> --token <token>\n"
-                 "                      --socks5 <ip:port> [--http-connect <ip:port>]\n"
-                 "                      [--path <local ip>]... [--client-id <id>]\n"
-                 "\n"
-                 "Options:\n"
-                 "  --server       <ip:port>   UDP address of the mqproxy server "
-                 "(required).\n"
-                 "  --token        <token>     Shared auth token (required).\n"
-                 "  --socks5       <ip:port>   Local TCP address for the SOCKS5 ingress "
-                 "(required).\n"
-                 "  --http-connect <ip:port>   Local TCP address for the HTTP CONNECT "
-                 "ingress.\n"
-                 "  --path         <local ip>  Local IP to bind a path to (repeatable). "
-                 "The\n"
-                 "                             first is the primary bind; each extra "
-                 "becomes a\n"
-                 "                             second/third MPQUIC path once the "
-                 "connection is\n"
-                 "                             multipath-ready.\n"
-                 "  --client-id    <id>        Client identifier sent at auth "
-                 "(default: mqproxy).\n"
-                 "  --qlog         <dir>       Write xquic qlog (EXTRA importance) to "
-                 "<dir>/client.qlog\n"
-                 "                             (the 1-B blocked-frame instrument).\n"
-                 "  --cc           <algo>      Congestion control: bbr (default) | bbr2 "
-                 "| cubic.\n"
-                 "  -h, --help                 Show this help and exit.\n");
+    fprintf(out,
+            "Usage: mqproxy client --server <ip:port> --token <token>\n"
+            "                      [--socks5 <ip:port>] [--http-connect <ip:port>]\n"
+            "                      [--gateway <ip:port>] [--path <local ip>]...\n"
+            "                      [--client-id <id>]\n"
+            "\n"
+            "At least one ingress is required: --socks5, --http-connect, or "
+            "--gateway.\n"
+            "\n"
+            "Options:\n"
+            "  --server       <ip:port>   UDP address of the mqproxy server "
+            "(required).\n"
+            "  --token        <token>     Shared auth token (required).\n"
+            "  --socks5       <ip:port>   Local TCP address for the SOCKS5 ingress.\n"
+            "  --http-connect <ip:port>   Local TCP address for the HTTP CONNECT "
+            "ingress.\n"
+            "  --gateway      <ip:port>   Local TCP address for the HTTP gateway "
+            "fetch\n"
+            "                             ingress (POST /_mqproxy/fetch over its own "
+            "H3\n"
+            "                             tunnel; independent of the SOCKS5/CONNECT "
+            "core).\n"
+            "  --path         <local ip>  Local IP to bind a path to (repeatable). "
+            "The\n"
+            "                             first is the primary bind; each extra "
+            "becomes a\n"
+            "                             second/third MPQUIC path once the "
+            "connection is\n"
+            "                             multipath-ready.\n"
+            "  --client-id    <id>        Client identifier sent at auth "
+            "(default: mqproxy).\n"
+            "  --qlog         <dir>       Write xquic qlog (EXTRA importance) to "
+            "<dir>/client.qlog\n"
+            "                             (the 1-B blocked-frame instrument).\n"
+            "  --cc           <algo>      Congestion control: bbr (default) | bbr2 "
+            "| cubic.\n"
+            "  -h, --help                 Show this help and exit.\n");
 }
 
 /* ── ip:port parsing ────────────────────────────────────────────────────────*/
@@ -362,6 +381,7 @@ cmd_client(int argc, char **argv)
     const char *token = NULL;
     const char *socks5 = NULL;
     const char *http_connect = NULL;
+    const char *gateway = NULL;
     const char *client_id = "mqproxy";
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
@@ -374,6 +394,7 @@ cmd_client(int argc, char **argv)
         OPT_TOKEN,
         OPT_SOCKS5,
         OPT_HTTP,
+        OPT_GATEWAY,
         OPT_PATH,
         OPT_CLIENT_ID,
         OPT_QLOG,
@@ -384,6 +405,7 @@ cmd_client(int argc, char **argv)
         {"token", required_argument, NULL, OPT_TOKEN},
         {"socks5", required_argument, NULL, OPT_SOCKS5},
         {"http-connect", required_argument, NULL, OPT_HTTP},
+        {"gateway", required_argument, NULL, OPT_GATEWAY},
         {"path", required_argument, NULL, OPT_PATH},
         {"client-id", required_argument, NULL, OPT_CLIENT_ID},
         {"qlog", required_argument, NULL, OPT_QLOG},
@@ -400,6 +422,7 @@ cmd_client(int argc, char **argv)
         case OPT_TOKEN: token = optarg; break;
         case OPT_SOCKS5: socks5 = optarg; break;
         case OPT_HTTP: http_connect = optarg; break;
+        case OPT_GATEWAY: gateway = optarg; break;
         case OPT_PATH:
             if (npaths < MQ_MAX_EXTRA_PATHS) {
                 paths[npaths++] = optarg;
@@ -437,8 +460,9 @@ cmd_client(int argc, char **argv)
         usage_client(stderr);
         return 2;
     }
-    if (!socks5) {
-        fprintf(stderr, "mqproxy client: missing required --socks5\n\n");
+    if (!socks5 && !http_connect && !gateway) {
+        fprintf(stderr, "mqproxy client: at least one ingress is required "
+                        "(--socks5, --http-connect, or --gateway)\n\n");
         usage_client(stderr);
         return 2;
     }
@@ -451,7 +475,8 @@ cmd_client(int argc, char **argv)
     }
     char socks5_ip[INET6_ADDRSTRLEN];
     uint16_t socks5_port = 0;
-    if (parse_ip_port(socks5, socks5_ip, sizeof(socks5_ip), &socks5_port) != 0) {
+    if (socks5 &&
+        parse_ip_port(socks5, socks5_ip, sizeof(socks5_ip), &socks5_port) != 0) {
         fprintf(stderr, "mqproxy client: invalid --socks5 address: %s\n", socks5);
         return 2;
     }
@@ -463,6 +488,18 @@ cmd_client(int argc, char **argv)
                 http_connect);
         return 2;
     }
+    char gw_ip[INET6_ADDRSTRLEN];
+    uint16_t gw_port = 0;
+    if (gateway && parse_ip_port(gateway, gw_ip, sizeof(gw_ip), &gw_port) != 0) {
+        fprintf(stderr, "mqproxy client: invalid --gateway address: %s\n", gateway);
+        return 2;
+    }
+
+    /* The TCP-proxy core (mq_client) is needed iff a SOCKS5 or HTTP CONNECT
+     * ingress is requested — both ride mq_client's tcp_open core. The gateway
+     * ingress is independent (its own mq_gw_client conn + auth), so a gateway-
+     * only client skips mq_client entirely. */
+    const int need_client = (socks5 != NULL) || (http_connect != NULL);
 
     /* The primary local bind for the client path. If --path was given, the
      * first one is the primary bind; each extra --path is brought up as an
@@ -478,6 +515,9 @@ cmd_client(int argc, char **argv)
     mq_client_t *client = NULL;
     mq_listener_t *socks5_l = NULL;
     mq_listener_t *http_l = NULL;
+    mq_h3_t *h3 = NULL;
+    mq_gw_client_t *gwc = NULL;
+    mq_fetch_listener_t *fetch_l = NULL;
     struct event *sint = NULL, *sterm = NULL;
 
     base = event_base_new();
@@ -509,55 +549,115 @@ cmd_client(int argc, char **argv)
         MQ_LOGE("failed to bind primary path %s", primary_ip);
         goto out;
     }
-    /* Window + multipath conn settings are applied inside mq_client_new
-     * (mq_conn_apply_mp_settings). */
-    client = mq_client_new(transport, rt, server_ip, server_port, client_id, token, cc);
-    if (!client) {
-        MQ_LOGE("failed to create client");
-        goto out;
-    }
-    if (mq_client_start(client) != 0) {
-        MQ_LOGE("failed to start client connection to %s:%u", server_ip, server_port);
-        goto out;
-    }
-
-    /* Bring up each extra --path (paths[1..]) as an additional MPQUIC path once
-     * the connection is multipath-ready (deferred internally via mq_conn_add_path).
-     * paths[0] is the primary bind handled above. */
-    if (npaths > 1) {
-        int added = mq_client_add_paths(client, &paths[1], npaths - 1);
-        if (added < 0) {
-            MQ_LOGE("failed to register extra paths");
+    /* TCP-proxy core (mq_client) + its SOCKS5/HTTP CONNECT ingress. Only created
+     * when a SOCKS5 or HTTP CONNECT ingress was requested; a gateway-only client
+     * skips it (the gateway conn below is independent, with its own auth). */
+    if (need_client) {
+        /* Window + multipath conn settings are applied inside mq_client_new
+         * (mq_conn_apply_mp_settings). */
+        client =
+            mq_client_new(transport, rt, server_ip, server_port, client_id, token, cc);
+        if (!client) {
+            MQ_LOGE("failed to create client");
             goto out;
         }
-        MQ_LOGI("registered %d extra multipath bind(s) (added once mp-ready)", added);
+        if (mq_client_start(client) != 0) {
+            MQ_LOGE("failed to start client connection to %s:%u", server_ip, server_port);
+            goto out;
+        }
+
+        /* Bring up each extra --path (paths[1..]) as an additional MPQUIC path
+         * once the connection is multipath-ready (deferred internally via
+         * mq_conn_add_path). paths[0] is the primary bind handled above. */
+        if (npaths > 1) {
+            int added = mq_client_add_paths(client, &paths[1], npaths - 1);
+            if (added < 0) {
+                MQ_LOGE("failed to register extra paths");
+                goto out;
+            }
+            MQ_LOGI("registered %d extra multipath bind(s) (added once mp-ready)", added);
+        }
+
+        mq_tcp_open_fn open_fn = mq_client_tcp_open_fn();
+        void *open_core = mq_client_tcp_open_core(client);
+
+        if (socks5) {
+            socks5_l =
+                mq_socks5_listener_new(base, socks5_ip, socks5_port, open_fn, open_core);
+            if (!socks5_l) {
+                MQ_LOGE("failed to bind SOCKS5 listener on %s:%u", socks5_ip,
+                        socks5_port);
+                goto out;
+            }
+        }
+        if (http_connect) {
+            http_l = mq_http_connect_listener_new(base, http_ip, http_port, open_fn,
+                                                  open_core);
+            if (!http_l) {
+                MQ_LOGE("failed to bind HTTP CONNECT listener on %s:%u", http_ip,
+                        http_port);
+                goto out;
+            }
+        }
     }
 
-    mq_tcp_open_fn open_fn = mq_client_tcp_open_fn();
-    void *open_core = mq_client_tcp_open_core(client);
-
-    socks5_l = mq_socks5_listener_new(base, socks5_ip, socks5_port, open_fn, open_core);
-    if (!socks5_l) {
-        MQ_LOGE("failed to bind SOCKS5 listener on %s:%u", socks5_ip, socks5_port);
-        goto out;
-    }
-    if (http_connect) {
-        http_l =
-            mq_http_connect_listener_new(base, http_ip, http_port, open_fn, open_core);
-        if (!http_l) {
-            MQ_LOGE("failed to bind HTTP CONNECT listener on %s:%u", http_ip, http_port);
+    /* HTTP gateway ingress (--gateway): an independent H3 tunnel to the same
+     * server (its own conn + X-Mq-Auth), fronted by a local fetch-API listener.
+     * mq_h3_init takes NULL server hooks (pure client). The gateway conn is
+     * established EAGERLY inside mq_gw_client_new. */
+    if (gateway) {
+        h3 = mq_h3_init(transport, NULL, NULL, NULL);
+        if (!h3) {
+            MQ_LOGE("failed to init H3 stack for gateway");
+            goto out;
+        }
+        gwc = mq_gw_client_new(transport, rt, h3, server_ip, server_port, token, cc);
+        if (!gwc) {
+            MQ_LOGE("failed to create gateway client (conn to %s:%u)", server_ip,
+                    server_port);
+            goto out;
+        }
+        /* The gateway conn gets its OWN extra paths — independent of mq_client's.
+         * Use the same --path list (paths[1..]); paths[0] is the primary bind,
+         * already in effect on the shared transport. */
+        if (npaths > 1) {
+            int added = mq_gw_client_add_paths(gwc, &paths[1], npaths - 1);
+            if (added < 0) {
+                MQ_LOGE("failed to register extra gateway paths");
+                goto out;
+            }
+            MQ_LOGI("registered %d extra gateway multipath bind(s)", added);
+        }
+        fetch_l =
+            mq_fetch_listener_new(mq_runtime_base(rt), gw_ip, gw_port,
+                                  mq_gw_client_fetch_cbs(), mq_gw_client_fetch_user(gwc));
+        if (!fetch_l) {
+            MQ_LOGE("failed to bind gateway fetch listener on %s:%u", gw_ip, gw_port);
             goto out;
         }
     }
+
     if (install_signal_handlers(base, rt, &sint, &sterm) != 0) {
         MQ_LOGE("failed to install signal handlers");
         goto out;
     }
 
-    MQ_LOGI("mqproxy client: server=%s:%u socks5=%s:%u%s%s%s (bind %s, cc=%s)", server_ip,
-            server_port, socks5_ip, socks5_port, http_connect ? " http-connect=" : "",
-            http_connect ? http_ip : "", http_connect ? "" : "", primary_ip,
-            mq_cc_name(cc));
+    {
+        char ingress[256];
+        int n = 0;
+        ingress[0] = '\0';
+        if (socks5)
+            n += snprintf(ingress + n, sizeof(ingress) - (size_t)n, " socks5=%s:%u",
+                          socks5_ip, socks5_port);
+        if (http_connect)
+            n += snprintf(ingress + n, sizeof(ingress) - (size_t)n, " http-connect=%s:%u",
+                          http_ip, http_port);
+        if (gateway)
+            n += snprintf(ingress + n, sizeof(ingress) - (size_t)n, " gateway=%s:%u",
+                          gw_ip, gw_port);
+        MQ_LOGI("mqproxy client: server=%s:%u%s (bind %s, cc=%s)", server_ip, server_port,
+                ingress, primary_ip, mq_cc_name(cc));
+    }
     mq_runtime_run(rt);
     rc = 0;
 
@@ -573,26 +673,55 @@ cmd_client(int argc, char **argv)
     }
 
 out:
-    /* Teardown order — verified against the in-flight callback graph (an earlier
-     * "free client first" ordering tripped a heap-use-after-free under ASan):
+    /* Teardown order — two distinct callback graphs co-exist here (the TCP-proxy
+     * core and the HTTP-gateway ingress), and their ordering contracts pull in
+     * OPPOSITE directions across mq_transport_free. Both are honored below.
      *
-     *   - The client registers client_on_state() on its mq_conn. That callback
-     *     is invoked DURING mq_transport_free (conn destroy -> close-notify), and
-     *     on MQ_CONN_CLOSED it (a) touches the mq_client and (b) FAILS every
-     *     in-flight tcp_open, firing each open-result cb. Those cbs write the
-     *     SOCKS5/HTTP reject reply onto the listener's per-conn state.
-     *   - Therefore BOTH the client AND the listeners must still be alive while
-     *     the transport is torn down. The transport must be freed FIRST so its
-     *     callbacks land on live objects.
-     *   - The transport's send_udp callback (the runtime, as cbs.user) may also
-     *     fire during engine destroy (final CONNECTION_CLOSE), so the runtime
-     *     must outlive mq_transport_free too.
+     * (A) TCP-proxy core (mq_client + SOCKS5/HTTP listeners) — verified against
+     *     the in-flight callback graph (an earlier "free client first" ordering
+     *     tripped a heap-use-after-free under ASan):
+     *       - The client registers client_on_state() on its mq_conn. That cb is
+     *         invoked DURING mq_transport_free (conn destroy -> close-notify),
+     *         and on MQ_CONN_CLOSED it (a) touches the mq_client and (b) FAILS
+     *         every in-flight tcp_open, firing each open-result cb, which writes
+     *         the SOCKS5/HTTP reject reply onto the listener's per-conn state.
+     *       - So BOTH the client AND its listeners must outlive mq_transport_free
+     *         (transport freed FIRST so its callbacks land on live objects), then
+     *         runtime, then client, then listeners.
+     *       - The transport's send_udp cb (the runtime, as cbs.user) may also
+     *         fire during engine destroy (final CONNECTION_CLOSE), so the runtime
+     *         must outlive mq_transport_free too.
      *
-     * Order: signal events -> transport (fires all conn-close + in-flight-open
-     * callbacks into the live runtime/client/listeners) -> runtime (closes
-     * sockets/timer; does not free base) -> client -> listeners -> base. */
+     * (B) HTTP-gateway ingress (mq_gw_client + mq_h3 + fetch listener) — the
+     *     SANCTIONED order is the REVERSE: mq_gw_client_free must run while the
+     *     H3 engine is STILL LIVE (it touches r->req for each in-flight request)
+     *     AND while the fetch listener is STILL LIVE (it mq_fetch_conn_abort()s
+     *     each live local handle). gw_client_free also DETACHES the gateway
+     *     conn-state cb, so the gateway conn's later close (fired inside
+     *     mq_h3_free / engine teardown) is a no-op back into the freed gw_client.
+     *     Therefore: gw_client BEFORE fetch listener BEFORE mq_h3_free BEFORE
+     *     mq_transport_free. (mq_h3_free before mq_transport_free is also the
+     *     standalone mq_h3.h contract; the gateway and tcp ALPN conn graphs are
+     *     independent, so freeing the H3 ctx does not disturb the tcp conns that
+     *     mq_transport_free later tears down for graph A.)
+     *
+     * Combined order:
+     *   signal events
+     *   -> gw_client_free        (engine+h3+fetch listener live; detaches gw
+     *                             conn-state, aborts live local handles)
+     *   -> fetch listener free   (gw handles already aborted/detached: safe)
+     *   -> mq_h3_free            (engine live; gw conn-close cb detached -> no-op)
+     *   -> mq_transport_free     (fires graph-A conn-close + in-flight-open cbs
+     *                             into the live runtime/client/socks5/http)
+     *   -> runtime free          (closes sockets/timer; does not free base)
+     *   -> mq_client_free
+     *   -> socks5 / http listener free
+     *   -> base free (CLI owns base). */
     if (sint) event_free(sint);
     if (sterm) event_free(sterm);
+    if (gwc) mq_gw_client_free(gwc);
+    if (fetch_l) mq_fetch_listener_free(fetch_l);
+    if (h3) mq_h3_free(h3);
     if (transport) mq_transport_free(transport);
     if (rt) mq_runtime_free(rt);
     if (client) mq_client_free(client);

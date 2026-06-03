@@ -37,7 +37,7 @@ done
 out=$("$BIN" client --help 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] || fail "'client --help' exited $rc (want 0)"
-for flag in "--server" "--token" "--socks5" "--http-connect" "--path"; do
+for flag in "--server" "--token" "--socks5" "--http-connect" "--gateway" "--path"; do
     echo "$out" | grep -q -- "$flag" || fail "'client --help' output missing '$flag'"
 done
 
@@ -48,6 +48,16 @@ rc=$?
 for flag in "--listen" "--token"; do
     echo "$out" | grep -q -- "$flag" || fail "'server --help' output missing '$flag'"
 done
+
+# ── client with no ingress: non-zero exit, names all three ingress flags ──────
+# --server/--token are present but none of --socks5/--http-connect/--gateway, so
+# the client must reject the invocation with a clear "at least one ingress" error.
+out=$("$BIN" client --server 127.0.0.1:4433 --token t 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] || fail "client with no ingress exited 0 (want non-zero)"
+echo "$out" | grep -q -- "--socks5" || fail "no-ingress error missing '--socks5'"
+echo "$out" | grep -q -- "--http-connect" || fail "no-ingress error missing '--http-connect'"
+echo "$out" | grep -q -- "--gateway" || fail "no-ingress error missing '--gateway'"
 
 # ── unknown subcommand: non-zero exit ─────────────────────────────────────────
 "$BIN" bogus-subcommand >/dev/null 2>&1
