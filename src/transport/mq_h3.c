@@ -504,9 +504,14 @@ mq_h3_connect(mq_h3_t *h, const struct sockaddr *peer, socklen_t peerlen, mq_cc_
         return NULL;
     }
 
-    /* Same conn settings as the raw conn (multipath + CC + flow control). */
+    /* Same conn settings as the raw conn (multipath + CC + flow control).
+     * proto_version MUST be set: xqc_h3_connect selects the H3 ALPN string via
+     * xqc_h3_alpn[proto_version], and the default (XQC_IDRAFT_INIT_VER == 0) maps
+     * to "" — an empty ALPN — which fails the client TLS handshake with
+     * NO_APPLICATION_PROTOCOL. QUIC v1 maps to the "h3" ALPN. */
     xqc_conn_settings_t s;
     memset(&s, 0, sizeof(s));
+    s.proto_version = XQC_VERSION_V1;
     mq_conn_apply_mp_settings(&s, /*is_server=*/0, cc);
 
     xqc_conn_ssl_config_t conn_ssl;
