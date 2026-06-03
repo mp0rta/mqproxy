@@ -28,6 +28,13 @@
 
 #include "util/mq_log.h"
 
+/* Dimension of the mp-ready subscriber table. Production subscribers are exactly
+ * two — the tcp conn and the h3 conn — but the table carries headroom so a test
+ * can register an extra (negative-path filter) subscriber alongside the real
+ * conns, and to absorb a future third proto without a struct change. The
+ * overflow guard in mq_transport_add_mp_ready_cb stays regardless. */
+#define MQ_MP_READY_SUBS_MAX 4
+
 struct mq_transport_s {
     xqc_engine_t *engine;
     mq_transport_callbacks_t cbs;
@@ -35,13 +42,13 @@ struct mq_transport_s {
     int is_server;
 
     /* Multipath readiness subscribers (added via mq_transport_add_mp_ready_cb).
-     * Fixed table: across the whole Phase 2-7 roadmap the subscribers are
-     * exactly two — the tcp conn and the h3 conn — so two slots suffice.
+     * Fixed table: production subscribers are the tcp conn and the h3 conn;
+     * MQ_MP_READY_SUBS_MAX carries headroom for tests/futures (see its comment).
      * ready_to_create_path is broadcast to every populated slot. */
     struct {
         mq_transport_mp_ready_fn fn;
         void *user;
-    } mp_ready_subs[2];
+    } mp_ready_subs[MQ_MP_READY_SUBS_MAX];
     int n_mp_ready_subs;
 
     /* qlog sink. qlog_fd < 0 == disabled (default). The xquic qlog callback
@@ -507,14 +514,37 @@ mq_transport_add_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn, voi
     if (!t || !fn) {
         return -1;
     }
-    if (t->n_mp_ready_subs >=
-        (int)(sizeof(t->mp_ready_subs) / sizeof(t->mp_ready_subs[0]))) {
-        return -1; /* fixed table full (tcp + h3 == 2 slots) */
+    if (t->n_mp_ready_subs >= MQ_MP_READY_SUBS_MAX) {
+        return -1; /* fixed table full (MQ_MP_READY_SUBS_MAX slots) */
     }
     t->mp_ready_subs[t->n_mp_ready_subs].fn = fn;
     t->mp_ready_subs[t->n_mp_ready_subs].user = user;
     t->n_mp_ready_subs++;
     return 0;
+}
+
+void
+mq_transport_remove_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn,
+                                void *user)
+{
+    if (!t || !fn) {
+        return;
+    }
+    /* Match by fn+user pair and compact the table (shift the tail down) so the
+     * broadcast loop never indexes a removed slot. The pair is the registration
+     * identity: the same fn may be registered for several conns, each with a
+     * distinct user (the mq_conn), so user must match too. */
+    for (int i = 0; i < t->n_mp_ready_subs; i++) {
+        if (t->mp_ready_subs[i].fn == fn && t->mp_ready_subs[i].user == user) {
+            for (int j = i; j < t->n_mp_ready_subs - 1; j++) {
+                t->mp_ready_subs[j] = t->mp_ready_subs[j + 1];
+            }
+            t->n_mp_ready_subs--;
+            t->mp_ready_subs[t->n_mp_ready_subs].fn = NULL;
+            t->mp_ready_subs[t->n_mp_ready_subs].user = NULL;
+            return;
+        }
+    }
 }
 
 int

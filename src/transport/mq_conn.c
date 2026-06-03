@@ -80,6 +80,9 @@ struct mq_conn_s {
 };
 
 static mq_alpn_ctx_t *mq_conn_actx(void *conn_user_data);
+/* Defined under "Multipath" below; forward-declared so mq_conn_close_notify can
+ * unsubscribe this conn from the transport's mp-ready broadcast before free(c). */
+static void mq_conn_on_mp_ready(const xqc_cid_t *scid, void *user);
 
 /* ── ALP connection callbacks ───────────────────────────────────────────── */
 
@@ -161,6 +164,13 @@ mq_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_us
     if (c->on_state) {
         c->on_state(c, MQ_CONN_CLOSED, c->on_state_user);
     }
+    /* Unsubscribe from the transport's mp-ready broadcast BEFORE free(c).
+     * mq_conn_connect registered mq_conn_on_mp_ready with `c` as the user
+     * pointer; with multiple conns on one transport (Phase 2: tcp + h3) the
+     * subscriber table outlives this conn, and a later readiness broadcast would
+     * deref the freed `c` (use-after-free). A no-op for server conns, which never
+     * subscribed (matched by fn+user, not found). */
+    mq_transport_remove_mp_ready_cb(c->transport, mq_conn_on_mp_ready, c);
     /* Release any secondary paths this conn owns (the runtime frees the read
      * event + socket via close_path_socket). */
     for (int i = 0; i < c->n_extra_paths; i++) {

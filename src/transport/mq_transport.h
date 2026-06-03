@@ -129,6 +129,11 @@ typedef void (*mq_transport_mp_ready_fn)(const xqc_cid_t *scid, void *user);
 int mq_transport_add_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn,
                                  void *user);
 
+/* Remove a previously-registered mp-ready subscriber (matched by fn+user pair).
+ * No-op if not found. Compacts the table. */
+void mq_transport_remove_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn,
+                                     void *user);
+
 /* Enable xquic's qlog sink, writing to "<dir>/<role>.qlog". Returns 0 on
  * success, -1 on bad args / open failure. *out_path (if non-NULL) receives the
  * opened path (borrowed, valid until mq_transport_free). */
