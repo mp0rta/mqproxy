@@ -460,13 +460,37 @@ mq_h3_free(mq_h3_t *h)
      * xqc_h3_ctx_destroy unregisters the H3 ALPNs and frees the H3 ctxs via the
      * still-live engine; if the engine were destroyed first it would already
      * have freed its ALPN list. Hence the contract: free the mq_h3 before
-     * mq_transport_free. Any conn wrappers still in the table are freed by their
-     * h3_conn_close_notify during the engine teardown in mq_transport_free —
-     * NOT here (close_notify is the single free point; freeing here would
-     * double-free). */
+     * mq_transport_free.
+     *
+     * CONN-WRAPPER OWNERSHIP: unlike mq_conn (whose ALPN ctx stays registered
+     * until xqc_engine_destroy, so the engine teardown fires conn_close_notify
+     * and frees each wrapper), the H3 ALPN callbacks are unregistered HERE by
+     * xqc_h3_ctx_destroy — strictly before the engine is destroyed in
+     * mq_transport_free. So any conn still in the table will NEVER get a
+     * subsequent h3_conn_close_notify (its callback is already gone), and the
+     * wrapper would leak. We therefore free the remaining wrappers ourselves,
+     * after the ctx is destroyed. (mq_h3_conn_close on a live conn defers its
+     * close_notify to engine teardown, which no longer reaches us — so this is
+     * the real single free point for any wrapper that outlived an explicit
+     * close, as well as for conns never closed by the owner.) */
     if (h->initialised && h->transport) {
         xqc_h3_ctx_destroy(mq_transport_xqc(h->transport));
     }
+    for (int i = 0; i < h->n_conns; i++) {
+        /* Best-effort lifecycle signal so an owner watching state sees the conn
+         * go away; then unsubscribe + free (mirrors h3_conn_close_notify, minus
+         * the path teardown which the engine destroy below reclaims). */
+        mq_h3_conn_t *c = h->conns[i];
+        if (c->on_state) {
+            c->on_state(c, /*established=*/0, c->on_state_user);
+        }
+        if (h->transport) {
+            mq_transport_remove_mp_ready_cb(h->transport, mq_h3_conn_on_mp_ready, c);
+        }
+        free(c);
+        h->conns[i] = NULL;
+    }
+    h->n_conns = 0;
     mq_h3_map_remove(h->transport);
     free(h);
 }
