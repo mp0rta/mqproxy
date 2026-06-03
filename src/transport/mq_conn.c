@@ -487,7 +487,7 @@ mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server, mq_cc_t cc)
         s->max_path_id_grant_max_value = 128;
     }
 
-    /* Congestion control: BBR2 (match mqvpn's default). Without this,
+    /* Congestion control: always install a CC callback. Without this,
      * cong_ctrl_callback stays NULL and the sender is effectively un-throttled
      * — on a real rate-limited/lossy path that overflows the queue, triggers a
      * loss/PTO retransmit storm, and collapses throughput to ~KB/s. It is

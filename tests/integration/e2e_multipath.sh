@@ -155,7 +155,7 @@ if [ "${KEEP_QLOG:-0}" = "1" ]; then
 fi
 
 # Congestion control: set CC=bbr2|bbr|cubic to A/B different algorithms.
-# Unset => the CLI default (bbr2). Passed to both server and client.
+# Unset => the CLI default (bbr). Passed to both server and client.
 CC_ARGS=()
 if [ -n "${CC:-}" ]; then
     CC_ARGS=(--cc "${CC}")
