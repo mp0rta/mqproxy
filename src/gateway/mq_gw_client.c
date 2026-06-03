@@ -1,0 +1,1137 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
+/* mq_gw_client.c — client-side fetch→H3 bridge. See mq_gw_client.h.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * PER-REQUEST OWNERSHIP (mq_gw_req_t)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Each accepted fetch request owns one mq_gw_req_t. It is referenced from two
+ * independent sides that can each die first or race:
+ *
+ *   LOCAL side  (the mq_fetch_listener handle): set on accept; cleared when we
+ *     call mq_fetch_conn_finish/abort, OR when the listener tells us the local
+ *     peer died (on_aborted). After any of those the handle is DEAD — we null it
+ *     and never touch it again. The req_ctx the listener threads back to us
+ *     stays valid until then.
+ *
+ *   TUNNEL side (the mq_h3_req): set on accept (mq_h3_req_open); cleared in the
+ *     H3 on_close callback (the wrapper is freed right after). After on_close we
+ *     null it and never touch it again.
+ *
+ * The mq_gw_req_t is freed when BOTH sides are detached. We track this with two
+ * flags (local_dead, h3_dead) and free in gw_req_maybe_free() once both are set.
+ * Every termination path routes through exactly one of:
+ *
+ *   - local terminates first: we mq_h3_req_reset (if h3 still live) → h3 on_close
+ *     fires later → both dead → free. We set local_dead immediately and drop the
+ *     handle so no further handle op runs.
+ *   - tunnel terminates first (h3 on_close): we finish/abort the local handle
+ *     (if still live) → that detaches local → both dead → free. on_close sets
+ *     h3_dead and nulls the req pointer.
+ *   - both race: idempotent flags; maybe_free runs only when both set, so the
+ *     struct is freed exactly once regardless of order.
+ *
+ * The listener guarantees no cbs fire after finish/abort; mq_h3 guarantees
+ * on_close fires exactly once. So each side flips its flag exactly once.
+ *
+ * One subtlety: when we call mq_fetch_conn_finish/abort from inside an H3
+ * callback, that does NOT synchronously re-enter our fetch cbs (the listener
+ * detaches first). So no reentrancy hazard there. Conversely, when the LOCAL
+ * side dies we learn it either via on_aborted (explicit) or via a handle op
+ * returning -1 (the listener handle is dead) — we treat a -1 from any write/
+ * resume as "local dead" and reset the tunnel.
+ */
+#include "gateway/mq_gw_client.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <event2/event.h>
+
+#include "gateway/mq_gw_headers.h"
+#include "gateway/mq_http1.h"
+#include "util/mq_log.h"
+
+/* Bound on the internal upload spill buffer (junction #1): bytes the local peer
+ * delivered that H3 could not immediately accept. When non-empty we pause the
+ * listener; we flush from on_write and resume_read once drained. */
+#define MQ_GW_UPLOAD_SPILL_MAX (256 * 1024)
+
+/* recv_body scratch size for the download path (junction #2). */
+#define MQ_GW_DOWNLOAD_CHUNK 16384
+
+/* Max number of forwarded request headers (request line pseudo-headers +
+ * x-mq-auth + x-mq-class + ordinary headers). MQ_HTTP1_MAX_HEADERS bounds the
+ * incoming set; add a margin for the pseudo-headers we synthesize. */
+#define MQ_GW_MAX_SEND_HDRS (MQ_HTTP1_MAX_HEADERS + 8)
+
+/* Poll interval (ms) for the mp-ready deferral timer (mirrors mq_client). */
+#define MQ_GW_MP_POLL_MS 50
+#define MQ_GW_MAX_PATHS  8
+#define MQ_GW_IP_MAX     64
+
+/* ── per-request state ──────────────────────────────────────────────────────*/
+
+typedef struct mq_gw_req_s {
+    mq_gw_client_t *cli;
+
+    /* local (listener) side */
+    void *handle; /* the fetch handle; NULL once detached (dead) */
+    int local_dead;
+
+    /* tunnel (H3) side */
+    mq_h3_req_t *req; /* NULL once on_close fired (dead) */
+    int h3_dead;
+
+    /* ── upload (junction #1) ── */
+    int64_t cl_remaining; /* CL bytes not yet handed to send_body; <0 == no body */
+    int upload_fin_sent;  /* the request's fin has been sent on the H3 side */
+    int upload_done;      /* on_body_done fired (listener will deliver no more) */
+    int paused;           /* we returned -1 to pause the listener read */
+    uint8_t *spill;       /* heap spill buffer (allocated lazily) */
+    size_t spill_len;     /* valid bytes in spill */
+    size_t spill_off;     /* bytes already flushed from spill */
+
+    /* ── download (junction #2) ── */
+    int resp_started;  /* we wrote the response status line locally */
+    int resp_chunked;  /* response is framed as Transfer-Encoding: chunked */
+    int read_deferred; /* local write hit highwater; stop recv_body until drain */
+    int resp_status;   /* parsed :status (for diagnostics) */
+
+    struct mq_gw_req_s *next; /* intrusive list of live requests on the client */
+} mq_gw_req_t;
+
+/* ── client state ───────────────────────────────────────────────────────────*/
+
+struct mq_gw_client_s {
+    mq_transport_t *t; /* borrowed */
+    mq_runtime_t *rt;  /* borrowed */
+    mq_h3_t *h3;       /* borrowed */
+    mq_cc_t cc;
+
+    char token[256];
+
+    struct sockaddr_in peer;
+    socklen_t peerlen;
+
+    mq_h3_conn_t *conn; /* the gateway tunnel conn (borrowed; freed by mq_h3) */
+    int conn_up;        /* 1 between established and closed */
+
+    mq_gw_req_t *reqs; /* intrusive list of live per-request states */
+
+    /* mp-poll timer (mirrors mq_client) */
+    char extra_paths[MQ_GW_MAX_PATHS][MQ_GW_IP_MAX];
+    size_t n_extra_paths;
+    size_t added_paths;
+    struct event *mp_timer;
+};
+
+/* ── forward decls ──────────────────────────────────────────────────────────*/
+static void gw_req_unlink(mq_gw_client_t *c, mq_gw_req_t *r);
+static void gw_req_maybe_free(mq_gw_req_t *r);
+static void gw_local_dead(mq_gw_req_t *r);
+static void h3_on_read(mq_h3_req_t *hr, int flag, void *user);
+static void h3_on_write(mq_h3_req_t *hr, void *user);
+static void h3_on_close(mq_h3_req_t *hr, void *user);
+static void local_drain_cb(void *user);
+static void upload_pump(mq_gw_req_t *r);
+static void download_pump(mq_gw_req_t *r);
+static void gw_local_error_req(mq_gw_req_t *r, int code, const char *reason,
+                               const char *xmq);
+
+/* ── small helpers ──────────────────────────────────────────────────────────*/
+
+/* Serialize a complete HTTP/1.1 error response (status + Connection: close +
+ * Content-Length: 0 + X-Mq-Error: <reason>) into buf. Returns the byte length,
+ * or 0 if it did not fit. */
+static size_t
+gw_build_error(char *buf, size_t cap, int code, const char *reason, const char *xmq_error)
+{
+    int o = 0, n;
+    n = mq_http1_write_status(buf + o, cap - o, code, reason);
+    if (n <= 0) return 0;
+    o += n;
+    n = mq_http1_write_header(buf + o, cap - o, "Connection", "close");
+    if (n <= 0) return 0;
+    o += n;
+    n = mq_http1_write_header(buf + o, cap - o, "Content-Length", "0");
+    if (n <= 0) return 0;
+    o += n;
+    n = mq_http1_write_header(buf + o, cap - o, "X-Mq-Error", xmq_error);
+    if (n <= 0) return 0;
+    o += n;
+    if ((size_t)o + 2 > cap) return 0;
+    buf[o++] = '\r';
+    buf[o++] = '\n';
+    return (size_t)o;
+}
+
+/* on_request REJECTION path: write the error response and return -1. The
+ * listener's on_request==-1 contract flushes + closes the connection itself
+ * (detached), so we MUST NOT call mq_fetch_conn_finish here (that would double
+ * the teardown). Write only. */
+static void
+gw_reject_write(void *handle, int code, const char *reason, const char *xmq_error)
+{
+    char buf[512];
+    size_t n = gw_build_error(buf, sizeof(buf), code, reason, xmq_error);
+    if (n) mq_fetch_conn_write(handle, buf, n);
+}
+
+/* POST-ACCEPT error path (the request was accepted, the listener is in RESP
+ * phase waiting for finish/abort): write the error response THEN finish. */
+static void
+gw_local_error(void *handle, int code, const char *reason, const char *xmq_error)
+{
+    char buf[512];
+    size_t n = gw_build_error(buf, sizeof(buf), code, reason, xmq_error);
+    if (n) mq_fetch_conn_write(handle, buf, n);
+    mq_fetch_conn_finish(handle);
+}
+
+/* Case-insensitive equality for a slice vs a NUL-terminated lowercase literal. */
+static int
+slice_ieq(const char *s, size_t sl, const char *lit)
+{
+    size_t ll = strlen(lit);
+    if (sl != ll) return 0;
+    for (size_t i = 0; i < sl; i++) {
+        char a = s[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != lit[i]) return 0;
+    }
+    return 1;
+}
+
+/* Find the value slice of header `name` (case-insensitive) in req; NULL if
+ * absent. *out_vl receives the value length. */
+static const char *
+find_hdr(const mq_http1_req_t *req, const char *name, size_t *out_vl)
+{
+    for (size_t i = 0; i < req->nh; i++) {
+        if (slice_ieq(req->h[i].n, req->h[i].nl, name)) {
+            if (out_vl) *out_vl = req->h[i].vl;
+            return req->h[i].v;
+        }
+    }
+    return NULL;
+}
+
+/* ── per-request lifecycle ──────────────────────────────────────────────────*/
+
+static void
+gw_req_unlink(mq_gw_client_t *c, mq_gw_req_t *r)
+{
+    mq_gw_req_t **pp = &c->reqs;
+    while (*pp) {
+        if (*pp == r) {
+            *pp = r->next;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+/* Free the per-request state once BOTH sides are detached. Idempotent guard via
+ * the two flags. */
+static void
+gw_req_maybe_free(mq_gw_req_t *r)
+{
+    if (!r->local_dead || !r->h3_dead) return;
+    gw_req_unlink(r->cli, r);
+    free(r->spill);
+    free(r);
+}
+
+/* The LOCAL side terminated (finish/abort already issued, OR on_aborted, OR a
+ * handle op returned -1). Detach the handle and, if the tunnel is still live,
+ * reset it so its on_close eventually frees the struct. */
+static void
+gw_local_dead(mq_gw_req_t *r)
+{
+    if (r->local_dead) return;
+    r->local_dead = 1;
+    r->handle = NULL; /* dead — never touch again */
+    if (!r->h3_dead && r->req) {
+        /* Mid-stream local death: reset the H3 request (truncated). on_close
+         * fires later and finishes the teardown. */
+        mq_h3_req_reset(r->req);
+    }
+    gw_req_maybe_free(r);
+}
+
+/* Finish the local side cleanly (response fully relayed). Detaches the handle. */
+static void
+gw_local_finish(mq_gw_req_t *r)
+{
+    if (r->local_dead) return;
+    void *h = r->handle;
+    r->local_dead = 1;
+    r->handle = NULL;
+    if (h) mq_fetch_conn_finish(h);
+    gw_req_maybe_free(r);
+}
+
+/* Abort the local side (mid-stream truncation visible to the local peer).
+ * Detaches the handle. */
+static void
+gw_local_abort(mq_gw_req_t *r)
+{
+    if (r->local_dead) return;
+    void *h = r->handle;
+    r->local_dead = 1;
+    r->handle = NULL;
+    if (h) mq_fetch_conn_abort(h);
+    gw_req_maybe_free(r);
+}
+
+/* ── on_request: validate + open the H3 request + forward headers ───────────*/
+
+static int
+gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ctx)
+{
+    mq_gw_client_t *c = (mq_gw_client_t *)user;
+    *req_ctx = NULL;
+
+    /* 1. duplicate X-Mq-* control headers → 400. */
+    if (mq_gw_has_dup_xmq(req)) {
+        gw_reject_write(handle, 400, "Bad Request", "duplicate-control-header");
+        return -1;
+    }
+
+    /* 2. X-Mq-Auth present + "Bearer <non-empty>" format check (client-side). */
+    size_t auth_vl = 0;
+    const char *auth = find_hdr(req, "x-mq-auth", &auth_vl);
+    if (!auth) {
+        gw_reject_write(handle, 400, "Bad Request", "missing-auth");
+        return -1;
+    }
+    {
+        const char *pfx = "Bearer ";
+        size_t pl = strlen(pfx);
+        if (auth_vl <= pl || strncmp(auth, pfx, pl) != 0) {
+            gw_reject_write(handle, 400, "Bad Request", "bad-auth-format");
+            return -1;
+        }
+    }
+
+    /* 3. X-Mq-Target parses. */
+    size_t tgt_vl = 0;
+    const char *tgt = find_hdr(req, "x-mq-target", &tgt_vl);
+    mq_gw_target_t target;
+    if (!tgt || mq_gw_parse_target(tgt, tgt_vl, &target) != 0) {
+        gw_reject_write(handle, 400, "Bad Request", "bad-target");
+        return -1;
+    }
+
+    /* 4. X-Mq-Method if present parses; default GET. */
+    char method[16];
+    size_t mth_vl = 0;
+    const char *mth = find_hdr(req, "x-mq-method", &mth_vl);
+    if (mth) {
+        if (mq_gw_parse_method(mth, mth_vl, method) != 0) {
+            gw_reject_write(handle, 400, "Bad Request", "bad-method");
+            return -1;
+        }
+    } else {
+        memcpy(method, "GET", 4);
+    }
+
+    /* 5. tunnel must be up. */
+    if (!c->conn_up || !c->conn) {
+        gw_reject_write(handle, 502, "Bad Gateway", "tunnel-unavailable");
+        return -1;
+    }
+
+    /* Accept: open the H3 request. */
+    mq_h3_req_t *hr = mq_h3_req_open(c->conn);
+    if (!hr) {
+        gw_reject_write(handle, 502, "Bad Gateway", "tunnel-unavailable");
+        return -1;
+    }
+
+    mq_gw_req_t *r = calloc(1, sizeof(*r));
+    if (!r) {
+        mq_h3_req_reset(hr);
+        gw_reject_write(handle, 502, "Bad Gateway", "internal-error");
+        return -1;
+    }
+    r->cli = c;
+    r->handle = handle;
+    r->req = hr;
+    r->cl_remaining = req->content_length; /* -1 (absent) or >=0 */
+    r->resp_status = 0;
+
+    /* fin = no body. CL==-1 (absent) OR CL<=0 → no body. */
+    int no_body = (req->content_length <= 0);
+
+    /* Build the forwarded header list. NUL-terminated C strings are required by
+     * mq_h3_req_send_headers, so copy each (name,value) into a per-request arena.
+     * The arena lives only for the duration of this call (send_headers copies the
+     * iovecs synchronously), so a stack arena is sufficient. */
+    mq_h3_header_t hs[MQ_GW_MAX_SEND_HDRS];
+    /* Per-header storage: target fields are already NUL-terminated in `target`;
+     * pseudo-headers point at static / target storage. For ordinary forwarded
+     * headers we copy name+value into name/value scratch. */
+    static const size_t NS = 128, VS = 1024;
+    char *namebuf = malloc(MQ_GW_MAX_SEND_HDRS * NS);
+    char *valbuf = malloc(MQ_GW_MAX_SEND_HDRS * VS);
+    if (!namebuf || !valbuf) {
+        free(namebuf);
+        free(valbuf);
+        mq_h3_req_reset(hr);
+        r->req = NULL;
+        r->h3_dead = 1;
+        gw_reject_write(handle, 502, "Bad Gateway", "internal-error");
+        free(r);
+        return -1;
+    }
+    size_t nh = 0;
+
+    /* :method / :scheme / :authority / :path (pseudo-headers first). */
+    hs[nh].name = ":method";
+    hs[nh].value = method;
+    nh++;
+    hs[nh].name = ":scheme";
+    hs[nh].value = target.scheme;
+    nh++;
+    hs[nh].name = ":authority";
+    hs[nh].value = target.authority;
+    nh++;
+    hs[nh].name = ":path";
+    hs[nh].value = target.path;
+    nh++;
+
+    /* x-mq-auth: forward the ORIGINAL header value (server verifies). */
+    {
+        char *nb = namebuf + nh * NS;
+        char *vb = valbuf + nh * VS;
+        size_t vl = auth_vl < VS - 1 ? auth_vl : VS - 1;
+        memcpy(nb, "x-mq-auth", 10);
+        memcpy(vb, auth, vl);
+        vb[vl] = '\0';
+        hs[nh].name = nb;
+        hs[nh].value = vb;
+        nh++;
+    }
+
+    /* x-mq-class if present. */
+    {
+        size_t cl_vl = 0;
+        const char *cls = find_hdr(req, "x-mq-class", &cl_vl);
+        if (cls && nh < MQ_GW_MAX_SEND_HDRS) {
+            char *nb = namebuf + nh * NS;
+            char *vb = valbuf + nh * VS;
+            size_t vl = cl_vl < VS - 1 ? cl_vl : VS - 1;
+            memcpy(nb, "x-mq-class", 11);
+            memcpy(vb, cls, vl);
+            vb[vl] = '\0';
+            hs[nh].name = nb;
+            hs[nh].value = vb;
+            nh++;
+        }
+    }
+
+    /* Remaining request headers, EXCEPT those stripped client-side (hop-by-hop,
+     * X-Mq-*, Host, Content-Length, Cookie). Lowercase the name (H3 requires
+     * lowercase field names). */
+    for (size_t i = 0; i < req->nh && nh < MQ_GW_MAX_SEND_HDRS; i++) {
+        const char *n = req->h[i].n;
+        size_t nl = req->h[i].nl;
+        if (mq_gw_strip_client(n, nl)) continue;
+        char *nb = namebuf + nh * NS;
+        char *vb = valbuf + nh * VS;
+        size_t cnl = nl < NS - 1 ? nl : NS - 1;
+        for (size_t j = 0; j < cnl; j++) {
+            char ch = n[j];
+            if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+            nb[j] = ch;
+        }
+        nb[cnl] = '\0';
+        size_t vl = req->h[i].vl < VS - 1 ? req->h[i].vl : VS - 1;
+        memcpy(vb, req->h[i].v, vl);
+        vb[vl] = '\0';
+        hs[nh].name = nb;
+        hs[nh].value = vb;
+        nh++;
+    }
+
+    /* Wire up H3 callbacks before sending so on_close cannot be lost. */
+    mq_h3_req_set_cbs(hr, h3_on_read, h3_on_write, h3_on_close, r);
+
+    long sh = mq_h3_req_send_headers(hr, hs, nh, no_body ? 1 : 0);
+    free(namebuf);
+    free(valbuf);
+
+    if (sh < 0) {
+        /* Hard send error: reset H3, synthesize 502. */
+        mq_h3_req_reset(hr);
+        r->req = NULL;
+        r->h3_dead = 1;
+        gw_reject_write(handle, 502, "Bad Gateway", "tunnel-unavailable");
+        free(r);
+        return -1;
+    }
+    if (sh == 0) {
+        /* EAGAIN on the header send (0 == NOTHING accepted; xqc_h3 never partially
+         * accepts a header section). A fresh H3 request's stream flow-control
+         * window comfortably holds a request header block, so this is essentially
+         * unreachable in practice. The header iovecs were built in a call-scoped
+         * arena (already freed above), so there is no buffer to retry from without
+         * a heap snapshot. Rather than carry that complexity for an unreachable
+         * path — or risk sending a malformed request — we fail closed with 502.
+         * (Documented design decision: header-EAGAIN is a hard 502, not a retry.) */
+        MQ_LOGW("mq_gw_client: header send EAGAIN (flow-control); failing closed");
+        mq_h3_req_reset(hr);
+        r->req = NULL;
+        r->h3_dead = 1;
+        gw_reject_write(handle, 502, "Bad Gateway", "tunnel-unavailable");
+        free(r);
+        return -1;
+    }
+
+    if (no_body) r->upload_fin_sent = 1;
+
+    /* Link the live request and hand the ctx back to the listener. */
+    r->next = c->reqs;
+    c->reqs = r;
+    *req_ctx = r;
+    return 0;
+}
+
+/* ── upload (junction #1) ───────────────────────────────────────────────────*/
+
+/* Try to push as much of the spill buffer into H3 as it will take. When the
+ * spill drains AND the upload is done, send the fin. Returns nothing; updates
+ * paused/resume bookkeeping. */
+static void
+upload_pump(mq_gw_req_t *r)
+{
+    if (r->h3_dead || !r->req) return;
+
+    /* Flush spill first. fin rides the LAST spill byte iff the local side has
+     * signalled body-done (no more chunks will arrive) and this segment is the
+     * tail. */
+    while (r->spill && r->spill_off < r->spill_len) {
+        size_t avail = r->spill_len - r->spill_off;
+        int last = (r->upload_done && !r->upload_fin_sent);
+        long acc =
+            mq_h3_req_send_body(r->req, r->spill + r->spill_off, avail, last ? 1 : 0);
+        if (acc < 0) {
+            /* H3 hard error: reset; on_close handles the rest. */
+            mq_h3_req_reset(r->req);
+            return;
+        }
+        if (acc == 0) break; /* still blocked; wait for next on_write */
+        r->spill_off += (size_t)acc;
+        if (r->cl_remaining > 0) r->cl_remaining -= acc;
+        if (last && (size_t)acc == avail)
+            r->upload_fin_sent = 1; /* fin went out with the last byte */
+    }
+
+    /* Spill drained? Reset the buffer + (maybe) resume the listener. */
+    if (r->spill && r->spill_off >= r->spill_len) {
+        r->spill_len = 0;
+        r->spill_off = 0;
+        if (r->paused && !r->local_dead && r->handle) {
+            r->paused = 0;
+            mq_fetch_conn_resume_read(r->handle);
+        }
+    }
+
+    /* All body delivered (on_body_done) and spill empty but fin not yet sent
+     * (e.g. the spill was already empty when body-done fired, or the fin could
+     * not ride a body byte) → send a bare fin. xqc_h3_request_finish on a
+     * 0-length tail does not consume flow control, so EAGAIN here is effectively
+     * unreachable; treat a non-negative return as success. */
+    if (r->upload_done && !r->upload_fin_sent &&
+        (!r->spill || r->spill_off >= r->spill_len)) {
+        long fr = mq_h3_req_finish(r->req);
+        if (fr < 0) {
+            mq_h3_req_reset(r->req);
+            return;
+        }
+        r->upload_fin_sent = 1;
+    }
+}
+
+static int
+gw_on_body(void *req_ctx, const uint8_t *p, size_t len)
+{
+    mq_gw_req_t *r = (mq_gw_req_t *)req_ctx;
+    if (r->local_dead) return 0;
+    if (r->h3_dead || !r->req) {
+        /* Tunnel gone but listener still feeding: drop bytes, ask for pause to
+         * stop further delivery; the eventual local teardown handles cleanup. */
+        return -1;
+    }
+
+    /* Append the new chunk after any spill that is still pending. The listener
+     * contract: a -1 return means "pause AFTER consuming this chunk" — so we
+     * MUST buffer the chunk if H3 cannot take all of it. */
+    size_t off = 0;
+
+    /* If nothing is buffered, try to send directly first (fast path). */
+    if (!r->spill || r->spill_off >= r->spill_len) {
+        long acc = mq_h3_req_send_body(r->req, p, len, 0);
+        if (acc < 0) {
+            mq_h3_req_reset(r->req);
+            return -1;
+        }
+        if (acc > 0 && r->cl_remaining > 0) r->cl_remaining -= acc;
+        off = (size_t)(acc > 0 ? acc : 0);
+        if (off >= len) return 0; /* fully accepted; no pause needed */
+    }
+
+    /* Buffer the remainder [p+off, p+len). Compact any drained spill first. */
+    if (r->spill && r->spill_off > 0) {
+        memmove(r->spill, r->spill + r->spill_off, r->spill_len - r->spill_off);
+        r->spill_len -= r->spill_off;
+        r->spill_off = 0;
+    }
+    size_t need = len - off;
+    size_t newlen = r->spill_len + need;
+    if (newlen > MQ_GW_UPLOAD_SPILL_MAX) {
+        /* Over the bound: still consume (contract) but the buffer is full. We
+         * grow up to the bound and keep what fits; anything beyond is a hard
+         * backpressure failure → reset the request rather than lose bytes
+         * silently. In practice the listener pauses on our -1 before we reach
+         * here, so this is a defensive ceiling. */
+        MQ_LOGW("mq_gw_client: upload spill ceiling hit (%zu); resetting request",
+                newlen);
+        mq_h3_req_reset(r->req);
+        return -1;
+    }
+    if (!r->spill) {
+        r->spill = malloc(MQ_GW_UPLOAD_SPILL_MAX);
+        if (!r->spill) {
+            mq_h3_req_reset(r->req);
+            return -1;
+        }
+        r->spill_len = 0;
+        r->spill_off = 0;
+    }
+    memcpy(r->spill + r->spill_len, p + off, need);
+    r->spill_len += need;
+
+    /* Buffer non-empty → pause the listener (consume-on-deliver honored). */
+    r->paused = 1;
+    return -1;
+}
+
+static void
+gw_on_body_done(void *req_ctx)
+{
+    mq_gw_req_t *r = (mq_gw_req_t *)req_ctx;
+    r->upload_done = 1;
+    if (r->local_dead || r->h3_dead || !r->req) return;
+    /* Flush any spill and send the fin if everything is out. */
+    upload_pump(r);
+}
+
+static void
+gw_on_aborted(void *req_ctx)
+{
+    mq_gw_req_t *r = (mq_gw_req_t *)req_ctx;
+    /* Local peer died mid-upload: truncated. Reset the H3 request (never finish)
+     * and detach the local side. The handle is already being torn down — do NOT
+     * call any handle op. */
+    r->handle = NULL; /* gw_local_dead would reset+null; do the reset path here */
+    if (r->local_dead) {
+        gw_req_maybe_free(r);
+        return;
+    }
+    r->local_dead = 1;
+    if (!r->h3_dead && r->req) mq_h3_req_reset(r->req);
+    gw_req_maybe_free(r);
+}
+
+/* ── download (junction #2): H3 response → local connection ─────────────────*/
+
+/* Header-capture context for recv_headers (download). */
+typedef struct {
+    mq_gw_req_t *r;
+    int status;
+    int has_cl;      /* response carried a content-length */
+    char head[8192]; /* assembled HTTP/1.1 response head */
+    size_t head_len;
+    int ok; /* head fit */
+} dl_hdr_ctx_t;
+
+static void
+dl_emit_header(dl_hdr_ctx_t *ctx, const char *n, const char *v)
+{
+    int n2 = mq_http1_write_header(ctx->head + ctx->head_len,
+                                   sizeof(ctx->head) - ctx->head_len, n, v);
+    if (n2 <= 0) {
+        ctx->ok = 0;
+        return;
+    }
+    ctx->head_len += (size_t)n2;
+}
+
+static void
+dl_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
+{
+    dl_hdr_ctx_t *ctx = (dl_hdr_ctx_t *)u;
+    if (!ctx->ok) return;
+
+    /* :status pseudo-header → status line. */
+    if (nl == 7 && memcmp(n, ":status", 7) == 0) {
+        int code = 0;
+        for (size_t i = 0; i < vl && v[i] >= '0' && v[i] <= '9'; i++)
+            code = code * 10 + (v[i] - '0');
+        if (code < 100 || code > 599) code = 502;
+        ctx->status = code;
+        int n2 = mq_http1_write_status(ctx->head + ctx->head_len,
+                                       sizeof(ctx->head) - ctx->head_len, code, "");
+        if (n2 <= 0) {
+            ctx->ok = 0;
+            return;
+        }
+        ctx->head_len += (size_t)n2;
+        return;
+    }
+
+    /* Other pseudo-headers (none expected on a response) → drop. */
+    if (nl > 0 && n[0] == ':') return;
+
+    /* Strip hop-by-hop. KEEP x-mq-* diagnostic headers (design: X-Mq-Origin-
+     * Protocol etc. SHOULD reach the local client). */
+    if (mq_gw_strip_hop(n, nl)) return;
+
+    /* content-length → passthrough (and remember we have one). */
+    if (slice_ieq(n, nl, "content-length")) ctx->has_cl = 1;
+
+    /* Build NUL-terminated name/value (bounded). */
+    char nb[128], vb[2048];
+    size_t cnl = nl < sizeof(nb) - 1 ? nl : sizeof(nb) - 1;
+    memcpy(nb, n, cnl);
+    nb[cnl] = '\0';
+    size_t cvl = vl < sizeof(vb) - 1 ? vl : sizeof(vb) - 1;
+    memcpy(vb, v, cvl);
+    vb[cvl] = '\0';
+    dl_emit_header(ctx, nb, vb);
+}
+
+/* Build + write the local response head from the H3 response headers. Returns 0
+ * on success (head written), -1 on a hard failure (caller aborts). */
+static int
+download_start_response(mq_gw_req_t *r)
+{
+    dl_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.r = r;
+    ctx.ok = 1;
+    ctx.status = 0;
+    ctx.head_len = 0;
+
+    int fin = 0;
+    int n = mq_h3_req_recv_headers(r->req, dl_each_header, &ctx, &fin);
+    if (n < 0 || !ctx.ok) return -1;
+    if (ctx.status == 0) {
+        /* No :status: malformed response. */
+        return -1;
+    }
+    r->resp_status = ctx.status;
+
+    /* No content-length → chunked framing for the body. */
+    if (!ctx.has_cl) {
+        r->resp_chunked = 1;
+        int n2 = mq_http1_write_header(ctx.head + ctx.head_len,
+                                       sizeof(ctx.head) - ctx.head_len,
+                                       "Transfer-Encoding", "chunked");
+        if (n2 <= 0) return -1;
+        ctx.head_len += (size_t)n2;
+    }
+
+    /* Connection: close (one request per local connection). */
+    {
+        int n2 =
+            mq_http1_write_header(ctx.head + ctx.head_len,
+                                  sizeof(ctx.head) - ctx.head_len, "Connection", "close");
+        if (n2 <= 0) return -1;
+        ctx.head_len += (size_t)n2;
+    }
+
+    /* Terminating blank line. */
+    if (ctx.head_len + 2 > sizeof(ctx.head)) return -1;
+    ctx.head[ctx.head_len++] = '\r';
+    ctx.head[ctx.head_len++] = '\n';
+
+    if (!r->handle) return -1;
+    /* Register the drain cb so a highwater hit during the body relay re-kicks
+     * the download read path. */
+    mq_fetch_conn_set_drain_cb(r->handle, local_drain_cb, r);
+    int wr = mq_fetch_conn_write(r->handle, ctx.head, ctx.head_len);
+    if (wr < 0) return -1;
+    r->resp_started = 1;
+
+    /* If headers carried fin (no body), finish immediately. For a chunked
+     * response with no body we still need the terminator. */
+    if (fin) {
+        if (r->resp_chunked) {
+            char term[8];
+            size_t tn = mq_http1_chunk_frame(term, sizeof(term), NULL, 0);
+            if (tn > 0) mq_fetch_conn_write(r->handle, term, tn);
+        }
+        gw_local_finish(r);
+    }
+    return 0;
+}
+
+/* Drain H3 body and write it to the local connection (framed as needed). Honors
+ * the local highwater: a write returning 0 sets read_deferred and stops; the
+ * local drain_cb re-kicks. */
+static void
+download_pump(mq_gw_req_t *r)
+{
+    if (r->local_dead || r->h3_dead || !r->req) return;
+    if (r->read_deferred) return; /* waiting for local drain */
+
+    uint8_t buf[MQ_GW_DOWNLOAD_CHUNK];
+    for (;;) {
+        int fin = 0;
+        long n = mq_h3_req_recv_body(r->req, buf, sizeof(buf), &fin);
+        if (n < 0) {
+            /* Hard recv error mid-download → abort the local side (truncation
+             * must be visible). */
+            gw_local_abort(r);
+            return;
+        }
+        if (n > 0) {
+            int wr;
+            if (r->resp_chunked) {
+                /* Frame the chunk: "<hex>\r\n<data>\r\n". Worst-case framing
+                 * overhead is small; write head then body then CRLF separately
+                 * to avoid a second large copy. */
+                char hdr[32];
+                int hn = snprintf(hdr, sizeof(hdr), "%lx\r\n", (unsigned long)n);
+                if (hn <= 0) {
+                    gw_local_abort(r);
+                    return;
+                }
+                wr = mq_fetch_conn_write(r->handle, hdr, (size_t)hn);
+                if (wr < 0) {
+                    gw_local_dead(r);
+                    return;
+                }
+                wr = mq_fetch_conn_write(r->handle, buf, (size_t)n);
+                if (wr < 0) {
+                    gw_local_dead(r);
+                    return;
+                }
+                int wr2 = mq_fetch_conn_write(r->handle, "\r\n", 2);
+                if (wr2 < 0) {
+                    gw_local_dead(r);
+                    return;
+                }
+                /* If either the body or trailing CRLF hit highwater, defer. */
+                if (wr == 0 || wr2 == 0) {
+                    r->read_deferred = 1;
+                    if (!fin) return;
+                }
+            } else {
+                wr = mq_fetch_conn_write(r->handle, buf, (size_t)n);
+                if (wr < 0) {
+                    gw_local_dead(r);
+                    return;
+                }
+                if (wr == 0) {
+                    r->read_deferred = 1;
+                    if (!fin) return;
+                }
+            }
+        }
+        if (fin) {
+            if (r->resp_chunked) {
+                char term[8];
+                size_t tn = mq_http1_chunk_frame(term, sizeof(term), NULL, 0);
+                if (tn > 0 && r->handle) mq_fetch_conn_write(r->handle, term, tn);
+            }
+            gw_local_finish(r);
+            return;
+        }
+        if (n == 0) return; /* no more body available right now */
+    }
+}
+
+/* Local output drained below the low watermark → resume the download read path
+ * (or flush more upload). Guard against re-entrancy. */
+static void
+local_drain_cb(void *user)
+{
+    mq_gw_req_t *r = (mq_gw_req_t *)user;
+    if (r->local_dead) return;
+    if (r->read_deferred) {
+        r->read_deferred = 0;
+        download_pump(r);
+    }
+}
+
+/* ── H3 request callbacks ───────────────────────────────────────────────────*/
+
+static void
+h3_on_read(mq_h3_req_t *hr, int flag, void *user)
+{
+    (void)hr;
+    mq_gw_req_t *r = (mq_gw_req_t *)user;
+    if (r->local_dead) {
+        /* Local gone: keep draining/discarding so the stream can finish, but do
+         * not write anywhere. We already reset on local death, so just return. */
+        return;
+    }
+
+    if (flag & (XQC_REQ_NOTIFY_READ_HEADER | XQC_REQ_NOTIFY_READ_TRAILER)) {
+        if (!r->resp_started) {
+            /* First (and for us only) header section → build local response. */
+            if (download_start_response(r) != 0) {
+                /* Malformed/short response head → abort if started else 502. */
+                if (r->resp_started)
+                    gw_local_abort(r);
+                else
+                    gw_local_error_req(r, 502, "Bad Gateway", "upstream-protocol");
+                return;
+            }
+        } else {
+            /* Trailer section: drain + ignore (we already sent Connection:close
+             * and either CL or chunked framing; trailers are not forwarded in the
+             * MVP). recv to keep xquic's flow moving. */
+            int tfin = 0;
+            mq_h3_req_recv_headers(r->req, NULL, NULL, &tfin);
+        }
+    }
+
+    if (r->local_dead) return;
+
+    /* Drain any available body. */
+    download_pump(r);
+}
+
+static void
+h3_on_write(mq_h3_req_t *hr, void *user)
+{
+    (void)hr;
+    mq_gw_req_t *r = (mq_gw_req_t *)user;
+    if (r->h3_dead || !r->req) return;
+    /* A previously-blocked send can resume: flush upload spill / fin. */
+    upload_pump(r);
+}
+
+static void
+h3_on_close(mq_h3_req_t *hr, void *user)
+{
+    (void)hr;
+    mq_gw_req_t *r = (mq_gw_req_t *)user;
+    r->h3_dead = 1;
+    r->req = NULL; /* freed right after this returns */
+
+    if (!r->local_dead) {
+        /* Tunnel closed. If the response never started, synthesize 502; else the
+         * local side must see a truncation (abort, not a fake clean finish).
+         * Detach the local handle INLINE (do NOT call the gw_local_* helpers —
+         * they call gw_req_maybe_free, which would free r out from under the
+         * final maybe_free below → use-after-free). */
+        void *h = r->handle;
+        r->local_dead = 1;
+        r->handle = NULL;
+        if (h) {
+            if (!r->resp_started)
+                gw_local_error(h, 502, "Bad Gateway", "upstream-reset");
+            else
+                mq_fetch_conn_abort(h);
+        }
+    }
+    gw_req_maybe_free(r); /* both sides now dead → frees r exactly once */
+}
+
+/* Synthesize an error response on a request whose handle is still live (used
+ * from the read path when the response head is malformed before we started). */
+static void
+gw_local_error_req(mq_gw_req_t *r, int code, const char *reason, const char *xmq)
+{
+    if (r->local_dead || !r->handle) return;
+    void *h = r->handle;
+    r->local_dead = 1;
+    r->handle = NULL;
+    gw_local_error(h, code, reason, xmq);
+    if (!r->h3_dead && r->req) mq_h3_req_reset(r->req);
+    gw_req_maybe_free(r);
+}
+
+/* ── conn state ─────────────────────────────────────────────────────────────*/
+
+static void
+gw_conn_state(mq_h3_conn_t *c, int established, void *user)
+{
+    (void)c;
+    mq_gw_client_t *cli = (mq_gw_client_t *)user;
+    if (established) {
+        cli->conn_up = 1;
+        MQ_LOGI("mq_gw_client: tunnel conn established");
+    } else {
+        cli->conn_up = 0;
+        cli->conn = NULL; /* the conn wrapper is freed after this returns */
+        MQ_LOGI("mq_gw_client: tunnel conn closed");
+        /* In-flight requests get their own per-request on_close from mq_h3, which
+         * handles their local teardown. Nothing to do here for them. */
+    }
+}
+
+/* ── mp-poll timer (mirrors mq_client) ──────────────────────────────────────*/
+
+static void
+gw_mp_timer_stop(mq_gw_client_t *c)
+{
+    if (c->mp_timer) {
+        event_free(c->mp_timer);
+        c->mp_timer = NULL;
+    }
+}
+
+static void
+gw_mp_timer_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void)fd;
+    (void)what;
+    mq_gw_client_t *c = (mq_gw_client_t *)arg;
+    if (!c->conn) {
+        gw_mp_timer_stop(c);
+        return;
+    }
+    if (!mq_h3_conn_mp_ready(c->conn)) return;
+    while (c->added_paths < c->n_extra_paths) {
+        const char *ip = c->extra_paths[c->added_paths];
+        int pid = mq_h3_conn_add_path(c->conn, ip, 0);
+        if (pid >= 0)
+            MQ_LOGI("mq_gw_client: extra path up: bind %s -> path_id %d", ip, pid);
+        else
+            MQ_LOGW("mq_gw_client: failed to add extra path bind %s (rc=%d)", ip, pid);
+        c->added_paths++;
+    }
+    gw_mp_timer_stop(c);
+}
+
+static void
+gw_mp_timer_arm(mq_gw_client_t *c)
+{
+    if (c->mp_timer || c->added_paths >= c->n_extra_paths) return;
+    struct event_base *base = mq_runtime_base(c->rt);
+    if (!base) return;
+    c->mp_timer = event_new(base, -1, EV_PERSIST, gw_mp_timer_cb, c);
+    if (!c->mp_timer) return;
+    struct timeval tv = {.tv_sec = 0, .tv_usec = MQ_GW_MP_POLL_MS * 1000};
+    event_add(c->mp_timer, &tv);
+}
+
+/* ── public API ─────────────────────────────────────────────────────────────*/
+
+static const mq_fetch_cbs_t g_gw_cbs = {
+    .on_request = gw_on_request,
+    .on_body = gw_on_body,
+    .on_body_done = gw_on_body_done,
+    .on_aborted = gw_on_aborted,
+};
+
+const mq_fetch_cbs_t *
+mq_gw_client_fetch_cbs(void)
+{
+    return &g_gw_cbs;
+}
+
+void *
+mq_gw_client_fetch_user(mq_gw_client_t *c)
+{
+    return c;
+}
+
+mq_gw_client_t *
+mq_gw_client_new(mq_transport_t *t, mq_runtime_t *rt, mq_h3_t *h3, const char *server_ip,
+                 uint16_t server_port, const char *token, mq_cc_t cc)
+{
+    if (!t || !rt || !h3 || !server_ip || !token) return NULL;
+
+    mq_gw_client_t *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    c->t = t;
+    c->rt = rt;
+    c->h3 = h3;
+    c->cc = cc;
+    snprintf(c->token, sizeof(c->token), "%s", token);
+
+    memset(&c->peer, 0, sizeof(c->peer));
+    c->peer.sin_family = AF_INET;
+    c->peer.sin_port = htons(server_port);
+    if (inet_pton(AF_INET, server_ip, &c->peer.sin_addr) != 1) {
+        free(c);
+        return NULL;
+    }
+    c->peerlen = sizeof(c->peer);
+
+    /* Eager connect (mirror mq_client). */
+    c->conn =
+        mq_h3_connect(h3, (struct sockaddr *)&c->peer, c->peerlen, cc, gw_conn_state, c);
+    if (!c->conn) {
+        free(c);
+        return NULL;
+    }
+    return c;
+}
+
+int
+mq_gw_client_add_paths(mq_gw_client_t *c, const char *const *ips, size_t n)
+{
+    if (!c || (n > 0 && !ips)) return -1;
+    size_t accepted = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!ips[i]) continue;
+        if (c->n_extra_paths >= MQ_GW_MAX_PATHS) {
+            MQ_LOGW("mq_gw_client: extra-path capacity %d reached; ignoring %s",
+                    MQ_GW_MAX_PATHS, ips[i]);
+            break;
+        }
+        snprintf(c->extra_paths[c->n_extra_paths], MQ_GW_IP_MAX, "%s", ips[i]);
+        c->n_extra_paths++;
+        accepted++;
+    }
+    gw_mp_timer_arm(c);
+    return (int)accepted;
+}
+
+void
+mq_gw_client_free(mq_gw_client_t *c)
+{
+    if (!c) return;
+    gw_mp_timer_stop(c);
+
+    /* Tear down in-flight requests. We reset the H3 side (its on_close will fire
+     * during engine teardown, not necessarily now) and detach the local side.
+     * To avoid double-free via on_close after we free the struct here, we free
+     * the request states ourselves and rely on the fact that mq_h3_free /
+     * transport teardown happens AFTER gw_client_free in the documented order —
+     * by then our wrappers are gone, so on_close would dereference freed memory.
+     *
+     * SAFE ORDERING: the caller frees gw_client BEFORE mq_h3_free. To make that
+     * safe, we must detach the H3 callbacks so on_close cannot reach a freed
+     * mq_gw_req_t. mq_h3_req_set_cbs(NULL...) clears them. */
+    mq_gw_req_t *r = c->reqs;
+    while (r) {
+        mq_gw_req_t *next = r->next;
+        if (!r->h3_dead && r->req) {
+            mq_h3_req_set_cbs(r->req, NULL, NULL, NULL, NULL);
+            mq_h3_req_reset(r->req);
+        }
+        if (!r->local_dead && r->handle) {
+            mq_fetch_conn_abort(r->handle);
+        }
+        free(r->spill);
+        free(r);
+        r = next;
+    }
+    c->reqs = NULL;
+    free(c);
+}

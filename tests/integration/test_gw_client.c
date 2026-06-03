@@ -38,6 +38,21 @@
 #include <event2/event.h>
 
 #include "gateway/mq_fetch_listener.h"
+#include "gateway/mq_gw_client.h"
+#include "runtime/mq_runtime_libevent.h"
+#include "transport/mq_conn.h"
+#include "transport/mq_h3.h"
+#include "transport/mq_transport.h"
+
+#include <xquic/xqc_http3.h>
+#include <xquic/xquic.h>
+
+#ifndef TEST_CERT_FILE
+#  define TEST_CERT_FILE "tests/certs/test.crt"
+#endif
+#ifndef TEST_KEY_FILE
+#  define TEST_KEY_FILE "tests/certs/test.key"
+#endif
 
 /* ── fake gateway state ─────────────────────────────────────────────────── */
 struct fake_gw {
@@ -700,6 +715,725 @@ test_highwater_drain(struct event_base *base)
     mq_fetch_listener_free(l);
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+ * Gateway client (Task 3.2): fetch→H3 bridge cases.
+ *
+ * These stand up a REAL in-process H3 tunnel over loopback UDP:
+ *   - a fake gateway SERVER: server transport (TLS) + runtime + mq_h3 with
+ *     server hooks that recv the forwarded request and reply per scenario;
+ *   - the CLIENT under test: client transport + runtime + mq_h3 (NULL hooks) +
+ *     mq_gw_client + a real mq_fetch_listener wired to the gw_client's cbs.
+ * A local "curl" socket POSTs /_mqproxy/fetch; we assert the response.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+/* Reserve an ephemeral loopback UDP port (bind :0, read it, close). */
+static uint16_t
+reserve_udp_port(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return 0;
+    }
+    socklen_t sl = sizeof(sa);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        close(fd);
+        return 0;
+    }
+    uint16_t port = ntohs(sa.sin_port);
+    close(fd);
+    return port;
+}
+
+/* ── fake gateway server (H3) ───────────────────────────────────────────────*/
+
+#define SRV_MAX_HDRS 32
+#define SRV_HDR_LEN  512
+
+typedef struct {
+    char name[SRV_HDR_LEN];
+    char value[SRV_HDR_LEN];
+} srv_hdr_t;
+
+/* Per-request server state + scenario controls. */
+typedef struct {
+    mq_h3_req_t *req;
+    int got_headers;
+    int saw_fin;
+    int closed;
+
+    srv_hdr_t hdrs[SRV_MAX_HDRS];
+    int n_hdrs;
+
+    uint8_t body[256 * 1024];
+    size_t body_len;
+
+    int responded;
+
+    /* response send state (driven by srv_respond + srv_on_req_write). */
+    const uint8_t *snd; /* response body to send (points at s->body or g_dl_body) */
+    size_t snd_total;   /* total response body length */
+    size_t snd_off;     /* bytes accepted so far */
+    int snd_fin_done;   /* the fin has been sent */
+
+    /* scenario controls (set on the shared server before the request). */
+    int scenario;      /* see SC_* below */
+    int request_count; /* incremented on each on_new_req (for case 4 asserts) */
+} gw_srv_t;
+
+enum {
+    SC_200_CL = 0,      /* 200 + content-length + body */
+    SC_200_NOCL = 1,    /* 200 WITHOUT content-length (forces chunked downstream) */
+    SC_ECHO_UPLOAD = 2, /* 200 + echo the received upload body back (CL) */
+    SC_RESET_MID = 3,   /* headers + partial body then reset (mid-download trunc) */
+};
+
+static gw_srv_t g_srv; /* one in-flight request at a time in these tests */
+
+static const uint8_t *g_dl_body; /* download body for SC_200_CL / SC_200_NOCL */
+static size_t g_dl_body_len;
+
+static void
+srv_capture_hdr(const char *n, size_t nl, const char *v, size_t vl, void *u)
+{
+    gw_srv_t *s = (gw_srv_t *)u;
+    if (s->n_hdrs >= SRV_MAX_HDRS) return;
+    srv_hdr_t *h = &s->hdrs[s->n_hdrs++];
+    size_t cn = nl < SRV_HDR_LEN - 1 ? nl : SRV_HDR_LEN - 1;
+    size_t cv = vl < SRV_HDR_LEN - 1 ? vl : SRV_HDR_LEN - 1;
+    memcpy(h->name, n, cn);
+    h->name[cn] = '\0';
+    memcpy(h->value, v, cv);
+    h->value[cv] = '\0';
+}
+
+static const char *
+srv_find_hdr(const gw_srv_t *s, const char *name)
+{
+    for (int i = 0; i < s->n_hdrs; i++)
+        if (strcmp(s->hdrs[i].name, name) == 0) return s->hdrs[i].value;
+    return NULL;
+}
+
+/* Push as much of the pending response body as xquic accepts, riding fin on the
+ * last byte; any EAGAIN remainder is retried from srv_on_req_write. Safe to call
+ * repeatedly. */
+static void
+srv_body_pump(gw_srv_t *s)
+{
+    if (!s->req || s->snd_fin_done) return;
+    while (s->snd_off < s->snd_total) {
+        int last = 1; /* whole remainder is the tail */
+        long acc = mq_h3_req_send_body(s->req, s->snd + s->snd_off,
+                                       s->snd_total - s->snd_off, last);
+        if (acc <= 0) return; /* EAGAIN: resume on the next on_write */
+        s->snd_off += (size_t)acc;
+        if (s->snd_off >= s->snd_total) {
+            s->snd_fin_done = 1; /* fin rode the last byte */
+            return;
+        }
+    }
+    /* Zero-length body: send a bare fin. */
+    if (s->snd_total == 0) {
+        mq_h3_req_finish(s->req);
+        s->snd_fin_done = 1;
+    }
+}
+
+static void
+srv_respond(gw_srv_t *s)
+{
+    if (s->responded || !s->req) return;
+    s->responded = 1;
+
+    if (s->scenario == SC_RESET_MID) {
+        /* Headers (no CL) + a partial body chunk, then reset → the downstream
+         * local socket must see a truncated (no clean terminator) close. */
+        mq_h3_header_t h[] = {{":status", "200"}};
+        mq_h3_req_send_headers(s->req, h, 1, 0);
+        static const uint8_t part[64] = {'P'};
+        mq_h3_req_send_body(s->req, part, sizeof(part), 0);
+        mq_h3_req_reset(s->req);
+        s->req = NULL;
+        return;
+    }
+
+    if (s->scenario == SC_ECHO_UPLOAD) {
+        char cl[32];
+        snprintf(cl, sizeof(cl), "%zu", s->body_len);
+        mq_h3_header_t h[] = {{":status", "200"}, {"content-length", cl}};
+        mq_h3_req_send_headers(s->req, h, 2, 0);
+        s->snd = s->body;
+        s->snd_total = s->body_len;
+        s->snd_off = 0;
+        srv_body_pump(s);
+        return;
+    }
+
+    /* SC_200_CL / SC_200_NOCL: download a fixed body. */
+    if (s->scenario == SC_200_NOCL) {
+        mq_h3_header_t h[] = {{":status", "200"}, {"x-mq-origin-protocol", "h2"}};
+        mq_h3_req_send_headers(s->req, h, 2, 0);
+    } else {
+        char cl[32];
+        snprintf(cl, sizeof(cl), "%zu", g_dl_body_len);
+        mq_h3_header_t h[] = {{":status", "200"}, {"content-length", cl}};
+        mq_h3_req_send_headers(s->req, h, 2, 0);
+    }
+    s->snd = g_dl_body;
+    s->snd_total = g_dl_body_len;
+    s->snd_off = 0;
+    srv_body_pump(s);
+}
+
+static void
+srv_on_req_read(mq_h3_req_t *r, int flag, void *user)
+{
+    gw_srv_t *s = (gw_srv_t *)user;
+    if (flag & (XQC_REQ_NOTIFY_READ_HEADER | XQC_REQ_NOTIFY_READ_TRAILER)) {
+        int fin = 0;
+        int n = mq_h3_req_recv_headers(r, srv_capture_hdr, s, &fin);
+        if (n >= 0) s->got_headers = 1;
+        if (fin) s->saw_fin = 1;
+    }
+    for (;;) {
+        int fin = 0;
+        long n = mq_h3_req_recv_body(r, s->body + s->body_len,
+                                     sizeof(s->body) - s->body_len, &fin);
+        if (n > 0) s->body_len += (size_t)n;
+        if (fin) s->saw_fin = 1;
+        if (n <= 0) break;
+    }
+    /* Respond once the full request body (fin) has arrived. */
+    if (s->saw_fin && !s->responded) srv_respond(s);
+}
+
+static void
+srv_on_req_write(mq_h3_req_t *r, void *user)
+{
+    (void)r;
+    gw_srv_t *s = (gw_srv_t *)user;
+    if (!s->responded) return;
+    srv_body_pump(s); /* resume any flow-control-blocked response body */
+}
+
+static void
+srv_on_req_close(mq_h3_req_t *r, void *user)
+{
+    (void)r;
+    gw_srv_t *s = (gw_srv_t *)user;
+    s->closed = 1;
+    s->req = NULL;
+}
+
+static void
+srv_on_new_req(mq_h3_req_t *r, void *user)
+{
+    (void)user;
+    g_srv.request_count++;
+    g_srv.req = r;
+    mq_h3_req_set_cbs(r, srv_on_req_read, srv_on_req_write, srv_on_req_close, &g_srv);
+}
+
+static void
+srv_on_new_conn(mq_h3_conn_t *c, void *user)
+{
+    (void)c;
+    (void)user;
+}
+
+/* ── gateway-client fixture ─────────────────────────────────────────────────*/
+
+typedef struct {
+    struct event_base *base;
+    mq_transport_t *srv_t;
+    mq_transport_t *cli_t;
+    mq_runtime_t *srv_rt;
+    mq_runtime_t *cli_rt;
+    mq_h3_t *srv_h3;
+    mq_h3_t *cli_h3;
+    mq_gw_client_t *gw;
+    mq_fetch_listener_t *listener;
+    uint16_t lport;
+} gw_fixture_t;
+
+static int
+gw_fixture_up(gw_fixture_t *f, const char *token)
+{
+    memset(f, 0, sizeof(*f));
+    memset(&g_srv, 0, sizeof(g_srv));
+
+    f->base = event_base_new();
+    if (!f->base) return -1;
+
+    uint16_t srv_port = reserve_udp_port();
+    if (!srv_port) return -1;
+
+    /* Server transport + runtime + h3 (server hooks). */
+    f->srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
+    if (!f->srv_t) return -1;
+    f->srv_rt = mq_runtime_new(f->srv_t, f->base);
+    if (!f->srv_rt) return -1;
+
+    /* Match the H3 fabric's mp settings so the negotiated conn settings line up. */
+    xqc_conn_settings_t srv_settings;
+    memset(&srv_settings, 0, sizeof(srv_settings));
+    srv_settings.proto_version = XQC_VERSION_V1;
+    srv_settings.pacing_on = 1;
+    mq_conn_apply_mp_settings(&srv_settings, /*is_server=*/1, MQ_CC_BBR2);
+    xqc_server_set_conn_settings(mq_transport_xqc(f->srv_t), &srv_settings);
+
+    f->srv_h3 = mq_h3_init(f->srv_t, srv_on_new_conn, srv_on_new_req, NULL);
+    if (!f->srv_h3) return -1;
+    if (mq_runtime_open_udp_path(f->srv_rt, "127.0.0.1", srv_port) != 0) return -1;
+
+    /* Client transport + runtime + h3 (pure client). */
+    f->cli_t = mq_transport_new(0);
+    if (!f->cli_t) return -1;
+    f->cli_rt = mq_runtime_new(f->cli_t, f->base);
+    if (!f->cli_rt) return -1;
+    if (mq_runtime_open_udp_path(f->cli_rt, "127.0.0.1", 0) != 0) return -1;
+    f->cli_h3 = mq_h3_init(f->cli_t, NULL, NULL, NULL);
+    if (!f->cli_h3) return -1;
+
+    f->gw = mq_gw_client_new(f->cli_t, f->cli_rt, f->cli_h3, "127.0.0.1", srv_port, token,
+                             MQ_CC_BBR2);
+    if (!f->gw) return -1;
+
+    /* Real fetch listener wired to the gw client's cbs. */
+    f->listener = mq_fetch_listener_new(f->base, "127.0.0.1", 0, mq_gw_client_fetch_cbs(),
+                                        mq_gw_client_fetch_user(f->gw));
+    if (!f->listener) return -1;
+    f->lport = mq_fetch_listener_port(f->listener);
+    if (!f->lport) return -1;
+
+    /* Pump until the tunnel conn is established (gw connected eagerly). */
+    uint64_t deadline = now_ms() + 5000;
+    while (now_ms() < deadline) {
+        event_base_loop(f->base, EVLOOP_NONBLOCK);
+        /* No direct accessor; a short settle is enough on loopback. The first
+         * fetch request itself drives further pumping. */
+        if (now_ms() > deadline - 4700) break; /* ~300ms settle */
+    }
+    return 0;
+}
+
+/* tunnel-unavailable fixture: gw points at a CLOSED UDP port (no server). */
+static int
+gw_fixture_up_dead(gw_fixture_t *f)
+{
+    memset(f, 0, sizeof(*f));
+    memset(&g_srv, 0, sizeof(g_srv));
+    f->base = event_base_new();
+    if (!f->base) return -1;
+    uint16_t dead = reserve_udp_port(); /* reserved then released → nothing listens */
+    if (!dead) return -1;
+
+    f->cli_t = mq_transport_new(0);
+    if (!f->cli_t) return -1;
+    f->cli_rt = mq_runtime_new(f->cli_t, f->base);
+    if (!f->cli_rt) return -1;
+    if (mq_runtime_open_udp_path(f->cli_rt, "127.0.0.1", 0) != 0) return -1;
+    f->cli_h3 = mq_h3_init(f->cli_t, NULL, NULL, NULL);
+    if (!f->cli_h3) return -1;
+    f->gw = mq_gw_client_new(f->cli_t, f->cli_rt, f->cli_h3, "127.0.0.1", dead, "tok",
+                             MQ_CC_BBR2);
+    if (!f->gw) return -1;
+    f->listener = mq_fetch_listener_new(f->base, "127.0.0.1", 0, mq_gw_client_fetch_cbs(),
+                                        mq_gw_client_fetch_user(f->gw));
+    if (!f->listener) return -1;
+    f->lport = mq_fetch_listener_port(f->listener);
+    if (!f->lport) return -1;
+    return 0;
+}
+
+static void
+gw_fixture_down(gw_fixture_t *f)
+{
+    /* Teardown order: mq_h3_free (mq_h3.h contract: before transport_free) then
+     * transport_free. The engine teardown fires conn-close + per-request
+     * close_notify into the STILL-LIVE gw_client + listener, which detach all
+     * in-flight requests and their local handles. So gw_client + listener MUST
+     * outlive the transport (mirrors test_e2e_single_path's fixture, where the
+     * proxy objects outlive the transport). Only then free gw_client, the
+     * runtimes (borrowed base), the listener, and finally the base. */
+    if (f->cli_h3) mq_h3_free(f->cli_h3);
+    if (f->srv_h3) mq_h3_free(f->srv_h3);
+    if (f->cli_t) mq_transport_free(f->cli_t);
+    if (f->srv_t) mq_transport_free(f->srv_t);
+    if (f->gw) mq_gw_client_free(f->gw);
+    if (f->cli_rt) mq_runtime_free(f->cli_rt);
+    if (f->srv_rt) mq_runtime_free(f->srv_rt);
+    if (f->listener) mq_fetch_listener_free(f->listener);
+    if (f->base) event_base_free(f->base);
+}
+
+/* Parse a chunked HTTP/1.1 body from the response buffer into out. Returns the
+ * de-chunked length, or (size_t)-1 on a framing error. `body_start` is the
+ * offset of the first chunk-size line (after the head's \r\n\r\n). */
+static size_t
+dechunk(const uint8_t *p, size_t len, uint8_t *out, size_t out_cap)
+{
+    size_t i = 0, o = 0;
+    for (;;) {
+        /* parse hex chunk size up to \r\n */
+        size_t sz = 0;
+        int any = 0;
+        while (i < len && p[i] != '\r') {
+            char ch = (char)p[i];
+            int d;
+            if (ch >= '0' && ch <= '9')
+                d = ch - '0';
+            else if (ch >= 'a' && ch <= 'f')
+                d = ch - 'a' + 10;
+            else if (ch >= 'A' && ch <= 'F')
+                d = ch - 'A' + 10;
+            else
+                return (size_t)-1;
+            sz = sz * 16 + (size_t)d;
+            any = 1;
+            i++;
+        }
+        if (!any || i + 1 >= len || p[i] != '\r' || p[i + 1] != '\n') return (size_t)-1;
+        i += 2;
+        if (sz == 0) return o; /* terminator */
+        if (i + sz + 2 > len || o + sz > out_cap) return (size_t)-1;
+        memcpy(out + o, p + i, sz);
+        o += sz;
+        i += sz;
+        if (p[i] != '\r' || p[i + 1] != '\n') return (size_t)-1;
+        i += 2;
+    }
+}
+
+/* Locate the response body start (offset after the head terminator). */
+static size_t
+head_end(const uint8_t *p, size_t len)
+{
+    for (size_t i = 0; i + 3 < len; i++)
+        if (p[i] == '\r' && p[i + 1] == '\n' && p[i + 2] == '\r' && p[i + 3] == '\n')
+            return i + 4;
+    return (size_t)-1;
+}
+
+/* Pump while sending the POST request and reading the full response to EOF. */
+static size_t
+fetch_roundtrip(struct event_base *base, uint16_t lport, const char *reqbytes,
+                size_t reqlen, uint8_t *out, size_t cap, uint64_t budget_ms)
+{
+    int c = dial(lport);
+    MQ_CHECK(c >= 0);
+    if (c < 0) return 0;
+    send_all(c, reqbytes, reqlen);
+    size_t got = pump_read_all(base, c, out, cap, budget_ms);
+    close(c);
+    pump_a_bit(base, 100);
+    return got;
+}
+
+/* ── Case 1: GET via fetch API → 200 + CL passthrough + byte-exact body ──────*/
+static void
+test_gw_get_cl(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up(&f, "sekrit") != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    static const uint8_t DL[] = "the-downloaded-file-contents-0123456789";
+    g_dl_body = DL;
+    g_dl_body_len = sizeof(DL) - 1;
+    g_srv.scenario = SC_200_CL;
+
+    const char *req = "POST /_mqproxy/fetch HTTP/1.1\r\n"
+                      "Host: x\r\n"
+                      "X-Mq-Auth: Bearer sekrit\r\n"
+                      "X-Mq-Target: https://example.test/file\r\n"
+                      "Cookie: should-be-stripped\r\n"
+                      "X-Custom-Hdr: keepme\r\n"
+                      "Content-Length: 0\r\n\r\n";
+    uint8_t reply[4096] = {0};
+    size_t got =
+        fetch_roundtrip(f.base, f.lport, req, strlen(req), reply, sizeof(reply), 6000);
+
+    MQ_CHECK(got > 0);
+    MQ_CHECK_MEM(reply, "HTTP/1.1 200", 12);
+    /* Server saw the forwarded request. */
+    MQ_CHECK_EQ_INT(g_srv.request_count, 1);
+    MQ_CHECK(g_srv.got_headers);
+    const char *m = srv_find_hdr(&g_srv, ":method");
+    const char *sc = srv_find_hdr(&g_srv, ":scheme");
+    const char *au = srv_find_hdr(&g_srv, ":authority");
+    const char *pa = srv_find_hdr(&g_srv, ":path");
+    const char *xa = srv_find_hdr(&g_srv, "x-mq-auth");
+    const char *ck = srv_find_hdr(&g_srv, "cookie");
+    const char *cu = srv_find_hdr(&g_srv, "x-custom-hdr");
+    MQ_CHECK(m && strcmp(m, "GET") == 0);
+    MQ_CHECK(sc && strcmp(sc, "https") == 0);
+    MQ_CHECK(au && strcmp(au, "example.test") == 0);
+    MQ_CHECK(pa && strcmp(pa, "/file") == 0);
+    MQ_CHECK(xa && strcmp(xa, "Bearer sekrit") == 0); /* forwarded verbatim */
+    MQ_CHECK(ck == NULL);                             /* Cookie stripped */
+    MQ_CHECK(cu && strcmp(cu, "keepme") == 0);        /* custom header kept */
+
+    /* Local reply: CL passthrough + byte-exact body. The response header name is
+     * carried verbatim from H3 (lowercase field names). */
+    MQ_CHECK(contains(reply, got, "content-length: 39"));
+    MQ_CHECK(contains(reply, got, (const char *)DL));
+
+    gw_fixture_down(&f);
+}
+
+/* ── Case 2: response WITHOUT content-length → chunked downstream ────────────*/
+static void
+test_gw_chunked(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up(&f, "sekrit") != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    static const uint8_t DL[] =
+        "no-content-length-here-so-this-must-be-chunked-downstream!!";
+    g_dl_body = DL;
+    g_dl_body_len = sizeof(DL) - 1;
+    g_srv.scenario = SC_200_NOCL;
+
+    const char *req = "POST /_mqproxy/fetch HTTP/1.1\r\n"
+                      "Host: x\r\n"
+                      "X-Mq-Auth: Bearer sekrit\r\n"
+                      "X-Mq-Target: https://example.test/stream\r\n"
+                      "Content-Length: 0\r\n\r\n";
+    uint8_t reply[4096] = {0};
+    size_t got =
+        fetch_roundtrip(f.base, f.lport, req, strlen(req), reply, sizeof(reply), 6000);
+
+    MQ_CHECK(got > 0);
+    MQ_CHECK_MEM(reply, "HTTP/1.1 200", 12);
+    MQ_CHECK(contains(reply, got, "Transfer-Encoding: chunked"));
+    /* x-mq-* diagnostic header forwarded downstream. */
+    MQ_CHECK(contains(reply, got, "x-mq-origin-protocol"));
+
+    size_t hs = head_end(reply, got);
+    MQ_CHECK(hs != (size_t)-1);
+    uint8_t debody[4096];
+    size_t dl = dechunk(reply + hs, got - hs, debody, sizeof(debody));
+    MQ_CHECK_EQ_INT((int)dl, (int)(sizeof(DL) - 1));
+    MQ_CHECK_MEM(debody, DL, sizeof(DL) - 1);
+
+    gw_fixture_down(&f);
+}
+
+/* ── Case 3: upload (POST with CL body ≥ 64 KiB) echoed back ─────────────────*/
+static void
+test_gw_upload(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up(&f, "sekrit") != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    g_srv.scenario = SC_ECHO_UPLOAD;
+
+    const size_t N = 96 * 1024;
+    uint8_t *body = malloc(N);
+    MQ_CHECK(body != NULL);
+    for (size_t i = 0; i < N; i++)
+        body[i] = (uint8_t)((i * 131 + 7) & 0xff);
+
+    char head[256];
+    int hn = snprintf(head, sizeof(head),
+                      "POST /_mqproxy/fetch HTTP/1.1\r\n"
+                      "Host: x\r\n"
+                      "X-Mq-Auth: Bearer sekrit\r\n"
+                      "X-Mq-Target: https://example.test/upload\r\n"
+                      "X-Mq-Method: POST\r\n"
+                      "Content-Length: %zu\r\n\r\n",
+                      N);
+    uint8_t *reqbuf = malloc((size_t)hn + N);
+    MQ_CHECK(reqbuf != NULL);
+    memcpy(reqbuf, head, (size_t)hn);
+    memcpy(reqbuf + hn, body, N);
+
+    int c = dial(f.lport);
+    MQ_CHECK(c >= 0);
+    /* Send the whole request (head + body); the local listener streams the body
+     * and our gw client applies backpressure as needed. */
+    send_all(c, reqbuf, (size_t)hn + N);
+
+    uint8_t *reply = malloc(N + 4096);
+    MQ_CHECK(reply != NULL);
+    size_t got = pump_read_all(f.base, c, reply, N + 4096, 15000);
+
+    MQ_CHECK(got > 0);
+    MQ_CHECK_MEM(reply, "HTTP/1.1 200", 12);
+    MQ_CHECK_EQ_INT(g_srv.request_count, 1);
+    const char *m = srv_find_hdr(&g_srv, ":method");
+    MQ_CHECK(m && strcmp(m, "POST") == 0);
+    MQ_CHECK(g_srv.saw_fin); /* upload finished cleanly */
+
+    /* The echoed body must reach the local socket byte-exact. */
+    size_t hs = head_end(reply, got);
+    MQ_CHECK(hs != (size_t)-1);
+    MQ_CHECK_EQ_INT((int)(got - hs), (int)N);
+    if (got - hs == N) MQ_CHECK(memcmp(reply + hs, body, N) == 0);
+
+    close(c);
+    pump_a_bit(f.base, 100);
+    free(body);
+    free(reqbuf);
+    free(reply);
+    gw_fixture_down(&f);
+}
+
+/* ── Case 4: 400 family (client-owned) — server never sees a request ─────────*/
+static void
+test_gw_400_family(void)
+{
+    /* 4a: missing X-Mq-Auth. */
+    {
+        gw_fixture_t f;
+        if (gw_fixture_up(&f, "sekrit") != 0) {
+            gw_fixture_down(&f);
+            MQ_CHECK(0);
+            return;
+        }
+        const char *req = "POST /_mqproxy/fetch HTTP/1.1\r\nHost: x\r\n"
+                          "X-Mq-Target: https://example.test/x\r\n"
+                          "Content-Length: 0\r\n\r\n";
+        uint8_t reply[1024] = {0};
+        size_t got = fetch_roundtrip(f.base, f.lport, req, strlen(req), reply,
+                                     sizeof(reply), 4000);
+        MQ_CHECK(got > 0);
+        MQ_CHECK_MEM(reply, "HTTP/1.1 400", 12);
+        MQ_CHECK(contains(reply, got, "X-Mq-Error: missing-auth"));
+        MQ_CHECK_EQ_INT(g_srv.request_count, 0); /* server never saw it */
+        gw_fixture_down(&f);
+    }
+    /* 4b: bad target (no scheme). */
+    {
+        gw_fixture_t f;
+        if (gw_fixture_up(&f, "sekrit") != 0) {
+            gw_fixture_down(&f);
+            MQ_CHECK(0);
+            return;
+        }
+        const char *req = "POST /_mqproxy/fetch HTTP/1.1\r\nHost: x\r\n"
+                          "X-Mq-Auth: Bearer sekrit\r\n"
+                          "X-Mq-Target: not-a-valid-url\r\n"
+                          "Content-Length: 0\r\n\r\n";
+        uint8_t reply[1024] = {0};
+        size_t got = fetch_roundtrip(f.base, f.lport, req, strlen(req), reply,
+                                     sizeof(reply), 4000);
+        MQ_CHECK(got > 0);
+        MQ_CHECK_MEM(reply, "HTTP/1.1 400", 12);
+        MQ_CHECK(contains(reply, got, "X-Mq-Error: bad-target"));
+        MQ_CHECK_EQ_INT(g_srv.request_count, 0);
+        gw_fixture_down(&f);
+    }
+    /* 4c: duplicate X-Mq-Target → 400. */
+    {
+        gw_fixture_t f;
+        if (gw_fixture_up(&f, "sekrit") != 0) {
+            gw_fixture_down(&f);
+            MQ_CHECK(0);
+            return;
+        }
+        const char *req = "POST /_mqproxy/fetch HTTP/1.1\r\nHost: x\r\n"
+                          "X-Mq-Auth: Bearer sekrit\r\n"
+                          "X-Mq-Target: https://example.test/a\r\n"
+                          "X-Mq-Target: https://example.test/b\r\n"
+                          "Content-Length: 0\r\n\r\n";
+        uint8_t reply[1024] = {0};
+        size_t got = fetch_roundtrip(f.base, f.lport, req, strlen(req), reply,
+                                     sizeof(reply), 4000);
+        MQ_CHECK(got > 0);
+        MQ_CHECK_MEM(reply, "HTTP/1.1 400", 12);
+        MQ_CHECK(contains(reply, got, "X-Mq-Error: duplicate-control-header"));
+        MQ_CHECK_EQ_INT(g_srv.request_count, 0);
+        gw_fixture_down(&f);
+    }
+}
+
+/* ── Case 5: tunnel-unavailable → 502 + X-Mq-Error: tunnel-unavailable ───────*/
+static void
+test_gw_tunnel_unavailable(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up_dead(&f) != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    const char *req = "POST /_mqproxy/fetch HTTP/1.1\r\nHost: x\r\n"
+                      "X-Mq-Auth: Bearer tok\r\n"
+                      "X-Mq-Target: https://example.test/x\r\n"
+                      "Content-Length: 0\r\n\r\n";
+    uint8_t reply[1024] = {0};
+    size_t got =
+        fetch_roundtrip(f.base, f.lport, req, strlen(req), reply, sizeof(reply), 3000);
+    MQ_CHECK(got > 0);
+    MQ_CHECK_MEM(reply, "HTTP/1.1 502", 12);
+    MQ_CHECK(contains(reply, got, "X-Mq-Error: tunnel-unavailable"));
+    gw_fixture_down(&f);
+}
+
+/* ── Case 6: mid-download reset → local socket sees a truncated close ────────*/
+static void
+test_gw_mid_download_reset(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up(&f, "sekrit") != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    g_srv.scenario = SC_RESET_MID;
+
+    const char *req = "POST /_mqproxy/fetch HTTP/1.1\r\nHost: x\r\n"
+                      "X-Mq-Auth: Bearer sekrit\r\n"
+                      "X-Mq-Target: https://example.test/trunc\r\n"
+                      "Content-Length: 0\r\n\r\n";
+    uint8_t reply[4096] = {0};
+    size_t got =
+        fetch_roundtrip(f.base, f.lport, req, strlen(req), reply, sizeof(reply), 6000);
+
+    /* The upstream was reset mid-response. Two valid outcomes depending on
+     * whether the 200 headers raced ahead of the RESET_STREAM:
+     *   (a) headers arrived first → local sees "HTTP/1.1 200" but the chunked
+     *       body is TRUNCATED: no clean "0\r\n\r\n" terminator (abort, not a
+     *       fake clean finish);
+     *   (b) the reset won the race (no headers delivered) → the bridge
+     *       synthesizes "HTTP/1.1 502" + X-Mq-Error: upstream-reset.
+     * In NEITHER case may the local client see a clean, complete download. */
+    MQ_CHECK(got > 0);
+    int is_200 = (got >= 12 && memcmp(reply, "HTTP/1.1 200", 12) == 0);
+    int is_502 = (got >= 12 && memcmp(reply, "HTTP/1.1 502", 12) == 0);
+    MQ_CHECK(is_200 || is_502);
+    if (is_200) {
+        /* Truncated: no clean chunked terminator. */
+        MQ_CHECK(!contains(reply, got, "\r\n0\r\n\r\n"));
+    } else if (is_502) {
+        MQ_CHECK(contains(reply, got, "X-Mq-Error: upstream-reset"));
+    }
+    /* The request was forwarded (server saw it). */
+    MQ_CHECK_EQ_INT(g_srv.request_count, 1);
+
+    gw_fixture_down(&f);
+}
+
 static void
 run_all(void)
 {
@@ -718,6 +1452,14 @@ run_all(void)
     test_highwater_drain(base);
 
     event_base_free(base);
+
+    /* Gateway-client (Task 3.2) cases — each owns its own base + transports. */
+    test_gw_get_cl();
+    test_gw_chunked();
+    test_gw_upload();
+    test_gw_400_family();
+    test_gw_tunnel_unavailable();
+    test_gw_mid_download_reset();
 }
 
 MQ_TEST_MAIN(run_all())

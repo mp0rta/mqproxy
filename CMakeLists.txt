@@ -20,6 +20,7 @@ add_library(mqproxy STATIC
     src/gateway/mq_http1.c
     src/gateway/mq_gw_headers.c
     src/gateway/mq_fetch_listener.c
+    src/gateway/mq_gw_client.c
     src/transport/mq_conn.c
     src/transport/mq_h3.c
     src/transport/mq_stream.c
@@ -167,9 +168,11 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_socks5_listener COMMAND test_socks5_listener)
 
-    # Fetch-API listener (Task 2.2). No transports/certs: drives the loopback
-    # HTTP/1.1 accept loop with fake gateway callbacks over real sockets. Linked
-    # against xquic/event like the other integration tests for uniformity.
+    # Fetch-API listener (Task 2.2) + gateway client fetch→H3 bridge (Task 3.2).
+    # The listener cases drive the loopback HTTP/1.1 accept loop with fake gateway
+    # callbacks over real sockets; the gateway-client cases stand up real
+    # client+server transports + runtimes + mq_h3 over loopback UDP, so this test
+    # now needs the cert/key defines (mirrors test_e2e_single_path).
     add_executable(test_gw_client tests/integration/test_gw_client.c)
     target_link_libraries(test_gw_client
         mqproxy
@@ -179,6 +182,9 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         pthread dl m stdc++)
     target_include_directories(test_gw_client PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_gw_client PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
     set_target_properties(test_gw_client PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_gw_client COMMAND test_gw_client)
