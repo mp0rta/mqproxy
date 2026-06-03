@@ -157,7 +157,16 @@ long mq_h3_req_finish(mq_h3_req_t *r);
  * borrowed name/value pointers (valid only during the call — copy out if
  * needed). *fin (if non-NULL) is set to 1 if the headers carry fin (no body).
  * Returns the number of headers delivered (>=0), or -1 on error. xquic owns the
- * returned header memory; it is consumed entirely within this call. */
+ * returned header memory; it is consumed entirely within this call.
+ *
+ * CALL GATING: xqc_h3_request_recv_headers returns NULL (mapped to -1 here)
+ * both on hard error AND when no header section is pending. Callers MUST gate
+ * calls on the READ_HEADER (flag & 1) or READ_TRAILER (flag & 4) bit from the
+ * on_read notify to avoid spurious -1 returns.
+ *
+ * TRAILERS: one call drains exactly one header section. If the request carries
+ * trailers, a second call is required after the READ_TRAILER notify fires —
+ * headers come first, trailers come second. */
 int mq_h3_req_recv_headers(mq_h3_req_t *r,
                            void (*each)(const char *n, size_t nl, const char *v,
                                         size_t vl, void *u),
@@ -168,7 +177,9 @@ int mq_h3_req_recv_headers(mq_h3_req_t *r,
  * *fin==0 means no body available right now (was -XQC_EAGAIN). */
 long mq_h3_req_recv_body(mq_h3_req_t *r, uint8_t *buf, size_t cap, int *fin);
 
-/* Send RESET_STREAM. The mq_h3_req is freed later via h3_request_close_notify. */
+/* Close the request. xqc_h3_request_close sends RESET_STREAM only if the
+ * request has not already completed; on a finished request it is a graceful
+ * close. The mq_h3_req is freed later via h3_request_close_notify. */
 void mq_h3_req_reset(mq_h3_req_t *r);
 
 #endif /* MQ_TRANSPORT_MQ_H3_H */

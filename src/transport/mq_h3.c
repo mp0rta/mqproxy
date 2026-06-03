@@ -98,7 +98,14 @@ struct mq_h3_s {
      * request to its owning connection. Same pattern + limitation as
      * mq_conn's active_server_conn (no public request->h3_conn accessor in the
      * shared lib; on this single-threaded engine a conn's create/handshake runs
-     * before its first request's create_notify). */
+     * before its first request's create_notify).
+     *
+     * xqc_h3_get_conn_user_data_by_request exists but returns the TRANSPORT
+     * user_data, not the mq_h3_conn wrapper — it is used below to recover the
+     * mq_h3 from the transport map, not to recover the per-conn wrapper. A true
+     * per-request h3-conn accessor would need a fork export (analogous to
+     * mq_conn.c's xqc_get_conn_alp_user_data_by_stream note); absent that, this
+     * windowed slot is the only safe recovery path. */
     mq_h3_conn_t *active_server_conn;
 };
 
@@ -333,6 +340,10 @@ mq_h3_request_create_notify(xqc_h3_request_t *r, void *h3s_user_data)
         return -1;
     }
     req->r = r;
+    /* active_server_conn can be NULL if the request's create_notify fires outside
+     * the conn create/handshake window (attribution window edge case, e.g. a very
+     * late peer-initiated stream after close_notify cleared the slot). Downstream
+     * owners MUST guard against a NULL req->conn before dereferencing it. */
     req->conn = h->active_server_conn;
     /* Bind the wrapper as the request's user_data so subsequent read/write/close
      * notifies recover it directly (independent per-stream slot — safe). */
@@ -635,7 +646,12 @@ mq_h3_req_open(mq_h3_conn_t *c)
     req->conn = c;
     /* Pass the wrapper as the request user_data so the synchronous
      * create_notify (and later read/write/close notifies) recover it. This is
-     * the independent per-stream slot — safe to own (unlike the conn slot). */
+     * the independent per-stream slot — safe to own (unlike the conn slot).
+     *
+     * No defensive post-create bind (unlike mq_conn_open_stream) is needed here:
+     * the request handle is only available as the return value of
+     * xqc_h3_request_create, and no callback can fire on a brand-new
+     * locally-initiated request before the caller has stored the return value. */
     xqc_h3_request_t *r =
         xqc_h3_request_create(mq_transport_xqc(c->transport), &c->cid, NULL, req);
     if (!r) {
@@ -742,7 +758,9 @@ mq_h3_req_recv_headers(mq_h3_req_t *r,
     }
     uint8_t xfin = 0;
     /* xquic OWNS the returned headers; they are valid only here (consumed
-     * within this call) — copy out via `each` if the caller needs them later. */
+     * within this call) — copy out via `each` if the caller needs them later.
+     * NULL is returned both on hard error AND when no header section is pending
+     * (READ_HEADER/READ_TRAILER not set); callers must gate on the notify flag. */
     xqc_http_headers_t *hdrs = xqc_h3_request_recv_headers(r->r, &xfin);
     if (!hdrs) {
         return -1;
