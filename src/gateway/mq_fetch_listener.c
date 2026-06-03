@@ -37,6 +37,13 @@
 #define MQ_FETCH_OUT_HIGHWATER (256 * 1024)
 #define MQ_FETCH_OUT_LOWWATER  (64 * 1024)
 
+/* Hard ceiling on the queued output buffer. A write that would push the queue
+ * (or its required capacity) above this is rejected with -1: it bounds memory
+ * for a stalled/slow client and is well above the high watermark, so a
+ * well-behaved gateway that stops on the 0 (high-watermark) return never hits
+ * it. */
+#define MQ_FETCH_OUT_MAX (4u * 1024 * 1024)
+
 /* Read chunk size for body streaming. */
 #define MQ_FETCH_RD_CHUNK 16384
 
@@ -140,7 +147,9 @@ out_pending(const struct mq_fetch_conn *c)
     return c->out_len - c->out_off;
 }
 
-/* Append len bytes to the output queue, growing as needed. Returns 0 on OOM. */
+/* Append len bytes to the output queue, growing as needed. Returns 0 on
+ * rejection (overflow guard / hard ceiling / OOM). The caller treats 0 as a
+ * fatal write error (handle dies). */
 static int
 out_append(struct mq_fetch_conn *c, const void *p, size_t len)
 {
@@ -154,10 +163,22 @@ out_append(struct mq_fetch_conn *c, const void *p, size_t len)
         c->out_len -= c->out_off;
         c->out_off = 0;
     }
-    if (c->out_len + len > c->out_cap) {
+    /* Overflow + ceiling guard: reject before any arithmetic can wrap size_t.
+     * c->out_len is already <= MQ_FETCH_OUT_MAX (this guard ran on every prior
+     * append), so out_len + len cannot wrap once len is bounded below. */
+    if (len > MQ_FETCH_OUT_MAX - c->out_len) return 0;
+    size_t need = c->out_len + len;
+    if (need > c->out_cap) {
         size_t ncap = c->out_cap ? c->out_cap : 4096;
-        while (ncap < c->out_len + len)
+        /* Double until it fits, guarding the doubling against size_t wrap.
+         * `need <= MQ_FETCH_OUT_MAX` bounds the loop. */
+        while (ncap < need) {
+            if (ncap > SIZE_MAX / 2) {
+                ncap = need; /* cannot double further; use the exact size */
+                break;
+            }
             ncap *= 2;
+        }
         uint8_t *nb = realloc(c->out, ncap);
         if (!nb) return 0;
         c->out = nb;
@@ -263,7 +284,11 @@ reply_error_and_close(struct mq_fetch_conn *c, int code, const char *reason)
  * Only the in-bounds portion (up to remaining Content-Length) is delivered to
  * on_body in a single call, so cbs observe EXACTLY Content-Length bytes. Any
  * bytes in this chunk beyond Content-Length are a protocol violation by the
- * peer: after on_body_done fires we abort the connection (on_aborted).
+ * peer, but the request body is fully received: on_body_done has fired and the
+ * gateway owns the write side. We do NOT fire on_aborted (its contract is "peer
+ * died BEFORE Content-Length") and we do NOT destroy the conn from here (that
+ * would discard a response the gateway may be mid-flushing); we simply stop
+ * reading and leave teardown to the gateway's finish()/abort().
  *
  * NOTE: *done is set when the caller must NOT touch `c` afterward — either the
  * read is paused, or the body completed (on_body_done may have finished/aborted
@@ -277,10 +302,11 @@ deliver_body(struct mq_fetch_conn *c, const uint8_t *p, size_t len, int *done)
 
     int64_t remain = c->body_total - c->body_delivered;
     size_t take = len;
-    int oversize = 0;
     if ((int64_t)take > remain) {
         take = (size_t)remain; /* deliver only up to Content-Length */
-        oversize = 1;          /* extra bytes follow: abort after on_body_done */
+        /* Extra bytes follow Content-Length: a peer protocol violation, but the
+         * body is complete. We stop reading after on_body_done (below) rather
+         * than aborting. */
     }
 
     if (take > 0 && l->cbs.on_body) {
@@ -304,20 +330,23 @@ deliver_body(struct mq_fetch_conn *c, const uint8_t *p, size_t len, int *done)
 
     if (c->body_delivered >= c->body_total) {
         /* Exactly Content-Length delivered. Move to RESP, then on_body_done —
-         * the gateway now owns the write side and will finish/abort. */
+         * the gateway now owns the write side and will finish/abort.
+         *
+         * If this chunk also carried trailing bytes past Content-Length, those
+         * are a peer protocol violation, but the request is fully received: we
+         * just stop reading (and let the RESP-phase read event, if still armed,
+         * discard any further bytes). We must NOT fire on_aborted and must NOT
+         * destroy the conn here — the gateway may be mid-response. *done was set
+         * above so the caller stops touching `c`.
+         *
+         * on_body_done itself may finish/abort (detach) the conn; after it
+         * returns we must not touch `c` unconditionally, so stop reading only
+         * while still attached. */
         c->phase = MQ_FC_RESP;
         if (done) *done = 1;
         if (l->cbs.on_body_done) l->cbs.on_body_done(c->req_ctx);
-
-        if (oversize && !c->detached) {
-            /* Trailing bytes past Content-Length: protocol violation. The
-             * gateway may already have finished/aborted (detached) from
-             * on_body_done; only abort if it did not. */
-            c->detached = 1;
-            if (l->cbs.on_aborted) l->cbs.on_aborted(c->req_ctx);
-            conn_destroy(c);
-            return -1;
-        }
+        /* Do not touch `c` past here unless we know it survived; the caller has
+         * *done set and will not loop. */
     }
     return 1;
 }
@@ -664,9 +693,16 @@ mq_fetch_conn_resume_read(void *handle)
     if (!c || c->detached) return;
     if (!c->read_paused) return;
     c->read_paused = 0;
-    if (c->read_ev) event_add(c->read_ev, NULL);
-    /* Kick the read loop so buffered/ready bytes are processed immediately. */
-    on_readable(c->fd, EV_READ, c);
+    if (c->read_ev) {
+        /* Re-enable reading, then schedule a deferred read kick rather than
+         * calling on_readable() inline. A gateway that resumes from inside
+         * on_body would otherwise recurse into the read loop (unbounded
+         * recursion) and could touch a conn freed deeper in the stack. Posting
+         * EV_READ defers the kick to the next loop turn, where any ready bytes
+         * are processed safely after the current callback unwinds. */
+        event_add(c->read_ev, NULL);
+        event_active(c->read_ev, EV_READ, 0);
+    }
 }
 
 int

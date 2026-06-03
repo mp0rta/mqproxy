@@ -34,7 +34,12 @@
  *   5. Peer EOF/error BEFORE content_length bytes are delivered => on_aborted
  *      (NOT on_body_done). After on_body_done, peer EOF is normal: the listener
  *      waits for the gateway to write the response via the handle ops.
- *   6. Body bytes exceeding content_length => the connection is aborted.
+ *   6. Body bytes exceeding content_length are a peer protocol violation, but
+ *      the body is fully received: on_body_done has already fired and the
+ *      gateway owns the write side. The listener does NOT fire on_aborted and
+ *      does NOT tear the connection down from the read path; it just stops
+ *      reading and leaves teardown to the gateway's finish()/abort() (so a
+ *      response the gateway is mid-flushing is not discarded).
  *
  * DESIGN NOTE — handle vs fd: the converged plan's on_request signature passes
  * an `int fd`, but the per-connection handle ops below need the listener's
@@ -127,14 +132,22 @@ void mq_fetch_listener_free(mq_fetch_listener_t *l);
 /* Stop reading body bytes from the peer (backpressure from the gateway). */
 void mq_fetch_conn_pause_read(void *handle);
 
-/* Resume reading body bytes after a pause. */
+/* Resume reading body bytes after a pause. The read kick is DEFERRED to the
+ * next event-loop turn (it does not re-enter the read path synchronously), so
+ * it is safe to call this from within on_body — there is no recursion into the
+ * read loop and no use-after-free window if a later callback tears the conn
+ * down. */
 void mq_fetch_conn_resume_read(void *handle);
 
 /* Append response bytes to the connection's output. Returns:
  *   >0  accepted (queued/sent),
  *    0  high-watermark hit — the output buffer is full; STOP feeding and wait
  *       for the drain callback (set via mq_fetch_conn_set_drain_cb) to fire,
- *   -1  error (handle dead / write failure). */
+ *   -1  error (handle dead / write failure / the write would push the queued
+ *       output above the internal hard ceiling, currently 4 MiB).
+ *
+ * A gateway that honors the 0 (high-watermark) return never reaches the hard
+ * ceiling; the ceiling only bounds memory for a misbehaving caller. */
 int mq_fetch_conn_write(void *handle, const void *p, size_t len);
 
 /* Register a callback fired when the output buffer drains below the low

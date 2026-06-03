@@ -54,8 +54,16 @@ struct fake_gw {
     int paused_flag; /* set to 1 when we asked for a pause */
 
     /* what on_body_done should do */
-    int write_echo_reply; /* on done, write 200 + accumulated body, finish */
-    int reject;           /* on_request returns -1 (handler-owned reply) */
+    int write_echo_reply;        /* on done, write 200 + accumulated body, finish */
+    int write_small_200_on_done; /* on done, write a small empty-body 200, finish */
+    int write_big_on_done;       /* on done, stream a large body to exercise hw */
+    int reject;                  /* on_request returns -1 (handler-owned reply) */
+
+    /* high-watermark / drain bookkeeping (write_big_on_done path) */
+    int saw_zero_return; /* mq_fetch_conn_write returned 0 at least once */
+    int drain_fired;     /* drain_cb invoked */
+    size_t big_total;    /* bytes to stream */
+    size_t big_sent;     /* bytes accepted so far */
 };
 
 static int
@@ -92,11 +100,85 @@ fake_on_body(void *req_ctx, const uint8_t *p, size_t len)
     return 0;
 }
 
+/* Write a small fixed 200 OK (empty body) via the handle, then finish. Used by
+ * the oversize-after-done case to prove a gateway response written after the
+ * body is complete still flushes to the client even though trailing garbage
+ * arrived. */
+static void
+write_small_200_and_finish(struct fake_gw *g)
+{
+    char head[128];
+    int o = 0, n;
+    n = mq_http1_write_status(head + o, sizeof(head) - o, 200, "OK");
+    o += n;
+    n = mq_http1_write_header(head + o, sizeof(head) - o, "Connection", "close");
+    o += n;
+    n = mq_http1_write_header(head + o, sizeof(head) - o, "Content-Length", "0");
+    o += n;
+    head[o++] = '\r';
+    head[o++] = '\n';
+    mq_fetch_conn_write(g->handle, head, (size_t)o);
+    mq_fetch_conn_finish(g->handle);
+}
+
+/* Feed as much of a large response body as the output queue accepts, stopping
+ * when mq_fetch_conn_write returns 0 (high watermark). When all bytes are
+ * accepted, finish. Drives the high-watermark/drain test. */
+static void
+big_pump(struct fake_gw *g)
+{
+    static const uint8_t chunk[8192] = {'A'};
+    while (g->big_sent < g->big_total) {
+        size_t want = g->big_total - g->big_sent;
+        if (want > sizeof(chunk)) want = sizeof(chunk);
+        int rc = mq_fetch_conn_write(g->handle, chunk, want);
+        if (rc < 0) return; /* handle dead */
+        g->big_sent += want;
+        if (rc == 0) {
+            g->saw_zero_return = 1;
+            return; /* high watermark: wait for drain_cb */
+        }
+    }
+    mq_fetch_conn_finish(g->handle);
+}
+
+static void
+big_drain_cb(void *user)
+{
+    struct fake_gw *g = (struct fake_gw *)user;
+    g->drain_fired = 1;
+    big_pump(g);
+}
+
 static void
 fake_on_body_done(void *req_ctx)
 {
     struct fake_gw *g = (struct fake_gw *)req_ctx;
     g->on_body_done_called++;
+    if (g->write_small_200_on_done) {
+        write_small_200_and_finish(g);
+        return;
+    }
+    if (g->write_big_on_done) {
+        /* Write a head with a large Content-Length, then stream the body,
+         * exercising the high watermark and drain callback. */
+        char head[128];
+        int o = 0, n;
+        n = mq_http1_write_status(head + o, sizeof(head) - o, 200, "OK");
+        o += n;
+        n = mq_http1_write_header(head + o, sizeof(head) - o, "Connection", "close");
+        o += n;
+        char cl[32];
+        snprintf(cl, sizeof(cl), "%zu", g->big_total);
+        n = mq_http1_write_header(head + o, sizeof(head) - o, "Content-Length", cl);
+        o += n;
+        head[o++] = '\r';
+        head[o++] = '\n';
+        mq_fetch_conn_write(g->handle, head, (size_t)o);
+        mq_fetch_conn_set_drain_cb(g->handle, big_drain_cb, g);
+        big_pump(g);
+        return;
+    }
     if (g->write_echo_reply) {
         char head[128];
         int o = 0, n;
@@ -486,12 +568,19 @@ test_backpressure(struct event_base *base)
     mq_fetch_listener_free(l);
 }
 
-/* ── Scenario 7: oversize body ──────────────────────────────────────────── */
+/* ── Scenario 7: oversize body (trailing garbage after a complete body) ──────
+ *
+ * Trailing bytes past Content-Length are a peer protocol violation, but the
+ * request body is FULLY received: on_body_done fires, the gateway writes its
+ * response, and that response must still flush to the client. The listener must
+ * NOT fire on_aborted (that contract is "peer died BEFORE CL") and must NOT yank
+ * the conn from the read path — teardown is the gateway's finish()/abort(). */
 static void
 test_oversize_body(struct event_base *base)
 {
     struct fake_gw g;
     memset(&g, 0, sizeof(g));
+    g.write_small_200_on_done = 1; /* gateway responds after the body completes */
     mq_fetch_cbs_t cbs = fake_cbs();
     mq_fetch_listener_t *l = mq_fetch_listener_new(base, "127.0.0.1", 0, &cbs, &g);
     MQ_CHECK(l != NULL);
@@ -506,17 +595,106 @@ test_oversize_body(struct event_base *base)
     send_all(c, head, strlen(head));
     send_all(c, "HELLOgarbage", 12);
 
-    pump_a_bit(base, 200);
+    /* The gateway's 200 (written from on_body_done) must reach the client. */
+    uint8_t reply[256] = {0};
+    size_t got = pump_read_all(base, c, reply, sizeof(reply), 2000);
 
-    /* on_body saw exactly CL=5 bytes; the conn was aborted (oversize). The
-     * listener fires on_aborted on the oversize path. */
+    /* on_body saw exactly CL=5 bytes; on_body_done fired exactly once. The
+     * trailing garbage must NOT fire on_aborted and must NOT discard the
+     * gateway's response. */
     MQ_CHECK_EQ_INT(g.on_request_called, 1);
     MQ_CHECK_EQ_INT(g.body_len, 5);
     MQ_CHECK_MEM(g.body, "HELLO", 5);
-    MQ_CHECK_EQ_INT(g.on_body_done_called, 1); /* exactly CL delivered first */
-    MQ_CHECK_EQ_INT(g.on_aborted_called, 1);   /* then the overflow aborts */
-    MQ_CHECK(pump_until_eof(base, c, 1000));
+    MQ_CHECK_EQ_INT(g.on_body_done_called, 1); /* exactly CL delivered */
+    MQ_CHECK_EQ_INT(g.on_aborted_called, 0);   /* NOT aborted: body was complete */
+    MQ_CHECK(got > 0);
+    MQ_CHECK_MEM(reply, "HTTP/1.1 200", 12); /* gateway response still flushed */
 
+    close(c);
+    pump_a_bit(base, 50);
+    mq_fetch_listener_free(l);
+}
+
+/* ── Scenario 8: free listener with a live mid-body conn ─────────────────────
+ *
+ * mq_fetch_listener_free must tear down a connection that is still mid-body
+ * (head parsed, on_request fired, body incomplete) without crashing or leaking
+ * (verified under ASan). No on_aborted is required here — free is a hard
+ * shutdown, not a peer EOF. */
+static void
+test_free_live_conn(struct event_base *base)
+{
+    struct fake_gw g;
+    memset(&g, 0, sizeof(g));
+    mq_fetch_cbs_t cbs = fake_cbs();
+    mq_fetch_listener_t *l = mq_fetch_listener_new(base, "127.0.0.1", 0, &cbs, &g);
+    MQ_CHECK(l != NULL);
+    uint16_t port = mq_fetch_listener_port(l);
+
+    int c = dial(port);
+    MQ_CHECK(c >= 0);
+
+    const char *head = "POST /_mqproxy/fetch HTTP/1.1\r\nHost: x\r\n"
+                       "Content-Length: 1000\r\n\r\n";
+    send_all(c, head, strlen(head));
+    send_all(c, "0123456789", 10); /* partial body: conn stays mid-body */
+    pump_a_bit(base, 100);
+
+    /* The conn is alive and mid-body. */
+    MQ_CHECK_EQ_INT(g.on_request_called, 1);
+    MQ_CHECK_EQ_INT(g.on_body_done_called, 0);
+
+    /* Free with the conn still live: must not crash / leak. */
+    mq_fetch_listener_free(l);
+
+    close(c);
+    pump_a_bit(base, 50);
+}
+
+/* ── Scenario 9: high watermark + drain ──────────────────────────────────────
+ *
+ * The gateway writes more than the high watermark, so mq_fetch_conn_write
+ * returns 0 at least once; the drain callback then fires and the write
+ * completes. */
+static void
+test_highwater_drain(struct event_base *base)
+{
+    struct fake_gw g;
+    memset(&g, 0, sizeof(g));
+    g.write_big_on_done = 1;
+    /* Far larger than any plausible loopback socket buffer, so the output queue
+     * is forced past the 256 KiB high watermark while the client is not being
+     * read. The gateway stops feeding at the watermark (queue stays ~256 KiB,
+     * well under the 4 MiB ceiling regardless of this total). */
+    g.big_total = 8 * 1024 * 1024;
+    mq_fetch_cbs_t cbs = fake_cbs();
+    mq_fetch_listener_t *l = mq_fetch_listener_new(base, "127.0.0.1", 0, &cbs, &g);
+    MQ_CHECK(l != NULL);
+    uint16_t port = mq_fetch_listener_port(l);
+
+    int c = dial(port);
+    MQ_CHECK(c >= 0);
+
+    const char *head = "POST /_mqproxy/fetch HTTP/1.1\r\nHost: x\r\n"
+                       "Content-Length: 0\r\n\r\n";
+    send_all(c, head, strlen(head));
+
+    /* Drain the client slowly enough that the queue actually crosses the high
+     * watermark first (pump a few times before reading everything). */
+    pump_a_bit(base, 50);
+
+    uint8_t *reply = malloc(g.big_total + 1024);
+    MQ_CHECK(reply != NULL);
+    size_t got = pump_read_all(base, c, reply, g.big_total + 1024, 4000);
+
+    MQ_CHECK_EQ_INT(g.on_body_done_called, 1);
+    MQ_CHECK_EQ_INT(g.saw_zero_return, 1); /* high watermark was hit */
+    MQ_CHECK_EQ_INT(g.drain_fired, 1);     /* drain cb fired */
+    MQ_CHECK_EQ_INT(g.big_sent, g.big_total);
+    MQ_CHECK(got >= g.big_total); /* full body reached the client */
+    MQ_CHECK_MEM(reply, "HTTP/1.1 200", 12);
+
+    free(reply);
     close(c);
     pump_a_bit(base, 50);
     mq_fetch_listener_free(l);
@@ -536,6 +714,8 @@ run_all(void)
     test_mid_body_abort(base);
     test_backpressure(base);
     test_oversize_body(base);
+    test_free_live_conn(base);
+    test_highwater_drain(base);
 
     event_base_free(base);
 }
