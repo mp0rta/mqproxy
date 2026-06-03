@@ -18,6 +18,7 @@
 #define MQ_PROXY_MQ_SERVER_H
 
 #include "runtime/mq_runtime_libevent.h"
+#include "transport/mq_conn.h" /* mq_cc_t */
 #include "transport/mq_transport.h"
 
 typedef struct mq_server_s mq_server_t;
@@ -26,7 +27,8 @@ typedef struct mq_server_s mq_server_t;
  * (libevent base for origin-fd relays) that expects `auth_token`. Registers the
  * ALPN + on_new_conn/on_new_stream hooks. The token string is copied. Returns
  * NULL on bad args / OOM / ALPN registration failure. */
-mq_server_t *mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token);
+mq_server_t *mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token,
+                           mq_cc_t cc);
 
 /* Total number of control-stream auth attempts processed across all
  * connections (test/observability hook). */

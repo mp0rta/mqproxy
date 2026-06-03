@@ -137,7 +137,7 @@ fixture_up(fixture_t *f)
     f->srv_rt = mq_runtime_new(f->srv_t, f->base);
     MQ_CHECK(f->srv_rt != NULL);
     if (!f->srv_rt) return -1;
-    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret");
+    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2);
     MQ_CHECK(f->server != NULL);
     if (!f->server) return -1;
 
@@ -153,8 +153,8 @@ fixture_up(fixture_t *f)
 
     MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->cli_rt, "127.0.0.1", 0), 0);
 
-    f->client =
-        mq_client_new(f->cli_t, f->cli_rt, "127.0.0.1", port, "client-1", "secret");
+    f->client = mq_client_new(f->cli_t, f->cli_rt, "127.0.0.1", port, "client-1",
+                              "secret", MQ_CC_BBR2);
     MQ_CHECK(f->client != NULL);
     if (!f->client) return -1;
 

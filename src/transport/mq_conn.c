@@ -433,8 +433,46 @@ mq_conn_dump_stats(mq_conn_t *c)
     free(st.paths_info);
 }
 
+mq_cc_t
+mq_cc_from_string(const char *name, int *ok)
+{
+    struct {
+        const char *name;
+        mq_cc_t cc;
+    } table[] = {
+        {"bbr2", MQ_CC_BBR2},
+        {"bbr", MQ_CC_BBR},
+        {"cubic", MQ_CC_CUBIC},
+    };
+    if (name) {
+        for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+            if (strcmp(name, table[i].name) == 0) {
+                if (ok) {
+                    *ok = 1;
+                }
+                return table[i].cc;
+            }
+        }
+    }
+    if (ok) {
+        *ok = 0;
+    }
+    return MQ_CC_BBR2;
+}
+
+const char *
+mq_cc_name(mq_cc_t cc)
+{
+    switch (cc) {
+    case MQ_CC_BBR: return "bbr";
+    case MQ_CC_CUBIC: return "cubic";
+    case MQ_CC_BBR2:
+    default: return "bbr2";
+    }
+}
+
 void
-mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server)
+mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server, mq_cc_t cc)
 {
     if (!s) {
         return;
@@ -456,8 +494,14 @@ mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server)
      * INVISIBLE on clean loopback or under ASan (the sanitizer's slowdown keeps
      * the send rate below the link rate), which is why it only surfaced in the
      * shaped 1-B benchmark. Applies to both sides; the download sender (server)
-     * needs it most. */
-    s->cong_ctrl_callback = xqc_bbr2_cb;
+     * needs it most. BBR2 is the default; --cc selects bbr/cubic for
+     * benchmarking. */
+    switch (cc) {
+    case MQ_CC_BBR: s->cong_ctrl_callback = xqc_bbr_cb; break;
+    case MQ_CC_CUBIC: s->cong_ctrl_callback = xqc_cubic_cb; break;
+    case MQ_CC_BBR2:
+    default: s->cong_ctrl_callback = xqc_bbr2_cb; break;
+    }
 
     /* Scheduler: minRTT. A single proxied flow is ONE QUIC stream, so we want
      * its packets spread across paths by RTT (within-stream multipath) to

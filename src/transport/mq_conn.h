@@ -27,6 +27,26 @@
 #include "transport/mq_stream.h"
 #include "transport/mq_transport.h"
 
+/* ── Congestion control selection ───────────────────────────────────────────
+ *
+ * Which xquic congestion-control algorithm the proxy installs on its conn
+ * settings. BBR2 is the default (best for bandwidth aggregation on lossy/shaped
+ * paths); BBR / CUBIC are selectable (e.g. CLI --cc) for benchmarking and A/B
+ * comparison. Maps to xqc_{bbr2,bbr,cubic}_cb in mq_conn_apply_mp_settings.
+ * (reno/copa are #ifdef-gated out of this xquic build, so not exposed.) */
+typedef enum {
+    MQ_CC_BBR2 = 0, /* default */
+    MQ_CC_BBR = 1,
+    MQ_CC_CUBIC = 2,
+} mq_cc_t;
+
+/* Parse a CC name ("bbr2"/"bbr"/"cubic") into mq_cc_t. On an unknown name
+ * returns MQ_CC_BBR2 and sets *ok=0 (if ok!=NULL); on a known name *ok=1. */
+mq_cc_t mq_cc_from_string(const char *name, int *ok);
+
+/* Human-readable name for logging ("bbr2"/"bbr"/"cubic"). */
+const char *mq_cc_name(mq_cc_t cc);
+
 /* ── Flow-control window sizing (aggregate-BDP target) ──────────────────────
  *
  * The proxy aggregates throughput across multiple paths, so the receive
@@ -68,7 +88,7 @@ _Static_assert(MQ_STREAM_WINDOW <= MQ_XQUIC_MAX_RECV_WINDOW,
  * memset() xqc_conn_settings_t. `is_server` selects the server-only
  * PATHS_BLOCKED auto-grant (max_path_id_grant_max_value). Call after setting
  * proto_version / cc / pacing etc. */
-void mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server);
+void mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server, mq_cc_t cc);
 
 typedef struct mq_conn_s mq_conn_t;
 

@@ -140,7 +140,7 @@ fixture_up(fixture_t *f, const char *client_token)
     f->srv_rt = mq_runtime_new(f->srv_t, f->base);
     MQ_CHECK(f->srv_rt != NULL);
     if (!f->srv_rt) return -1;
-    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret");
+    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2);
     MQ_CHECK(f->server != NULL);
     if (!f->server) return -1;
 
@@ -156,8 +156,8 @@ fixture_up(fixture_t *f, const char *client_token)
 
     MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->cli_rt, "127.0.0.1", 0), 0);
 
-    f->client =
-        mq_client_new(f->cli_t, f->cli_rt, "127.0.0.1", port, "client-1", client_token);
+    f->client = mq_client_new(f->cli_t, f->cli_rt, "127.0.0.1", port, "client-1",
+                              client_token, MQ_CC_BBR2);
     MQ_CHECK(f->client != NULL);
     if (!f->client) return -1;
     mq_client_set_on_auth(f->client, on_auth, NULL);
@@ -701,7 +701,7 @@ test_data_stream_preauth_reset(void)
     mq_runtime_t *srv_rt = srv_t ? mq_runtime_new(srv_t, base) : NULL;
     MQ_CHECK(srv_rt != NULL);
     mq_server_t *server =
-        (srv_t && srv_rt) ? mq_server_new(srv_t, srv_rt, "secret") : NULL;
+        (srv_t && srv_rt) ? mq_server_new(srv_t, srv_rt, "secret", MQ_CC_BBR2) : NULL;
     MQ_CHECK(server != NULL);
 
     int srv_bound = srv_rt ? mq_runtime_open_udp_path(srv_rt, "127.0.0.1", srv_port) : -1;

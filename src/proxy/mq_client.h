@@ -37,7 +37,7 @@ typedef void (*mq_client_on_auth_fn)(int ok, mq_auth_err_t err, void *user);
  * poll timer. The strings are copied. Returns NULL on bad args / OOM. */
 mq_client_t *mq_client_new(mq_transport_t *t, mq_runtime_t *rt, const char *server_ip,
                            uint16_t server_port, const char *client_id,
-                           const char *auth_token);
+                           const char *auth_token, mq_cc_t cc);
 
 /* Register the auth-result callback (call before mq_client_start). */
 void mq_client_set_on_auth(mq_client_t *c, mq_client_on_auth_fn fn, void *user);

@@ -99,6 +99,7 @@ typedef struct mq_client_data_s mq_client_data_t;
 struct mq_client_s {
     mq_transport_t *transport;
     mq_runtime_t *rt;
+    mq_cc_t cc; /* congestion control for this client's conn */
     char server_ip[64];
     uint16_t server_port;
 
@@ -533,7 +534,8 @@ forward:
 
 mq_client_t *
 mq_client_new(mq_transport_t *t, mq_runtime_t *rt, const char *server_ip,
-              uint16_t server_port, const char *client_id, const char *auth_token)
+              uint16_t server_port, const char *client_id, const char *auth_token,
+              mq_cc_t cc)
 {
     if (!t || !rt || !server_ip || !client_id || !auth_token) {
         return NULL;
@@ -544,6 +546,7 @@ mq_client_new(mq_transport_t *t, mq_runtime_t *rt, const char *server_ip,
     }
     c->transport = t;
     c->rt = rt;
+    c->cc = cc;
     c->server_port = server_port;
     snprintf(c->server_ip, sizeof(c->server_ip), "%s", server_ip);
 
@@ -606,7 +609,7 @@ mq_client_start(mq_client_t *c)
     settings.pacing_on = 1;
     settings.max_pkt_out_size = 1200;
     /* Multipath + aggregate-BDP flow-control windows (see mq_conn.h). */
-    mq_conn_apply_mp_settings(&settings, /*is_server=*/0);
+    mq_conn_apply_mp_settings(&settings, /*is_server=*/0, c->cc);
 
     c->conn = mq_conn_connect(c->transport, (struct sockaddr *)&sa, sizeof(sa),
                               MQ_CLIENT_ALPN, &settings, c);

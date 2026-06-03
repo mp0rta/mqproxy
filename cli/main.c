@@ -86,6 +86,8 @@ usage_server(FILE *out)
                  "                      test key when omitted.\n"
                  "  --qlog   <dir>      Write xquic qlog (EXTRA importance) to "
                  "<dir>/server.qlog.\n"
+                 "  --cc     <algo>     Congestion control: bbr2 (default) | bbr | "
+                 "cubic.\n"
                  "  -h, --help          Show this help and exit.\n");
 }
 
@@ -116,6 +118,8 @@ usage_client(FILE *out)
                  "  --qlog         <dir>       Write xquic qlog (EXTRA importance) to "
                  "<dir>/client.qlog\n"
                  "                             (the 1-B blocked-frame instrument).\n"
+                 "  --cc           <algo>      Congestion control: bbr2 (default) | bbr "
+                 "| cubic.\n"
                  "  -h, --help                 Show this help and exit.\n");
 }
 
@@ -208,14 +212,17 @@ cmd_server(int argc, char **argv)
     const char *cert = NULL;
     const char *key = NULL;
     const char *qlog_dir = NULL;
+    const char *cc_name = NULL;
+    mq_cc_t cc = MQ_CC_BBR2;
 
-    enum { OPT_LISTEN = 256, OPT_TOKEN, OPT_CERT, OPT_KEY, OPT_QLOG };
+    enum { OPT_LISTEN = 256, OPT_TOKEN, OPT_CERT, OPT_KEY, OPT_QLOG, OPT_CC };
     static const struct option longopts[] = {
         {"listen", required_argument, NULL, OPT_LISTEN},
         {"token", required_argument, NULL, OPT_TOKEN},
         {"cert", required_argument, NULL, OPT_CERT},
         {"key", required_argument, NULL, OPT_KEY},
         {"qlog", required_argument, NULL, OPT_QLOG},
+        {"cc", required_argument, NULL, OPT_CC},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -229,8 +236,20 @@ cmd_server(int argc, char **argv)
         case OPT_CERT: cert = optarg; break;
         case OPT_KEY: key = optarg; break;
         case OPT_QLOG: qlog_dir = optarg; break;
+        case OPT_CC: cc_name = optarg; break;
         case 'h': usage_server(stdout); return 0;
         default: usage_server(stderr); return 2;
+        }
+    }
+
+    if (cc_name) {
+        int ok = 0;
+        cc = mq_cc_from_string(cc_name, &ok);
+        if (!ok) {
+            fprintf(stderr, "mqproxy server: invalid --cc '%s' (bbr2|bbr|cubic)\n\n",
+                    cc_name);
+            usage_server(stderr);
+            return 2;
         }
     }
 
@@ -296,7 +315,7 @@ cmd_server(int argc, char **argv)
         MQ_LOGE("failed to bind listen path %s:%u", listen_ip, listen_port);
         goto out;
     }
-    server = mq_server_new(transport, rt, token);
+    server = mq_server_new(transport, rt, token, cc);
     if (!server) {
         MQ_LOGE("failed to create server");
         goto out;
@@ -306,7 +325,8 @@ cmd_server(int argc, char **argv)
         goto out;
     }
 
-    MQ_LOGI("mqproxy server listening on %s:%u", listen_ip, listen_port);
+    MQ_LOGI("mqproxy server listening on %s:%u (cc=%s)", listen_ip, listen_port,
+            mq_cc_name(cc));
     mq_runtime_run(rt);
     rc = 0;
 
@@ -344,6 +364,8 @@ cmd_client(int argc, char **argv)
     const char *http_connect = NULL;
     const char *client_id = "mqproxy";
     const char *qlog_dir = NULL;
+    const char *cc_name = NULL;
+    mq_cc_t cc = MQ_CC_BBR2;
     const char *paths[MQ_MAX_EXTRA_PATHS];
     size_t npaths = 0;
 
@@ -355,6 +377,7 @@ cmd_client(int argc, char **argv)
         OPT_PATH,
         OPT_CLIENT_ID,
         OPT_QLOG,
+        OPT_CC,
     };
     static const struct option longopts[] = {
         {"server", required_argument, NULL, OPT_SERVER},
@@ -364,6 +387,7 @@ cmd_client(int argc, char **argv)
         {"path", required_argument, NULL, OPT_PATH},
         {"client-id", required_argument, NULL, OPT_CLIENT_ID},
         {"qlog", required_argument, NULL, OPT_QLOG},
+        {"cc", required_argument, NULL, OPT_CC},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -386,8 +410,20 @@ cmd_client(int argc, char **argv)
             break;
         case OPT_CLIENT_ID: client_id = optarg; break;
         case OPT_QLOG: qlog_dir = optarg; break;
+        case OPT_CC: cc_name = optarg; break;
         case 'h': usage_client(stdout); return 0;
         default: usage_client(stderr); return 2;
+        }
+    }
+
+    if (cc_name) {
+        int ok = 0;
+        cc = mq_cc_from_string(cc_name, &ok);
+        if (!ok) {
+            fprintf(stderr, "mqproxy client: invalid --cc '%s' (bbr2|bbr|cubic)\n\n",
+                    cc_name);
+            usage_client(stderr);
+            return 2;
         }
     }
 
@@ -475,7 +511,7 @@ cmd_client(int argc, char **argv)
     }
     /* Window + multipath conn settings are applied inside mq_client_new
      * (mq_conn_apply_mp_settings). */
-    client = mq_client_new(transport, rt, server_ip, server_port, client_id, token);
+    client = mq_client_new(transport, rt, server_ip, server_port, client_id, token, cc);
     if (!client) {
         MQ_LOGE("failed to create client");
         goto out;
@@ -518,9 +554,10 @@ cmd_client(int argc, char **argv)
         goto out;
     }
 
-    MQ_LOGI("mqproxy client: server=%s:%u socks5=%s:%u%s%s%s (bind %s)", server_ip,
+    MQ_LOGI("mqproxy client: server=%s:%u socks5=%s:%u%s%s%s (bind %s, cc=%s)", server_ip,
             server_port, socks5_ip, socks5_port, http_connect ? " http-connect=" : "",
-            http_connect ? http_ip : "", http_connect ? "" : "", primary_ip);
+            http_connect ? http_ip : "", http_connect ? "" : "", primary_ip,
+            mq_cc_name(cc));
     mq_runtime_run(rt);
     rc = 0;
 
