@@ -410,6 +410,18 @@ mq_transport_on_udp_recv(mq_transport_t *t, uint64_t path, const uint8_t *pkt, s
 void
 mq_transport_tick(mq_transport_t *t)
 {
+    if (!t) {
+        return;
+    }
+    /* Clear any previously-recorded deadline BEFORE running the engine. xquic
+     * only calls set_event_timer when it wants a (re)wakeup; main_logic below
+     * re-arms the deadline via set_event_timer iff it still has pending work.
+     * Without this clear, a stale (already-elapsed) deadline makes
+     * next_timeout_ms return 0 forever, so the runtime re-arms a 0ms timer in a
+     * tight loop and spins at 100% CPU (a perpetually self-re-adding 0ms libevent
+     * timer never lets event_base_loop return). This mirrors the old mq_engine
+     * one-shot timer that was armed only on demand by set_event_timer. */
+    t->have_deadline = 0;
     xqc_engine_main_logic(t->engine);
 }
 
