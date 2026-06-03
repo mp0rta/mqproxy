@@ -86,7 +86,7 @@ usage_server(FILE *out)
                  "                      test key when omitted.\n"
                  "  --qlog   <dir>      Write xquic qlog (EXTRA importance) to "
                  "<dir>/server.qlog.\n"
-                 "  --cc     <algo>     Congestion control: bbr2 (default) | bbr | "
+                 "  --cc     <algo>     Congestion control: bbr (default) | bbr2 | "
                  "cubic.\n"
                  "  -h, --help          Show this help and exit.\n");
 }
@@ -118,7 +118,7 @@ usage_client(FILE *out)
                  "  --qlog         <dir>       Write xquic qlog (EXTRA importance) to "
                  "<dir>/client.qlog\n"
                  "                             (the 1-B blocked-frame instrument).\n"
-                 "  --cc           <algo>      Congestion control: bbr2 (default) | bbr "
+                 "  --cc           <algo>      Congestion control: bbr (default) | bbr2 "
                  "| cubic.\n"
                  "  -h, --help                 Show this help and exit.\n");
 }
@@ -213,7 +213,7 @@ cmd_server(int argc, char **argv)
     const char *key = NULL;
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
-    mq_cc_t cc = MQ_CC_BBR2;
+    mq_cc_t cc = MQ_CC_DEFAULT;
 
     enum { OPT_LISTEN = 256, OPT_TOKEN, OPT_CERT, OPT_KEY, OPT_QLOG, OPT_CC };
     static const struct option longopts[] = {
@@ -365,7 +365,7 @@ cmd_client(int argc, char **argv)
     const char *client_id = "mqproxy";
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
-    mq_cc_t cc = MQ_CC_BBR2;
+    mq_cc_t cc = MQ_CC_DEFAULT;
     const char *paths[MQ_MAX_EXTRA_PATHS];
     size_t npaths = 0;
 

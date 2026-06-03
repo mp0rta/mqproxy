@@ -30,18 +30,23 @@
 /* ── Congestion control selection ───────────────────────────────────────────
  *
  * Which xquic congestion-control algorithm the proxy installs on its conn
- * settings. BBR2 is the default (best for bandwidth aggregation on lossy/shaped
- * paths); BBR / CUBIC are selectable (e.g. CLI --cc) for benchmarking and A/B
- * comparison. Maps to xqc_{bbr2,bbr,cubic}_cb in mq_conn_apply_mp_settings.
- * (reno/copa are #ifdef-gated out of this xquic build, so not exposed.) */
+ * settings. BBR is the default (MQ_CC_DEFAULT) — it gave the best single-path
+ * throughput in the shaped 1-B benchmark; BBR2 / CUBIC are selectable (e.g. CLI
+ * --cc) for benchmarking and A/B comparison. Maps to xqc_{bbr2,bbr,cubic}_cb in
+ * mq_conn_apply_mp_settings. (reno/copa are #ifdef-gated out of this xquic
+ * build, so not exposed.) */
 typedef enum {
-    MQ_CC_BBR2 = 0, /* default */
+    MQ_CC_BBR2 = 0,
     MQ_CC_BBR = 1,
     MQ_CC_CUBIC = 2,
 } mq_cc_t;
 
+/* The policy default CC used when none is explicitly selected (CLI --cc unset).
+ * The enum numeric values are independent of this. */
+#define MQ_CC_DEFAULT MQ_CC_BBR
+
 /* Parse a CC name ("bbr2"/"bbr"/"cubic") into mq_cc_t. On an unknown name
- * returns MQ_CC_BBR2 and sets *ok=0 (if ok!=NULL); on a known name *ok=1. */
+ * returns MQ_CC_DEFAULT and sets *ok=0 (if ok!=NULL); on a known name *ok=1. */
 mq_cc_t mq_cc_from_string(const char *name, int *ok);
 
 /* Human-readable name for logging ("bbr2"/"bbr"/"cubic"). */

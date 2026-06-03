@@ -457,7 +457,7 @@ mq_cc_from_string(const char *name, int *ok)
     if (ok) {
         *ok = 0;
     }
-    return MQ_CC_BBR2;
+    return MQ_CC_DEFAULT;
 }
 
 const char *
@@ -494,8 +494,8 @@ mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server, mq_cc_t cc)
      * INVISIBLE on clean loopback or under ASan (the sanitizer's slowdown keeps
      * the send rate below the link rate), which is why it only surfaced in the
      * shaped 1-B benchmark. Applies to both sides; the download sender (server)
-     * needs it most. BBR2 is the default; --cc selects bbr/cubic for
-     * benchmarking. */
+     * needs it most. BBR is the default (MQ_CC_DEFAULT); --cc selects
+     * bbr2/cubic for benchmarking. */
     switch (cc) {
     case MQ_CC_BBR: s->cong_ctrl_callback = xqc_bbr_cb; break;
     case MQ_CC_CUBIC: s->cong_ctrl_callback = xqc_cubic_cb; break;
