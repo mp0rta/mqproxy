@@ -69,6 +69,9 @@ find_head_end(const uint8_t *buf, size_t len)
 /* ---------------------------------------------------------------------------
  * Content-Length parse: strict decimal into [0, INT64_MAX]. Returns 0 on
  * success (writes *out), -1 on any error (empty / non-digit / overflow).
+ * Leading zeros are accepted by design: the numeric value is unambiguous
+ * ("007" == 7), and rejecting them would add complexity with no security gain
+ * on this trust boundary.
  * ------------------------------------------------------------------------- */
 static int
 parse_content_length(const char *s, size_t sl, int64_t *out)
@@ -158,7 +161,22 @@ mq_http1_parse_req(const uint8_t *buf, size_t len, mq_http1_req_t *out)
     size_t path_len = path_end - path_start;
     if (path_len >= sizeof(out->path)) return MQ_HTTP1_BAD; /* +1 for NUL */
 
-    /* version field: "HTTP/" prefix, non-empty */
+    /* Reject any control byte (< 0x20) or DEL (0x7f) in the path span.
+     * A NUL byte would silently truncate the NUL-terminated out->path, so
+     * downstream strlen consumers would see a different path than the wire
+     * (NUL-injection / path-confusion vector).  Other bytes < 0x20 and 0x7f
+     * are in the same injection class as the NUL/CR guard on header values. */
+    for (size_t i = path_start; i < path_end; i++) {
+        unsigned char b = (unsigned char)p[i];
+        if (b < 0x20 || b == 0x7f) return MQ_HTTP1_BAD;
+    }
+
+    /* Method span: is_tchar() already rejects every byte < 0x20 and 0x7f
+     * (including NUL), so no additional check is needed here. */
+
+    /* Version field: validated only as "HTTP/"-prefixed and non-empty; the
+     * gateway never branches on the minor version number (HTTP/1.0 vs 1.1
+     * distinction is handled by the caller, not here). */
     size_t v_start = path_end + 1;
     if (v_start >= line_end) return MQ_HTTP1_BAD;
     if (line_end - v_start < 5 || memcmp(p + v_start, "HTTP/", 5) != 0)

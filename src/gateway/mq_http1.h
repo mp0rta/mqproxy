@@ -80,7 +80,11 @@ int mq_http1_write_status(char *dst, size_t cap, int code, const char *reason);
 int mq_http1_write_header(char *dst, size_t cap, const char *n, const char *v);
 
 /* "<lowercase-hex-len>\r\n<data>\r\n". Returns bytes written, or 0 if cap is
- * too small to hold the whole frame. */
+ * too small to hold the whole frame.
+ *
+ * len==0 emits the "0\r\n\r\n" last-chunk terminator (5 bytes).  Callers
+ * framing a normal body chunk MUST NOT pass len==0 unless they intend to
+ * signal end-of-chunked-body. */
 size_t mq_http1_chunk_frame(char *dst, size_t cap, const uint8_t *p, size_t len);
 
 #endif

@@ -406,6 +406,46 @@ test_dup_headers_preserved(void)
     MQ_CHECK_MEM(r.h[1].v, "b", 1);
 }
 
+/* ---- embedded NUL in path → BAD (NUL-injection/truncation vector) ---- */
+static void
+test_path_nul(void)
+{
+    /* "GET /a\0b HTTP/1.1\r\n\r\n" — must use sizeof, not strlen. */
+    static const char REQ[] = "GET /a\0b HTTP/1.1\r\n\r\n";
+    size_t len = sizeof(REQ) - 1;
+    mq_http1_req_t r;
+    mq_http1_status_t st = mq_http1_parse_req((const uint8_t *)REQ, len, &r);
+    MQ_CHECK_EQ_INT(st, MQ_HTTP1_BAD);
+}
+
+/* ---- control byte 0x1f in path → BAD (same injection class) ---- */
+static void
+test_path_ctrl_1f(void)
+{
+    /* "GET /a\x1fb HTTP/1.1\r\n\r\n" — split to avoid \x1fb being treated as
+     * a single (out-of-range) hex escape. */
+    static const char REQ[] = "GET /a\x1f"
+                              "b HTTP/1.1\r\n\r\n";
+    size_t len = sizeof(REQ) - 1;
+    mq_http1_req_t r;
+    mq_http1_status_t st = mq_http1_parse_req((const uint8_t *)REQ, len, &r);
+    MQ_CHECK_EQ_INT(st, MQ_HTTP1_BAD);
+}
+
+/* ---- DEL (0x7f) in path → BAD (same injection class) ---- */
+static void
+test_path_del(void)
+{
+    /* "GET /a\x7fb HTTP/1.1\r\n\r\n" — split to avoid \x7fb being treated as
+     * a single (out-of-range) hex escape by some compilers. */
+    static const char REQ[] = "GET /a\x7f"
+                              "b HTTP/1.1\r\n\r\n";
+    size_t len = sizeof(REQ) - 1;
+    mq_http1_req_t r;
+    mq_http1_status_t st = mq_http1_parse_req((const uint8_t *)REQ, len, &r);
+    MQ_CHECK_EQ_INT(st, MQ_HTTP1_BAD);
+}
+
 /* ---- oversized path (> path buffer) → BAD ---- */
 static void
 test_path_too_long(void)
@@ -532,6 +572,9 @@ MQ_TEST_MAIN({
     test_method_too_long();
     test_method_non_token();
     test_path_not_slash();
+    test_path_nul();
+    test_path_ctrl_1f();
+    test_path_del();
     test_cl_dup_identical();
     test_cl_dup_differing();
     test_cl_non_numeric();
