@@ -99,6 +99,14 @@ mq_h3_conn_t *mq_h3_connect(mq_h3_t *h, const struct sockaddr *peer, socklen_t p
  * Client conns only. */
 int mq_h3_conn_mp_ready(const mq_h3_conn_t *c);
 
+/* Re-point (or DETACH, with st==NULL) this conn's lifecycle callback. The owner
+ * MUST call this with st==NULL before it frees the `user` it passed to
+ * mq_h3_connect, if the owner can be freed while the conn is still alive: the
+ * conn outlives mq_h3_connect's caller and its close transition fires during
+ * mq_h3_free / engine teardown, so a dangling `user` would be a use-after-free.
+ * Safe on NULL. */
+void mq_h3_conn_set_state_cb(mq_h3_conn_t *c, mq_h3_conn_state_fn st, void *user);
+
 /* Create a NEW MPQUIC path bound to local_ip:port (port 0 == ephemeral), open
  * its UDP socket via the transport, and mark it available. MUST be called after
  * mq_h3_conn_mp_ready(c) == 1. Returns the new path_id (>0) or -1 on failure.

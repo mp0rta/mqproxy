@@ -579,6 +579,16 @@ mq_h3_conn_mp_ready(const mq_h3_conn_t *c)
     return c ? c->mp_ready : 0;
 }
 
+void
+mq_h3_conn_set_state_cb(mq_h3_conn_t *c, mq_h3_conn_state_fn st, void *user)
+{
+    if (!c) {
+        return;
+    }
+    c->on_state = st;
+    c->on_state_user = user;
+}
+
 int
 mq_h3_conn_add_path(mq_h3_conn_t *c, const char *local_ip, uint16_t port)
 {

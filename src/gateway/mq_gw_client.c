@@ -41,6 +41,14 @@
  * side dies we learn it either via on_aborted (explicit) or via a handle op
  * returning -1 (the listener handle is dead) — we treat a -1 from any write/
  * resume as "local dead" and reset the tunnel.
+ *
+ * HANDLE INVARIANT: r->handle is set exactly once (at accept) and is nulled in
+ * the SAME step that sets r->local_dead=1 (every such site does both). Therefore
+ * `!r->local_dead` ⟹ `r->handle != NULL`. Code that has already established
+ * `!r->local_dead` (e.g. download_pump, which returns early if local_dead) may
+ * call mq_fetch_conn_* on r->handle WITHOUT a redundant NULL guard. The few
+ * `if (r->handle)` guards that remain are at points reachable independent of
+ * that early check and are kept for defence-in-depth.
  */
 #include "gateway/mq_gw_client.h"
 
@@ -88,13 +96,12 @@ typedef struct mq_gw_req_s {
     int h3_dead;
 
     /* ── upload (junction #1) ── */
-    int64_t cl_remaining; /* CL bytes not yet handed to send_body; <0 == no body */
-    int upload_fin_sent;  /* the request's fin has been sent on the H3 side */
-    int upload_done;      /* on_body_done fired (listener will deliver no more) */
-    int paused;           /* we returned -1 to pause the listener read */
-    uint8_t *spill;       /* heap spill buffer (allocated lazily) */
-    size_t spill_len;     /* valid bytes in spill */
-    size_t spill_off;     /* bytes already flushed from spill */
+    int upload_fin_sent; /* the request's fin has been sent on the H3 side */
+    int upload_done;     /* on_body_done fired (listener will deliver no more) */
+    int paused;          /* we returned -1 to pause the listener read */
+    uint8_t *spill;      /* heap spill buffer (allocated lazily) */
+    size_t spill_len;    /* valid bytes in spill */
+    size_t spill_off;    /* bytes already flushed from spill */
 
     /* ── download (junction #2) ── */
     int resp_started;  /* we wrote the response status line locally */
@@ -363,7 +370,6 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     r->cli = c;
     r->handle = handle;
     r->req = hr;
-    r->cl_remaining = req->content_length; /* -1 (absent) or >=0 */
     r->resp_status = 0;
 
     /* fin = no body. CL==-1 (absent) OR CL<=0 → no body. */
@@ -468,7 +474,12 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     free(valbuf);
 
     if (sh < 0) {
-        /* Hard send error: reset H3, synthesize 502. */
+        /* Hard send error: reset H3, synthesize 502. Callbacks are already wired
+         * (set_cbs above), and mq_h3_req_reset is DEFERRED — its on_close fires
+         * later. We are about to free r, so we MUST detach the callbacks FIRST
+         * or that deferred on_close would run h3_on_close on freed memory (UAF →
+         * double free via gw_req_maybe_free). r is not yet linked into c->reqs. */
+        mq_h3_req_set_cbs(hr, NULL, NULL, NULL, NULL);
         mq_h3_req_reset(hr);
         r->req = NULL;
         r->h3_dead = 1;
@@ -486,6 +497,9 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
          * path — or risk sending a malformed request — we fail closed with 502.
          * (Documented design decision: header-EAGAIN is a hard 502, not a retry.) */
         MQ_LOGW("mq_gw_client: header send EAGAIN (flow-control); failing closed");
+        /* Same UAF hazard as the sh<0 path: detach the deferred on_close before
+         * freeing r. */
+        mq_h3_req_set_cbs(hr, NULL, NULL, NULL, NULL);
         mq_h3_req_reset(hr);
         r->req = NULL;
         r->h3_dead = 1;
@@ -528,7 +542,6 @@ upload_pump(mq_gw_req_t *r)
         }
         if (acc == 0) break; /* still blocked; wait for next on_write */
         r->spill_off += (size_t)acc;
-        if (r->cl_remaining > 0) r->cl_remaining -= acc;
         if (last && (size_t)acc == avail)
             r->upload_fin_sent = 1; /* fin went out with the last byte */
     }
@@ -582,7 +595,6 @@ gw_on_body(void *req_ctx, const uint8_t *p, size_t len)
             mq_h3_req_reset(r->req);
             return -1;
         }
-        if (acc > 0 && r->cl_remaining > 0) r->cl_remaining -= acc;
         off = (size_t)(acc > 0 ? acc : 0);
         if (off >= len) return 0; /* fully accepted; no pause needed */
     }
@@ -890,7 +902,12 @@ h3_on_read(mq_h3_req_t *hr, int flag, void *user)
         if (!r->resp_started) {
             /* First (and for us only) header section → build local response. */
             if (download_start_response(r) != 0) {
-                /* Malformed/short response head → abort if started else 502. */
+                /* Malformed/short response head → abort if started else 502.
+                 * NOTE: download_start_response only ever returns non-zero BEFORE
+                 * it sets r->resp_started (every failure path returns earlier), so
+                 * the resp_started branch is defensive-only / currently
+                 * unreachable; it is kept to stay correct if that ordering ever
+                 * changes (e.g. a post-head write failure path is added). */
                 if (r->resp_started)
                     gw_local_abort(r);
                 else
@@ -1108,16 +1125,24 @@ mq_gw_client_free(mq_gw_client_t *c)
     if (!c) return;
     gw_mp_timer_stop(c);
 
-    /* Tear down in-flight requests. We reset the H3 side (its on_close will fire
-     * during engine teardown, not necessarily now) and detach the local side.
-     * To avoid double-free via on_close after we free the struct here, we free
-     * the request states ourselves and rely on the fact that mq_h3_free /
-     * transport teardown happens AFTER gw_client_free in the documented order —
-     * by then our wrappers are gone, so on_close would dereference freed memory.
-     *
-     * SAFE ORDERING: the caller frees gw_client BEFORE mq_h3_free. To make that
-     * safe, we must detach the H3 callbacks so on_close cannot reach a freed
-     * mq_gw_req_t. mq_h3_req_set_cbs(NULL...) clears them. */
+    /* DETACH the conn-state callback first. gw_client_free runs while the H3
+     * engine is still live (sanctioned order), so the conn's close transition
+     * still fires LATER, during mq_h3_free / engine teardown — by then `c` is
+     * freed. Clearing on_state(user) here stops gw_conn_state from touching the
+     * freed gw_client. (The conn itself is borrowed; mq_h3 frees it.) */
+    if (c->conn) mq_h3_conn_set_state_cb(c->conn, NULL, NULL);
+
+    /* Tear down in-flight requests. SANCTIONED TEARDOWN ORDER (see header):
+     * gw_client_free runs FIRST, while the H3 engine is STILL LIVE — so touching
+     * r->req here is valid. For each live request we:
+     *   1. DETACH its H3 callbacks (set_cbs NULL) so the deferred on_close that
+     *      mq_h3_req_reset schedules cannot re-enter h3_on_close on the
+     *      mq_gw_req_t we are about to free (that would be a UAF + double free).
+     *   2. RESET the H3 request (truncate the tunnel side cleanly).
+     *   3. ABORT the local handle (the local peer sees a truncated response).
+     *   4. Free the per-request state ourselves (we own it; both sides detached).
+     * Because we cleared the callbacks, the subsequent mq_h3_free engine teardown
+     * fires no callback back into us — our wrappers and r are already gone. */
     mq_gw_req_t *r = c->reqs;
     while (r) {
         mq_gw_req_t *next = r->next;

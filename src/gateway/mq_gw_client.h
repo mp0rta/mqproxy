@@ -24,9 +24,17 @@
  * runtime own the UDP paths.
  *
  * OWNERSHIP / LIFETIME:
- *   - t / rt / h3 are BORROWED (the caller owns them). The caller MUST free the
- *     gw_client BEFORE mq_h3_free, and mq_h3_free BEFORE mq_transport_free
- *     (mq_h3.h contract).
+ *   - t / rt / h3 are BORROWED (the caller owns them).
+ *   - SANCTIONED TEARDOWN ORDER (MANDATORY):
+ *
+ *         mq_gw_client_free(gw)  →  mq_h3_free(h3)  →  mq_transport_free(t)
+ *
+ *     gw_client MUST be freed FIRST, while the H3 engine is STILL LIVE. Doing so
+ *     lets mq_gw_client_free detach each in-flight request's H3 callbacks
+ *     (mq_h3_req_set_cbs(NULL,...)) and reset it against a live engine — safe,
+ *     no UAF. If mq_h3_free ran first, the per-request wrappers would already be
+ *     destroyed and any gw_client touch of r->req (set_cbs/reset) would be a UAF.
+ *     mq_h3_free BEFORE mq_transport_free is the separate mq_h3.h contract.
  *   - Per-request state (mq_gw_req_t, internal) is owned by the bridge and freed
  *     exactly once on EVERY termination order — see mq_gw_client.c for the
  *     ownership rules across local-first / tunnel-first / racing teardown.
@@ -80,9 +88,14 @@ void *mq_gw_client_fetch_user(mq_gw_client_t *c);
  * bad args. */
 int mq_gw_client_add_paths(mq_gw_client_t *c, const char *const *ips, size_t n);
 
-/* Free the gateway client: tear down any in-flight requests (resetting their H3
- * requests, dropping their per-request state) and the mp-poll timer. Does NOT
- * free t / rt / h3. Safe on NULL. */
+/* Free the gateway client: tear down any in-flight requests (detaching their H3
+ * callbacks, resetting their H3 requests, aborting their local handles, dropping
+ * their per-request state) and the mp-poll timer. Does NOT free t / rt / h3.
+ * Safe on NULL.
+ *
+ * MUST be called BEFORE mq_h3_free (see the SANCTIONED TEARDOWN ORDER above):
+ * it touches r->req on live in-flight requests, which is only valid while the H3
+ * engine still exists. */
 void mq_gw_client_free(mq_gw_client_t *c);
 
 #endif /* MQ_GATEWAY_MQ_GW_CLIENT_H */

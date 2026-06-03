@@ -795,6 +795,7 @@ enum {
     SC_200_NOCL = 1,    /* 200 WITHOUT content-length (forces chunked downstream) */
     SC_ECHO_UPLOAD = 2, /* 200 + echo the received upload body back (CL) */
     SC_RESET_MID = 3,   /* headers + partial body then reset (mid-download trunc) */
+    SC_HANG = 4,        /* receive everything but NEVER respond (request stays live) */
 };
 
 static gw_srv_t g_srv; /* one in-flight request at a time in these tests */
@@ -853,6 +854,13 @@ static void
 srv_respond(gw_srv_t *s)
 {
     if (s->responded || !s->req) return;
+
+    if (s->scenario == SC_HANG) {
+        /* Never respond: leave the request open so the bridge has a live in-flight
+         * request at teardown. Do NOT mark responded (nothing was sent). */
+        return;
+    }
+
     s->responded = 1;
 
     if (s->scenario == SC_RESET_MID) {
@@ -1059,18 +1067,18 @@ gw_fixture_up_dead(gw_fixture_t *f)
 static void
 gw_fixture_down(gw_fixture_t *f)
 {
-    /* Teardown order: mq_h3_free (mq_h3.h contract: before transport_free) then
-     * transport_free. The engine teardown fires conn-close + per-request
-     * close_notify into the STILL-LIVE gw_client + listener, which detach all
-     * in-flight requests and their local handles. So gw_client + listener MUST
-     * outlive the transport (mirrors test_e2e_single_path's fixture, where the
-     * proxy objects outlive the transport). Only then free gw_client, the
-     * runtimes (borrowed base), the listener, and finally the base. */
+    /* SANCTIONED TEARDOWN ORDER (mq_gw_client.h): gw_client_free FIRST, while the
+     * client H3 engine is STILL LIVE, so it can detach (set_cbs NULL) + reset any
+     * in-flight request against a live engine and abort its local handle — no
+     * UAF. THEN mq_h3_free (mq_h3.h contract: before transport_free), THEN
+     * transport_free. The listener is freed after gw_client (gw_client aborts the
+     * local handles; the listener then tears down its own conn state). The server
+     * side has no gw_client, so its h3/transport free in the usual order. */
+    if (f->gw) mq_gw_client_free(f->gw);
     if (f->cli_h3) mq_h3_free(f->cli_h3);
     if (f->srv_h3) mq_h3_free(f->srv_h3);
     if (f->cli_t) mq_transport_free(f->cli_t);
     if (f->srv_t) mq_transport_free(f->srv_t);
-    if (f->gw) mq_gw_client_free(f->gw);
     if (f->cli_rt) mq_runtime_free(f->cli_rt);
     if (f->srv_rt) mq_runtime_free(f->srv_rt);
     if (f->listener) mq_fetch_listener_free(f->listener);
@@ -1434,6 +1442,65 @@ test_gw_mid_download_reset(void)
     gw_fixture_down(&f);
 }
 
+/* ── Case 7: teardown with a request mid-flight (sanctioned order) ───────────
+ *
+ * A POST upload is STARTED but never completed (only part of the promised CL
+ * body is sent) and the server NEVER responds (SC_HANG). At teardown the bridge
+ * therefore holds a live in-flight mq_gw_req_t: the H3 request is open (tunnel
+ * side live), the local handle is live, no response has begun. We then tear down
+ * in the sanctioned order (gw_client_free FIRST, while the H3 engine is still
+ * live). gw_client_free must detach the H3 callbacks + reset the request against
+ * the LIVE engine and abort the local handle, with NO use-after-free and NO leak
+ * (verified under ASan / LSan). */
+static void
+test_gw_teardown_midflight(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up(&f, "sekrit") != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    g_srv.scenario = SC_HANG; /* server receives but never responds */
+
+    /* Promise a large body but send only a fraction of it: the upload is started
+     * (request open, headers + partial body forwarded) but never finished, so the
+     * bridge keeps a live in-flight request. */
+    const size_t CL = 256 * 1024;
+    char head[256];
+    int hn = snprintf(head, sizeof(head),
+                      "POST /_mqproxy/fetch HTTP/1.1\r\n"
+                      "Host: x\r\n"
+                      "X-Mq-Auth: Bearer sekrit\r\n"
+                      "X-Mq-Target: https://example.test/hang\r\n"
+                      "X-Mq-Method: POST\r\n"
+                      "Content-Length: %zu\r\n\r\n",
+                      CL);
+
+    int c = dial(f.lport);
+    MQ_CHECK(c >= 0);
+    send_all(c, head, (size_t)hn);
+    /* Only a small slice of the promised body — upload stays mid-flight. */
+    uint8_t chunk[4096];
+    memset(chunk, 'U', sizeof(chunk));
+    send_all(c, chunk, sizeof(chunk));
+
+    /* Pump enough to drive the H3 request open + forward headers/partial body to
+     * the (hanging) server. The request is now live on the bridge. */
+    pump_a_bit(f.base, 400);
+
+    /* The server saw exactly one request and never responded. */
+    MQ_CHECK_EQ_INT(g_srv.request_count, 1);
+    MQ_CHECK_EQ_INT(g_srv.responded, 0);
+
+    /* Tear down with the request still mid-flight, in the sanctioned order
+     * (gw_fixture_down frees gw_client FIRST while the H3 engine is live). Must
+     * be ASan-clean and leak-free. */
+    close(c);
+    pump_a_bit(f.base, 50);
+    gw_fixture_down(&f);
+}
+
 static void
 run_all(void)
 {
@@ -1460,6 +1527,7 @@ run_all(void)
     test_gw_400_family();
     test_gw_tunnel_unavailable();
     test_gw_mid_download_reset();
+    test_gw_teardown_midflight();
 }
 
 MQ_TEST_MAIN(run_all())
