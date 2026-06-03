@@ -96,36 +96,56 @@ mq_gw_parse_target(const char *s, size_t len, mq_gw_target_t *out)
         return -1;
     }
 
-    /* authority = bytes up to first '/' or '?' (or end). */
+    /* authority = bytes up to first '/' or '?' (or end).
+     * Bracket tracking is only honoured when '[' appears at the very first
+     * byte of the authority (IPv6 literal).  A '[' anywhere else is illegal
+     * in a host and must cause the whole target to be rejected. */
     size_t a_start = off;
     size_t i = off;
     int in_brackets = 0;
+    int bracket_err = 0; /* set if '[' seen at a non-zero authority offset */
     for (; i < len; i++) {
         char c = s[i];
-        if (c == '[')
-            in_brackets = 1;
-        else if (c == ']')
+        if (c == '[') {
+            if (i == a_start)
+                in_brackets = 1;
+            else
+                bracket_err = 1; /* stray '[' — mark and keep scanning */
+        } else if (c == ']') {
             in_brackets = 0;
-        else if (!in_brackets && (c == '/' || c == '?'))
+        } else if (!in_brackets && (c == '/' || c == '?')) {
             break;
+        }
     }
+    if (bracket_err) return -1;
+
     size_t a_len = i - a_start;
     if (a_len == 0 || a_len > 255) return -1;
 
     const char *auth = s + a_start;
 
-    /* Reject userinfo and forbidden bytes anywhere in the authority. */
+    /* Reject userinfo, forbidden bytes, and any '['/']' that are not part
+     * of a well-formed leading IPv6 literal (i.e. auth[0] == '[' with a
+     * matching ']').  A lone ']' when the authority is not bracketed is
+     * illegal. */
+    int is_bracketed = (auth[0] == '[');
     for (size_t k = 0; k < a_len; k++) {
         unsigned char c = (unsigned char)auth[k];
         if (c == '@') return -1; /* userinfo — credential-injection surface */
         if (c == '#') return -1; /* fragment cannot appear in authority */
         if (is_forbidden_uri_byte(c)) return -1;
+        /* '[' at k>0 was already caught by bracket_err above (the scan loop
+         * continued past a stray '[' only if bracket_err was set, which
+         * triggered an early return).  Guard here too for safety. */
+        if (c == '[' && k != 0) return -1;
+        /* ']' is only legal inside a bracketed IPv6 literal. */
+        if (c == ']' && !is_bracketed) return -1;
     }
 
     /* Validate host:port split. For a bracketed IPv6 literal "[...]", the
      * colon scan starts after ']'; otherwise split on the LAST ':'. */
     size_t colon_scan_from = 0;
-    if (auth[0] == '[') {
+    if (is_bracketed) {
         /* find closing ']' */
         size_t rb = 0;
         int found = 0;
@@ -153,6 +173,11 @@ mq_gw_parse_target(const char *s, size_t len, mq_gw_target_t *out)
             if (auth[k] < '0' || auth[k] > '9') return -1;
         /* host part must be non-empty (e.g. ":8443" is invalid) */
         if (pc == 0) return -1;
+        /* non-bracketed host must not itself contain ':' (e.g. "h:80:90") */
+        if (!is_bracketed) {
+            for (size_t k = 0; k < pc; k++)
+                if (auth[k] == ':') return -1;
+        }
     }
 
     /* path+query = the rest (from index i to end). */

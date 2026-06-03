@@ -211,6 +211,74 @@ test_target_empty(void)
     MQ_CHECK_EQ_INT(mq_gw_parse_target("", 0, &t), -1);
 }
 
+/* ---- [DEFECT-1] stray '[' not at position 0 → authority injection → reject ---- */
+static void
+test_target_stray_open_bracket(void)
+{
+    mq_gw_target_t t;
+    /* '[' at offset 3 in authority: the '/' after the bracket is swallowed
+     * and the entire "foo[bar/x" would reach the backend as host — reject. */
+    MQ_CHECK_EQ_INT(pt("https://foo[bar/x", &t), -1);
+}
+
+/* ---- [DEFECT-2] non-bracket host with embedded colon (h:80:90) → reject ---- */
+static void
+test_target_double_colon_port(void)
+{
+    mq_gw_target_t t;
+    /* last-colon split leaves "h:80" as host which contains ':' — illegal */
+    MQ_CHECK_EQ_INT(pt("https://h:80:90/x", &t), -1);
+}
+
+/* ---- [DEFECT-3] leading ']' with no opening '[' → reject ---- */
+static void
+test_target_lone_close_bracket(void)
+{
+    mq_gw_target_t t;
+    MQ_CHECK_EQ_INT(pt("https://]nobracket/x", &t), -1);
+    MQ_CHECK_EQ_INT(pt("https://]/x", &t), -1);
+}
+
+/* ---- IPv6: junk immediately after ']' (no ':') → reject ---- */
+static void
+test_target_ipv6_junk_after_bracket(void)
+{
+    mq_gw_target_t t;
+    MQ_CHECK_EQ_INT(pt("https://[::1]x80/", &t), -1);
+}
+
+/* ---- IPv6: empty port after ']' → reject ---- */
+static void
+test_target_ipv6_empty_port(void)
+{
+    mq_gw_target_t t;
+    MQ_CHECK_EQ_INT(pt("https://[::1]:/", &t), -1);
+}
+
+/* ---- IPv6: non-digit port after ']' → reject ---- */
+static void
+test_target_ipv6_bad_port(void)
+{
+    mq_gw_target_t t;
+    MQ_CHECK_EQ_INT(pt("https://[::1]:80x/", &t), -1);
+}
+
+/* ---- IPv6: unclosed '[' → reject ---- */
+static void
+test_target_ipv6_unclosed(void)
+{
+    mq_gw_target_t t;
+    MQ_CHECK_EQ_INT(pt("https://[unclosed/", &t), -1);
+}
+
+/* ---- IPv6: empty bracket host '[]:80' → reject ---- */
+static void
+test_target_ipv6_empty_host(void)
+{
+    mq_gw_target_t t;
+    MQ_CHECK_EQ_INT(pt("https://[]:80/", &t), -1);
+}
+
 /* ===================================================================
  * mq_gw_parse_method
  * =================================================================== */
@@ -500,6 +568,15 @@ MQ_TEST_MAIN({
     test_target_authority_too_long();
     test_target_path_too_long();
     test_target_empty();
+    /* bracket/colon defects */
+    test_target_stray_open_bracket();
+    test_target_double_colon_port();
+    test_target_lone_close_bracket();
+    test_target_ipv6_junk_after_bracket();
+    test_target_ipv6_empty_port();
+    test_target_ipv6_bad_port();
+    test_target_ipv6_unclosed();
+    test_target_ipv6_empty_host();
     /* method */
     test_method_lower();
     test_method_mixed();
