@@ -299,6 +299,143 @@ on_server_stream(mq_stream_t *s, void *user)
                       /*on_close=*/NULL, NULL);
 }
 
+/* ── broadcast mp-ready test state ───────────────────────────────────────── */
+
+/* A standalone subscriber registered via mq_transport_add_mp_ready_cb alongside
+ * the conn's own subscriber: it records that it fired and copies out the scid so
+ * the test can confirm the broadcast delivered the readiness signal (and the
+ * exact scid xquic supplied). */
+typedef struct {
+    int fired;
+    xqc_cid_t scid;
+} mp_sub_t;
+
+static void
+on_extra_mp_ready(const xqc_cid_t *scid, void *user)
+{
+    mp_sub_t *sub = (mp_sub_t *)user;
+    sub->fired = 1;
+    if (scid) {
+        memcpy(&sub->scid, scid, sizeof(sub->scid));
+    }
+}
+
+/* Broadcast test: with multipath enabled, drive a real handshake to the point
+ * where xquic fires ready_to_create_path_notify, with TWO subscribers on the
+ * client transport — the conn's own (registered inside mq_conn_connect) plus an
+ * extra one registered via the new mq_transport_add_mp_ready_cb. Assert BOTH
+ * fire (broadcast), the extra one received the conn's scid, and the conn's own
+ * subscriber flipped mq_conn_mp_ready (its scid filter matched). This is the
+ * Phase 2 invariant: subscribers no longer clobber each other and every
+ * subscriber sees every conn's readiness. */
+static void
+test_mp_ready_broadcast(void)
+{
+    fabric_t fabric;
+    memset(&fabric, 0, sizeof(fabric));
+
+    endpoint_t client_ctx = {.outbound = &fabric.to_server, .role = "client"};
+    endpoint_t server_ctx = {.outbound = &fabric.to_client, .role = "server"};
+
+    mq_transport_callbacks_t cbs = {
+        .send_udp = fab_send_udp,
+        .open_path_socket = fab_open_path_socket,
+        .close_path_socket = fab_close_path_socket,
+    };
+
+    mq_transport_t *client = mq_transport_new(/*is_server=*/0);
+    MQ_CHECK(client != NULL);
+    mq_transport_t *server = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
+    MQ_CHECK(server != NULL);
+    if (!client || !server) {
+        if (client) mq_transport_free(client);
+        if (server) mq_transport_free(server);
+        return;
+    }
+    mq_transport_set_callbacks(client, &cbs, &client_ctx);
+    mq_transport_set_callbacks(server, &cbs, &server_ctx);
+
+    int rc = mq_conn_register_alpn(server, TEST_ALPN, on_server_conn, NULL, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    rc = mq_conn_register_alpn(client, TEST_ALPN, NULL, NULL, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    /* The server is a pure responder, but it must advertise enable_multipath +
+     * the larger path-id grant so the client's ready_to_create_path_notify can
+     * fire (multipath is negotiated; both sides must enable it). */
+    xqc_conn_settings_t srv_settings;
+    memset(&srv_settings, 0, sizeof(srv_settings));
+    srv_settings.proto_version = XQC_VERSION_V1;
+    srv_settings.pacing_on = 1;
+    mq_conn_apply_mp_settings(&srv_settings, /*is_server=*/1, MQ_CC_DEFAULT);
+    xqc_server_set_conn_settings(mq_transport_xqc(server), &srv_settings);
+
+    /* Register the extra subscriber BEFORE connect so it occupies the second of
+     * the two table slots (mq_conn_connect takes the first for the conn). */
+    mp_sub_t extra = {0};
+    rc = mq_transport_add_mp_ready_cb(client, on_extra_mp_ready, &extra);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    struct sockaddr_in srv_addr;
+    make_addr(&srv_addr, SRV_PORT);
+
+    /* Multipath ON on both sides so xquic fires ready_to_create_path_notify. */
+    xqc_conn_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.proto_version = XQC_VERSION_V1;
+    settings.pacing_on = 1;
+    settings.max_pkt_out_size = 1200;
+    mq_conn_apply_mp_settings(&settings, /*is_server=*/0, MQ_CC_DEFAULT);
+
+    mq_conn_t *conn = mq_conn_connect(client, (struct sockaddr *)&srv_addr,
+                                      sizeof(srv_addr), TEST_ALPN, &settings, NULL);
+    MQ_CHECK(conn != NULL);
+    if (!conn) {
+        mq_transport_free(client);
+        mq_transport_free(server);
+        return;
+    }
+
+    /* Drive until BOTH subscribers have fired (mp-ready broadcast) or the bounded
+     * caps fire. mq_conn_mp_ready reflects the conn's own (scid-filtered)
+     * subscriber; extra.fired reflects the standalone one. */
+    uint64_t deadline = now_ms() + WALL_BUDGET_MS;
+    int iters = 0;
+    while ((!extra.fired || !mq_conn_mp_ready(conn)) && iters < MAX_ITERS &&
+           now_ms() < deadline) {
+        mq_transport_tick(client);
+        mq_transport_tick(server);
+        fabric_drain(&fabric.to_server, server, SRV_PORT, CLI_PORT);
+        fabric_drain(&fabric.to_client, client, CLI_PORT, SRV_PORT);
+        (void)mq_transport_next_timeout_ms(client);
+        (void)mq_transport_next_timeout_ms(server);
+        iters++;
+    }
+
+    /* Both subscribers fired: the broadcast reached every slot. */
+    MQ_CHECK(extra.fired);
+    MQ_CHECK(mq_conn_mp_ready(conn));
+
+    /* The extra subscriber received a non-empty scid (xquic supplied the conn's
+     * scid to every subscriber). */
+    MQ_CHECK(extra.scid.cid_len > 0);
+
+    mq_conn_close(conn);
+
+    uint64_t close_deadline = now_ms() + 200;
+    int close_iters = 0;
+    while (close_iters < MAX_ITERS && now_ms() < close_deadline) {
+        mq_transport_tick(client);
+        mq_transport_tick(server);
+        fabric_drain(&fabric.to_server, server, SRV_PORT, CLI_PORT);
+        fabric_drain(&fabric.to_client, client, CLI_PORT, SRV_PORT);
+        close_iters++;
+    }
+
+    mq_transport_free(client);
+    mq_transport_free(server);
+}
+
 static void
 test_transport_fabric(void)
 {
@@ -444,4 +581,7 @@ test_transport_fabric(void)
     mq_transport_free(server);
 }
 
-MQ_TEST_MAIN(test_transport_fabric())
+MQ_TEST_MAIN({
+    test_transport_fabric();
+    test_mp_ready_broadcast();
+})

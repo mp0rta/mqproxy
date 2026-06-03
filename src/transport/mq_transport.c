@@ -34,9 +34,15 @@ struct mq_transport_s {
     void *user;
     int is_server;
 
-    /* Multipath readiness hook (set via mq_transport_set_mp_ready_cb). */
-    mq_transport_mp_ready_fn mp_ready_fn;
-    void *mp_ready_user;
+    /* Multipath readiness subscribers (added via mq_transport_add_mp_ready_cb).
+     * Fixed table: across the whole Phase 2-7 roadmap the subscribers are
+     * exactly two — the tcp conn and the h3 conn — so two slots suffice.
+     * ready_to_create_path is broadcast to every populated slot. */
+    struct {
+        mq_transport_mp_ready_fn fn;
+        void *user;
+    } mp_ready_subs[2];
+    int n_mp_ready_subs;
 
     /* qlog sink. qlog_fd < 0 == disabled (default). The xquic qlog callback
      * writes rendered lines here when armed via mq_transport_enable_qlog. */
@@ -187,14 +193,18 @@ mq_transport_server_refuse(xqc_engine_t *engine, xqc_connection_t *conn,
 
 /* Multipath ready-to-create-path notify. xquic fires this once cids are
  * exchanged (precondition for xqc_conn_create_path). conn_user_data is the
- * connection's transport user_data == the mq_transport. Route to the registered
- * mp_ready hook so mq_conn can flip its flag. */
+ * connection's transport user_data == the mq_transport. Broadcast to every
+ * subscriber: with multiple conns on one transport (Phase 2: tcp + h3) the scid
+ * identifies WHICH conn became ready, so each subscriber filters by scid. */
 static void
 mq_transport_ready_to_create_path(const xqc_cid_t *scid, void *conn_user_data)
 {
     mq_transport_t *t = (mq_transport_t *)conn_user_data;
-    if (t && t->mp_ready_fn) {
-        t->mp_ready_fn(scid, t->mp_ready_user);
+    if (!t) {
+        return;
+    }
+    for (int i = 0; i < t->n_mp_ready_subs; i++) {
+        t->mp_ready_subs[i].fn(scid, t->mp_ready_subs[i].user);
     }
 }
 
@@ -487,14 +497,20 @@ mq_transport_close_path(mq_transport_t *t, uint64_t path)
     t->cbs.close_path_socket(path, t->user);
 }
 
-void
-mq_transport_set_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn, void *user)
+int
+mq_transport_add_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn, void *user)
 {
-    if (!t) {
-        return;
+    if (!t || !fn) {
+        return -1;
     }
-    t->mp_ready_fn = fn;
-    t->mp_ready_user = user;
+    if (t->n_mp_ready_subs >=
+        (int)(sizeof(t->mp_ready_subs) / sizeof(t->mp_ready_subs[0]))) {
+        return -1; /* fixed table full (tcp + h3 == 2 slots) */
+    }
+    t->mp_ready_subs[t->n_mp_ready_subs].fn = fn;
+    t->mp_ready_subs[t->n_mp_ready_subs].user = user;
+    t->n_mp_ready_subs++;
+    return 0;
 }
 
 int

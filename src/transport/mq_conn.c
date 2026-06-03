@@ -274,14 +274,19 @@ mq_conn_register_alpn(mq_transport_t *t, const char *alpn, mq_conn_on_new_fn on_
 
 /* ── Multipath ──────────────────────────────────────────────────────────── */
 
-/* Engine mp-ready hook: xquic signalled this conn can create a path. The user
- * pointer is the client mq_conn registered in mq_conn_connect. */
+/* Engine mp-ready hook: xquic signalled that the conn identified by scid can
+ * create a path. The user pointer is the client mq_conn registered in
+ * mq_conn_connect. The notification is broadcast to every subscriber on the
+ * transport, so filter by scid (cid_len + cid_buf) and only flip OUR conn. */
 static void
 mq_conn_on_mp_ready(const xqc_cid_t *scid, void *user)
 {
-    (void)scid;
     mq_conn_t *c = (mq_conn_t *)user;
-    if (c) {
+    if (!c || !c->have_cid || !scid) {
+        return;
+    }
+    if (scid->cid_len == c->cid.cid_len &&
+        memcmp(scid->cid_buf, c->cid.cid_buf, c->cid.cid_len) == 0) {
         c->mp_ready = 1;
     }
 }
@@ -550,10 +555,16 @@ mq_conn_connect(mq_transport_t *t, const struct sockaddr *peer, socklen_t peerle
     c->is_server = 0;
     c->owner = owner;
 
-    /* Route xquic's ready_to_create_path_notify (delivered to the transport) to
-     * this conn so mq_conn_mp_ready flips once paths can be created. One conn
-     * per client transport, so a single slot suffices. */
-    mq_transport_set_mp_ready_cb(t, mq_conn_on_mp_ready, c);
+    /* Subscribe to xquic's ready_to_create_path_notify (delivered to the
+     * transport) so mq_conn_mp_ready flips once paths can be created. The
+     * notification is broadcast to every subscriber on the transport (Phase 2:
+     * a tcp conn and an h3 conn share one engine), so mq_conn_on_mp_ready
+     * filters by scid to flip only THIS conn. */
+    if (mq_transport_add_mp_ready_cb(t, mq_conn_on_mp_ready, c) != 0) {
+        MQ_LOGE("mq_conn: mp-ready subscriber table full");
+        free(c);
+        return NULL;
+    }
 
     xqc_conn_ssl_config_t conn_ssl;
     memset(&conn_ssl, 0, sizeof(conn_ssl));
