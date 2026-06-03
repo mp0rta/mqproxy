@@ -32,10 +32,10 @@
 
 #include "proxy/mq_client.h"
 #include "proxy/mq_server.h"
+#include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h"
-#include "transport/mq_engine.h"
-#include "transport/mq_path.h"
 #include "transport/mq_stream.h"
+#include "transport/mq_transport.h"
 #include "wire/mq_wire.h"
 
 #define TEST_ALPN "mqproxy-tcp/1"
@@ -53,6 +53,34 @@ now_ms(void)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Reserve an ephemeral loopback UDP port: bind a temp socket to :0, read the
+ * assigned port, then close it so a runtime can bind that fixed port. The
+ * runtime no longer exposes the bound port of an ephemeral (:0) bind, so the
+ * test pins a concrete port for the server up front. */
+static uint16_t
+reserve_udp_port(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return 0;
+    }
+    socklen_t sl = sizeof(sa);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        close(fd);
+        return 0;
+    }
+    uint16_t port = ntohs(sa.sin_port);
+    close(fd);
+    return port;
 }
 
 /* ── auth-callback bookkeeping ──────────────────────────────────────────── */
@@ -85,10 +113,10 @@ on_client_state(mq_conn_t *c, mq_conn_state_t st, void *user)
  * auth-attempt counter) via out_server; client conn via out_conn. */
 typedef struct {
     struct event_base *base;
-    mq_engine_t *srv;
-    mq_engine_t *cli;
-    mq_path_t *srv_path;
-    mq_path_t *cli_path;
+    mq_transport_t *srv_t;
+    mq_transport_t *cli_t;
+    mq_runtime_t *srv_rt;
+    mq_runtime_t *cli_rt;
     mq_server_t *server;
     mq_client_t *client;
 } fixture_t;
@@ -101,36 +129,38 @@ fixture_up(fixture_t *f, const char *client_token)
     MQ_CHECK(f->base != NULL);
     if (!f->base) return -1;
 
-    /* Server */
-    f->srv = mq_engine_new_server(f->base, TEST_CERT_FILE, TEST_KEY_FILE);
-    MQ_CHECK(f->srv != NULL);
-    if (!f->srv) return -1;
-    f->server = mq_server_new(f->srv, "secret");
+    uint16_t port = reserve_udp_port();
+    MQ_CHECK(port != 0);
+    if (!port) return -1;
+
+    /* Server: transport (TLS) + runtime borrowing the shared base. */
+    f->srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
+    MQ_CHECK(f->srv_t != NULL);
+    if (!f->srv_t) return -1;
+    f->srv_rt = mq_runtime_new(f->srv_t, f->base);
+    MQ_CHECK(f->srv_rt != NULL);
+    if (!f->srv_rt) return -1;
+    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2);
     MQ_CHECK(f->server != NULL);
     if (!f->server) return -1;
 
-    f->srv_path = mq_path_open(f->srv, 0, "127.0.0.1", 0);
-    MQ_CHECK(f->srv_path != NULL);
-    if (!f->srv_path) return -1;
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->srv_rt, "127.0.0.1", port), 0);
 
-    struct sockaddr_storage srv_addr;
-    socklen_t srv_addrlen = 0;
-    MQ_CHECK_EQ_INT(mq_path_local_addr(f->srv_path, &srv_addr, &srv_addrlen), 0);
-    uint16_t port = ntohs(((struct sockaddr_in *)&srv_addr)->sin_port);
+    /* Client: transport + runtime borrowing the SAME shared base. */
+    f->cli_t = mq_transport_new(0);
+    MQ_CHECK(f->cli_t != NULL);
+    if (!f->cli_t) return -1;
+    f->cli_rt = mq_runtime_new(f->cli_t, f->base);
+    MQ_CHECK(f->cli_rt != NULL);
+    if (!f->cli_rt) return -1;
 
-    /* Client */
-    f->cli = mq_engine_new(0, f->base);
-    MQ_CHECK(f->cli != NULL);
-    if (!f->cli) return -1;
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->cli_rt, "127.0.0.1", 0), 0);
 
-    f->client = mq_client_new(f->cli, "127.0.0.1", port, "client-1", client_token);
+    f->client = mq_client_new(f->cli_t, f->cli_rt, "127.0.0.1", port, "client-1",
+                              client_token, MQ_CC_BBR2);
     MQ_CHECK(f->client != NULL);
     if (!f->client) return -1;
     mq_client_set_on_auth(f->client, on_auth, NULL);
-
-    f->cli_path = mq_path_open(f->cli, 0, "127.0.0.1", 0);
-    MQ_CHECK(f->cli_path != NULL);
-    if (!f->cli_path) return -1;
 
     MQ_CHECK_EQ_INT(mq_client_start(f->client), 0);
     mq_client_set_on_state(f->client, on_client_state, NULL);
@@ -140,14 +170,16 @@ fixture_up(fixture_t *f, const char *client_token)
 static void
 fixture_down(fixture_t *f)
 {
-    /* Tear down in dependency order: paths first, then engines. Freeing an
-     * engine destroys its connections, firing conn_close_notify which invokes
-     * the client/server state callbacks (whose `user` is the mq_client /
-     * mq_server). So those must outlive the engine — free them LAST. */
-    if (f->cli_path) mq_path_close(f->cli_path);
-    if (f->srv_path) mq_path_close(f->srv_path);
-    if (f->cli) mq_engine_free(f->cli);
-    if (f->srv) mq_engine_free(f->srv);
+    /* Per side: free the transport FIRST (engine destroy fires conn_close_notify
+     * -> the client/server state callbacks, whose `user` is the mq_client /
+     * mq_server, and may also fire the runtime send_udp on a final close), so the
+     * runtime + client + server must outlive the transport. Then the runtimes
+     * (which BORROWED the shared base, so they do NOT free it), then the proxy
+     * objects. The test owns the shared base and frees it last. */
+    if (f->cli_t) mq_transport_free(f->cli_t);
+    if (f->srv_t) mq_transport_free(f->srv_t);
+    if (f->cli_rt) mq_runtime_free(f->cli_rt);
+    if (f->srv_rt) mq_runtime_free(f->srv_rt);
     if (f->client) mq_client_free(f->client);
     if (f->server) mq_server_free(f->server);
     if (f->base) event_base_free(f->base);
@@ -660,38 +692,41 @@ test_data_stream_preauth_reset(void)
     MQ_CHECK(base != NULL);
     if (!base) return;
 
-    mq_engine_t *srv = mq_engine_new_server(base, TEST_CERT_FILE, TEST_KEY_FILE);
-    MQ_CHECK(srv != NULL);
-    mq_server_t *server = srv ? mq_server_new(srv, "secret") : NULL;
+    uint16_t srv_port = reserve_udp_port();
+    MQ_CHECK(srv_port != 0);
+
+    /* Server: transport (TLS) + runtime borrowing the shared base. */
+    mq_transport_t *srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
+    MQ_CHECK(srv_t != NULL);
+    mq_runtime_t *srv_rt = srv_t ? mq_runtime_new(srv_t, base) : NULL;
+    MQ_CHECK(srv_rt != NULL);
+    mq_server_t *server =
+        (srv_t && srv_rt) ? mq_server_new(srv_t, srv_rt, "secret", MQ_CC_BBR2) : NULL;
     MQ_CHECK(server != NULL);
 
-    mq_path_t *srv_path = srv ? mq_path_open(srv, 0, "127.0.0.1", 0) : NULL;
-    MQ_CHECK(srv_path != NULL);
+    int srv_bound = srv_rt ? mq_runtime_open_udp_path(srv_rt, "127.0.0.1", srv_port) : -1;
+    MQ_CHECK_EQ_INT(srv_bound, 0);
 
     echo_origin_t origin;
     uint16_t origin_port = 0;
     if (base) MQ_CHECK_EQ_INT(echo_origin_up(&origin, base, &origin_port), 0);
 
-    uint16_t srv_port = 0;
-    if (srv_path) {
-        struct sockaddr_storage sa;
-        socklen_t sl = 0;
-        MQ_CHECK_EQ_INT(mq_path_local_addr(srv_path, &sa, &sl), 0);
-        srv_port = ntohs(((struct sockaddr_in *)&sa)->sin_port);
-    }
-
-    mq_engine_t *cli = mq_engine_new(0, base);
-    MQ_CHECK(cli != NULL);
-    if (cli) MQ_CHECK_EQ_INT(mq_conn_register_alpn(cli, TEST_ALPN, NULL, NULL, NULL), 0);
-    mq_path_t *cli_path = cli ? mq_path_open(cli, 0, "127.0.0.1", 0) : NULL;
-    MQ_CHECK(cli_path != NULL);
+    /* Client: RAW transport conn (no mq_client / no AUTH_REQUEST). */
+    mq_transport_t *cli_t = mq_transport_new(0);
+    MQ_CHECK(cli_t != NULL);
+    mq_runtime_t *cli_rt = cli_t ? mq_runtime_new(cli_t, base) : NULL;
+    MQ_CHECK(cli_rt != NULL);
+    if (cli_t)
+        MQ_CHECK_EQ_INT(mq_conn_register_alpn(cli_t, TEST_ALPN, NULL, NULL, NULL), 0);
+    int cli_bound = cli_rt ? mq_runtime_open_udp_path(cli_rt, "127.0.0.1", 0) : -1;
+    MQ_CHECK_EQ_INT(cli_bound, 0);
 
     datastream_t d;
     memset(&d, 0, sizeof(d));
     preauth_ctx_t pctx = {.origin_port = origin_port, .d = &d, .opened = 0};
 
     mq_conn_t *conn = NULL;
-    if (cli && cli_path) {
+    if (cli_t && cli_bound == 0) {
         struct sockaddr_in sa;
         memset(&sa, 0, sizeof(sa));
         sa.sin_family = AF_INET;
@@ -702,7 +737,7 @@ test_data_stream_preauth_reset(void)
         settings.proto_version = XQC_VERSION_V1;
         settings.pacing_on = 1;
         settings.max_pkt_out_size = 1200;
-        conn = mq_conn_connect(cli, (struct sockaddr *)&sa, sizeof(sa), TEST_ALPN,
+        conn = mq_conn_connect(cli_t, (struct sockaddr *)&sa, sizeof(sa), TEST_ALPN,
                                &settings, NULL);
         MQ_CHECK(conn != NULL);
         if (conn) mq_conn_set_on_state(conn, preauth_on_state, &pctx);
@@ -718,10 +753,12 @@ test_data_stream_preauth_reset(void)
     MQ_CHECK(!(d.resp_seen && d.resp.status == MQ_STATUS_OK));
 
     echo_origin_down(&origin);
-    if (cli_path) mq_path_close(cli_path);
-    if (srv_path) mq_path_close(srv_path);
-    if (cli) mq_engine_free(cli);
-    if (srv) mq_engine_free(srv);
+    /* Per side: transport first, then runtime (borrowed base, not freed here),
+     * then the server. The test frees the shared base last. */
+    if (cli_t) mq_transport_free(cli_t);
+    if (srv_t) mq_transport_free(srv_t);
+    if (cli_rt) mq_runtime_free(cli_rt);
+    if (srv_rt) mq_runtime_free(srv_rt);
     if (server) mq_server_free(server);
     if (base) event_base_free(base);
 }

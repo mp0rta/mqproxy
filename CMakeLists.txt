@@ -17,10 +17,10 @@ add_library(mqproxy STATIC
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
     src/ingress/mq_listener.c
-    src/transport/mq_engine.c
-    src/transport/mq_path.c
     src/transport/mq_conn.c
-    src/transport/mq_stream.c)
+    src/transport/mq_stream.c
+    src/transport/mq_transport.c
+    src/runtime/mq_runtime_libevent.c)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 enable_testing()
@@ -168,6 +168,22 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_e2e_single_path PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_e2e_single_path COMMAND test_e2e_single_path)
+
+    add_executable(test_transport_fabric tests/integration/test_transport_fabric.c)
+    target_link_libraries(test_transport_fabric
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_transport_fabric PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_transport_fabric PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_transport_fabric PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_transport_fabric COMMAND test_transport_fabric)
 
     add_executable(test_two_paths tests/integration/test_two_paths.c)
     target_link_libraries(test_two_paths

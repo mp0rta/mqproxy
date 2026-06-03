@@ -1,60 +1,51 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 mp0rta
 
-/* test_path_bind.c — Task 9 smoke test.
+/* test_path_bind.c — runtime primary-path bind smoke test (Chunk 7).
  *
- * Opens an mq_path on 127.0.0.1:0 against a client-mode engine, checks the fd
- * is valid and an ephemeral port was assigned, then closes everything cleanly
- * (ASan-clean: read event freed, fd closed, struct freed, engine torn down).
+ * Opens the primary UDP path via mq_runtime_open_udp_path on 127.0.0.1:0 against
+ * a client-mode transport+runtime, checks the bind succeeds (ephemeral port-0
+ * bind yields a usable path), that a bad local IP is rejected without leaking,
+ * and that a second open of the (already-bound) primary path is refused. Then it
+ * tears everything down cleanly (ASan-clean).
+ *
+ * The fine-grained mq_path accessors (fd / id / local_addr) are gone; the
+ * runtime only exposes open success, so that is what we assert.
  */
 #include "mqtest.h"
 
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "transport/mq_engine.h"
-#include "transport/mq_path.h"
-
-static uint16_t
-port_of(const struct sockaddr_storage *ss)
-{
-    if (ss->ss_family == AF_INET) {
-        return ntohs(((const struct sockaddr_in *)ss)->sin_port);
-    }
-    if (ss->ss_family == AF_INET6) {
-        return ntohs(((const struct sockaddr_in6 *)ss)->sin6_port);
-    }
-    return 0;
-}
+#include "runtime/mq_runtime_libevent.h"
+#include "transport/mq_transport.h"
 
 static void
 test_path_bind(void)
 {
-    mq_engine_t *e = mq_engine_new(/*is_server=*/0, /*base=*/NULL);
-    MQ_CHECK(e != NULL);
-    if (!e) return;
+    mq_transport_t *t = mq_transport_new(/*is_server=*/0);
+    MQ_CHECK(t != NULL);
+    if (!t) return;
 
-    mq_path_t *p = mq_path_open(e, /*path_id=*/0, "127.0.0.1", /*port=*/0);
-    MQ_CHECK(p != NULL);
-    if (p) {
-        MQ_CHECK(mq_path_fd(p) >= 0);
-        MQ_CHECK_EQ_INT(mq_path_id(p), 0);
-
-        struct sockaddr_storage ss;
-        socklen_t len = 0;
-        MQ_CHECK_EQ_INT(mq_path_local_addr(p, &ss, &len), 0);
-        MQ_CHECK(len > 0);
-        MQ_CHECK(ss.ss_family == AF_INET);
-        MQ_CHECK(port_of(&ss) != 0); /* ephemeral port assigned */
-
-        /* Bad-address path returns NULL without leaking. */
-        mq_path_t *bad = mq_path_open(e, 1, "not-an-ip", 0);
-        MQ_CHECK(bad == NULL);
-
-        mq_path_close(p);
+    mq_runtime_t *rt = mq_runtime_new(t, /*base=*/NULL);
+    MQ_CHECK(rt != NULL);
+    if (!rt) {
+        mq_transport_free(t);
+        return;
     }
 
-    mq_engine_free(e);
+    /* Ephemeral port-0 bind on loopback succeeds and yields a usable path. */
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(rt, "127.0.0.1", /*port=*/0), 0);
+
+    /* A bad local address is rejected without leaking. */
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(rt, "not-an-ip", 0), -1);
+
+    /* The primary path is already open; a second open of it is refused. */
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(rt, "127.0.0.1", 0), -1);
+
+    /* Teardown per side: transport first, then runtime. */
+    mq_transport_free(t);
+    mq_runtime_free(rt);
 }
 
 MQ_TEST_MAIN(test_path_bind())

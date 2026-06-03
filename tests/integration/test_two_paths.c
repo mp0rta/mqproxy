@@ -34,9 +34,9 @@
 #include "ingress/mq_listener.h"
 #include "proxy/mq_client.h"
 #include "proxy/mq_server.h"
+#include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h"
-#include "transport/mq_engine.h"
-#include "transport/mq_path.h"
+#include "transport/mq_transport.h"
 #include "util/mq_log.h"
 
 #ifndef TEST_CERT_FILE
@@ -73,17 +73,45 @@ test_window_constants(void)
 }
 
 /* ── full-stack fixture (mirrors test_e2e_single_path) ───────────────────── */
+/* The SECOND MPQUIC path (Task 17) is now opened internally by mq_conn_add_path
+ * routing through the transport's open_path_socket callback into the client
+ * runtime — there is no test-owned second-path handle to track or free. */
 typedef struct {
     struct event_base *base;
-    mq_engine_t *srv;
-    mq_engine_t *cli;
-    mq_path_t *srv_path;
-    mq_path_t *cli_path;
+    mq_transport_t *srv_t;
+    mq_transport_t *cli_t;
+    mq_runtime_t *srv_rt;
+    mq_runtime_t *cli_rt;
     mq_server_t *server;
     mq_client_t *client;
     mq_listener_t *socks5;
-    mq_path_t *cli_path2; /* second client path (Task 17) */
 } fixture_t;
+
+/* Reserve an ephemeral loopback UDP port (the runtime no longer exposes the
+ * bound port of a :0 bind, so the server pins a concrete port up front). */
+static uint16_t
+reserve_udp_port(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return 0;
+    }
+    socklen_t sl = sizeof(sa);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        close(fd);
+        return 0;
+    }
+    uint16_t port = ntohs(sa.sin_port);
+    close(fd);
+    return port;
+}
 
 static int
 fixture_up(fixture_t *f)
@@ -93,33 +121,35 @@ fixture_up(fixture_t *f)
     MQ_CHECK(f->base != NULL);
     if (!f->base) return -1;
 
-    f->srv = mq_engine_new_server(f->base, TEST_CERT_FILE, TEST_KEY_FILE);
-    MQ_CHECK(f->srv != NULL);
-    if (!f->srv) return -1;
-    f->server = mq_server_new(f->srv, "secret");
+    uint16_t port = reserve_udp_port();
+    MQ_CHECK(port != 0);
+    if (!port) return -1;
+
+    f->srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
+    MQ_CHECK(f->srv_t != NULL);
+    if (!f->srv_t) return -1;
+    f->srv_rt = mq_runtime_new(f->srv_t, f->base);
+    MQ_CHECK(f->srv_rt != NULL);
+    if (!f->srv_rt) return -1;
+    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2);
     MQ_CHECK(f->server != NULL);
     if (!f->server) return -1;
 
-    f->srv_path = mq_path_open(f->srv, 0, "127.0.0.1", 0);
-    MQ_CHECK(f->srv_path != NULL);
-    if (!f->srv_path) return -1;
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->srv_rt, "127.0.0.1", port), 0);
 
-    struct sockaddr_storage srv_addr;
-    socklen_t srv_addrlen = 0;
-    MQ_CHECK_EQ_INT(mq_path_local_addr(f->srv_path, &srv_addr, &srv_addrlen), 0);
-    uint16_t port = ntohs(((struct sockaddr_in *)&srv_addr)->sin_port);
+    f->cli_t = mq_transport_new(0);
+    MQ_CHECK(f->cli_t != NULL);
+    if (!f->cli_t) return -1;
+    f->cli_rt = mq_runtime_new(f->cli_t, f->base);
+    MQ_CHECK(f->cli_rt != NULL);
+    if (!f->cli_rt) return -1;
 
-    f->cli = mq_engine_new(0, f->base);
-    MQ_CHECK(f->cli != NULL);
-    if (!f->cli) return -1;
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->cli_rt, "127.0.0.1", 0), 0);
 
-    f->client = mq_client_new(f->cli, "127.0.0.1", port, "client-1", "secret");
+    f->client = mq_client_new(f->cli_t, f->cli_rt, "127.0.0.1", port, "client-1",
+                              "secret", MQ_CC_BBR2);
     MQ_CHECK(f->client != NULL);
     if (!f->client) return -1;
-
-    f->cli_path = mq_path_open(f->cli, 0, "127.0.0.1", 0);
-    MQ_CHECK(f->cli_path != NULL);
-    if (!f->cli_path) return -1;
 
     MQ_CHECK_EQ_INT(mq_client_start(f->client), 0);
 
@@ -134,14 +164,18 @@ fixture_up(fixture_t *f)
 static void
 fixture_down(fixture_t *f)
 {
-    if (f->socks5) mq_listener_free(f->socks5);
-    if (f->cli_path2) mq_path_close(f->cli_path2);
-    if (f->cli_path) mq_path_close(f->cli_path);
-    if (f->srv_path) mq_path_close(f->srv_path);
-    if (f->cli) mq_engine_free(f->cli);
-    if (f->srv) mq_engine_free(f->srv);
+    /* Per side: transport first (fires conn-close + in-flight callbacks into the
+     * live runtime/client/server/listener, and tears down the second path via
+     * close_path_socket on the client runtime), then the runtimes (which BORROWED
+     * the shared base, so they do NOT free it), then the proxy objects + the
+     * listener. The test owns the shared base and frees it last. */
+    if (f->cli_t) mq_transport_free(f->cli_t);
+    if (f->srv_t) mq_transport_free(f->srv_t);
+    if (f->cli_rt) mq_runtime_free(f->cli_rt);
+    if (f->srv_rt) mq_runtime_free(f->srv_rt);
     if (f->client) mq_client_free(f->client);
     if (f->server) mq_server_free(f->server);
+    if (f->socks5) mq_listener_free(f->socks5);
     if (f->base) event_base_free(f->base);
 }
 

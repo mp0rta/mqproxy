@@ -154,6 +154,14 @@ if [ "${KEEP_QLOG:-0}" = "1" ]; then
     QLOG_ON=1
 fi
 
+# Congestion control: set CC=bbr2|bbr|cubic to A/B different algorithms.
+# Unset => the CLI default (bbr). Passed to both server and client.
+CC_ARGS=()
+if [ -n "${CC:-}" ]; then
+    CC_ARGS=(--cc "${CC}")
+    note "e2e_multipath: congestion control = ${CC}"
+fi
+
 ORIGIN_PID=""
 SERVER_PID=""
 CLIENT_PID=""
@@ -242,6 +250,7 @@ start_server() {
         --token "${TOKEN}" \
         --cert "${MQPROXY_CERT}" --key "${MQPROXY_KEY}" \
         "${QLOG_ARGS[@]}" \
+        "${CC_ARGS[@]}" \
         >"${WORK}/server.log" 2>&1 &
     SERVER_PID=$!
     sleep 0.5
@@ -259,6 +268,7 @@ start_client() {
         --token "${TOKEN}" \
         --socks5 "127.0.0.1:${SOCKS_PORT}" \
         "${QLOG_ARGS[@]}" \
+        "${CC_ARGS[@]}" \
         "${path_args[@]}" \
         >"${WORK}/client.log" 2>&1 &
     CLIENT_PID=$!
@@ -267,7 +277,7 @@ start_client() {
 }
 
 stop_client() {
-    # SIGTERM: the CLI handles it (mq_engine_stop -> loop breaks -> it logs
+    # SIGTERM: the CLI handles it (mq_runtime_stop -> loop breaks -> it logs
     # mq_conn_dump_stats per-path counters to client.log before teardown).
     [ -n "${CLIENT_PID}" ] && kill -TERM "${CLIENT_PID}" 2>/dev/null
     wait "${CLIENT_PID}" 2>/dev/null
