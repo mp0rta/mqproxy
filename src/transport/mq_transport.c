@@ -74,6 +74,14 @@ mq_transport_set_event_timer(xqc_usec_t wake_after, void *engine_user_data)
     }
     t->next_deadline_us = mq_tr_now_us() + wake_after;
     t->have_deadline = 1;
+    /* Notify the caller that the deadline changed so it can (re)arm its timer
+     * immediately — even when set_event_timer is invoked from an app-initiated
+     * path (connect / stream send) that is not followed by a tick or recv.
+     * Without this, a connect-time retransmission timer would not arm until the
+     * next inbound packet, stalling a connect whose first packet is lost. */
+    if (t->cbs.on_timer) {
+        t->cbs.on_timer(t->user);
+    }
 }
 
 /* xquic log callback (REQUIRED by the engine). Route to mq_log. */

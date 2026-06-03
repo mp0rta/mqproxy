@@ -92,6 +92,15 @@ rt_timer_cb(evutil_socket_t fd, short what, void *arg)
     rt_rearm_timer(rt);
 }
 
+/* on_timer callback: the transport's deadline changed (xquic called
+ * set_event_timer). Re-arm immediately so deadlines set from app-initiated
+ * paths (connect / stream send) — not just tick/recv — are honoured. */
+static void
+rt_on_timer(void *user)
+{
+    rt_rearm_timer((mq_runtime_t *)user);
+}
+
 /* ── transport callbacks ──────────────────────────────────────────────── */
 
 /* send_udp: route an outbound packet to the path's UDP socket. Falls back to
@@ -334,6 +343,7 @@ static const mq_transport_callbacks_t g_runtime_cbs = {
     .send_udp = rt_send_udp,
     .open_path_socket = rt_open_path_socket,
     .close_path_socket = rt_close_path_socket,
+    .on_timer = rt_on_timer,
 };
 
 /* ── lifecycle ────────────────────────────────────────────────────────── */

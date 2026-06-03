@@ -45,6 +45,17 @@ typedef struct {
 
     /* core -> caller: the additional path's socket may be closed. */
     void (*close_path_socket)(uint64_t path, void *user);
+
+    /* core -> caller: the engine's next-wakeup deadline just changed (xquic
+     * called set_event_timer). The caller should (re)read
+     * mq_transport_next_timeout_ms() and (re)arm its timer. This fires for
+     * EVERY deadline change — including those set during app-initiated calls
+     * (mq_conn_connect / mq_stream_send) that are NOT followed by a tick or
+     * recv — so e.g. a connect-time retransmission timer is armed immediately
+     * even with no inbound traffic (restoring the old mq_engine behaviour where
+     * set_event_timer armed the libevent timer directly). Optional (may be
+     * NULL); without it the caller only re-arms after tick/recv. */
+    void (*on_timer)(void *user);
 } mq_transport_callbacks_t;
 
 /* Create a transport in client (is_server==0) or server (is_server!=0) mode.
