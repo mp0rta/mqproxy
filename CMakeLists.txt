@@ -18,6 +18,7 @@ add_library(mqproxy STATIC
     src/ingress/mq_http_connect.c
     src/ingress/mq_listener.c
     src/gateway/mq_http1.c
+    src/gateway/mq_fetch_listener.c
     src/transport/mq_conn.c
     src/transport/mq_h3.c
     src/transport/mq_stream.c
@@ -159,6 +160,22 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_socks5_listener PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_socks5_listener COMMAND test_socks5_listener)
+
+    # Fetch-API listener (Task 2.2). No transports/certs: drives the loopback
+    # HTTP/1.1 accept loop with fake gateway callbacks over real sockets. Linked
+    # against xquic/event like the other integration tests for uniformity.
+    add_executable(test_gw_client tests/integration/test_gw_client.c)
+    target_link_libraries(test_gw_client
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_gw_client PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_gw_client PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_gw_client COMMAND test_gw_client)
 
     add_executable(test_e2e_single_path tests/integration/test_e2e_single_path.c)
     target_link_libraries(test_e2e_single_path
