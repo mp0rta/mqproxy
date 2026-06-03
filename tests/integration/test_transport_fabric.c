@@ -108,7 +108,6 @@ typedef struct {
 /* Per-transport context: which queue this endpoint WRITES into when it sends,
  * plus the synthetic local addr xquic must see on the receiving side. */
 typedef struct {
-    fabric_t *fabric;
     fabric_queue_t *outbound; /* the PEER's inbound queue */
     const char *role;
 } endpoint_t;
@@ -307,10 +306,8 @@ test_transport_fabric(void)
     memset(&fabric, 0, sizeof(fabric));
 
     /* Per-endpoint contexts: each transport sends into the PEER's queue. */
-    endpoint_t client_ctx = {
-        .fabric = &fabric, .outbound = &fabric.to_server, .role = "client"};
-    endpoint_t server_ctx = {
-        .fabric = &fabric, .outbound = &fabric.to_client, .role = "server"};
+    endpoint_t client_ctx = {.outbound = &fabric.to_server, .role = "client"};
+    endpoint_t server_ctx = {.outbound = &fabric.to_client, .role = "server"};
 
     mq_transport_callbacks_t cbs = {
         .send_udp = fab_send_udp,
