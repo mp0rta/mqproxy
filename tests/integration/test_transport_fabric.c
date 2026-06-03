@@ -1,50 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 mp0rta
 
-/* test_transport_fabric.c — Chunk 2: socket-free in-memory transport fabric
- * E2E (design §7). This is a deliberately RED test at this chunk.
+/* test_transport_fabric.c — socket-free + libevent-free transport+stream
+ * data-plane E2E (design §7, plan Chunk 8).
  *
  * Two mq_transport instances (client + server) are driven ENTIRELY in memory:
- * no real UDP sockets, no libevent dispatch. An in-memory "fabric" with two
- * directional packet queues stands in for the network — each transport's
- * send_udp callback enqueues into the PEER's inbound queue, and a single-
- * threaded bounded driver loop ticks both transports and drains each queue
- * into the peer via mq_transport_on_udp_recv (design §7):
+ * no real UDP sockets, no libevent dispatch, no mq_client / mq_server / mq_flow.
+ * An in-memory "fabric" with two directional packet queues stands in for the
+ * network — each transport's send_udp callback enqueues into the PEER's inbound
+ * queue, and a single-threaded bounded driver loop ticks both transports and
+ * drains each queue into the peer via mq_transport_on_udp_recv (design §7):
  *
  *     client mq_transport.send_udp ──┐
  *                                     ├─ in-memory fabric (per-path queues)
  *     server mq_transport.send_udp ──┘   peer's on_udp_recv ← driver drains
  *
- *     driver: while (i<MAX && !success) {
+ *     driver: while (i<MAX && !done) {
  *                 tick(client); tick(server);
  *                 drain client→server via on_udp_recv(server,…);
  *                 drain server→client via on_udp_recv(client,…);
  *             }
  *
- * ── WHY THIS FAILS NOW (RED), and what is STUBBED ──────────────────────────
+ * Because there is no libevent timer, the driver MANUALLY ticks both sides each
+ * iteration (the transport's on_timer callback is left unused — manual ticking
+ * replaces the runtime's armed timer).
  *
- * At Chunk 2 mq_transport is a thin SHELL over mq_engine (see
- * src/transport/mq_transport.c):
- *   - the send_udp / open_path_socket callbacks are STORED but never invoked
- *     (Chunk 3/6 invert mq_engine's direct socket I/O onto them);
- *   - mq_transport_on_udp_recv is a no-op that returns 0 (Chunk 5 wires it to
- *     xqc_engine_packet_process);
- *   - mq_transport_next_timeout_ms returns -1 (Chunk 4).
- * So no packet ever enters the fabric and nothing is ever delivered: the
- * `success` flag stays false and the final MQ_CHECK asserts cleanly (the
- * process exits non-zero WITHOUT hanging or crashing — the driver loop is
- * bounded at MAX_ITERS).
+ * WHAT THIS VERIFIES — a full MPQUIC handshake plus a bidirectional stream
+ * exchange over the real mq_conn / mq_stream API, with no I/O:
+ *   1. the client conn reaches MQ_CONN_ESTABLISHED;
+ *   2. the server observes the peer-initiated stream (on_new_stream);
+ *   3. the server reads the client's payload and ECHOES it back with FIN;
+ *   4. the client reads the echo and the bytes match exactly (byte integrity)
+ *      with a clean FIN on both directions.
  *
- * SCOPE NOTE (per plan Chunk 2 REALISM clause): the proxy layer
- * (mq_client_new / mq_server_new / mq_conn_connect / mq_conn_register_alpn)
- * still takes mq_engine_t*, NOT mq_transport_t*, at this chunk, and
- * mq_transport.h does not expose the wrapped engine. The full AUTH +
- * CONNECT_TCP + bidirectional relay wiring on top of mq_transport therefore
- * cannot be expressed yet — it depends on the Chunk 7 proxy retarget. This
- * test establishes the harness SHAPE (fabric + two transports + bounded
- * driver loop over the real mq_transport API) and asserts the end-to-end
- * delivery invariant. Chunk 8 makes it GREEN and grows the assertions to the
- * full auth/CONNECT_TCP/relay byte-integrity criterion of design §7/§11 #2.
+ * SCOPE NOTE: a fully socket-free auth + CONNECT_TCP + origin-relay test is NOT
+ * achievable here — the proxy relay layer (mq_server / mq_flow) is libevent +
+ * real-socket coupled until Phase F (design §7). That full criterion is covered
+ * by the loopback E2E tests (test_e2e_single_path, test_client_server) which run
+ * the real proxy layer. This test isolates the transport+stream data plane and
+ * proves it correct deterministically, socket-free + libevent-free.
  */
 #include "mqtest.h"
 
@@ -53,9 +47,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include <xquic/xquic.h>
 
+#include "transport/mq_conn.h"
+#include "transport/mq_stream.h"
 #include "transport/mq_transport.h"
 
 #ifndef TEST_CERT_FILE
@@ -65,12 +62,28 @@
 #  define TEST_KEY_FILE "tests/certs/test.key"
 #endif
 
-/* Cap the driver loop so the test can NEVER hang even though delivery is not
- * wired. With a working transport a handshake settles in a handful of round
- * trips; this is comfortably above that. */
-#define MAX_ITERS       2000
+#define TEST_ALPN "mqproxy-tcp/1"
+
+/* Cap the driver loop so the test can NEVER hang. A working transport settles
+ * the handshake + a one-shot stream echo in a handful of round trips; this is
+ * comfortably above that. A regression must FAIL (cap reached), not hang. */
+#define MAX_ITERS       4000
 #define FABRIC_MAX_PKTS 256
 #define FABRIC_MTU      2048
+
+/* Wall-clock backstop (ms): even if the cap were mis-sized, the loop cannot run
+ * longer than this. */
+#define WALL_BUDGET_MS 5000
+
+/* Synthetic loopback ports for the two logical endpoints. Real binds never
+ * happen; these only have to give xquic two distinct, stable (local,peer)
+ * 4-tuples so it keys the path consistently across packets. */
+#define CLI_PORT 50001
+#define SRV_PORT 50002
+
+/* The payload whose round-trip byte integrity is the core assertion. */
+static const unsigned char PAYLOAD[] = "the quick brown fox jumps over the lazy dog";
+#define PAYLOAD_LEN (sizeof(PAYLOAD) - 1)
 
 /* ── in-memory fabric ────────────────────────────────────────────────────── */
 
@@ -78,12 +91,9 @@ typedef struct {
     uint8_t buf[FABRIC_MTU];
     size_t len;
     uint64_t path;
-    struct sockaddr_storage peer;
-    socklen_t peerlen;
 } fabric_pkt_t;
 
-/* One directional queue (a simple ring is unnecessary; a bounded FIFO drained
- * to empty each tick suffices for the in-memory baseline). */
+/* One directional queue (a bounded FIFO drained to empty each tick). */
 typedef struct {
     fabric_pkt_t pkts[FABRIC_MAX_PKTS];
     size_t count;
@@ -96,7 +106,8 @@ typedef struct {
     int paths_opened;         /* count of open_path_socket calls (logical only) */
 } fabric_t;
 
-/* Per-transport context: which queue this endpoint WRITES into when it sends. */
+/* Per-transport context: which queue this endpoint WRITES into when it sends,
+ * plus the synthetic local addr xquic must see on the receiving side. */
 typedef struct {
     fabric_t *fabric;
     fabric_queue_t *outbound; /* the PEER's inbound queue */
@@ -104,8 +115,7 @@ typedef struct {
 } endpoint_t;
 
 static void
-fabric_enqueue(fabric_queue_t *q, uint64_t path, const uint8_t *pkt, size_t len,
-               const struct sockaddr *peer, socklen_t peerlen)
+fabric_enqueue(fabric_queue_t *q, uint64_t path, const uint8_t *pkt, size_t len)
 {
     if (q->count >= FABRIC_MAX_PKTS || len > FABRIC_MTU) {
         q->overflow = 1;
@@ -115,30 +125,39 @@ fabric_enqueue(fabric_queue_t *q, uint64_t path, const uint8_t *pkt, size_t len,
     memcpy(p->buf, pkt, len);
     p->len = len;
     p->path = path;
-    p->peerlen = 0;
-    if (peer && peerlen > 0 && peerlen <= (socklen_t)sizeof(p->peer)) {
-        memcpy(&p->peer, peer, peerlen);
-        p->peerlen = peerlen;
-    }
+}
+
+static void
+make_addr(struct sockaddr_in *sa, uint16_t port)
+{
+    memset(sa, 0, sizeof(*sa));
+    sa->sin_family = AF_INET;
+    sa->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa->sin_port = htons(port);
 }
 
 /* ── mq_transport callbacks (the fabric backend) ─────────────────────────── */
 
 /* send_udp: copy the packet into the PEER's inbound queue and report the byte
  * count written (xquic's xqc_socket_write_pt contract; UDP is all-or-nothing).
- * On the Chunk-2 shell this is NEVER invoked (mq_transport does not yet route
- * sends through the callback), which is precisely why delivery — and thus the
- * test — fails. */
+ * The destination addr is implicit (each endpoint writes only into its peer's
+ * queue), so it is not carried — the drain synthesises the (local,peer) tuple
+ * from the receiving endpoint's identity. */
 static int
 fab_send_udp(uint64_t path, const uint8_t *pkt, size_t len, const struct sockaddr *peer,
              socklen_t peerlen, void *user)
 {
+    (void)peer;
+    (void)peerlen;
     endpoint_t *ep = (endpoint_t *)user;
-    fabric_enqueue(ep->outbound, path, pkt, len, peer, peerlen);
+    fabric_enqueue(ep->outbound, path, pkt, len);
     return (int)len;
 }
 
-/* open_path_socket: record the path as a logical channel; no real socket. */
+/* open_path_socket: record the path as a logical channel; no real socket. The
+ * primary path (path 0) is never routed through here — xquic sends primary
+ * traffic via write_socket with no socket lifecycle — so this only fires if a
+ * secondary path were added (not exercised by this test). */
 static int
 fab_open_path_socket(uint64_t path, const char *local_ip, uint16_t port, void *user)
 {
@@ -158,31 +177,132 @@ fab_close_path_socket(uint64_t path, void *user)
 }
 
 /* Drain every queued packet into `dst` via the real on_udp_recv input edge.
- * Returns the number of packets that on_udp_recv reported as consumed (>0).
- * On the shell transport on_udp_recv is a no-op returning 0, so nothing is
- * ever counted as consumed. */
+ * `dst` is the receiving endpoint, bound (logically) to dst_port; the source is
+ * bound to src_port. xquic keys the path on the (local,peer) 4-tuple, so the
+ * receiving side must always see local=dst_port, peer=src_port.
+ *
+ * Returns the number of packets on_udp_recv reported as accepted. The success
+ * code from xqc_engine_packet_process is XQC_OK == 0, so a successfully consumed
+ * packet returns 0 (>= 0); only a hard error is < 0. We count r >= 0. */
 static int
-fabric_drain(fabric_queue_t *q, mq_transport_t *dst)
+fabric_drain(fabric_queue_t *q, mq_transport_t *dst, uint16_t dst_port, uint16_t src_port)
 {
-    /* xqc_engine_packet_process needs a non-NULL local (bind) address — it keys
-     * the path on the (local,peer) 4-tuple. The fabric has no real socket, so
-     * synthesise a loopback local addr; it just has to be a valid sockaddr. */
-    struct sockaddr_in local;
-    memset(&local, 0, sizeof(local));
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    local.sin_port = htons(0);
+    struct sockaddr_in local, peer;
+    make_addr(&local, dst_port);
+    make_addr(&peer, src_port);
 
     int consumed = 0;
     for (size_t i = 0; i < q->count; i++) {
         fabric_pkt_t *p = &q->pkts[i];
         int r = mq_transport_on_udp_recv(dst, p->path, p->buf, p->len,
                                          (struct sockaddr *)&local, sizeof(local),
-                                         (struct sockaddr *)&p->peer, p->peerlen);
-        if (r > 0) consumed++;
+                                         (struct sockaddr *)&peer, sizeof(peer));
+        if (r >= 0) consumed++;
     }
     q->count = 0;
     return consumed;
+}
+
+static uint64_t
+now_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* ── application state (the data-plane assertions) ───────────────────────── */
+
+static int g_client_established;
+static int g_client_closed;
+
+/* Server side: the echo stream + the bytes seen so far. */
+static mq_stream_t *g_server_stream;
+static unsigned char g_server_rx[FABRIC_MTU];
+static size_t g_server_rx_len;
+static int g_server_saw_fin;
+static int g_server_echoed;
+
+/* Client side: the echo received back from the server. */
+static unsigned char g_client_rx[FABRIC_MTU];
+static size_t g_client_rx_len;
+static int g_client_saw_fin;
+
+static void
+on_client_state(mq_conn_t *c, mq_conn_state_t st, void *user)
+{
+    (void)c;
+    (void)user;
+    if (st == MQ_CONN_ESTABLISHED) {
+        g_client_established = 1;
+    } else if (st == MQ_CONN_CLOSED) {
+        g_client_closed = 1;
+    }
+}
+
+/* Client stream readable: drain the server's echo and note the FIN. */
+static void
+on_client_stream_readable(mq_stream_t *s, void *user)
+{
+    (void)user;
+    for (;;) {
+        int fin = 0;
+        long n = mq_stream_recv(s, g_client_rx + g_client_rx_len,
+                                sizeof(g_client_rx) - g_client_rx_len, &fin);
+        if (n > 0) {
+            g_client_rx_len += (size_t)n;
+        }
+        if (fin) {
+            g_client_saw_fin = 1;
+        }
+        if (n <= 0) break;
+    }
+}
+
+/* Server stream readable: drain the client's payload; once FIN is seen, echo
+ * the accumulated bytes back with FIN. */
+static void
+on_server_stream_readable(mq_stream_t *s, void *user)
+{
+    (void)user;
+    for (;;) {
+        int fin = 0;
+        long n = mq_stream_recv(s, g_server_rx + g_server_rx_len,
+                                sizeof(g_server_rx) - g_server_rx_len, &fin);
+        if (n > 0) {
+            g_server_rx_len += (size_t)n;
+        }
+        if (fin) {
+            g_server_saw_fin = 1;
+        }
+        if (n <= 0) break;
+    }
+
+    if (g_server_saw_fin && !g_server_echoed) {
+        long sent = mq_stream_send(s, g_server_rx, g_server_rx_len, /*fin=*/1);
+        if (sent >= 0) {
+            g_server_echoed = 1;
+        }
+    }
+}
+
+/* Server side: accepted connections surface here. */
+static void
+on_server_conn(mq_conn_t *c, void *user)
+{
+    (void)c;
+    (void)user;
+}
+
+/* Server side: peer-initiated stream surfaces here — wire its read callback so
+ * we receive + echo the client's payload. */
+static void
+on_server_stream(mq_stream_t *s, void *user)
+{
+    (void)user;
+    g_server_stream = s;
+    mq_stream_set_cbs(s, on_server_stream_readable, /*on_writable=*/NULL,
+                      /*on_close=*/NULL, NULL);
 }
 
 static void
@@ -204,7 +324,7 @@ test_transport_fabric(void)
     };
 
     /* Two transports over the shared fabric: client + server (with TLS material
-     * so the server transport is handshake-capable once delivery is wired). */
+     * so the server transport is handshake-capable). */
     mq_transport_t *client = mq_transport_new(/*is_server=*/0, &cbs, &client_ctx);
     MQ_CHECK(client != NULL);
     mq_transport_t *server =
@@ -216,42 +336,111 @@ test_transport_fabric(void)
         return;
     }
 
-    /* The xqc engines must be reachable through the public accessor (used by the
-     * proxy layer in later chunks to drive conn/stream over the transport). */
     MQ_CHECK(mq_transport_xqc(client) != NULL);
     MQ_CHECK(mq_transport_xqc(server) != NULL);
 
-    /* Bounded driver loop (design §7): tick both, then drain each direction
-     * into the peer. `success` is the end-to-end delivery invariant — at least
-     * one packet observed crossing the fabric AND consumed by the peer's input
-     * edge. On the Chunk-2 shell, send_udp is never called (queues stay empty)
-     * and on_udp_recv is a no-op (returns 0), so this never becomes true. The
-     * loop is bounded, so the test always terminates (no hang). */
-    int success = 0;
-    int delivered = 0;
-    for (int i = 0; i < MAX_ITERS && !success; i++) {
+    /* Register the ALPN on both engines: server supplies new-conn / new-stream
+     * hooks; the client is a pure initiator (NULL server hooks). */
+    int rc =
+        mq_conn_register_alpn(server, TEST_ALPN, on_server_conn, on_server_stream, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    rc = mq_conn_register_alpn(client, TEST_ALPN, NULL, NULL, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    /* The client connects to the server's synthetic loopback address. The
+     * primary path (path 0) needs no open_path_socket — xquic emits its packets
+     * via write_socket, which the fabric routes by endpoint identity. */
+    struct sockaddr_in srv_addr;
+    make_addr(&srv_addr, SRV_PORT);
+
+    xqc_conn_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.proto_version = XQC_VERSION_V1;
+    settings.pacing_on = 1;
+    settings.max_pkt_out_size = 1200;
+
+    mq_conn_t *conn = mq_conn_connect(client, (struct sockaddr *)&srv_addr,
+                                      sizeof(srv_addr), TEST_ALPN, &settings, NULL);
+    MQ_CHECK(conn != NULL);
+    if (!conn) {
+        mq_transport_free(client);
+        mq_transport_free(server);
+        return;
+    }
+    mq_conn_set_on_state(conn, on_client_state, NULL);
+
+    /* ── Phase 1: drive the handshake to ESTABLISHED ─────────────────────── */
+    uint64_t deadline = now_ms() + WALL_BUDGET_MS;
+    int iters = 0;
+    while (!g_client_established && iters < MAX_ITERS && now_ms() < deadline) {
         mq_transport_tick(client);
         mq_transport_tick(server);
-        delivered += fabric_drain(&fabric.to_server, server);
-        delivered += fabric_drain(&fabric.to_client, client);
-        /* next_timeout_ms is part of the real driver contract (runtime arms a
-         * timer from it). Exercise it so the harness shape matches §7; the shell
-         * returns -1 (no work scheduled). */
+        fabric_drain(&fabric.to_server, server, SRV_PORT, CLI_PORT);
+        fabric_drain(&fabric.to_client, client, CLI_PORT, SRV_PORT);
         (void)mq_transport_next_timeout_ms(client);
         (void)mq_transport_next_timeout_ms(server);
-        if (delivered > 0) success = 1;
+        iters++;
+    }
+    MQ_CHECK(g_client_established);
+
+    /* ── Phase 2: client opens a bidi stream, sends the payload with FIN ──── */
+    mq_stream_t *cs = mq_conn_open_stream(conn);
+    MQ_CHECK(cs != NULL);
+    if (cs) {
+        mq_stream_set_cbs(cs, on_client_stream_readable, /*on_writable=*/NULL,
+                          /*on_close=*/NULL, NULL);
+        long sent = mq_stream_send(cs, PAYLOAD, PAYLOAD_LEN, /*fin=*/1);
+        MQ_CHECK_EQ_INT((int)sent, (int)PAYLOAD_LEN);
     }
 
-    /* The fabric must not have silently dropped packets (would mask a failure as
-     * a pass once delivery is wired). On the shell these stay empty/false. */
+    /* Drive until the round-trip echo lands (or the bounded caps fire). */
+    int done = 0;
+    while (!done && iters < MAX_ITERS && now_ms() < deadline) {
+        mq_transport_tick(client);
+        mq_transport_tick(server);
+        fabric_drain(&fabric.to_server, server, SRV_PORT, CLI_PORT);
+        fabric_drain(&fabric.to_client, client, CLI_PORT, SRV_PORT);
+        (void)mq_transport_next_timeout_ms(client);
+        (void)mq_transport_next_timeout_ms(server);
+        iters++;
+        done = (g_client_saw_fin && g_client_rx_len == PAYLOAD_LEN);
+    }
+
+    /* The fabric must not have silently dropped packets (would mask a failure
+     * as a pass). */
     MQ_CHECK_EQ_INT(fabric.to_server.overflow, 0);
     MQ_CHECK_EQ_INT(fabric.to_client.overflow, 0);
 
-    /* THE RED ASSERTION. Chunk 8 wires the transport delivery path (and the
-     * Chunk 7 proxy retarget supplies auth + CONNECT_TCP + relay on top); this
-     * flips to true then. Today it is false — a CLEAN assert failure, not a
-     * crash or hang. */
+    int established = g_client_established;
+    int server_saw_stream = (g_server_stream != NULL) && g_server_saw_fin;
+    int echo_matches = (g_client_rx_len == PAYLOAD_LEN) &&
+                       (memcmp(g_client_rx, PAYLOAD, PAYLOAD_LEN) == 0);
+    int clean_close = g_client_saw_fin && g_server_echoed;
+
+    int success = established && server_saw_stream && echo_matches && clean_close;
+    if (!success) {
+        fprintf(stderr,
+                "fabric E2E FAILED [%s/%s]: established=%d server_saw_stream=%d "
+                "(stream=%p server_fin=%d) echo_matches=%d (rx_len=%zu want=%zu) "
+                "clean_close=%d (client_fin=%d echoed=%d) iters=%d\n",
+                client_ctx.role, server_ctx.role, established, server_saw_stream,
+                (void *)g_server_stream, g_server_saw_fin, echo_matches, g_client_rx_len,
+                (size_t)PAYLOAD_LEN, clean_close, g_client_saw_fin, g_server_echoed,
+                iters);
+    }
     MQ_CHECK(success);
+
+    mq_conn_close(conn);
+
+    /* Pump briefly so close frames flush (bounded). */
+    uint64_t close_deadline = now_ms() + 200;
+    while (!g_client_closed && iters < MAX_ITERS && now_ms() < close_deadline) {
+        mq_transport_tick(client);
+        mq_transport_tick(server);
+        fabric_drain(&fabric.to_server, server, SRV_PORT, CLI_PORT);
+        fabric_drain(&fabric.to_client, client, CLI_PORT, SRV_PORT);
+        iters++;
+    }
 
     mq_transport_free(client);
     mq_transport_free(server);
