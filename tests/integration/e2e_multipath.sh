@@ -267,7 +267,7 @@ start_client() {
 }
 
 stop_client() {
-    # SIGTERM: the CLI handles it (mq_engine_stop -> loop breaks -> it logs
+    # SIGTERM: the CLI handles it (mq_runtime_stop -> loop breaks -> it logs
     # mq_conn_dump_stats per-path counters to client.log before teardown).
     [ -n "${CLIENT_PID}" ] && kill -TERM "${CLIENT_PID}" 2>/dev/null
     wait "${CLIENT_PID}" 2>/dev/null

@@ -272,9 +272,9 @@ cmd_server(int argc, char **argv)
         MQ_LOGE("failed to create event base");
         goto out;
     }
-    /* The runtime installs its callbacks onto the transport, so pass NULL cbs to
-     * mq_transport_new_server. */
-    transport = mq_transport_new_server(/*cbs=*/NULL, /*user=*/NULL, cert, key);
+    /* The runtime installs its callbacks onto the transport via
+     * mq_transport_set_callbacks (in mq_runtime_new). */
+    transport = mq_transport_new_server(cert, key);
     if (!transport) {
         MQ_LOGE("failed to create server transport (cert=%s key=%s)", cert, key);
         goto out;
@@ -449,9 +449,9 @@ cmd_client(int argc, char **argv)
         MQ_LOGE("failed to create event base");
         goto out;
     }
-    /* The runtime installs its callbacks onto the transport, so pass NULL cbs to
-     * mq_transport_new. */
-    transport = mq_transport_new(/*is_server=*/0, /*cbs=*/NULL, /*user=*/NULL);
+    /* The runtime installs its callbacks onto the transport via
+     * mq_transport_set_callbacks (in mq_runtime_new). */
+    transport = mq_transport_new(/*is_server=*/0);
     if (!transport) {
         MQ_LOGE("failed to create client transport");
         goto out;

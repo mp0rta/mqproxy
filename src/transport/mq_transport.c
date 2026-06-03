@@ -10,8 +10,7 @@
  * mq_transport_next_timeout_ms (Chunk 4) and drives the engine via tick.
  *
  * Engine/ssl/config setup is a faithful port of mq_engine's mq_engine_new_impl;
- * the engine/transport/ssl callback tables mirror mq_engine.c. on_udp_recv is a
- * Chunk-1 stub (real impl is Chunk 5); next_timeout_ms returns -1 (Chunk 4).
+ * the engine/transport/ssl callback tables mirror mq_engine.c.
  *
  * NB: src/transport/mq_transport.c must stay libevent-free.
  */
@@ -255,19 +254,15 @@ mq_transport_save_tp(const char *data, size_t data_len, void *conn_user_data)
 /* ── lifecycle ────────────────────────────────────────────────────────── */
 
 static mq_transport_t *
-mq_transport_new_impl(int is_server, const mq_transport_callbacks_t *cbs, void *user,
-                      const char *cert_file, const char *key_file)
+mq_transport_new_impl(int is_server, const char *cert_file, const char *key_file)
 {
     mq_transport_t *t = calloc(1, sizeof(*t));
     if (!t) {
         return NULL;
     }
-    if (cbs) {
-        t->cbs = *cbs;
-    } else {
-        memset(&t->cbs, 0, sizeof(t->cbs));
-    }
-    t->user = user;
+    /* Callbacks are installed later via mq_transport_set_callbacks. */
+    memset(&t->cbs, 0, sizeof(t->cbs));
+    t->user = NULL;
     t->is_server = is_server ? 1 : 0;
     t->qlog_fd = -1; /* qlog disabled until mq_transport_enable_qlog */
 
@@ -345,20 +340,19 @@ mq_transport_new_impl(int is_server, const mq_transport_callbacks_t *cbs, void *
 }
 
 mq_transport_t *
-mq_transport_new(int is_server, const mq_transport_callbacks_t *cbs, void *user)
+mq_transport_new(int is_server)
 {
-    return mq_transport_new_impl(is_server, cbs, user, NULL, NULL);
+    return mq_transport_new_impl(is_server, NULL, NULL);
 }
 
 mq_transport_t *
-mq_transport_new_server(const mq_transport_callbacks_t *cbs, void *user,
-                        const char *cert_file, const char *key_file)
+mq_transport_new_server(const char *cert_file, const char *key_file)
 {
     if (!cert_file || !key_file) {
         MQ_LOGE("mq_transport: server transport requires cert_file and key_file");
         return NULL;
     }
-    return mq_transport_new_impl(/*is_server=*/1, cbs, user, cert_file, key_file);
+    return mq_transport_new_impl(/*is_server=*/1, cert_file, key_file);
 }
 
 void

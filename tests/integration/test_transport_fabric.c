@@ -103,7 +103,6 @@ typedef struct {
 typedef struct {
     fabric_queue_t to_server; /* packets the client sent, awaiting the server */
     fabric_queue_t to_client; /* packets the server sent, awaiting the client */
-    int paths_opened;         /* count of open_path_socket calls (logical only) */
 } fabric_t;
 
 /* Per-transport context: which queue this endpoint WRITES into when it sends,
@@ -154,18 +153,17 @@ fab_send_udp(uint64_t path, const uint8_t *pkt, size_t len, const struct sockadd
     return (int)len;
 }
 
-/* open_path_socket: record the path as a logical channel; no real socket. The
- * primary path (path 0) is never routed through here — xquic sends primary
- * traffic via write_socket with no socket lifecycle — so this only fires if a
- * secondary path were added (not exercised by this test). */
+/* open_path_socket: no real socket. The primary path (path 0) is never routed
+ * through here — xquic sends primary traffic via write_socket with no socket
+ * lifecycle — so this only fires if a secondary path were added (not exercised
+ * by this test). Installed for completeness; a no-op success. */
 static int
 fab_open_path_socket(uint64_t path, const char *local_ip, uint16_t port, void *user)
 {
     (void)path;
     (void)local_ip;
     (void)port;
-    endpoint_t *ep = (endpoint_t *)user;
-    ep->fabric->paths_opened++;
+    (void)user;
     return 0;
 }
 
@@ -214,7 +212,6 @@ now_ms(void)
 /* ── application state (the data-plane assertions) ───────────────────────── */
 
 static int g_client_established;
-static int g_client_closed;
 
 /* Server side: the echo stream + the bytes seen so far. */
 static mq_stream_t *g_server_stream;
@@ -235,8 +232,6 @@ on_client_state(mq_conn_t *c, mq_conn_state_t st, void *user)
     (void)user;
     if (st == MQ_CONN_ESTABLISHED) {
         g_client_established = 1;
-    } else if (st == MQ_CONN_CLOSED) {
-        g_client_closed = 1;
     }
 }
 
@@ -325,16 +320,17 @@ test_transport_fabric(void)
 
     /* Two transports over the shared fabric: client + server (with TLS material
      * so the server transport is handshake-capable). */
-    mq_transport_t *client = mq_transport_new(/*is_server=*/0, &cbs, &client_ctx);
+    mq_transport_t *client = mq_transport_new(/*is_server=*/0);
     MQ_CHECK(client != NULL);
-    mq_transport_t *server =
-        mq_transport_new_server(&cbs, &server_ctx, TEST_CERT_FILE, TEST_KEY_FILE);
+    mq_transport_t *server = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
     MQ_CHECK(server != NULL);
     if (!client || !server) {
         if (client) mq_transport_free(client);
         if (server) mq_transport_free(server);
         return;
     }
+    mq_transport_set_callbacks(client, &cbs, &client_ctx);
+    mq_transport_set_callbacks(server, &cbs, &server_ctx);
 
     MQ_CHECK(mq_transport_xqc(client) != NULL);
     MQ_CHECK(mq_transport_xqc(server) != NULL);
@@ -432,14 +428,19 @@ test_transport_fabric(void)
 
     mq_conn_close(conn);
 
-    /* Pump briefly so close frames flush (bounded). */
+    /* Pump briefly so the local CONNECTION_CLOSE frame flushes to the peer
+     * (bounded). xquic surfaces conn_close_notify only at engine teardown (after
+     * its closing/drain timer), not within this in-memory pump, so the
+     * MQ_CONN_CLOSED transition is not asserted here — the clean-close byte-level
+     * criterion (client FIN seen + server echoed with FIN) is asserted above. */
     uint64_t close_deadline = now_ms() + 200;
-    while (!g_client_closed && iters < MAX_ITERS && now_ms() < close_deadline) {
+    int close_iters = 0;
+    while (close_iters < MAX_ITERS && now_ms() < close_deadline) {
         mq_transport_tick(client);
         mq_transport_tick(server);
         fabric_drain(&fabric.to_server, server, SRV_PORT, CLI_PORT);
         fabric_drain(&fabric.to_client, client, CLI_PORT, SRV_PORT);
-        iters++;
+        close_iters++;
     }
 
     mq_transport_free(client);

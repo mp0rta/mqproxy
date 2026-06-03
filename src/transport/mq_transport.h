@@ -59,23 +59,21 @@ typedef struct {
 } mq_transport_callbacks_t;
 
 /* Create a transport in client (is_server==0) or server (is_server!=0) mode.
- * cbs is copied (NULL tolerated == zeroed). user is stored opaquely. Returns
+ * Callbacks are installed separately via mq_transport_set_callbacks. Returns
  * NULL on failure. */
-mq_transport_t *mq_transport_new(int is_server, const mq_transport_callbacks_t *cbs,
-                                 void *user);
+mq_transport_t *mq_transport_new(int is_server);
 
 /* Create a server-mode transport with a TLS certificate + private key (PEM
- * files, both required). cbs/user as in mq_transport_new. Returns NULL on
- * failure. */
-mq_transport_t *mq_transport_new_server(const mq_transport_callbacks_t *cbs, void *user,
-                                        const char *cert_file, const char *key_file);
+ * files, both required). Callbacks are installed separately via
+ * mq_transport_set_callbacks. Returns NULL on failure. */
+mq_transport_t *mq_transport_new_server(const char *cert_file, const char *key_file);
 
 void mq_transport_free(mq_transport_t *t);
 
 /* Install (or replace) the transport's callbacks and opaque user pointer after
  * construction. cbs is copied (NULL == zeroed). Used by the runtime, which is
  * created after the transport and must register itself as the callback user.
- * Additive; production paths construct callbacks at mq_transport_new time. */
+ * This is the sole way to install transport callbacks. */
 void mq_transport_set_callbacks(mq_transport_t *t, const mq_transport_callbacks_t *cbs,
                                 void *user);
 

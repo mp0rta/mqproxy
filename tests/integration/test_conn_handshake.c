@@ -125,8 +125,7 @@ test_conn_handshake(void)
     MQ_CHECK(srv_port != 0);
 
     /* ── Server: transport (with TLS) + runtime borrowing the shared base ── */
-    mq_transport_t *srv_t = mq_transport_new_server(/*cbs=*/NULL, /*user=*/NULL,
-                                                    TEST_CERT_FILE, TEST_KEY_FILE);
+    mq_transport_t *srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
     MQ_CHECK(srv_t != NULL);
     mq_runtime_t *srv_rt = srv_t ? mq_runtime_new(srv_t, base) : NULL;
     MQ_CHECK(srv_rt != NULL);
@@ -140,8 +139,7 @@ test_conn_handshake(void)
     MQ_CHECK_EQ_INT(srv_bound, 0);
 
     /* ── Client: transport + runtime borrowing the SAME shared base ── */
-    mq_transport_t *cli_t =
-        mq_transport_new(/*is_server=*/0, /*cbs=*/NULL, /*user=*/NULL);
+    mq_transport_t *cli_t = mq_transport_new(/*is_server=*/0);
     MQ_CHECK(cli_t != NULL);
     mq_runtime_t *cli_rt = cli_t ? mq_runtime_new(cli_t, base) : NULL;
     MQ_CHECK(cli_rt != NULL);

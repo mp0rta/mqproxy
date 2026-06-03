@@ -134,7 +134,7 @@ fixture_up(fixture_t *f, const char *client_token)
     if (!port) return -1;
 
     /* Server: transport (TLS) + runtime borrowing the shared base. */
-    f->srv_t = mq_transport_new_server(NULL, NULL, TEST_CERT_FILE, TEST_KEY_FILE);
+    f->srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
     MQ_CHECK(f->srv_t != NULL);
     if (!f->srv_t) return -1;
     f->srv_rt = mq_runtime_new(f->srv_t, f->base);
@@ -147,7 +147,7 @@ fixture_up(fixture_t *f, const char *client_token)
     MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->srv_rt, "127.0.0.1", port), 0);
 
     /* Client: transport + runtime borrowing the SAME shared base. */
-    f->cli_t = mq_transport_new(0, NULL, NULL);
+    f->cli_t = mq_transport_new(0);
     MQ_CHECK(f->cli_t != NULL);
     if (!f->cli_t) return -1;
     f->cli_rt = mq_runtime_new(f->cli_t, f->base);
@@ -696,8 +696,7 @@ test_data_stream_preauth_reset(void)
     MQ_CHECK(srv_port != 0);
 
     /* Server: transport (TLS) + runtime borrowing the shared base. */
-    mq_transport_t *srv_t =
-        mq_transport_new_server(NULL, NULL, TEST_CERT_FILE, TEST_KEY_FILE);
+    mq_transport_t *srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
     MQ_CHECK(srv_t != NULL);
     mq_runtime_t *srv_rt = srv_t ? mq_runtime_new(srv_t, base) : NULL;
     MQ_CHECK(srv_rt != NULL);
@@ -713,7 +712,7 @@ test_data_stream_preauth_reset(void)
     if (base) MQ_CHECK_EQ_INT(echo_origin_up(&origin, base, &origin_port), 0);
 
     /* Client: RAW transport conn (no mq_client / no AUTH_REQUEST). */
-    mq_transport_t *cli_t = mq_transport_new(0, NULL, NULL);
+    mq_transport_t *cli_t = mq_transport_new(0);
     MQ_CHECK(cli_t != NULL);
     mq_runtime_t *cli_rt = cli_t ? mq_runtime_new(cli_t, base) : NULL;
     MQ_CHECK(cli_rt != NULL);

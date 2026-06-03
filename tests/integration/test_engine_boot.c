@@ -35,7 +35,7 @@ test_engine_boot(void)
     /* Construction order: transport first, then the runtime (which installs its
      * callbacks onto the transport as cbs.user). The runtime owns its own base
      * here (base == NULL). */
-    mq_transport_t *t = mq_transport_new(/*is_server=*/0, /*cbs=*/NULL, /*user=*/NULL);
+    mq_transport_t *t = mq_transport_new(/*is_server=*/0);
     MQ_CHECK(t != NULL);
     if (!t) return;
 

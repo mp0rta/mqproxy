@@ -113,6 +113,8 @@ rt_send_udp(uint64_t path, const uint8_t *pkt, size_t len, const struct sockaddr
 {
     mq_runtime_t *rt = (mq_runtime_t *)user;
     if (!rt || path >= MQ_RT_MAX_PATHS) {
+        MQ_LOGW("mq_runtime: send on out-of-range path_id %llu",
+                (unsigned long long)path);
         return -1;
     }
 
@@ -124,6 +126,8 @@ rt_send_udp(uint64_t path, const uint8_t *pkt, size_t len, const struct sockaddr
          * challenge reaches the peer via the primary 4-tuple. */
         fd = rt->paths[0].fd;
         if (fd < 0) {
+            MQ_LOGW("mq_runtime: send on unmapped path_id %llu (no primary fallback)",
+                    (unsigned long long)path);
             return -1;
         }
     }
