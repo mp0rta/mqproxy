@@ -60,35 +60,33 @@ add_test(NAME test_http_connect COMMAND test_http_connect)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
-    # CHUNK7B: re-enable after retarget — references deleted mq_engine.
-    # add_executable(test_engine_boot tests/integration/test_engine_boot.c)
-    # target_link_libraries(test_engine_boot
-    #     mqproxy
-    #     xquic
-    #     ${EVENT_CORE_LIB}
-    #     ${EVENT_EXTRA_LIB}
-    #     pthread dl m stdc++)
-    # target_include_directories(test_engine_boot PRIVATE tests src
-    #     ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
-    # # libxquic.so is loaded at runtime from the xquic build dir; embed an
-    # # rpath so ctest runs without LD_LIBRARY_PATH.
-    # set_target_properties(test_engine_boot PROPERTIES
-    #     BUILD_RPATH "${XQUIC_BUILD_DIR}")
-    # add_test(NAME test_engine_boot COMMAND test_engine_boot)
+    add_executable(test_engine_boot tests/integration/test_engine_boot.c)
+    target_link_libraries(test_engine_boot
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_engine_boot PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    # libxquic.so is loaded at runtime from the xquic build dir; embed an
+    # rpath so ctest runs without LD_LIBRARY_PATH.
+    set_target_properties(test_engine_boot PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_engine_boot COMMAND test_engine_boot)
 
-    # CHUNK7B: re-enable after retarget — references deleted mq_engine/mq_path.
-    # add_executable(test_path_bind tests/integration/test_path_bind.c)
-    # target_link_libraries(test_path_bind
-    #     mqproxy
-    #     xquic
-    #     ${EVENT_CORE_LIB}
-    #     ${EVENT_EXTRA_LIB}
-    #     pthread dl m stdc++)
-    # target_include_directories(test_path_bind PRIVATE tests src
-    #     ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
-    # set_target_properties(test_path_bind PROPERTIES
-    #     BUILD_RPATH "${XQUIC_BUILD_DIR}")
-    # add_test(NAME test_path_bind COMMAND test_path_bind)
+    add_executable(test_path_bind tests/integration/test_path_bind.c)
+    target_link_libraries(test_path_bind
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_path_bind PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_path_bind PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_path_bind COMMAND test_path_bind)
 
     # Self-signed cert/key for the loopback handshake test. Committed under
     # tests/certs (test-only); regenerated at configure time if missing.
@@ -110,39 +108,37 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         endif()
     endif()
 
-    # CHUNK7B: re-enable after retarget — references deleted mq_engine/mq_path.
-    # add_executable(test_conn_handshake tests/integration/test_conn_handshake.c)
-    # target_link_libraries(test_conn_handshake
-    #     mqproxy
-    #     xquic
-    #     ${EVENT_CORE_LIB}
-    #     ${EVENT_EXTRA_LIB}
-    #     pthread dl m stdc++)
-    # target_include_directories(test_conn_handshake PRIVATE tests src
-    #     ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
-    # target_compile_definitions(test_conn_handshake PRIVATE
-    #     TEST_CERT_FILE="${MQ_CERT_FILE}"
-    #     TEST_KEY_FILE="${MQ_KEY_FILE}")
-    # set_target_properties(test_conn_handshake PROPERTIES
-    #     BUILD_RPATH "${XQUIC_BUILD_DIR}")
-    # add_test(NAME test_conn_handshake COMMAND test_conn_handshake)
+    add_executable(test_conn_handshake tests/integration/test_conn_handshake.c)
+    target_link_libraries(test_conn_handshake
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_conn_handshake PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_conn_handshake PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_conn_handshake PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_conn_handshake COMMAND test_conn_handshake)
 
-    # CHUNK7B: re-enable after retarget — references deleted mq_engine/mq_path.
-    # add_executable(test_client_server tests/integration/test_client_server.c)
-    # target_link_libraries(test_client_server
-    #     mqproxy
-    #     xquic
-    #     ${EVENT_CORE_LIB}
-    #     ${EVENT_EXTRA_LIB}
-    #     pthread dl m stdc++)
-    # target_include_directories(test_client_server PRIVATE tests src
-    #     ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
-    # target_compile_definitions(test_client_server PRIVATE
-    #     TEST_CERT_FILE="${MQ_CERT_FILE}"
-    #     TEST_KEY_FILE="${MQ_KEY_FILE}")
-    # set_target_properties(test_client_server PROPERTIES
-    #     BUILD_RPATH "${XQUIC_BUILD_DIR}")
-    # add_test(NAME test_client_server COMMAND test_client_server)
+    add_executable(test_client_server tests/integration/test_client_server.c)
+    target_link_libraries(test_client_server
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_client_server PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_client_server PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_client_server PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_client_server COMMAND test_client_server)
 
     add_executable(test_socks5_listener tests/integration/test_socks5_listener.c)
     target_link_libraries(test_socks5_listener
@@ -157,22 +153,21 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_socks5_listener COMMAND test_socks5_listener)
 
-    # CHUNK7B: re-enable after retarget — references deleted mq_engine/mq_path.
-    # add_executable(test_e2e_single_path tests/integration/test_e2e_single_path.c)
-    # target_link_libraries(test_e2e_single_path
-    #     mqproxy
-    #     xquic
-    #     ${EVENT_CORE_LIB}
-    #     ${EVENT_EXTRA_LIB}
-    #     pthread dl m stdc++)
-    # target_include_directories(test_e2e_single_path PRIVATE tests src
-    #     ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
-    # target_compile_definitions(test_e2e_single_path PRIVATE
-    #     TEST_CERT_FILE="${MQ_CERT_FILE}"
-    #     TEST_KEY_FILE="${MQ_KEY_FILE}")
-    # set_target_properties(test_e2e_single_path PROPERTIES
-    #     BUILD_RPATH "${XQUIC_BUILD_DIR}")
-    # add_test(NAME test_e2e_single_path COMMAND test_e2e_single_path)
+    add_executable(test_e2e_single_path tests/integration/test_e2e_single_path.c)
+    target_link_libraries(test_e2e_single_path
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_e2e_single_path PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_e2e_single_path PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_e2e_single_path PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_e2e_single_path COMMAND test_e2e_single_path)
 
     add_executable(test_transport_fabric tests/integration/test_transport_fabric.c)
     target_link_libraries(test_transport_fabric
@@ -190,39 +185,37 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_transport_fabric COMMAND test_transport_fabric)
 
-    # CHUNK7B: re-enable after retarget — references deleted mq_engine/mq_path.
-    # add_executable(test_two_paths tests/integration/test_two_paths.c)
-    # target_link_libraries(test_two_paths
-    #     mqproxy
-    #     xquic
-    #     ${EVENT_CORE_LIB}
-    #     ${EVENT_EXTRA_LIB}
-    #     pthread dl m stdc++)
-    # target_include_directories(test_two_paths PRIVATE tests src
-    #     ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
-    # target_compile_definitions(test_two_paths PRIVATE
-    #     TEST_CERT_FILE="${MQ_CERT_FILE}"
-    #     TEST_KEY_FILE="${MQ_KEY_FILE}")
-    # set_target_properties(test_two_paths PROPERTIES
-    #     BUILD_RPATH "${XQUIC_BUILD_DIR}")
-    # add_test(NAME test_two_paths COMMAND test_two_paths)
+    add_executable(test_two_paths tests/integration/test_two_paths.c)
+    target_link_libraries(test_two_paths
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_two_paths PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_two_paths PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_two_paths PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_two_paths COMMAND test_two_paths)
 
-    # CHUNK7B: re-enable after retarget — references deleted mq_engine/mq_path.
-    # add_executable(test_qlog_blocked tests/integration/test_qlog_blocked.c)
-    # target_link_libraries(test_qlog_blocked
-    #     mqproxy
-    #     xquic
-    #     ${EVENT_CORE_LIB}
-    #     ${EVENT_EXTRA_LIB}
-    #     pthread dl m stdc++)
-    # target_include_directories(test_qlog_blocked PRIVATE tests src
-    #     ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
-    # target_compile_definitions(test_qlog_blocked PRIVATE
-    #     TEST_CERT_FILE="${MQ_CERT_FILE}"
-    #     TEST_KEY_FILE="${MQ_KEY_FILE}")
-    # set_target_properties(test_qlog_blocked PROPERTIES
-    #     BUILD_RPATH "${XQUIC_BUILD_DIR}")
-    # add_test(NAME test_qlog_blocked COMMAND test_qlog_blocked)
+    add_executable(test_qlog_blocked tests/integration/test_qlog_blocked.c)
+    target_link_libraries(test_qlog_blocked
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_qlog_blocked PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_qlog_blocked PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_qlog_blocked PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_qlog_blocked COMMAND test_qlog_blocked)
 
     # ---- mqproxy CLI (client/server binaries) ----
     # The static library target is also named `mqproxy`; give the executable a

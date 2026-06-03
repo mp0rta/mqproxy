@@ -11,7 +11,7 @@
  * script relies on, which CAN run here:
  *
  *   1. Enable xquic qlog at EVENT_IMPORTANCE_EXTRA on the client engine, writing
- *      to a tmp file (mq_engine_enable_qlog).
+ *      to a tmp file (mq_transport_enable_qlog).
  *   2. Bring up an authed client+server over a single loopback path and run a
  *      clean multi-hundred-KB download through a real SOCKS5 tcp_open. The 16MB
  *      flow-control window dwarfs the loopback BDP, so the transfer is NEVER
@@ -48,9 +48,9 @@
 #include "ingress/mq_listener.h"
 #include "proxy/mq_client.h"
 #include "proxy/mq_server.h"
+#include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h"
-#include "transport/mq_engine.h"
-#include "transport/mq_path.h"
+#include "transport/mq_transport.h"
 #include "util/mq_log.h"
 
 #ifndef TEST_CERT_FILE
@@ -78,16 +78,42 @@ set_nonblock(int fd)
 /* ── full-stack fixture (mirrors test_two_paths, qlog armed on the client) ── */
 typedef struct {
     struct event_base *base;
-    mq_engine_t *srv;
-    mq_engine_t *cli;
-    mq_path_t *srv_path;
-    mq_path_t *cli_path;
+    mq_transport_t *srv_t;
+    mq_transport_t *cli_t;
+    mq_runtime_t *srv_rt;
+    mq_runtime_t *cli_rt;
     mq_server_t *server;
     mq_client_t *client;
     mq_listener_t *socks5;
     char qlog_dir[256];
-    char qlog_path[320]; /* fixture-owned copy (engine's borrow is freed early) */
+    char qlog_path[320]; /* fixture-owned copy (transport's borrow is freed early) */
 } fixture_t;
+
+/* Reserve an ephemeral loopback UDP port (the runtime no longer exposes the
+ * bound port of a :0 bind, so the server pins a concrete port up front). */
+static uint16_t
+reserve_udp_port(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return 0;
+    }
+    socklen_t sl = sizeof(sa);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        close(fd);
+        return 0;
+    }
+    uint16_t port = ntohs(sa.sin_port);
+    close(fd);
+    return port;
+}
 
 static int
 fixture_up(fixture_t *f)
@@ -97,27 +123,27 @@ fixture_up(fixture_t *f)
     MQ_CHECK(f->base != NULL);
     if (!f->base) return -1;
 
-    f->srv = mq_engine_new_server(f->base, TEST_CERT_FILE, TEST_KEY_FILE);
-    MQ_CHECK(f->srv != NULL);
-    if (!f->srv) return -1;
-    f->server = mq_server_new(f->srv, "secret");
+    uint16_t port = reserve_udp_port();
+    MQ_CHECK(port != 0);
+    if (!port) return -1;
+
+    f->srv_t = mq_transport_new_server(NULL, NULL, TEST_CERT_FILE, TEST_KEY_FILE);
+    MQ_CHECK(f->srv_t != NULL);
+    if (!f->srv_t) return -1;
+    f->srv_rt = mq_runtime_new(f->srv_t, f->base);
+    MQ_CHECK(f->srv_rt != NULL);
+    if (!f->srv_rt) return -1;
+    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret");
     MQ_CHECK(f->server != NULL);
     if (!f->server) return -1;
 
-    f->srv_path = mq_path_open(f->srv, 0, "127.0.0.1", 0);
-    MQ_CHECK(f->srv_path != NULL);
-    if (!f->srv_path) return -1;
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->srv_rt, "127.0.0.1", port), 0);
 
-    struct sockaddr_storage srv_addr;
-    socklen_t srv_addrlen = 0;
-    MQ_CHECK_EQ_INT(mq_path_local_addr(f->srv_path, &srv_addr, &srv_addrlen), 0);
-    uint16_t port = ntohs(((struct sockaddr_in *)&srv_addr)->sin_port);
+    f->cli_t = mq_transport_new(0, NULL, NULL);
+    MQ_CHECK(f->cli_t != NULL);
+    if (!f->cli_t) return -1;
 
-    f->cli = mq_engine_new(0, f->base);
-    MQ_CHECK(f->cli != NULL);
-    if (!f->cli) return -1;
-
-    /* Arm qlog on the CLIENT engine to a per-pid tmp dir BEFORE any traffic. */
+    /* Arm qlog on the CLIENT transport to a per-pid tmp dir BEFORE any traffic. */
     snprintf(f->qlog_dir, sizeof(f->qlog_dir), "/tmp/mqproxy_qlog_test_%d",
              (int)getpid());
     if (mkdir(f->qlog_dir, 0700) != 0 && errno != EEXIST) {
@@ -125,17 +151,20 @@ fixture_up(fixture_t *f)
         return -1;
     }
     const char *qpath = NULL;
-    MQ_CHECK_EQ_INT(mq_engine_enable_qlog(f->cli, f->qlog_dir, &qpath), 0);
+    MQ_CHECK_EQ_INT(mq_transport_enable_qlog(f->cli_t, f->qlog_dir, &qpath), 0);
     MQ_CHECK(qpath != NULL);
     if (qpath) snprintf(f->qlog_path, sizeof(f->qlog_path), "%s", qpath);
 
-    f->client = mq_client_new(f->cli, "127.0.0.1", port, "client-1", "secret");
+    f->cli_rt = mq_runtime_new(f->cli_t, f->base);
+    MQ_CHECK(f->cli_rt != NULL);
+    if (!f->cli_rt) return -1;
+
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->cli_rt, "127.0.0.1", 0), 0);
+
+    f->client =
+        mq_client_new(f->cli_t, f->cli_rt, "127.0.0.1", port, "client-1", "secret");
     MQ_CHECK(f->client != NULL);
     if (!f->client) return -1;
-
-    f->cli_path = mq_path_open(f->cli, 0, "127.0.0.1", 0);
-    MQ_CHECK(f->cli_path != NULL);
-    if (!f->cli_path) return -1;
 
     MQ_CHECK_EQ_INT(mq_client_start(f->client), 0);
 
@@ -150,13 +179,19 @@ fixture_up(fixture_t *f)
 static void
 fixture_down(fixture_t *f)
 {
-    if (f->socks5) mq_listener_free(f->socks5);
-    if (f->cli_path) mq_path_close(f->cli_path);
-    if (f->srv_path) mq_path_close(f->srv_path);
-    if (f->cli) mq_engine_free(f->cli); /* closes + flushes the qlog fd */
-    if (f->srv) mq_engine_free(f->srv);
+    /* Per side: transport first (flushes + closes the qlog fd; fires conn-close +
+     * in-flight callbacks into the live runtime/client/server/listener), then the
+     * runtimes (which BORROWED the shared base, so they do NOT free it), then the
+     * proxy objects + listener. The test owns the shared base and frees it last.
+     * Guarded so it is safe after the early client-side teardown below NULLs the
+     * already-freed members. */
+    if (f->cli_t) mq_transport_free(f->cli_t); /* closes + flushes the qlog fd */
+    if (f->srv_t) mq_transport_free(f->srv_t);
+    if (f->cli_rt) mq_runtime_free(f->cli_rt);
+    if (f->srv_rt) mq_runtime_free(f->srv_rt);
     if (f->client) mq_client_free(f->client);
     if (f->server) mq_server_free(f->server);
+    if (f->socks5) mq_listener_free(f->socks5);
     if (f->base) event_base_free(f->base);
     /* Remove the tmp qlog file + dir (best effort). */
     if (f->qlog_path[0]) unlink(f->qlog_path);
@@ -466,22 +501,29 @@ test_qlog_unblocked_transfer(void)
     close(c);
     echo_origin_down(&origin);
 
-    /* Tear the client transport down FIRST so all qlog lines are flushed and the
-     * qlog fd closed, while keeping the file on disk for the grep below. We free
-     * the bits that touch the qlog (socks5 listener, client path, client engine)
-     * and NULL them so fixture_down does not double-free. The qlog file is fully
-     * written once the engine is destroyed. */
+    /* Tear the CLIENT side down FIRST so all qlog lines are flushed and the qlog
+     * fd closed, while keeping the file on disk for the grep below. The qlog file
+     * is fully written once the client transport (which owns the xqc engine +
+     * qlog sink) is destroyed. Free in the verified order — transport (fires the
+     * conn-close + in-flight callbacks into the live runtime/client/listener),
+     * then runtime (borrowed base, not freed), then client, then listener — and
+     * NULL each so fixture_down does not double-free. The server side stays alive
+     * until fixture_down. */
+    if (f.cli_t) {
+        mq_transport_free(f.cli_t); /* flushes + closes the qlog fd */
+        f.cli_t = NULL;
+    }
+    if (f.cli_rt) {
+        mq_runtime_free(f.cli_rt);
+        f.cli_rt = NULL;
+    }
+    if (f.client) {
+        mq_client_free(f.client);
+        f.client = NULL;
+    }
     if (f.socks5) {
         mq_listener_free(f.socks5);
         f.socks5 = NULL;
-    }
-    if (f.cli_path) {
-        mq_path_close(f.cli_path);
-        f.cli_path = NULL;
-    }
-    if (f.cli) {
-        mq_engine_free(f.cli); /* flushes + closes the qlog fd */
-        f.cli = NULL;
     }
 
     /* Now grep the rendered qlog — the exact reads the .sh performs. */

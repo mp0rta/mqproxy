@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 mp0rta
 
-/* test_conn_handshake.c — Task 10 integration test.
+/* test_conn_handshake.c — loopback MPQUIC handshake over mq_transport+mq_runtime.
  *
- * Drives a real loopback MPQUIC handshake between two engines sharing one
+ * Drives a real loopback MPQUIC handshake between two transport cores sharing one
  * libevent base:
- *   - a server-mode mq_engine with a self-signed cert/key, ALPN
- *     "mqproxy-tcp/1" registered, bound to 127.0.0.1:<ephemeral> via mq_path;
- *   - a client-mode mq_engine + mq_path that mq_conn_connect()s to the
- *     server's bound address.
+ *   - a server-mode mq_transport with a self-signed cert/key, ALPN
+ *     "mqproxy-tcp/1" registered, whose runtime binds the primary path to
+ *     127.0.0.1:<reserved ephemeral port>;
+ *   - a client-mode mq_transport whose runtime binds 127.0.0.1:0 and whose
+ *     mq_conn_connect()s to the server's bound address.
  *
- * The loop is pumped (EVLOOP_NONBLOCK) under a bounded wall-clock budget
- * until the client's on_state callback reports ESTABLISHED. Then everything
- * is torn down and the test must be ASan-clean.
+ * Both runtimes BORROW the shared base; the test pumps it with
+ * event_base_loop(EVLOOP_NONBLOCK) under a bounded wall-clock budget until the
+ * client's on_state callback reports ESTABLISHED. Then everything is torn down
+ * and the test must be ASan-clean.
  *
- * No application stream data is exchanged — this validates handshake only.
+ * No application stream data is exchanged beyond a tiny stream to validate the
+ * stream callback wiring — this validates handshake only.
  */
 #include "mqtest.h"
 
@@ -22,13 +25,14 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <event2/event.h>
 
+#include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h"
-#include "transport/mq_engine.h"
-#include "transport/mq_path.h"
 #include "transport/mq_stream.h"
+#include "transport/mq_transport.h"
 
 #define TEST_ALPN "mqproxy-tcp/1"
 
@@ -55,7 +59,7 @@ on_client_state(mq_conn_t *c, mq_conn_state_t st, void *user)
     }
 }
 
-/* Server-side: accepted connections surface here (Task 11/12 consumes this). */
+/* Server-side: accepted connections surface here. */
 static int g_server_conn_seen;
 static void
 on_server_conn(mq_conn_t *c, void *user)
@@ -82,6 +86,34 @@ now_ms(void)
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+/* Reserve an ephemeral loopback UDP port: bind a temp socket to :0, read the
+ * assigned port, then close it so the runtime can bind that fixed port. The
+ * runtime no longer exposes the bound port of an ephemeral (:0) bind, so the
+ * test pins a concrete port for the server up front. */
+static uint16_t
+reserve_udp_port(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return 0;
+    }
+    socklen_t sl = sizeof(sa);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        close(fd);
+        return 0;
+    }
+    uint16_t port = ntohs(sa.sin_port);
+    close(fd);
+    return port;
+}
+
 static void
 test_conn_handshake(void)
 {
@@ -89,34 +121,46 @@ test_conn_handshake(void)
     MQ_CHECK(base != NULL);
     if (!base) return;
 
-    /* ── Server ── */
-    mq_engine_t *srv = mq_engine_new_server(base, TEST_CERT_FILE, TEST_KEY_FILE);
-    MQ_CHECK(srv != NULL);
+    uint16_t srv_port = reserve_udp_port();
+    MQ_CHECK(srv_port != 0);
 
-    int rc =
-        mq_conn_register_alpn(srv, TEST_ALPN, on_server_conn, on_server_stream, NULL);
+    /* ── Server: transport (with TLS) + runtime borrowing the shared base ── */
+    mq_transport_t *srv_t = mq_transport_new_server(/*cbs=*/NULL, /*user=*/NULL,
+                                                    TEST_CERT_FILE, TEST_KEY_FILE);
+    MQ_CHECK(srv_t != NULL);
+    mq_runtime_t *srv_rt = srv_t ? mq_runtime_new(srv_t, base) : NULL;
+    MQ_CHECK(srv_rt != NULL);
+
+    int rc = srv_t ? mq_conn_register_alpn(srv_t, TEST_ALPN, on_server_conn,
+                                           on_server_stream, NULL)
+                   : -1;
     MQ_CHECK_EQ_INT(rc, 0);
 
-    mq_path_t *srv_path = mq_path_open(srv, /*path_id=*/0, "127.0.0.1", /*port=*/0);
-    MQ_CHECK(srv_path != NULL);
+    int srv_bound = srv_rt ? mq_runtime_open_udp_path(srv_rt, "127.0.0.1", srv_port) : -1;
+    MQ_CHECK_EQ_INT(srv_bound, 0);
 
-    struct sockaddr_storage srv_addr;
-    socklen_t srv_addrlen = 0;
-    MQ_CHECK_EQ_INT(mq_path_local_addr(srv_path, &srv_addr, &srv_addrlen), 0);
+    /* ── Client: transport + runtime borrowing the SAME shared base ── */
+    mq_transport_t *cli_t =
+        mq_transport_new(/*is_server=*/0, /*cbs=*/NULL, /*user=*/NULL);
+    MQ_CHECK(cli_t != NULL);
+    mq_runtime_t *cli_rt = cli_t ? mq_runtime_new(cli_t, base) : NULL;
+    MQ_CHECK(cli_rt != NULL);
 
-    /* ── Client ── */
-    mq_engine_t *cli = mq_engine_new(/*is_server=*/0, base);
-    MQ_CHECK(cli != NULL);
-
-    rc = mq_conn_register_alpn(cli, TEST_ALPN, NULL, NULL, NULL);
+    rc = cli_t ? mq_conn_register_alpn(cli_t, TEST_ALPN, NULL, NULL, NULL) : -1;
     MQ_CHECK_EQ_INT(rc, 0);
 
-    mq_path_t *cli_path = mq_path_open(cli, /*path_id=*/0, "127.0.0.1", /*port=*/0);
-    MQ_CHECK(cli_path != NULL);
+    int cli_bound = cli_rt ? mq_runtime_open_udp_path(cli_rt, "127.0.0.1", 0) : -1;
+    MQ_CHECK_EQ_INT(cli_bound, 0);
 
-    if (!srv || !cli || !srv_path || !cli_path) {
+    if (!srv_t || !srv_rt || !cli_t || !cli_rt || srv_bound != 0 || cli_bound != 0) {
         goto cleanup;
     }
+
+    struct sockaddr_in srv_addr;
+    memset(&srv_addr, 0, sizeof(srv_addr));
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    srv_addr.sin_port = htons(srv_port);
 
     xqc_conn_settings_t settings;
     memset(&settings, 0, sizeof(settings));
@@ -124,14 +168,14 @@ test_conn_handshake(void)
     settings.pacing_on = 1;
     settings.max_pkt_out_size = 1200;
 
-    mq_conn_t *conn = mq_conn_connect(cli, (struct sockaddr *)&srv_addr, srv_addrlen,
-                                      TEST_ALPN, &settings, NULL);
+    mq_conn_t *conn = mq_conn_connect(cli_t, (struct sockaddr *)&srv_addr,
+                                      sizeof(srv_addr), TEST_ALPN, &settings, NULL);
     MQ_CHECK(conn != NULL);
     if (!conn) goto cleanup;
 
     mq_conn_set_on_state(conn, on_client_state, NULL);
 
-    /* Pump both engines (shared base) until established or 3s budget. */
+    /* Pump both sides (shared base) until established or 3s budget. */
     uint64_t deadline = now_ms() + 3000;
     while (!g_client_established && now_ms() < deadline) {
         event_base_loop(base, EVLOOP_NONBLOCK);
@@ -142,8 +186,7 @@ test_conn_handshake(void)
 
     /* Bonus: open one client stream and confirm the server's
      * stream_create_notify fires (validates the mq_stream wrappers + the ALP
-     * stream callback wiring). A short send forces the stream to be opened on
-     * the wire. */
+     * stream callback wiring). A short send forces the stream open on the wire. */
     mq_stream_t *cs = mq_conn_open_stream(conn);
     MQ_CHECK(cs != NULL);
     if (cs) {
@@ -167,10 +210,13 @@ test_conn_handshake(void)
     }
 
 cleanup:
-    if (cli_path) mq_path_close(cli_path);
-    if (srv_path) mq_path_close(srv_path);
-    if (cli) mq_engine_free(cli);
-    if (srv) mq_engine_free(srv);
+    /* Per side: free the transport first (engine destroy; callbacks land on the
+     * still-live runtime), then the runtime (which BORROWED the base, so it does
+     * NOT free it). The test owns the shared base and frees it last. */
+    if (cli_t) mq_transport_free(cli_t);
+    if (srv_t) mq_transport_free(srv_t);
+    if (cli_rt) mq_runtime_free(cli_rt);
+    if (srv_rt) mq_runtime_free(srv_rt);
     event_base_free(base);
 }
 
