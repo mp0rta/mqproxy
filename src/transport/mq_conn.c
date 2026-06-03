@@ -428,13 +428,22 @@ mq_conn_path_bytes(const mq_conn_t *c, uint64_t path_id, uint64_t *sent, uint64_
 }
 
 void
-mq_conn_dump_stats(mq_conn_t *c)
+mq_conn_dump_stats_cid(mq_transport_t *t, const xqc_cid_t *cid)
 {
-    xqc_conn_stats_t st;
-    if (mq_conn_stats_snapshot(c, &st) != 0) {
+    if (!t || !cid) {
         MQ_LOGI("mq_conn stats: no connection");
         return;
     }
+    xqc_engine_t *xeng = mq_transport_xqc(t);
+    if (!xeng) {
+        MQ_LOGI("mq_conn stats: no connection");
+        return;
+    }
+    /* xqc_conn_get_stats returns a snapshot whose heap-allocated paths_info MUST
+     * be released with libc free() — NOT xqc_free — and may be NULL with count 0
+     * (no free needed, free(NULL) is safe). Mirrors mq_conn_stats_snapshot's
+     * ownership contract for the cid-keyed callers (mq_h3). */
+    xqc_conn_stats_t st = xqc_conn_get_stats(xeng, cid);
     if (!st.paths_info || st.paths_info_count == 0) {
         MQ_LOGI("mq_conn stats: no path metrics");
         free(st.paths_info); /* free(NULL) is safe; count 0 may carry a buffer */
@@ -448,6 +457,16 @@ mq_conn_dump_stats(mq_conn_t *c)
                 (unsigned long long)st.paths_info[i].path_recv_bytes);
     }
     free(st.paths_info);
+}
+
+void
+mq_conn_dump_stats(mq_conn_t *c)
+{
+    if (!c || !c->have_cid) {
+        MQ_LOGI("mq_conn stats: no connection");
+        return;
+    }
+    mq_conn_dump_stats_cid(c->transport, &c->cid);
 }
 
 mq_cc_t

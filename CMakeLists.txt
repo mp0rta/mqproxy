@@ -18,6 +18,7 @@ add_library(mqproxy STATIC
     src/ingress/mq_http_connect.c
     src/ingress/mq_listener.c
     src/transport/mq_conn.c
+    src/transport/mq_h3.c
     src/transport/mq_stream.c
     src/transport/mq_transport.c
     src/runtime/mq_runtime_libevent.c)

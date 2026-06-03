@@ -175,6 +175,16 @@ int mq_conn_path_state(const mq_conn_t *c, uint64_t path_id);
  * ownership contract — see xqc_conn_stats_t doc). Smoke-safe on any conn. */
 void mq_conn_dump_stats(mq_conn_t *c);
 
+/* mq_conn_dump_stats_cid: the cid-keyed core of mq_conn_dump_stats, shared with
+ * mq_h3 (whose conn wrapper is keyed by an h3 cid, not an mq_conn). Snapshots
+ * per-path byte counters via xqc_conn_get_stats(transport-engine, cid) and logs
+ * each path's id / send-bytes / recv-bytes at INFO; logs "no path metrics" if
+ * xquic reports none. The heap-allocated paths_info buffer is freed with libc
+ * free() (the xquic ownership contract — see xqc_conn_stats_t doc). A no-op if
+ * t/cid is NULL. Both H3 and raw conns share ONE engine, so the cid alone
+ * selects the connection. */
+void mq_conn_dump_stats_cid(mq_transport_t *t, const xqc_cid_t *cid);
+
 /* mq_conn_path_bytes: read path_id's cumulative send/recv byte counters from
  * the same stats snapshot. On success writes *sent / *recv and returns 0; if
  * the conn is unknown or path_id has no metrics, returns -1 and leaves *sent /
