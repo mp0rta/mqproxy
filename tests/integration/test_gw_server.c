@@ -1374,6 +1374,47 @@ test_gws_mid_reset(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 9: rejected requests reclaim per-request state ──────────
+ *
+ * Regression for the no-origin reject state leak: a request rejected BEFORE the
+ * origin side ever exists (wrong token → 403, bad header/target → 400) had
+ * oreq==NULL && origin_dead==0, so h3_on_close never flipped origin_dead and
+ * gw_req_maybe_free never freed the state — it stayed linked in s->reqs forever.
+ * Send N wrong-token requests sequentially on one conn, then assert the live
+ * per-request count is 0 once all close + the loop drains. */
+static void
+test_gws_reject_no_leak(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+
+    const int N = 8;
+    for (int i = 0; i < N; i++) {
+        cli_req_t c;
+        memset(&c, 0, sizeof(c));
+        int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin),
+                                  "/blob", "Bearer WRONG", NULL, 0, 0, NULL);
+        MQ_CHECK_EQ_INT(rc, 0);
+        uint64_t deadline = now_ms() + 5000;
+        while (!c.closed && now_ms() < deadline)
+            event_base_loop(f.base, EVLOOP_NONBLOCK);
+        MQ_CHECK_EQ_INT(c.status, 403);
+    }
+
+    /* All N rejected requests have closed; let any deferred on_close drain. */
+    pump_a_bit(f.base, 300);
+
+    MQ_CHECK_EQ_INT(mq_gw_server_requests(f.gw), (unsigned)N);
+    /* The leak shows here: pre-fix this returns N (8); post-fix it must be 0. */
+    MQ_CHECK_EQ_INT(mq_gw_server_live_reqs(f.gw), 0);
+
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 8: teardown with a request in flight (origin /slow) ──────*/
 static void
 test_gws_teardown_inflight(void)
@@ -1430,6 +1471,7 @@ main(void)
     test_gws_upload();
     test_gws_chunked_upload();
     test_gws_mid_reset();
+    test_gws_reject_no_leak();
     test_gws_teardown_inflight();
 
     if (mq_test_failures) {

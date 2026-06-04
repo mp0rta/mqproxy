@@ -205,9 +205,12 @@ gw_req_maybe_free(mq_gw_req_t *r)
 
 /* Synthesize and send an H3 error response (status + x-mq-error + content-length:
  * 0), then finish the request. Used for auth/validation failures and origin
- * errors that occur BEFORE any response header has been sent. The origin side is
- * already detached by the caller (origin_dead). After this the H3 side finishes
- * naturally → on_close fires → maybe_free. */
+ * errors that occur BEFORE any response header has been sent. This does NOT
+ * touch the origin side: most callers (auth/validation rejects) run before the
+ * origin ever exists and leave origin_dead==0 — h3_on_close flips origin_dead
+ * unconditionally once oreq==NULL (no live origin without an oreq), so the H3
+ * side finishing naturally → on_close → maybe_free reclaims the state. (The
+ * origin-error caller, origin_on_done, has already set origin_dead itself.) */
 static void
 gw_send_error(mq_gw_req_t *r, const char *status, const char *xmq_error)
 {
@@ -813,13 +816,22 @@ h3_on_close(mq_h3_req_t *hr, void *user)
     r->h3_dead = 1;
     r->req = NULL; /* freed right after this returns */
 
-    /* If the origin request is still live (client reset / conn died before the
-     * origin completed), abort it. on_close is an mq_h3 callback — NOT a curl
-     * callback — so mq_origin_abort is safe here (re-entrancy contract). abort
-     * fires NO on_done, so we flip origin_dead ourselves. */
-    if (!r->origin_dead && r->oreq) {
-        mq_origin_abort(r->oreq);
-        r->oreq = NULL;
+    /* Flip the origin side dead so gw_req_maybe_free can reclaim the state.
+     * Two cases, handled uniformly:
+     *   - origin live (oreq != NULL): client reset / conn died before the origin
+     *     completed → abort it. on_close is an mq_h3 callback — NOT a curl
+     *     callback — so mq_origin_abort is safe here (re-entrancy contract).
+     *     abort fires NO on_done, so we flip origin_dead ourselves.
+     *   - origin NEVER existed (oreq == NULL): the request was rejected pre-origin
+     *     (403/400/bad-header/bad-target) and the synthetic-error path did not run
+     *     gw_dispatch's origin_dead=1 (those rejects leave it 0). The origin side
+     *     cannot be live without an oreq, so flip origin_dead unconditionally —
+     *     otherwise maybe_free never runs and the state leaks in s->reqs. */
+    if (!r->origin_dead) {
+        if (r->oreq) {
+            mq_origin_abort(r->oreq);
+            r->oreq = NULL;
+        }
         r->origin_dead = 1;
     }
     gw_req_maybe_free(r);
@@ -908,6 +920,16 @@ unsigned
 mq_gw_server_requests(const mq_gw_server_t *s)
 {
     return s ? s->requests : 0;
+}
+
+unsigned
+mq_gw_server_live_reqs(const mq_gw_server_t *s)
+{
+    if (!s) return 0;
+    unsigned n = 0;
+    for (const mq_gw_req_t *r = s->reqs; r; r = r->next)
+        n++;
+    return n;
 }
 
 void

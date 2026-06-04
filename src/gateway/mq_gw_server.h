@@ -86,4 +86,12 @@ void mq_gw_server_free(mq_gw_server_t *s);
  * accepted at the H3 layer before auth runs). 0 on a NULL arg. */
 unsigned mq_gw_server_requests(const mq_gw_server_t *s);
 
+/* Count of per-request states currently LIVE (linked in the server's intrusive
+ * request list) — i.e. allocated but not yet reclaimed by the dual-flag
+ * exactly-once teardown (observability / test hook; mirrors
+ * mq_gw_server_requests). After every in-flight request completes and the loop
+ * is pumped this returns 0; a non-zero residual under wrong-token / rejected
+ * traffic is a per-request state leak. 0 on a NULL arg. */
+unsigned mq_gw_server_live_reqs(const mq_gw_server_t *s);
+
 #endif /* MQ_GATEWAY_MQ_GW_SERVER_H */
