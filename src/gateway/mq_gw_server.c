@@ -553,6 +553,12 @@ typedef struct {
     char authority[256];
     char path[1024];
     int has_method, has_scheme, has_authority, has_path;
+    /* A pseudo-header value that did NOT fit its buffer was silently truncated by
+     * copy_z. Silent truncation of :authority / :path changes the outbound target
+     * (a redirection / SSRF surface); a clipped :method becomes a different verb.
+     * Capture the overlong condition so gw_dispatch rejects rather than acts on a
+     * truncated value. */
+    int method_overlong, scheme_overlong, authority_overlong, path_overlong;
 
     /* auth + class */
     char auth[512];
@@ -590,15 +596,19 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
     /* Pseudo-headers. */
     if (nl > 0 && n[0] == ':') {
         if (slice_ieq(n, nl, ":method")) {
+            if (vl >= sizeof(ctx->method)) ctx->method_overlong = 1;
             copy_z(ctx->method, sizeof(ctx->method), v, vl);
             ctx->has_method = 1;
         } else if (slice_ieq(n, nl, ":scheme")) {
+            if (vl >= sizeof(ctx->scheme)) ctx->scheme_overlong = 1;
             copy_z(ctx->scheme, sizeof(ctx->scheme), v, vl);
             ctx->has_scheme = 1;
         } else if (slice_ieq(n, nl, ":authority")) {
+            if (vl >= sizeof(ctx->authority)) ctx->authority_overlong = 1;
             copy_z(ctx->authority, sizeof(ctx->authority), v, vl);
             ctx->has_authority = 1;
         } else if (slice_ieq(n, nl, ":path")) {
+            if (vl >= sizeof(ctx->path)) ctx->path_overlong = 1;
             copy_z(ctx->path, sizeof(ctx->path), v, vl);
             ctx->has_path = 1;
         }
@@ -715,11 +725,32 @@ gw_dispatch(mq_gw_req_t *r)
         MQ_LOGI("mq_gw_server: x-mq-class='%s'", cls_safe);
     }
 
-    /* Validate pseudo-headers. */
+    /* Validate pseudo-headers. An overlong :method (silently clipped above) is a
+     * verb-confusion surface; reject it with the same 400 as a missing/empty one. */
     if (!ctx.has_method || !ctx.has_scheme || !ctx.has_authority || !ctx.has_path ||
         ctx.method[0] == '\0' || ctx.authority[0] == '\0' || ctx.path[0] == '\0' ||
-        ctx.path[0] != '/' || !scheme_ok(ctx.scheme)) {
+        ctx.path[0] != '/' || !scheme_ok(ctx.scheme) || ctx.method_overlong ||
+        ctx.scheme_overlong) {
         gw_send_error(r, "400", "bad-request");
+        return;
+    }
+    /* Validate + canonicalise :method with the SAME strictness as the client side
+     * (mq_gw_parse_method: RFC 7230 token chars only, <=15, ASCII-uppercased).
+     * curl does NOT sanitize CURLOPT_CUSTOMREQUEST, so an unvalidated method from
+     * a direct H3 peer (e.g. "GE T" / "GET\r") is a request-line-injection surface.
+     * Overwrite ctx.method in place with the canonical (uppercased) form. */
+    {
+        char canon[16];
+        if (mq_gw_parse_method(ctx.method, strlen(ctx.method), canon) != 0) {
+            gw_send_error(r, "400", "bad-request");
+            return;
+        }
+        memcpy(ctx.method, canon, sizeof(ctx.method));
+    }
+    /* An overlong :authority / :path was silently truncated by copy_z — that
+     * changes the outbound target (redirection / SSRF surface), so reject. */
+    if (ctx.authority_overlong || ctx.path_overlong) {
+        gw_send_error(r, "400", "bad-target");
         return;
     }
     /* Re-validate :authority / :path strictness on this side of the tunnel

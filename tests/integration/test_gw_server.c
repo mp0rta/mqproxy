@@ -1374,6 +1374,88 @@ test_gws_mid_reset(void)
     gws_fixture_down(&f);
 }
 
+/* Helper: send ONE request with the given pseudo-headers, pump to close, and
+ * return the captured H3 :status (0 if the request never produced a response).
+ * `*err_out` (if non-NULL) receives a copy of the x-mq-error value. */
+static int
+gws_one_status(gws_fixture_t *f, const char *method, const char *scheme,
+               const char *authority, const char *path, char *err_out, size_t err_cap)
+{
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(4096);
+    c.body_cap = 4096;
+    int rc = gws_send_request(f, &c, method, scheme, authority, path, "Bearer sekrit",
+                              NULL, 0, 0, NULL);
+    if (rc != 0) {
+        free(c.body);
+        return -1;
+    }
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f->base, EVLOOP_NONBLOCK);
+    if (err_out) {
+        const char *e = cli_find_hdr(&c, "x-mq-error");
+        snprintf(err_out, err_cap, "%s", e ? e : "");
+    }
+    int st = c.status;
+    free(c.body);
+    return st;
+}
+
+/* ── gw_server Case 10: :method validated server-side (smuggling defense) ────
+ *
+ * curl does NOT sanitize CURLOPT_CUSTOMREQUEST, so an unvalidated :method from a
+ * direct H3 peer is a request-line-injection surface. The gw_server must validate
+ * with mq_gw_parse_method BEFORE use: token chars only, <=15, uppercased. */
+static void
+test_gws_method_validation(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    const char *auth = origin_authority(&f.origin);
+    char err[64];
+
+    /* :method with an embedded space → 400 bad-request. */
+    MQ_CHECK_EQ_INT(gws_one_status(&f, "GE T", "http", auth, "/blob", err, sizeof(err)),
+                    400);
+    MQ_CHECK(strcmp(err, "bad-request") == 0);
+
+    /* :method with a CR → 400 bad-request. */
+    MQ_CHECK_EQ_INT(gws_one_status(&f, "GET\r", "http", auth, "/blob", err, sizeof(err)),
+                    400);
+    MQ_CHECK(strcmp(err, "bad-request") == 0);
+
+    /* :method 16+ chars (overlong, would be silently clipped) → 400. */
+    MQ_CHECK_EQ_INT(gws_one_status(&f, "AAAAAAAAAAAAAAAAAAAA", "http", auth, "/blob", err,
+                                   sizeof(err)),
+                    400);
+    MQ_CHECK(strcmp(err, "bad-request") == 0);
+
+    /* lowercase "get" → accepted (uppercased): request reaches the origin → 200,
+     * and the origin sees GET. */
+    f.origin.saw_xmq = 0;
+    MQ_CHECK_EQ_INT(gws_one_status(&f, "get", "http", auth, "/blob", err, sizeof(err)),
+                    200);
+
+    /* :authority 256+ bytes (overlong — silent truncation changes the target!)
+     * → 400 bad-target. */
+    {
+        char big[300];
+        memset(big, 'a', sizeof(big) - 1);
+        big[sizeof(big) - 1] = '\0';
+        MQ_CHECK_EQ_INT(gws_one_status(&f, "GET", "http", big, "/blob", err, sizeof(err)),
+                        400);
+        MQ_CHECK(strcmp(err, "bad-target") == 0);
+    }
+
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 9: rejected requests reclaim per-request state ──────────
  *
  * Regression for the no-origin reject state leak: a request rejected BEFORE the
@@ -1472,6 +1554,7 @@ main(void)
     test_gws_chunked_upload();
     test_gws_mid_reset();
     test_gws_reject_no_leak();
+    test_gws_method_validation();
     test_gws_teardown_inflight();
 
     if (mq_test_failures) {
