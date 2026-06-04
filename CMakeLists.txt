@@ -3,6 +3,7 @@ project(mqproxy VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 include(cmake/BuildSetup.cmake)
+find_package(CURL REQUIRED)
 
 add_library(mqproxy STATIC
     src/util/mq_log.c
@@ -26,6 +27,7 @@ add_library(mqproxy STATIC
     src/transport/mq_stream.c
     src/transport/mq_transport.c
     src/runtime/mq_runtime_libevent.c)
+target_link_libraries(mqproxy PUBLIC CURL::libcurl)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 enable_testing()

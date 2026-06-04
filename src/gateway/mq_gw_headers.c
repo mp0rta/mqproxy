@@ -3,7 +3,21 @@
 
 #include "gateway/mq_gw_headers.h"
 
+#include <curl/curl.h>
 #include <string.h>
+
+/* The MQ_GW_CURL_* constants in mq_gw_headers.h are mirrors of CURLE_* values
+ * so that Chunk-3 unit tests compile without libcurl.  These asserts pin the
+ * mirrors to the real libcurl values; any future divergence is caught at
+ * compile time rather than silently producing wrong HTTP status codes. */
+_Static_assert(MQ_GW_CURL_RESOLVE == CURLE_COULDNT_RESOLVE_HOST,
+               "MQ_GW_CURL_RESOLVE must equal CURLE_COULDNT_RESOLVE_HOST");
+_Static_assert(MQ_GW_CURL_CONNECT == CURLE_COULDNT_CONNECT,
+               "MQ_GW_CURL_CONNECT must equal CURLE_COULDNT_CONNECT");
+_Static_assert(MQ_GW_CURL_TIMEDOUT == CURLE_OPERATION_TIMEDOUT,
+               "MQ_GW_CURL_TIMEDOUT must equal CURLE_OPERATION_TIMEDOUT");
+_Static_assert(MQ_GW_CURL_PEER_VERIFY == CURLE_PEER_FAILED_VERIFICATION,
+               "MQ_GW_CURL_PEER_VERIFY must equal CURLE_PEER_FAILED_VERIFICATION");
 
 /* ---------------------------------------------------------------------------
  * Small ASCII helpers (locale-independent; we never want locale to influence
