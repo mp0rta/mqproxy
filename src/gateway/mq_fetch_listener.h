@@ -87,14 +87,42 @@ struct event_base;
 typedef struct mq_fetch_listener_s mq_fetch_listener_t;
 
 /* Gateway-supplied callbacks. All are invoked from the event loop. None may
- * free the listener. A callback may call the handle ops (write/pause/resume/
- * finish/abort) on its own connection's handle. */
+ * free the listener.
+ *
+ * ── HANDLE-OP RE-ENTRANCY CONTRACT (which ops are safe from which callback) ──
+ * The listener touches the connection object AFTER on_request and on_body
+ * return (drive_head reads c->body_total + calls deliver_body after on_request;
+ * deliver_body does `c->body_delivered += take` immediately after on_body
+ * returns — see mq_fetch_listener.c). finish()/abort() DETACH and may DESTROY
+ * the connection, so calling them from inside on_request or on_body would make
+ * those post-return touches a use-after-free. Therefore:
+ *
+ *   - mq_fetch_conn_finish / mq_fetch_conn_abort MUST NOT be called from within
+ *     on_request or on_body. Use the RETURN VALUES instead: return -1 from
+ *     on_request = "I already replied via the handle ops" (listener flushes +
+ *     closes); return -1 from on_body = "consumed, but pause reading".
+ *   - finish/abort ARE safe from on_body_done and from any later (RESP-phase)
+ *     point, and from OUTSIDE any callback (the normal hand-back). on_body_done
+ *     is the listener's LAST touch of the connection on the read path: it sets
+ *     the *done out-param (deliver_body, drive_head) BEFORE invoking on_body_done
+ *     and does not touch `c` afterward, so finish/abort there is safe — this is
+ *     the normal echo path (reply + finish from on_body_done).
+ *   - mq_fetch_conn_pause_read / resume_read / write / set_drain_cb are safe
+ *     ANYWHERE (they early-return when the handle is detached; resume_read
+ *     defers its read kick, so it is even safe from inside on_body).
+ *   - on_aborted is terminal: the handle is already being torn down — drop it
+ *     and call NO handle op (not even finish/abort). */
 typedef struct {
     /* The request head parsed (valid POST /_mqproxy/fetch). The listener will
      * then stream body bytes to on_body. Return 0 = accepted (listener
      * proceeds to stream the body); return -1 = the handler already wrote its
      * own error reply (the listener just flushes and closes). *req_ctx is the
      * handler's per-request context, threaded into the later callbacks.
+     *
+     * MUST NOT call finish/abort (the listener touches the conn after this
+     * returns — UAF); reply-and-close is signalled by returning -1 after
+     * writing via the handle ops. write/pause_read/resume_read/set_drain_cb are
+     * safe here.
      *
      * `req`'s header slices point into the listener's read buffer and are valid
      * only for the duration of this call — copy anything you need to keep. */
@@ -105,10 +133,17 @@ typedef struct {
      * call (the listener never re-delivers it). Return value signals only
      * backpressure: 0 = keep streaming; -1 = consumed-but-now-full, so the
      * listener stops reading further body until the gateway calls
-     * mq_fetch_conn_resume_read(). p is valid only for this call. */
+     * mq_fetch_conn_resume_read(). p is valid only for this call.
+     *
+     * MUST NOT call finish/abort (the listener touches the conn after this
+     * returns — UAF); use the -1 return to pause. write/pause_read/resume_read/
+     * set_drain_cb are safe here. */
     int (*on_body)(void *req_ctx, const uint8_t *p, size_t len);
 
-    /* Exactly content_length body bytes have been delivered to on_body. */
+    /* Exactly content_length body bytes have been delivered to on_body. The
+     * listener will not touch the connection on the read path after this returns
+     * (the read path's *done discipline guarantees it), so finish/abort ARE safe
+     * here — this is the normal response-phase hand-back. */
     void (*on_body_done)(void *req_ctx);
 
     /* The local peer died (EOF/error) before content_length bytes arrived. The
