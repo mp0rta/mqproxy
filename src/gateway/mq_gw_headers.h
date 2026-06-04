@@ -91,6 +91,27 @@ int mq_gw_strip_hop(const char *n, size_t nl);
 int mq_gw_has_dup_xmq(const mq_http1_req_t *req);
 
 /* ---------------------------------------------------------------------------
+ * Control-byte rejection (defense-in-depth against header / request smuggling)
+ *
+ * A forwarded header NAME or VALUE that carries control bytes is a smuggling /
+ * response-splitting surface once it is replayed to the origin (or serialized
+ * back into an HTTP/1 response). Both helpers return 1 when the (s,sl) slice is
+ * clean and 0 when it contains a forbidden byte.
+ *
+ *   mq_gw_hdr_name_ok  — rejects any byte < 0x20 (controls incl. TAB) or 0x7f.
+ *   mq_gw_hdr_value_ok — rejects any byte < 0x20 EXCEPT 0x09 (HTAB is permitted
+ *                        in field values per RFC 7230), and rejects 0x7f.
+ * ------------------------------------------------------------------------- */
+int mq_gw_hdr_name_ok(const char *s, size_t sl);
+int mq_gw_hdr_value_ok(const char *s, size_t sl);
+
+/* Returns 1 if (s,sl) is free of SP, CR, LF, other control bytes (<0x20), and
+ * 0x7f — the strictness mq_gw_parse_target applies to authority/path, exposed so
+ * the gateway server can re-validate the :authority / :path pseudo-headers it
+ * receives over the tunnel before building an outbound URL. */
+int mq_gw_uri_field_ok(const char *s, size_t sl);
+
+/* ---------------------------------------------------------------------------
  * libcurl result code → HTTP status  (design §10.1)
  *
  * Mirrored constants so this translation unit compiles WITHOUT libcurl. The

@@ -523,6 +523,26 @@ test_write_header_too_small(void)
     MQ_CHECK_EQ_INT((unsigned char)buf[0], 0xAB);
 }
 
+/* ---- write_header rejects CR/LF in name or value (header injection) ---- */
+static void
+test_write_header_rejects_crlf(void)
+{
+    char buf[128];
+    /* CR / LF in the value → reject, nothing written. */
+    memset(buf, 0xAB, sizeof buf);
+    MQ_CHECK(mq_http1_write_header(buf, sizeof buf, "X-Test", "a\rb") < 0);
+    MQ_CHECK_EQ_INT((unsigned char)buf[0], 0xAB);
+    MQ_CHECK(mq_http1_write_header(buf, sizeof buf, "X-Test", "a\nb") < 0);
+    MQ_CHECK(mq_http1_write_header(buf, sizeof buf, "X-Test", "a\r\nEvil: x") < 0);
+    /* CR / LF in the name → reject. */
+    MQ_CHECK(mq_http1_write_header(buf, sizeof buf, "X-Te\rst", "v") < 0);
+    MQ_CHECK(mq_http1_write_header(buf, sizeof buf, "X-Te\nst", "v") < 0);
+    /* A clean header still serializes. */
+    int n = mq_http1_write_header(buf, sizeof buf, "X-Test", "clean value");
+    MQ_CHECK(n > 0);
+    MQ_CHECK_MEM(buf, "X-Test: clean value\r\n", (size_t)n);
+}
+
 /* ---- chunk_frame exact bytes for a known 5-byte payload ---- */
 static void
 test_chunk_frame(void)
@@ -601,6 +621,7 @@ MQ_TEST_MAIN({
     test_write_status_too_small();
     test_write_header();
     test_write_header_too_small();
+    test_write_header_rejects_crlf();
     test_chunk_frame();
     test_chunk_frame_hex();
     test_chunk_frame_too_small();

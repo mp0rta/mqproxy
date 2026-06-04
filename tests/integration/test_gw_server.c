@@ -1109,6 +1109,57 @@ test_gws_400(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 4b: 400 on control bytes in a forwarded header / :path ───*/
+static void
+test_gws_bad_header(void)
+{
+    /* 4b-i: a forwarded header VALUE with a control byte (CR) → 400 bad-header. */
+    {
+        gws_fixture_t f;
+        if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+            gws_fixture_down(&f);
+            MQ_CHECK(0);
+            return;
+        }
+        cli_req_t c;
+        memset(&c, 0, sizeof(c));
+        mq_h3_header_t extra[] = {{"x-evil", "a\r\nInjected: 1"}};
+        int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin),
+                                  "/blob", "Bearer sekrit", extra, 1, 0, NULL);
+        MQ_CHECK_EQ_INT(rc, 0);
+        uint64_t deadline = now_ms() + 5000;
+        while (!c.closed && now_ms() < deadline)
+            event_base_loop(f.base, EVLOOP_NONBLOCK);
+        MQ_CHECK_EQ_INT(c.status, 400);
+        const char *err = cli_find_hdr(&c, "x-mq-error");
+        MQ_CHECK(err && strcmp(err, "bad-header") == 0);
+        /* The request never reached the origin. */
+        MQ_CHECK_EQ_INT(f.origin.saw_xmq, 0);
+        gws_fixture_down(&f);
+    }
+    /* 4b-ii: a :path with a control byte → 400 bad-target. */
+    {
+        gws_fixture_t f;
+        if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+            gws_fixture_down(&f);
+            MQ_CHECK(0);
+            return;
+        }
+        cli_req_t c;
+        memset(&c, 0, sizeof(c));
+        int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin),
+                                  "/bl\tob", "Bearer sekrit", NULL, 0, 0, NULL);
+        MQ_CHECK_EQ_INT(rc, 0);
+        uint64_t deadline = now_ms() + 5000;
+        while (!c.closed && now_ms() < deadline)
+            event_base_loop(f.base, EVLOOP_NONBLOCK);
+        MQ_CHECK_EQ_INT(c.status, 400);
+        const char *err = cli_find_hdr(&c, "x-mq-error");
+        MQ_CHECK(err && strcmp(err, "bad-target") == 0);
+        gws_fixture_down(&f);
+    }
+}
+
 /* ── gw_server Case 5: 502 on NXDOMAIN authority + on refused ───────────────*/
 static void
 test_gws_502(void)
@@ -1374,6 +1425,7 @@ main(void)
     test_gws_class();
     test_gws_403();
     test_gws_400();
+    test_gws_bad_header();
     test_gws_502();
     test_gws_upload();
     test_gws_chunked_upload();

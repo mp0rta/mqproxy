@@ -308,6 +308,40 @@ mq_gw_has_dup_xmq(const mq_http1_req_t *req)
 }
 
 /* ---------------------------------------------------------------------------
+ * Control-byte rejection
+ * ------------------------------------------------------------------------- */
+int
+mq_gw_hdr_name_ok(const char *s, size_t sl)
+{
+    for (size_t i = 0; i < sl; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7f) return 0; /* controls (incl. TAB) + DEL */
+    }
+    return 1;
+}
+
+int
+mq_gw_hdr_value_ok(const char *s, size_t sl)
+{
+    for (size_t i = 0; i < sl; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0x09) continue;             /* HTAB is permitted in values */
+        if (c < 0x20 || c == 0x7f) return 0; /* other controls + DEL */
+    }
+    return 1;
+}
+
+int
+mq_gw_uri_field_ok(const char *s, size_t sl)
+{
+    /* is_forbidden_uri_byte already covers SP, all controls (<0x20, includes
+     * CR/LF), and 0x7f. */
+    for (size_t i = 0; i < sl; i++)
+        if (is_forbidden_uri_byte((unsigned char)s[i])) return 0;
+    return 1;
+}
+
+/* ---------------------------------------------------------------------------
  * curl result code → HTTP status (design §10.1)
  * ------------------------------------------------------------------------- */
 int

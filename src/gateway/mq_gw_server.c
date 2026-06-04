@@ -582,7 +582,9 @@ typedef struct {
     /* content-length from the request headers (for INFILESIZE), -1 if absent. */
     int64_t content_length;
 
-    int bad; /* a header could not be stored (overflow) — diagnostic */
+    int bad;        /* a header could not be stored (overflow) — diagnostic */
+    int bad_header; /* a forwarded header name/value carried control bytes →
+                     * reject the whole request with 400 (smuggling posture). */
 } req_hdr_ctx_t;
 
 static void
@@ -647,6 +649,14 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
 
     /* Strip server→origin (x-mq-*) and hop-by-hop. Forward the rest. */
     if (mq_gw_strip_server(n, nl) || mq_gw_strip_hop(n, nl)) return;
+    /* Defense-in-depth: reject (whole request → 400) any forwarded header whose
+     * NAME or VALUE carries control bytes. A name/value smuggling a CR/LF would
+     * be a request-splitting surface once replayed to the origin. HTAB is
+     * permitted in values only (mirrors D3 / mq_gw_parse_target strictness). */
+    if (!mq_gw_hdr_name_ok(n, nl) || !mq_gw_hdr_value_ok(v, vl)) {
+        ctx->bad_header = 1;
+        return;
+    }
     if (ctx->n_fwd >= MQ_GWS_MAX_HDRS) {
         ctx->bad = 1;
         return;
@@ -684,6 +694,11 @@ gw_dispatch(mq_gw_req_t *r)
         gw_send_error(r, "400", "bad-request");
         return;
     }
+    /* A forwarded header carried control bytes → reject (smuggling posture). */
+    if (ctx.bad_header) {
+        gw_send_error(r, "400", "bad-header");
+        return;
+    }
     /* fin on the header section → no request body. */
     r->has_body = fin ? 0 : 1;
     if (fin) r->h3_body_fin = 1;
@@ -718,6 +733,14 @@ gw_dispatch(mq_gw_req_t *r)
         ctx.method[0] == '\0' || ctx.authority[0] == '\0' || ctx.path[0] == '\0' ||
         ctx.path[0] != '/' || !scheme_ok(ctx.scheme)) {
         gw_send_error(r, "400", "bad-request");
+        return;
+    }
+    /* Re-validate :authority / :path strictness on this side of the tunnel
+     * (defense-in-depth, mirrors mq_gw_parse_target): reject SP, CR, LF, other
+     * control bytes, and 0x7f before these are folded into an outbound URL. */
+    if (!mq_gw_uri_field_ok(ctx.authority, strlen(ctx.authority)) ||
+        !mq_gw_uri_field_ok(ctx.path, strlen(ctx.path))) {
+        gw_send_error(r, "400", "bad-target");
         return;
     }
 

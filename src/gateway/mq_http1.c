@@ -282,6 +282,17 @@ mq_http1_write_status(char *dst, size_t cap, int code, const char *reason)
 int
 mq_http1_write_header(char *dst, size_t cap, const char *n_, const char *v)
 {
+    /* Defense-in-depth for the download path: the value (and, less plausibly,
+     * the name) may carry bytes that originate from the origin's response. A CR
+     * or LF embedded here would split the serialized response (header injection
+     * / response splitting); a NUL would truncate it. Reject rather than emit a
+     * malformed/dangerous header section. (NUL cannot appear inside these C
+     * strings, but we check defensively in case callers ever pass slices.) */
+    for (const char *p = n_; *p; p++)
+        if (*p == '\r' || *p == '\n') return -1;
+    for (const char *p = v; *p; p++)
+        if (*p == '\r' || *p == '\n') return -1;
+
     int need = snprintf(NULL, 0, "%s: %s\r\n", n_, v);
     if (need < 0 || (size_t)need + 1 > cap) return -1;
     snprintf(dst, cap, "%s: %s\r\n", n_, v);

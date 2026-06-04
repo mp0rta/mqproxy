@@ -132,7 +132,19 @@ void mq_origin_free(mq_origin_t *o);
 
 /* Start a request. url is the absolute origin URL; method is the HTTP method
  * verb. hs[0..n) are request headers (NUL-terminated name/value C strings,
- * mq_h3_header_t). upload semantics by upload_len:
+ * mq_h3_header_t).
+ *
+ * PRECONDITION: every header NAME and VALUE must be free of CR and LF (and NUL,
+ * implied by C-string termination). curl serializes "name: value\r\n" onto the
+ * wire verbatim, so a CR/LF in a caller-supplied value would split the request
+ * (header injection / request smuggling). The gateway server enforces this
+ * upstream (mq_gw_hdr_name_ok / mq_gw_hdr_value_ok reject control bytes before
+ * a header reaches here). As a SECOND line of defense, libcurl >= 7.84.0 itself
+ * strips CR/LF from header values passed via CURLOPT_HTTPHEADER — this version
+ * floor is load-bearing: on an older libcurl the caller-side check above is the
+ * only barrier.
+ *
+ * upload semantics by upload_len:
  *   >= 0                       → upload exactly that many bytes (sets INFILESIZE)
  *                                sourced from cbs->pull_body.
  *   MQ_ORIGIN_UPLOAD_CHUNKED   → upload a body of unknown length via chunked TE,
