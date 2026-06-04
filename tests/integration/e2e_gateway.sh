@@ -166,10 +166,14 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_PUT(self):
-        # The gateway server forwards the H3 upload body to the origin as
-        # Transfer-Encoding: chunked (the request carries no Content-Length over
-        # the tunnel), so handle BOTH framings. Reply "len=<bytes received>".
+        # A request with a KNOWN Content-Length is forwarded to the origin with
+        # Content-Length framing (the gw client re-emits the validated CL over
+        # the tunnel; design §7.1 "再計算"). The genuinely-lengthless path still
+        # uses Transfer-Encoding: chunked, so handle BOTH framings and report
+        # which one was seen via the x-framing response header so the harness can
+        # assert it. Reply "len=<bytes received>".
         te = self.headers.get("Transfer-Encoding", "")
+        framing = "chunked" if "chunked" in te.lower() else "content-length"
         total = 0
         with open(SAVE, "wb") as f:
             if "chunked" in te.lower():
@@ -203,6 +207,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Framing", framing)
         self.end_headers()
         self.wfile.write(body)
 
@@ -332,7 +337,8 @@ fi
 # ── case 2: 8MB upload (PUT), origin saved file byte-exact + len=<n> ──────────
 rm -f "${UPLOAD_SAVE}"
 UP_RESP="${WORK}/up_resp.txt"
-code2="$(curl -s -o "${UP_RESP}" -w '%{http_code}' --max-time 30 \
+UP_HDR="${WORK}/up_resp_headers.txt"
+code2="$(curl -s -o "${UP_RESP}" -D "${UP_HDR}" -w '%{http_code}' --max-time 30 \
     -X POST "http://${GW}/_mqproxy/fetch" \
     -H "${AUTH}" \
     -H "X-Mq-Method: PUT" \
@@ -342,7 +348,12 @@ code2="$(curl -s -o "${UP_RESP}" -w '%{http_code}' --max-time 30 \
 [ -f "${UPLOAD_SAVE}" ] || fail 2 "origin did not save the uploaded body"
 cmp -s "${BIGFILE}" "${UPLOAD_SAVE}" || fail 2 "origin-saved upload differs from big.bin"
 grep -q '^len=8388608$' "${UP_RESP}" || fail 2 "upload response not 'len=8388608'; got: $(head -c 120 "${UP_RESP}")"
-ok 2 "8MB upload byte-exact at origin + len=8388608"
+# The known request Content-Length is re-emitted over the tunnel (design §7.1
+# "再計算"), so the origin must have seen Content-Length framing, NOT chunked.
+# The origin records which framing it saw in the x-framing response header.
+grep -qi '^x-framing:[[:space:]]*content-length' "${UP_HDR}" || \
+    fail 2 "origin upload framing not content-length; got: $(grep -i x-framing "${UP_HDR}" || echo '<none>')"
+ok 2 "8MB upload byte-exact at origin + len=8388608 + Content-Length framing"
 
 # ── case 3: wrong token → 403 + x-mq-error: auth-failed ──────────────────────
 H3="${WORK}/c3_headers.txt"

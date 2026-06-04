@@ -1290,6 +1290,15 @@ test_gw_upload(void)
     MQ_CHECK_EQ_INT(g_srv.request_count, 1);
     const char *m = srv_find_hdr(&g_srv, ":method");
     MQ_CHECK(m && strcmp(m, "POST") == 0);
+    /* The known request Content-Length must be re-emitted over the tunnel
+     * (design §7.1 "再計算"): the gw client strips the client's original CL and
+     * sends its own validated value, so the server frames the upload by CL. */
+    {
+        const char *cl = srv_find_hdr(&g_srv, "content-length");
+        char want[32];
+        snprintf(want, sizeof(want), "%zu", N);
+        MQ_CHECK(cl && strcmp(cl, want) == 0);
+    }
     MQ_CHECK(g_srv.saw_fin); /* upload finished cleanly */
 
     /* The echoed body must reach the local socket byte-exact. */

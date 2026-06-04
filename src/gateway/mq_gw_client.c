@@ -442,6 +442,27 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         }
     }
 
+    /* content-length: re-emit the recomputed value over the tunnel when the
+     * request has a known body length (CL > 0). Design §7.1 ("再計算"): the
+     * ORIGINAL Content-Length header is stripped (mq_gw_strip_client) and we
+     * emit our own validated value (req->content_length), so the value the
+     * server sees is the one this client actually committed to streaming — not
+     * an attacker-controlled duplicate. CL == 0 means fin-on-headers / no body
+     * (no_body above), so no content-length header is needed in that case. The
+     * server honors this via ctx.content_length → CURLOPT_INFILESIZE_LARGE;
+     * absent CL on a body request falls back to the chunked sentinel. */
+    if (req->content_length > 0 && nh < MQ_GW_MAX_SEND_HDRS) {
+        char *nb = namebuf + nh * NS;
+        char *vb = valbuf + nh * VS;
+        memcpy(nb, "content-length", 15);
+        int vn = snprintf(vb, VS, "%lld", (long long)req->content_length);
+        if (vn > 0 && (size_t)vn < VS) {
+            hs[nh].name = nb;
+            hs[nh].value = vb;
+            nh++;
+        }
+    }
+
     /* Remaining request headers, EXCEPT those stripped client-side (hop-by-hop,
      * X-Mq-*, Host, Content-Length, Cookie). Lowercase the name (H3 requires
      * lowercase field names). */
