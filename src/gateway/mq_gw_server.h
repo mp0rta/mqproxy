@@ -47,6 +47,23 @@
  *     wrappers would already be destroyed and any touch would be a UAF.
  *     NOTE: capture the h3 handle (mq_gw_server_h3(s)) BEFORE mq_gw_server_free —
  *     the handle accessor reads the gw_server struct, which free() releases.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * KNOWN LIMITATION — pre-auth per-stream memory (mirrors mq_fetch_listener.h)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Each opened H3 stream allocates its per-request state (mq_gw_req_t — ~90 KB: the
+ * inline response-header arena (64 * (128+1024) ~= 72 KB) plus the 16 KB pend
+ * buffer; the spill buffer is allocated lazily only for a bodied upload) in
+ * on_new_req, BEFORE the request headers are parsed and BEFORE auth runs. The
+ * COUNT of concurrent
+ * per-request states is bounded only by xquic's per-connection stream limit
+ * (1024), so a single tokenless peer that opens streams without ever sending a
+ * valid (or any) auth header can pin on the order of ~90 MB of per-request state
+ * pre-auth. No origin is contacted without a successful Bearer-token auth, so this
+ * is purely a memory-amplification surface, not an SSRF/relay one. This is
+ * acceptable for the Phase 2 single-trusted-client scope; a global per-process
+ * memory budget / concurrency cap (the D6 multi-client hardening item) is deferred
+ * to Phase 5, alongside the symmetric mq_fetch_listener.h per-process-sum limit.
  */
 #ifndef MQ_GATEWAY_MQ_GW_SERVER_H
 #define MQ_GATEWAY_MQ_GW_SERVER_H

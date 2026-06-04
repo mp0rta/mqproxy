@@ -77,6 +77,14 @@
  * incoming set; add a margin for the pseudo-headers we synthesize. */
 #define MQ_GW_MAX_SEND_HDRS (MQ_HTTP1_MAX_HEADERS + 8)
 
+/* Per-forwarded-header arena slot caps (name / value). A slot holds cap-1 bytes
+ * + NUL, so a name >= NAME_CAP or value >= VAL_CAP would be truncated. These bound
+ * BOTH the gw_on_request reject check (fail closed before opening the H3 request)
+ * AND the forwarding arena declarations — keep them in lockstep here so the two
+ * sites can never drift. */
+#define MQ_GW_HDR_NAME_CAP 128
+#define MQ_GW_HDR_VAL_CAP  1024
+
 /* Poll interval (ms) for the mp-ready deferral timer (mirrors mq_client). */
 #define MQ_GW_MP_POLL_MS 50
 #define MQ_GW_MAX_PATHS  8
@@ -350,19 +358,20 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
 
     /* 4b. Reject (locally, BEFORE opening the H3 request) any header that would
      * not fit the forwarding arena, instead of silently clamping it. The arena
-     * slots are NS(128) name / VS(1024) value, holding cap-1 bytes + NUL — so a
-     * name >= 128 or value >= 1024 would be truncated. A clamped X-Mq-Auth can't
-     * authenticate anyway, and a clamped forwarded value is a corruption /
-     * smuggling surface; fail closed with 400 header-too-long. (The download-side
-     * pseudo + diagnostic headers are validated where they are emitted.) */
+     * slots are MQ_GW_HDR_NAME_CAP name / MQ_GW_HDR_VAL_CAP value, holding cap-1
+     * bytes + NUL — so a name >= NAME_CAP or value >= VAL_CAP would be truncated.
+     * A clamped X-Mq-Auth can't authenticate anyway, and a clamped forwarded value
+     * is a corruption / smuggling surface; fail closed with 400 header-too-long.
+     * (The download-side pseudo + diagnostic headers are validated where they are
+     * emitted.) */
     {
-        if (auth_vl >= 1024) {
+        if (auth_vl >= MQ_GW_HDR_VAL_CAP) {
             gw_reject_write(handle, 400, "Bad Request", "header-too-long");
             return -1;
         }
         size_t xcl_vl = 0;
         const char *xcl = find_hdr(req, "x-mq-class", &xcl_vl);
-        if (xcl && xcl_vl >= 1024) {
+        if (xcl && xcl_vl >= MQ_GW_HDR_VAL_CAP) {
             gw_reject_write(handle, 400, "Bad Request", "header-too-long");
             return -1;
         }
@@ -370,7 +379,7 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
             const char *n = req->h[i].n;
             size_t nl = req->h[i].nl;
             if (mq_gw_strip_client(n, nl)) continue;
-            if (nl >= 128 || req->h[i].vl >= 1024) {
+            if (nl >= MQ_GW_HDR_NAME_CAP || req->h[i].vl >= MQ_GW_HDR_VAL_CAP) {
                 gw_reject_write(handle, 400, "Bad Request", "header-too-long");
                 return -1;
             }
@@ -412,7 +421,9 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     /* Per-header storage: target fields are already NUL-terminated in `target`;
      * pseudo-headers point at static / target storage. For ordinary forwarded
      * headers we copy name+value into name/value scratch. */
-    static const size_t NS = 128, VS = 1024;
+    /* Local aliases for the file-scope arena caps (used below for per-slot
+     * pointer math + bounded copies). Same constants as the §4b reject check. */
+    static const size_t NS = MQ_GW_HDR_NAME_CAP, VS = MQ_GW_HDR_VAL_CAP;
     char *namebuf = malloc(MQ_GW_MAX_SEND_HDRS * NS);
     char *valbuf = malloc(MQ_GW_MAX_SEND_HDRS * VS);
     if (!namebuf || !valbuf) {

@@ -72,7 +72,11 @@
  * bounded, however. This is acceptable for the Phase 2 single-trusted-client
  * scope (one local app drives a small number of in-flight fetches); a global
  * memory budget / concurrency cap is deferred to the multi-client hardening work
- * (Phase 5).
+ * (Phase 5). Relatedly, the listener enforces NO read/idle timeout: a peer that
+ * dribbles the request head or holds a half-sent Content-Length body open forever
+ * (slowloris / CL-hold) ties up a connection indefinitely. This is a conscious
+ * single-trusted-client scope decision; an idle/read timeout is revisited in the
+ * same Phase 5 hardening work.
  */
 #ifndef MQ_GATEWAY_MQ_FETCH_LISTENER_H
 #define MQ_GATEWAY_MQ_FETCH_LISTENER_H
