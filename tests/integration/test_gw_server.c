@@ -39,8 +39,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <curl/curl.h> /* CURL_HTTP_VERSION_1_1 for the on_done http_ver assert */
 #include <event2/buffer.h>
@@ -49,7 +51,22 @@
 #include <event2/keyvalq_struct.h>
 
 #include "gateway/mq_gw_headers.h" /* MQ_GW_CURL_* mirrors */
+#include "gateway/mq_gw_server.h"
 #include "gateway/mq_origin_curl.h"
+#include "runtime/mq_runtime_libevent.h"
+#include "transport/mq_conn.h"
+#include "transport/mq_h3.h"
+#include "transport/mq_transport.h"
+
+#include <xquic/xqc_http3.h>
+#include <xquic/xquic.h>
+
+#ifndef TEST_CERT_FILE
+#  define TEST_CERT_FILE "tests/certs/test.crt"
+#endif
+#ifndef TEST_KEY_FILE
+#  define TEST_KEY_FILE "tests/certs/test.key"
+#endif
 
 /* ── timing helpers (mirror the other integration tests) ────────────────────*/
 static uint64_t
@@ -92,12 +109,37 @@ typedef struct {
     struct evhttp *http;
     uint16_t port;
     size_t blob_len; /* size served by GET /blob */
+
+    /* Captured request headers from the most recent /blob request (for the
+     * gw_server forwarding asserts: NO x-mq-* reach the origin; custom header
+     * forwarded). */
+    int saw_xmq;         /* any x-mq-* request header seen */
+    int saw_custom;      /* x-custom-hdr: keepme seen */
+    char custom_val[64]; /* its value */
 } origin_t;
+
+/* Scan the request headers: flag any x-mq-* and capture x-custom-hdr. */
+static void
+origin_capture_req_hdrs(struct evhttp_request *req, origin_t *o)
+{
+    struct evkeyvalq *h = evhttp_request_get_input_headers(req);
+    if (!h) return;
+    struct evkeyval *kv;
+    TAILQ_FOREACH(kv, h, next)
+    {
+        if (strncasecmp(kv->key, "x-mq-", 5) == 0) o->saw_xmq = 1;
+        if (strcasecmp(kv->key, "x-custom-hdr") == 0) {
+            o->saw_custom = 1;
+            snprintf(o->custom_val, sizeof(o->custom_val), "%s", kv->value);
+        }
+    }
+}
 
 static void
 origin_cb_blob(struct evhttp_request *req, void *arg)
 {
     origin_t *o = (origin_t *)arg;
+    origin_capture_req_hdrs(req, o);
     struct evbuffer *out = evbuffer_new();
     for (size_t i = 0; i < o->blob_len; i++) {
         uint8_t b = pat_byte(i);
@@ -114,6 +156,12 @@ typedef struct {
     struct event *timer;
 } slow_ctx_t;
 
+/* Outstanding /slow context so origin_down can free a still-pending timer (the
+ * gw_server teardown case frees the fixture BEFORE the 300ms timer fires; without
+ * this the slow_ctx + its timer would leak under LSan). Single-slot is enough —
+ * these tests have at most one /slow request in flight. */
+static slow_ctx_t *g_pending_slow;
+
 static void
 slow_fire(evutil_socket_t fd, short what, void *arg)
 {
@@ -124,6 +172,7 @@ slow_fire(evutil_socket_t fd, short what, void *arg)
     evhttp_send_reply(sc->req, 200, "OK", out);
     evbuffer_free(out);
     event_free(sc->timer);
+    if (g_pending_slow == sc) g_pending_slow = NULL;
     free(sc);
 }
 
@@ -138,6 +187,7 @@ origin_cb_slow(struct evhttp_request *req, void *arg)
     struct timeval tv = {0, 300 * 1000};
     sc->timer = evtimer_new(g_origin_base, slow_fire, sc);
     evtimer_add(sc->timer, &tv);
+    g_pending_slow = sc;
 }
 
 /* PUT /up: drain the request body, reply 200 with "len=<n>". */
@@ -192,6 +242,14 @@ origin_down(origin_t *o)
 {
     if (o->http) evhttp_free(o->http);
     o->http = NULL;
+    /* Free a /slow timer that never fired (fixture torn down before the 300ms
+     * reply). evhttp_free above already released the bound request, so only our
+     * own ctx + timer remain. */
+    if (g_pending_slow) {
+        if (g_pending_slow->timer) event_free(g_pending_slow->timer);
+        free(g_pending_slow);
+        g_pending_slow = NULL;
+    }
 }
 
 /* ── shared per-request capture ─────────────────────────────────────────────*/
@@ -557,6 +615,672 @@ test_status_line_parser(void)
     MQ_CHECK_EQ_INT(mq_origin_parse_status_line("HTTP/1.1 99 x", 13), -1); /* <100 */
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+ * Gateway SERVER (Task 4.3): H3 request → origin execution → H3 response.
+ *
+ * These stand up a REAL in-process H3 tunnel over loopback UDP plus the evhttp
+ * origin (reused from above):
+ *   - the gw_server under test: server transport (TLS) + runtime + mq_gw_server
+ *     (which mq_h3_init's its own hooks). The evhttp origin is on the SAME base.
+ *   - a fake H3 CLIENT: client transport + runtime + mq_h3 (NULL hooks) that
+ *     opens an H3 request, forwards the pseudo-headers + x-mq-auth + arbitrary
+ *     headers, optionally uploads a body, and captures the H3 response.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* Reserve an ephemeral loopback UDP port (bind :0, read it, close). */
+static uint16_t
+reserve_udp_port(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return 0;
+    }
+    socklen_t sl = sizeof(sa);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        close(fd);
+        return 0;
+    }
+    uint16_t port = ntohs(sa.sin_port);
+    close(fd);
+    return port;
+}
+
+/* ── client-side H3 response capture ────────────────────────────────────────*/
+
+#define CLI_MAX_HDRS 32
+#define CLI_HDR_LEN  512
+
+typedef struct {
+    char name[CLI_HDR_LEN];
+    char value[CLI_HDR_LEN];
+} cli_hdr_t;
+
+typedef struct {
+    mq_h3_req_t *req;
+
+    /* response captured from the gw_server */
+    int got_headers;
+    int status; /* parsed :status */
+    cli_hdr_t hdrs[CLI_MAX_HDRS];
+    int n_hdrs;
+
+    uint8_t *body;
+    size_t body_cap;
+    size_t body_len;
+    int saw_fin;
+    int closed;
+
+    /* upload source (set before sending the request) */
+    const uint8_t *up_src;
+    size_t up_total;
+    size_t up_sent;
+    int up_fin_sent;
+
+    /* control: reset the request once we have received `reset_after` body bytes */
+    int reset_after; /* >0 = reset mid-download after this many bytes */
+    int did_reset;
+} cli_req_t;
+
+static void
+cli_capture_hdr(const char *n, size_t nl, const char *v, size_t vl, void *u)
+{
+    cli_req_t *c = (cli_req_t *)u;
+    if (nl == 7 && memcmp(n, ":status", 7) == 0) {
+        int code = 0;
+        for (size_t i = 0; i < vl && v[i] >= '0' && v[i] <= '9'; i++)
+            code = code * 10 + (v[i] - '0');
+        c->status = code;
+        return;
+    }
+    if (c->n_hdrs >= CLI_MAX_HDRS) return;
+    cli_hdr_t *h = &c->hdrs[c->n_hdrs++];
+    size_t cn = nl < CLI_HDR_LEN - 1 ? nl : CLI_HDR_LEN - 1;
+    size_t cv = vl < CLI_HDR_LEN - 1 ? vl : CLI_HDR_LEN - 1;
+    memcpy(h->name, n, cn);
+    h->name[cn] = '\0';
+    memcpy(h->value, v, cv);
+    h->value[cv] = '\0';
+}
+
+static const char *
+cli_find_hdr(const cli_req_t *c, const char *name)
+{
+    for (int i = 0; i < c->n_hdrs; i++)
+        if (strcasecmp(c->hdrs[i].name, name) == 0) return c->hdrs[i].value;
+    return NULL;
+}
+
+/* Push as much of the pending upload as xquic accepts, riding fin on the last
+ * byte; EAGAIN remainder retried from cli_on_write. */
+static void
+cli_upload_pump(cli_req_t *c)
+{
+    if (!c->req || c->up_fin_sent) return;
+    while (c->up_sent < c->up_total) {
+        long acc = mq_h3_req_send_body(c->req, c->up_src + c->up_sent,
+                                       c->up_total - c->up_sent, /*fin=*/1);
+        if (acc <= 0) return; /* EAGAIN: resume on next on_write */
+        c->up_sent += (size_t)acc;
+        if (c->up_sent >= c->up_total) {
+            c->up_fin_sent = 1;
+            return;
+        }
+    }
+    if (c->up_total == 0) {
+        mq_h3_req_finish(c->req);
+        c->up_fin_sent = 1;
+    }
+}
+
+static void
+cli_on_read(mq_h3_req_t *r, int flag, void *user)
+{
+    cli_req_t *c = (cli_req_t *)user;
+    if (flag & (XQC_REQ_NOTIFY_READ_HEADER | XQC_REQ_NOTIFY_READ_TRAILER)) {
+        int fin = 0;
+        int n = mq_h3_req_recv_headers(r, cli_capture_hdr, c, &fin);
+        if (n >= 0) c->got_headers = 1;
+        if (fin) c->saw_fin = 1;
+    }
+    for (;;) {
+        int fin = 0;
+        size_t room = c->body_cap > c->body_len ? c->body_cap - c->body_len : 0;
+        uint8_t scratch[4096];
+        uint8_t *dst = c->body ? c->body + c->body_len : scratch;
+        size_t cap = c->body ? room : sizeof(scratch);
+        if (cap == 0) {
+            dst = scratch;
+            cap = sizeof(scratch);
+        }
+        long n = mq_h3_req_recv_body(r, dst, cap, &fin);
+        if (n > 0 && c->body && room > 0)
+            c->body_len += (size_t)((size_t)n < room ? n : room);
+        if (fin) c->saw_fin = 1;
+        /* Mid-download reset trigger (case 7). */
+        if (c->reset_after > 0 && !c->did_reset &&
+            c->body_len >= (size_t)c->reset_after) {
+            c->did_reset = 1;
+            mq_h3_req_reset(c->req);
+            c->req = NULL;
+            return;
+        }
+        if (n <= 0) break;
+    }
+}
+
+static void
+cli_on_write(mq_h3_req_t *r, void *user)
+{
+    (void)r;
+    cli_req_t *c = (cli_req_t *)user;
+    cli_upload_pump(c);
+}
+
+static void
+cli_on_close(mq_h3_req_t *r, void *user)
+{
+    (void)r;
+    cli_req_t *c = (cli_req_t *)user;
+    c->closed = 1;
+    c->req = NULL;
+}
+
+/* ── gw_server fixture ──────────────────────────────────────────────────────*/
+
+typedef struct {
+    struct event_base *base;
+    origin_t origin;
+    mq_transport_t *srv_t;
+    mq_runtime_t *srv_rt;
+    mq_gw_server_t *gw;
+
+    mq_transport_t *cli_t;
+    mq_runtime_t *cli_rt;
+    mq_h3_t *cli_h3;
+    mq_h3_conn_t *cli_conn;
+    int cli_conn_up;
+} gws_fixture_t;
+
+static void
+gws_cli_conn_state(mq_h3_conn_t *cn, int established, void *user)
+{
+    (void)cn;
+    gws_fixture_t *f = (gws_fixture_t *)user;
+    if (established)
+        f->cli_conn_up = 1;
+    else
+        f->cli_conn_up = 0;
+}
+
+static int
+gws_fixture_up(gws_fixture_t *f, const char *token, size_t blob_len)
+{
+    memset(f, 0, sizeof(*f));
+
+    f->base = event_base_new();
+    if (!f->base) return -1;
+
+    /* evhttp origin on the shared base. */
+    if (origin_up(f->base, &f->origin, blob_len) != 0) return -1;
+
+    uint16_t srv_port = reserve_udp_port();
+    if (!srv_port) return -1;
+
+    /* Server transport + runtime + gw_server (mq_h3_init done inside gw_server). */
+    f->srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
+    if (!f->srv_t) return -1;
+    f->srv_rt = mq_runtime_new(f->srv_t, f->base);
+    if (!f->srv_rt) return -1;
+
+    xqc_conn_settings_t srv_settings;
+    memset(&srv_settings, 0, sizeof(srv_settings));
+    srv_settings.proto_version = XQC_VERSION_V1;
+    srv_settings.pacing_on = 1;
+    mq_conn_apply_mp_settings(&srv_settings, /*is_server=*/1, MQ_CC_BBR2);
+    xqc_server_set_conn_settings(mq_transport_xqc(f->srv_t), &srv_settings);
+
+    f->gw = mq_gw_server_new(f->srv_t, f->srv_rt, token, NULL, 10);
+    if (!f->gw) return -1;
+    if (mq_runtime_open_udp_path(f->srv_rt, "127.0.0.1", srv_port) != 0) return -1;
+
+    /* Client transport + runtime + h3 (pure client). */
+    f->cli_t = mq_transport_new(0);
+    if (!f->cli_t) return -1;
+    f->cli_rt = mq_runtime_new(f->cli_t, f->base);
+    if (!f->cli_rt) return -1;
+    if (mq_runtime_open_udp_path(f->cli_rt, "127.0.0.1", 0) != 0) return -1;
+    f->cli_h3 = mq_h3_init(f->cli_t, NULL, NULL, NULL);
+    if (!f->cli_h3) return -1;
+
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(srv_port);
+    inet_pton(AF_INET, "127.0.0.1", &peer.sin_addr);
+    f->cli_conn = mq_h3_connect(f->cli_h3, (struct sockaddr *)&peer, sizeof(peer),
+                                MQ_CC_BBR2, gws_cli_conn_state, f);
+    if (!f->cli_conn) return -1;
+
+    /* Pump until the client conn is established. */
+    uint64_t deadline = now_ms() + 5000;
+    while (!f->cli_conn_up && now_ms() < deadline)
+        event_base_loop(f->base, EVLOOP_NONBLOCK);
+    return f->cli_conn_up ? 0 : -1;
+}
+
+static void
+gws_fixture_down(gws_fixture_t *f)
+{
+    /* SANCTIONED TEARDOWN ORDER (mq_gw_server.h): capture the server h3 BEFORE
+     * gw_server_free (the accessor reads the freed struct otherwise), then
+     * gw_server_free FIRST (aborts in-flight origin + detaches H3 cbs against the
+     * LIVE engine), THEN mq_h3_free (both sides), THEN transport_free. */
+    mq_h3_t *srv_h3 = mq_gw_server_h3(f->gw);
+    if (f->gw) mq_gw_server_free(f->gw);
+    if (f->cli_h3) mq_h3_free(f->cli_h3);
+    if (srv_h3) mq_h3_free(srv_h3);
+    if (f->cli_t) mq_transport_free(f->cli_t);
+    if (f->srv_t) mq_transport_free(f->srv_t);
+    if (f->cli_rt) mq_runtime_free(f->cli_rt);
+    if (f->srv_rt) mq_runtime_free(f->srv_rt);
+    origin_down(&f->origin);
+    if (f->base) event_base_free(f->base);
+}
+
+/* Open + send an H3 request at the gw_server. `extra` headers are appended after
+ * the standard pseudo+auth set. Returns 0 on success (request open + headers
+ * sent). The caller wires cli cbs first via the returned cli_req. */
+static int
+gws_send_request(gws_fixture_t *f, cli_req_t *c, const char *method, const char *scheme,
+                 const char *authority, const char *path, const char *auth,
+                 const mq_h3_header_t *extra, size_t n_extra, int has_body,
+                 const char *content_length)
+{
+    mq_h3_req_t *hr = mq_h3_req_open(f->cli_conn);
+    if (!hr) return -1;
+    c->req = hr;
+    mq_h3_req_set_cbs(hr, cli_on_read, cli_on_write, cli_on_close, c);
+
+    mq_h3_header_t hs[CLI_MAX_HDRS];
+    size_t nh = 0;
+    if (method) {
+        hs[nh].name = ":method";
+        hs[nh].value = method;
+        nh++;
+    }
+    if (scheme) {
+        hs[nh].name = ":scheme";
+        hs[nh].value = scheme;
+        nh++;
+    }
+    if (authority) {
+        hs[nh].name = ":authority";
+        hs[nh].value = authority;
+        nh++;
+    }
+    if (path) {
+        hs[nh].name = ":path";
+        hs[nh].value = path;
+        nh++;
+    }
+    if (auth) {
+        hs[nh].name = "x-mq-auth";
+        hs[nh].value = auth;
+        nh++;
+    }
+    if (has_body && content_length) {
+        hs[nh].name = "content-length";
+        hs[nh].value = content_length;
+        nh++;
+    }
+    for (size_t i = 0; i < n_extra && nh < CLI_MAX_HDRS; i++)
+        hs[nh++] = extra[i];
+
+    long sh = mq_h3_req_send_headers(hr, hs, nh, has_body ? 0 : 1);
+    if (sh <= 0) return -1;
+    if (has_body) cli_upload_pump(c);
+    return 0;
+}
+
+/* Build an authority string "127.0.0.1:<port>". */
+static const char *
+origin_authority(const origin_t *o)
+{
+    static char buf[64];
+    snprintf(buf, sizeof(buf), "127.0.0.1:%u", (unsigned)o->port);
+    return buf;
+}
+
+/* ── gw_server Case 1: GET happy path ───────────────────────────────────────*/
+static void
+test_gws_get(void)
+{
+    const size_t N = 64 * 1024;
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", N) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(N);
+    c.body_cap = N;
+
+    mq_h3_header_t extra[] = {{"x-custom-hdr", "keepme"}};
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/blob",
+                              "Bearer sekrit", extra, 1, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    uint64_t deadline = now_ms() + 10000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 200);
+    MQ_CHECK(c.got_headers);
+    MQ_CHECK_EQ_INT((long long)c.body_len, (long long)N);
+    /* Byte-exact vs the origin pattern. */
+    int ok = 1;
+    for (size_t i = 0; i < N && i < c.body_len && ok; i++)
+        if (c.body[i] != pat_byte(i)) ok = 0;
+    MQ_CHECK(ok);
+    /* x-mq-origin-protocol present (origin is HTTP/1.1). */
+    const char *prot = cli_find_hdr(&c, "x-mq-origin-protocol");
+    MQ_CHECK(prot && strcmp(prot, "http/1.1") == 0);
+    /* The origin saw NO x-mq-* headers, but DID see the forwarded custom header. */
+    MQ_CHECK_EQ_INT(f.origin.saw_xmq, 0);
+    MQ_CHECK_EQ_INT(f.origin.saw_custom, 1);
+    MQ_CHECK(strcmp(f.origin.custom_val, "keepme") == 0);
+    MQ_CHECK_EQ_INT(mq_gw_server_requests(f.gw), 1);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
+/* ── gw_server Case 2: x-mq-class forwarded + logged (request completes) ─────*/
+static void
+test_gws_class(void)
+{
+    const size_t N = 4096;
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", N) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(N);
+    c.body_cap = N;
+
+    /* x-mq-class is stripped server-side before the origin; the gw logs it at
+     * INFO (manual evidence in test output). We just assert the request
+     * completes 200 and the origin saw NO x-mq-* (class included). */
+    mq_h3_header_t extra[] = {{"x-mq-class", "bulk"}};
+    printf("[case2] sending x-mq-class: bulk (expect an INFO log line from gw_server)\n");
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/blob",
+                              "Bearer sekrit", extra, 1, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    uint64_t deadline = now_ms() + 10000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 200);
+    MQ_CHECK_EQ_INT((long long)c.body_len, (long long)N);
+    MQ_CHECK_EQ_INT(f.origin.saw_xmq, 0); /* x-mq-class did NOT reach the origin */
+    MQ_CHECK_EQ_INT(mq_gw_server_requests(f.gw), 1);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
+/* ── gw_server Case 3: 403 on a wrong token (no origin contact) ─────────────*/
+static void
+test_gws_403(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/blob",
+                              "Bearer WRONG", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 403);
+    const char *err = cli_find_hdr(&c, "x-mq-error");
+    MQ_CHECK(err && strcmp(err, "auth-failed") == 0);
+    /* No origin contact: the origin never saw a request. */
+    MQ_CHECK_EQ_INT(f.origin.saw_xmq, 0);
+    MQ_CHECK_EQ_INT(f.origin.saw_custom, 0);
+
+    gws_fixture_down(&f);
+}
+
+/* ── gw_server Case 4: 400 on a missing :authority ──────────────────────────*/
+static void
+test_gws_400(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+
+    /* Omit :authority (pass NULL). */
+    int rc = gws_send_request(&f, &c, "GET", "http", NULL, "/blob", "Bearer sekrit", NULL,
+                              0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 400);
+    const char *err = cli_find_hdr(&c, "x-mq-error");
+    MQ_CHECK(err && strcmp(err, "bad-request") == 0);
+    MQ_CHECK_EQ_INT(f.origin.saw_xmq, 0);
+
+    gws_fixture_down(&f);
+}
+
+/* ── gw_server Case 5: 502 on NXDOMAIN authority + on refused ───────────────*/
+static void
+test_gws_502(void)
+{
+    /* 5a: NXDOMAIN authority → curl:6 (CURLE_COULDNT_RESOLVE_HOST) → 502. */
+    {
+        gws_fixture_t f;
+        if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+            gws_fixture_down(&f);
+            MQ_CHECK(0);
+            return;
+        }
+        cli_req_t c;
+        memset(&c, 0, sizeof(c));
+        int rc = gws_send_request(&f, &c, "GET", "http", "nxdomain-mqproxy-test.invalid",
+                                  "/x", "Bearer sekrit", NULL, 0, 0, NULL);
+        MQ_CHECK_EQ_INT(rc, 0);
+        uint64_t deadline = now_ms() + 10000;
+        while (!c.closed && now_ms() < deadline)
+            event_base_loop(f.base, EVLOOP_NONBLOCK);
+        MQ_CHECK_EQ_INT(c.status, 502);
+        const char *err = cli_find_hdr(&c, "x-mq-error");
+        char want[16];
+        snprintf(want, sizeof(want), "curl:%d", MQ_GW_CURL_RESOLVE);
+        MQ_CHECK(err && strcmp(err, want) == 0);
+        gws_fixture_down(&f);
+    }
+    /* 5b: connection refused (127.0.0.1:1) → curl:7 → 502. */
+    {
+        gws_fixture_t f;
+        if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+            gws_fixture_down(&f);
+            MQ_CHECK(0);
+            return;
+        }
+        cli_req_t c;
+        memset(&c, 0, sizeof(c));
+        int rc = gws_send_request(&f, &c, "GET", "http", "127.0.0.1:1", "/x",
+                                  "Bearer sekrit", NULL, 0, 0, NULL);
+        MQ_CHECK_EQ_INT(rc, 0);
+        uint64_t deadline = now_ms() + 10000;
+        while (!c.closed && now_ms() < deadline)
+            event_base_loop(f.base, EVLOOP_NONBLOCK);
+        MQ_CHECK_EQ_INT(c.status, 502);
+        const char *err = cli_find_hdr(&c, "x-mq-error");
+        char want[16];
+        snprintf(want, sizeof(want), "curl:%d", MQ_GW_CURL_CONNECT);
+        MQ_CHECK(err && strcmp(err, want) == 0);
+        gws_fixture_down(&f);
+    }
+}
+
+/* ── gw_server Case 6: upload PUT 64 KiB+ → origin echoes len=<n> ────────────*/
+static void
+test_gws_upload(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 0) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    const size_t N = 96 * 1024;
+    uint8_t *src = malloc(N);
+    for (size_t i = 0; i < N; i++)
+        src[i] = pat_byte(i);
+
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(256);
+    c.body_cap = 256;
+    c.up_src = src;
+    c.up_total = N;
+
+    char cl[32];
+    snprintf(cl, sizeof(cl), "%zu", N);
+    int rc = gws_send_request(&f, &c, "PUT", "http", origin_authority(&f.origin), "/up",
+                              "Bearer sekrit", NULL, 0, 1, cl);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    uint64_t deadline = now_ms() + 15000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 200);
+    MQ_CHECK_EQ_INT((long long)c.up_sent, (long long)N);
+    /* Origin replied "len=<N>". */
+    c.body[c.body_len < c.body_cap ? c.body_len : c.body_cap - 1] = '\0';
+    char want[32];
+    snprintf(want, sizeof(want), "len=%zu", N);
+    MQ_CHECK(strstr((char *)c.body, want) != NULL);
+
+    free(src);
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
+/* ── gw_server Case 7: mid-download client reset → origin reaped, gw survives ─*/
+static void
+test_gws_mid_reset(void)
+{
+    const size_t N = 1024 * 1024; /* big enough that a reset lands mid-body */
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", N) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(N);
+    c.body_cap = N;
+    c.reset_after = 16 * 1024; /* reset once 16 KiB has arrived */
+
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/blob",
+                              "Bearer sekrit", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    /* Pump until our reset fires + a settle so the gw reaps the origin handle. */
+    uint64_t deadline = now_ms() + 10000;
+    while (!c.did_reset && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+    MQ_CHECK_EQ_INT(c.did_reset, 1);
+    pump_a_bit(f.base, 500); /* let the gw's on_close abort the origin */
+
+    MQ_CHECK_EQ_INT(mq_gw_server_requests(f.gw), 1);
+
+    /* A subsequent request on the same conn still works (gw did not crash / wedge).
+     * Reuse the origin's /up route as a quick 0-byte round-trip. */
+    f.origin.saw_xmq = 0;
+    cli_req_t c2;
+    memset(&c2, 0, sizeof(c2));
+    c2.body = malloc(256);
+    c2.body_cap = 256;
+    int rc2 = gws_send_request(&f, &c2, "GET", "http", origin_authority(&f.origin),
+                               "/blob", "Bearer sekrit", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc2, 0);
+    deadline = now_ms() + 10000;
+    while (!c2.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+    MQ_CHECK_EQ_INT(c2.status, 200);
+    MQ_CHECK_EQ_INT(mq_gw_server_requests(f.gw), 2);
+
+    free(c.body);
+    free(c2.body);
+    gws_fixture_down(&f);
+}
+
+/* ── gw_server Case 8: teardown with a request in flight (origin /slow) ──────*/
+static void
+test_gws_teardown_inflight(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 0) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+
+    /* /slow replies only after a 300ms origin timer — so at teardown the gw holds
+     * a live in-flight origin request. */
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/slow",
+                              "Bearer sekrit", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    /* Pump enough to forward the request + start the origin (but NOT the 300ms
+     * reply). The gw now has a live origin request. */
+    pump_a_bit(f.base, 80);
+    MQ_CHECK_EQ_INT(c.closed, 0); /* not done yet */
+    MQ_CHECK_EQ_INT(mq_gw_server_requests(f.gw), 1);
+
+    /* Tear down mid-request, sanctioned order. Must be ASan / LSan clean. */
+    gws_fixture_down(&f);
+}
+
 int
 main(void)
 {
@@ -573,6 +1297,16 @@ main(void)
     test_status_line_parser();
 
     event_base_free(base);
+
+    /* Gateway-server (Task 4.3) cases — each owns its own base + transports. */
+    test_gws_get();
+    test_gws_class();
+    test_gws_403();
+    test_gws_400();
+    test_gws_502();
+    test_gws_upload();
+    test_gws_mid_reset();
+    test_gws_teardown_inflight();
 
     if (mq_test_failures) {
         fprintf(stderr, "%d failure(s)\n", mq_test_failures);

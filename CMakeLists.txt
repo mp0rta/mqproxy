@@ -22,6 +22,7 @@ add_library(mqproxy STATIC
     src/gateway/mq_gw_headers.c
     src/gateway/mq_fetch_listener.c
     src/gateway/mq_gw_client.c
+    src/gateway/mq_gw_server.c
     src/gateway/mq_origin_curl.c
     src/transport/mq_conn.c
     src/transport/mq_h3.c
@@ -206,6 +207,11 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         pthread dl m stdc++)
     target_include_directories(test_gw_server PRIVATE tests src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    # Task 4.3 extends this test with gw_server cases that stand up a real H3
+    # client+server over loopback UDP, so it needs the cert/key defines.
+    target_compile_definitions(test_gw_server PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
     set_target_properties(test_gw_server PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_gw_server COMMAND test_gw_server)

@@ -122,12 +122,24 @@ mq_origin_t *mq_origin_new(struct event_base *base, const char *ca_file,
  * in-flight requests must already be terminated (on_done) or aborted. */
 void mq_origin_free(mq_origin_t *o);
 
+/* Sentinel for mq_origin_start's upload_len: a request body IS present but its
+ * length is not known up front (no Content-Length). curl uploads it with
+ * chunked Transfer-Encoding (CURLOPT_UPLOAD=1, no INFILESIZE), pulling bytes
+ * from cbs->pull_body until pull_body returns -1 (EOF). Distinct from a plain
+ * negative (no body): only this exact value enables the bodied-but-lengthless
+ * upload, so existing `upload_len < 0 == no body` callers are unaffected. */
+#define MQ_ORIGIN_UPLOAD_CHUNKED ((int64_t) - 2)
+
 /* Start a request. url is the absolute origin URL; method is the HTTP method
  * verb. hs[0..n) are request headers (NUL-terminated name/value C strings,
- * mq_h3_header_t). upload_len >= 0 enables an upload of exactly that many bytes
- * sourced from cbs->pull_body; upload_len < 0 means no request body. cbs/u carry
- * the response callbacks and owner context. Returns the request, or NULL on
- * failure (no callback fires on a NULL return). */
+ * mq_h3_header_t). upload semantics by upload_len:
+ *   >= 0                       → upload exactly that many bytes (sets INFILESIZE)
+ *                                sourced from cbs->pull_body.
+ *   MQ_ORIGIN_UPLOAD_CHUNKED   → upload a body of unknown length via chunked TE,
+ *                                sourced from cbs->pull_body (EOF = pull -1).
+ *   any other negative (e.g. -1) → no request body.
+ * cbs/u carry the response callbacks and owner context. Returns the request, or
+ * NULL on failure (no callback fires on a NULL return). */
 mq_origin_req_t *mq_origin_start(mq_origin_t *o, const char *url, const char *method,
                                  const mq_h3_header_t *hs, size_t n, int64_t upload_len,
                                  const mq_origin_cbs_t *cbs, void *u);

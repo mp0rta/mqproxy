@@ -540,7 +540,9 @@ mq_origin_start(mq_origin_t *o, const char *url, const char *method,
     r->o = o;
     r->cbs = *cbs;
     r->u = u;
-    r->upload = (upload_len >= 0);
+    /* Upload if a known length (>=0) OR the chunked sentinel. Any other negative
+     * means no request body. */
+    r->upload = (upload_len >= 0 || upload_len == MQ_ORIGIN_UPLOAD_CHUNKED);
 
     r->easy = curl_easy_init();
     if (!r->easy) {
@@ -629,7 +631,11 @@ mq_origin_start(mq_origin_t *o, const char *url, const char *method,
 
     if (r->upload) {
         curl_easy_setopt(e, CURLOPT_UPLOAD, 1L);
-        curl_easy_setopt(e, CURLOPT_INFILESIZE_LARGE, (curl_off_t)upload_len);
+        /* Known length → set INFILESIZE (curl frames an exact-length body).
+         * Chunked sentinel → leave INFILESIZE unset so curl uploads with chunked
+         * Transfer-Encoding, pulling until pull_body signals EOF (-1). */
+        if (upload_len >= 0)
+            curl_easy_setopt(e, CURLOPT_INFILESIZE_LARGE, (curl_off_t)upload_len);
         curl_easy_setopt(e, CURLOPT_READFUNCTION, read_cb);
         curl_easy_setopt(e, CURLOPT_READDATA, r);
     }
