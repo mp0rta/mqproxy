@@ -1384,6 +1384,46 @@ test_gw_400_family(void)
     }
 }
 
+/* ── Case 4d: oversized forwarded header rejected locally (not truncated) ────
+ *
+ * A forwarded request header VALUE >= 1024 (the H3 forwarding arena slot) would
+ * be silently clamped before reaching the tunnel. The gw_client must reject the
+ * fetch with 400 header-too-long BEFORE opening the H3 request — the server never
+ * sees it. */
+static void
+test_gw_oversized_header(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up(&f, "sekrit") != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+
+    /* Build a request with a 2000-byte X-Custom-Hdr value. */
+    char big[2000];
+    memset(big, 'v', sizeof(big));
+    char req[4096];
+    int rn = snprintf(req, sizeof(req),
+                      "POST /_mqproxy/fetch HTTP/1.1\r\nHost: x\r\n"
+                      "X-Mq-Auth: Bearer sekrit\r\n"
+                      "X-Mq-Target: https://example.test/x\r\n"
+                      "X-Custom-Hdr: %.*s\r\n"
+                      "Content-Length: 0\r\n\r\n",
+                      (int)sizeof(big), big);
+    MQ_CHECK(rn > 0 && (size_t)rn < sizeof(req));
+
+    uint8_t reply[1024] = {0};
+    size_t got =
+        fetch_roundtrip(f.base, f.lport, req, (size_t)rn, reply, sizeof(reply), 4000);
+    MQ_CHECK(got > 0);
+    MQ_CHECK_MEM(reply, "HTTP/1.1 400", 12);
+    MQ_CHECK(contains(reply, got, "X-Mq-Error: header-too-long"));
+    MQ_CHECK_EQ_INT(g_srv.request_count, 0); /* server never saw it */
+
+    gw_fixture_down(&f);
+}
+
 /* ── Case 5: tunnel-unavailable → 502 + X-Mq-Error: tunnel-unavailable ───────*/
 static void
 test_gw_tunnel_unavailable(void)
@@ -1534,6 +1574,7 @@ run_all(void)
     test_gw_chunked();
     test_gw_upload();
     test_gw_400_family();
+    test_gw_oversized_header();
     test_gw_tunnel_unavailable();
     test_gw_mid_download_reset();
     test_gw_teardown_midflight();

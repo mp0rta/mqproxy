@@ -348,6 +348,35 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         memcpy(method, "GET", 4);
     }
 
+    /* 4b. Reject (locally, BEFORE opening the H3 request) any header that would
+     * not fit the forwarding arena, instead of silently clamping it. The arena
+     * slots are NS(128) name / VS(1024) value, holding cap-1 bytes + NUL — so a
+     * name >= 128 or value >= 1024 would be truncated. A clamped X-Mq-Auth can't
+     * authenticate anyway, and a clamped forwarded value is a corruption /
+     * smuggling surface; fail closed with 400 header-too-long. (The download-side
+     * pseudo + diagnostic headers are validated where they are emitted.) */
+    {
+        if (auth_vl >= 1024) {
+            gw_reject_write(handle, 400, "Bad Request", "header-too-long");
+            return -1;
+        }
+        size_t xcl_vl = 0;
+        const char *xcl = find_hdr(req, "x-mq-class", &xcl_vl);
+        if (xcl && xcl_vl >= 1024) {
+            gw_reject_write(handle, 400, "Bad Request", "header-too-long");
+            return -1;
+        }
+        for (size_t i = 0; i < req->nh; i++) {
+            const char *n = req->h[i].n;
+            size_t nl = req->h[i].nl;
+            if (mq_gw_strip_client(n, nl)) continue;
+            if (nl >= 128 || req->h[i].vl >= 1024) {
+                gw_reject_write(handle, 400, "Bad Request", "header-too-long");
+                return -1;
+            }
+        }
+    }
+
     /* 5. tunnel must be up. */
     if (!c->conn_up || !c->conn) {
         gw_reject_write(handle, 502, "Bad Gateway", "tunnel-unavailable");
@@ -740,14 +769,20 @@ dl_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
     /* content-length → passthrough (and remember we have one). */
     if (slice_ieq(n, nl, "content-length")) ctx->has_cl = 1;
 
-    /* Build NUL-terminated name/value (bounded). */
+    /* Build NUL-terminated name/value (bounded). An origin response header NAME or
+     * VALUE that would not fit must FAIL the response (ctx->ok = 0 → caller takes
+     * the failure path), not be silently truncated: a clipped value corrupts the
+     * downstream response, and origin headers this large are pathological — failing
+     * closed beats corrupting. */
     char nb[128], vb[2048];
-    size_t cnl = nl < sizeof(nb) - 1 ? nl : sizeof(nb) - 1;
-    memcpy(nb, n, cnl);
-    nb[cnl] = '\0';
-    size_t cvl = vl < sizeof(vb) - 1 ? vl : sizeof(vb) - 1;
-    memcpy(vb, v, cvl);
-    vb[cvl] = '\0';
+    if (nl >= sizeof(nb) || vl >= sizeof(vb)) {
+        ctx->ok = 0;
+        return;
+    }
+    memcpy(nb, n, nl);
+    nb[nl] = '\0';
+    memcpy(vb, v, vl);
+    vb[vl] = '\0';
     dl_emit_header(ctx, nb, vb);
 }
 

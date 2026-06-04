@@ -678,6 +678,14 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
         ctx->bad_header = 1;
         return;
     }
+    /* A forwarded NAME/VALUE that would not fit its arena slot must be REJECTED,
+     * not silently truncated by copy_z: a clipped header changes what reaches the
+     * origin (and a truncated value is a smuggling surface). Reuse the bad-header
+     * 400 path. nl/vl are the FULL slice lengths; the slots hold cap-1 + NUL. */
+    if (nl >= sizeof(ctx->fwd_name[0]) || vl >= sizeof(ctx->fwd_val[0])) {
+        ctx->bad_header = 1;
+        return;
+    }
     if (ctx->n_fwd >= MQ_GWS_MAX_HDRS) {
         ctx->bad = 1;
         return;

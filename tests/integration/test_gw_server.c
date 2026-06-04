@@ -1456,6 +1456,46 @@ test_gws_method_validation(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 12: oversized forwarded header rejected (not truncated) ──
+ *
+ * A forwarded header VALUE >= 1024 bytes (the arena slot) would be silently
+ * clamped by copy_z, changing what reaches the origin. The gw_server must reject
+ * with 400 bad-header instead. */
+static void
+test_gws_oversized_header(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(4096);
+    c.body_cap = 4096;
+
+    char big[1501];
+    memset(big, 'x', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    mq_h3_header_t extra[] = {{"x-big-hdr", big}};
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/blob",
+                              "Bearer sekrit", extra, 1, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 400);
+    const char *err = cli_find_hdr(&c, "x-mq-error");
+    MQ_CHECK(err && strcmp(err, "bad-header") == 0);
+    /* The request never reached the origin. */
+    MQ_CHECK_EQ_INT(f.origin.saw_xmq, 0);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 11: strict content-length parse on the tunnel side ──────
  *
  * Mirror mq_http1's strictness: an overflowing / non-digit / duplicated
@@ -1621,6 +1661,7 @@ main(void)
     test_gws_reject_no_leak();
     test_gws_method_validation();
     test_gws_content_length_strict();
+    test_gws_oversized_header();
     test_gws_teardown_inflight();
 
     if (mq_test_failures) {
