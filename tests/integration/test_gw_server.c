@@ -113,12 +113,15 @@ typedef struct {
     /* Captured request headers from the most recent /blob request (for the
      * gw_server forwarding asserts: NO x-mq-* reach the origin; custom header
      * forwarded). */
-    int saw_xmq;         /* any x-mq-* request header seen */
-    int saw_custom;      /* x-custom-hdr: keepme seen */
-    char custom_val[64]; /* its value */
+    int saw_xmq;            /* any x-mq-* request header seen */
+    int saw_custom;         /* x-custom-hdr: keepme seen */
+    char custom_val[64];    /* its value */
+    int saw_content_length; /* content-length request header seen (upload tests) */
 } origin_t;
 
-/* Scan the request headers: flag any x-mq-* and capture x-custom-hdr. */
+/* Scan the request headers: flag any x-mq-*, capture x-custom-hdr, and note
+ * whether a content-length header reached the origin (used by chunked-upload
+ * assert to confirm the gw_server stripped it before forwarding). */
 static void
 origin_capture_req_hdrs(struct evhttp_request *req, origin_t *o)
 {
@@ -132,6 +135,7 @@ origin_capture_req_hdrs(struct evhttp_request *req, origin_t *o)
             o->saw_custom = 1;
             snprintf(o->custom_val, sizeof(o->custom_val), "%s", kv->value);
         }
+        if (strcasecmp(kv->key, "content-length") == 0) o->saw_content_length = 1;
     }
 }
 
@@ -194,7 +198,8 @@ origin_cb_slow(struct evhttp_request *req, void *arg)
 static void
 origin_cb_up(struct evhttp_request *req, void *arg)
 {
-    (void)arg;
+    origin_t *o = (origin_t *)arg;
+    origin_capture_req_hdrs(req, o);
     struct evbuffer *in = evhttp_request_get_input_buffer(req);
     size_t n = in ? evbuffer_get_length(in) : 0;
     if (in) evbuffer_drain(in, n);
@@ -1201,6 +1206,72 @@ test_gws_upload(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 6b: chunked upload PUT 32 KiB (NO content-length header) ─
+ *
+ * The client sends a PUT with has_body=1 but omits content-length from the H3
+ * request.  gw_server detects has_body && CL absent → upload_len = CHUNKED →
+ * libcurl uses chunked Transfer-Encoding toward the origin.
+ *
+ * Assert:
+ *   - H3 response status == 200.
+ *   - Origin reply body contains "len=32768" (origin drained the full 32 KiB).
+ *   - origin.saw_content_length == 0: the gw_server never forwarded a
+ *     content-length request header (it is stripped before the origin, even when
+ *     the client had sent one; in this test the client never sends one either).
+ *     NOTE: evhttp on the origin side reassembles the chunked body and does NOT
+ *     synthesize a content-length in the parsed request headers, so the assert
+ *     is reliable without special evhttp configuration.
+ */
+static void
+test_gws_chunked_upload(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 0) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+
+    const size_t N = 32 * 1024;
+    uint8_t *src = malloc(N);
+    for (size_t i = 0; i < N; i++)
+        src[i] = pat_byte(i);
+
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(256);
+    c.body_cap = 256;
+    c.up_src = src;
+    c.up_total = N;
+
+    /* has_body=1, content_length=NULL → no CL header on the H3 request; the
+     * gw_server must classify this as CHUNKED and use chunked TE toward origin. */
+    int rc = gws_send_request(&f, &c, "PUT", "http", origin_authority(&f.origin), "/up",
+                              "Bearer sekrit", NULL, 0, /*has_body=*/1, /*cl=*/NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    uint64_t deadline = now_ms() + 15000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 200);
+    MQ_CHECK_EQ_INT((long long)c.up_sent, (long long)N);
+
+    /* Origin echoes the received byte count. */
+    c.body[c.body_len < c.body_cap ? c.body_len : c.body_cap - 1] = '\0';
+    char want[32];
+    snprintf(want, sizeof(want), "len=%zu", N);
+    MQ_CHECK(strstr((char *)c.body, want) != NULL);
+
+    /* gw_server must NOT have forwarded a content-length request header.
+     * evhttp natively handles chunked requests so origin sees no synthesized CL. */
+    MQ_CHECK_EQ_INT(f.origin.saw_content_length, 0);
+
+    free(src);
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 7: mid-download client reset → origin reaped, gw survives ─*/
 static void
 test_gws_mid_reset(void)
@@ -1305,6 +1376,7 @@ main(void)
     test_gws_400();
     test_gws_502();
     test_gws_upload();
+    test_gws_chunked_upload();
     test_gws_mid_reset();
     test_gws_teardown_inflight();
 

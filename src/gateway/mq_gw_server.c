@@ -168,6 +168,20 @@ slice_ieq(const char *s, size_t sl, const char *lit)
     return 1;
 }
 
+/* Sanitize an attacker-controlled string for log emission: cap at `maxlen`
+ * chars and replace non-printable bytes (<0x20 or >=0x7f) with '?'. Writes a
+ * NUL-terminated result into `out` (which must have capacity maxlen+1). */
+static void
+sanitize_for_log(char *out, size_t maxlen, const char *s, size_t slen)
+{
+    size_t n = slen < maxlen ? slen : maxlen;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        out[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    out[n] = '\0';
+}
+
 /* http_ver → wire protocol token for x-mq-origin-protocol. */
 static const char *
 http_ver_token(long ver)
@@ -613,7 +627,10 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
         ctx->has_class = 1;
         return;
     }
-    /* Remember content-length for the upload framing, then forward it too. */
+    /* Remember content-length for the upload framing, but do NOT forward it to
+     * the origin: CURLOPT_INFILESIZE_LARGE is the sole framing source, so
+     * forwarding CL as a request header would create a divergence surface for
+     * CL-based request-smuggling (defense mirrors mq_gw_strip_client's CL rule). */
     if (slice_ieq(n, nl, "content-length")) {
         int64_t cl = 0;
         int ok = vl > 0;
@@ -625,6 +642,7 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
             cl = cl * 10 + (v[i] - '0');
         }
         if (ok) ctx->content_length = cl;
+        return; /* strip from forwarded set */
     }
 
     /* Strip server→origin (x-mq-*) and hop-by-hop. Forward the rest. */
@@ -687,8 +705,13 @@ gw_dispatch(mq_gw_req_t *r)
         }
     }
 
-    /* x-mq-class: accept + log only (design: forward+log). */
-    if (ctx.has_class) MQ_LOGI("mq_gw_server: x-mq-class='%s'", ctx.cls);
+    /* x-mq-class: accept + log only (design: forward+log).
+     * Sanitize before logging: the value is attacker-controlled (log-injection). */
+    if (ctx.has_class) {
+        char cls_safe[65]; /* 64 visible chars + NUL */
+        sanitize_for_log(cls_safe, 64, ctx.cls, strlen(ctx.cls));
+        MQ_LOGI("mq_gw_server: x-mq-class='%s'", cls_safe);
+    }
 
     /* Validate pseudo-headers. */
     if (!ctx.has_method || !ctx.has_scheme || !ctx.has_authority || !ctx.has_path ||
