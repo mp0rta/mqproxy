@@ -574,6 +574,10 @@ typedef struct {
 
     /* content-length from the request headers (for INFILESIZE), -1 if absent. */
     int64_t content_length;
+    int cl_seen; /* a content-length header was parsed (duplicate detection) */
+    int bad_cl;  /* content-length was empty / non-digit / overflowed / duplicated
+                  * → reject the whole request with 400 (mirrors mq_http1's strict
+                  * parse; a silently-unset CL would mis-frame the upload). */
 
     int bad;        /* a header could not be stored (overflow) — diagnostic */
     int bad_header; /* a forwarded header name/value carried control bytes →
@@ -631,6 +635,17 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
      * forwarding CL as a request header would create a divergence surface for
      * CL-based request-smuggling (defense mirrors mq_gw_strip_client's CL rule). */
     if (slice_ieq(n, nl, "content-length")) {
+        /* A SECOND content-length (even identical) is a framing ambiguity → reject
+         * (mirrors mq_http1: a duplicate CL is a request-smuggling surface). */
+        if (ctx->cl_seen) {
+            ctx->bad_cl = 1;
+            return;
+        }
+        ctx->cl_seen = 1;
+        /* Strict decimal into [0, INT64_MAX]; empty / non-digit / overflow → reject
+         * rather than silently leaving content_length unset (which would fall back
+         * to chunked and mis-frame a bodied request). Mirrors the INT64_MAX/10
+         * overflow guard in mq_http1.c parse_content_length. */
         int64_t cl = 0;
         int ok = vl > 0;
         for (size_t i = 0; i < vl; i++) {
@@ -638,9 +653,18 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
                 ok = 0;
                 break;
             }
-            cl = cl * 10 + (v[i] - '0');
+            int d = v[i] - '0';
+            if (cl > (int64_t)922337203685477580LL ||
+                (cl == (int64_t)922337203685477580LL && d > 7)) {
+                ok = 0;
+                break;
+            }
+            cl = cl * 10 + d;
         }
-        if (ok) ctx->content_length = cl;
+        if (ok)
+            ctx->content_length = cl;
+        else
+            ctx->bad_cl = 1;
         return; /* strip from forwarded set */
     }
 
@@ -694,6 +718,12 @@ gw_dispatch(mq_gw_req_t *r)
     /* A forwarded header carried control bytes → reject (smuggling posture). */
     if (ctx.bad_header) {
         gw_send_error(r, "400", "bad-header");
+        return;
+    }
+    /* content-length was empty / non-digit / overflowed / duplicated → reject
+     * rather than mis-frame the upload (strict, mirrors mq_http1). */
+    if (ctx.bad_cl) {
+        gw_send_error(r, "400", "bad-request");
         return;
     }
     /* fin on the header section → no request body. */

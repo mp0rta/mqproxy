@@ -1456,6 +1456,71 @@ test_gws_method_validation(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 11: strict content-length parse on the tunnel side ──────
+ *
+ * Mirror mq_http1's strictness: an overflowing / non-digit / duplicated
+ * content-length on a bodied H3 request must be rejected (400 bad-request), not
+ * silently unset (which would fall back to chunked) or last-win. A request body
+ * is required so the CL is actually consulted. */
+static void
+test_gws_content_length_strict(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 0) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    const char *auth = origin_authority(&f.origin);
+
+    struct {
+        const char *cl;     /* content-length value */
+        const char *cl_dup; /* second content-length value, or NULL */
+        int want_status;
+        const char *desc;
+    } cases[] = {
+        {"9999999999999999999999", NULL, 400, "overflow"},
+        {"12a", NULL, 400, "non-digit"},
+        {"", NULL, 400, "empty"},
+        {"5", "5", 400, "duplicate (identical)"},
+        {"5", "6", 400, "duplicate (differing)"},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cli_req_t c;
+        memset(&c, 0, sizeof(c));
+        c.body = malloc(4096);
+        c.body_cap = 4096;
+
+        mq_h3_header_t extra[2];
+        size_t ne = 0;
+        extra[ne].name = "content-length";
+        extra[ne].value = cases[i].cl;
+        ne++;
+        if (cases[i].cl_dup) {
+            extra[ne].name = "content-length";
+            extra[ne].value = cases[i].cl_dup;
+            ne++;
+        }
+        /* has_body=1, content_length param NULL (we supply CL via `extra`). We do
+         * not stream a body — the reject lands on the header section. */
+        int rc = gws_send_request(&f, &c, "PUT", "http", auth, "/up", "Bearer sekrit",
+                                  extra, ne, /*has_body=*/1, /*cl=*/NULL);
+        MQ_CHECK_EQ_INT(rc, 0);
+        uint64_t deadline = now_ms() + 5000;
+        while (!c.closed && now_ms() < deadline)
+            event_base_loop(f.base, EVLOOP_NONBLOCK);
+        printf("[case11] CL=%s -> %d (want %d)\n", cases[i].desc, c.status,
+               cases[i].want_status);
+        MQ_CHECK_EQ_INT(c.status, cases[i].want_status);
+        const char *err = cli_find_hdr(&c, "x-mq-error");
+        MQ_CHECK(err && strcmp(err, "bad-request") == 0);
+        free(c.body);
+    }
+
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 9: rejected requests reclaim per-request state ──────────
  *
  * Regression for the no-origin reject state leak: a request rejected BEFORE the
@@ -1555,6 +1620,7 @@ main(void)
     test_gws_mid_reset();
     test_gws_reject_no_leak();
     test_gws_method_validation();
+    test_gws_content_length_strict();
     test_gws_teardown_inflight();
 
     if (mq_test_failures) {
