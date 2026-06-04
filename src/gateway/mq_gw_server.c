@@ -48,6 +48,7 @@
 
 #include "gateway/mq_gw_headers.h"
 #include "gateway/mq_origin_curl.h"
+#include "util/mq_ct.h"
 #include "util/mq_log.h"
 
 /* Bound on the H3→origin upload spill (junction #3): body bytes recv'd from the
@@ -134,23 +135,6 @@ static void h3_on_read(mq_h3_req_t *hr, int flag, void *user);
 static void h3_on_write(mq_h3_req_t *hr, void *user);
 static void h3_on_close(mq_h3_req_t *hr, void *user);
 static void download_flush(mq_gw_req_t *r);
-
-/* ── constant-time token compare ────────────────────────────────────────────
- * Replicated from mq_server.c (ct_equal): the proxy server keeps it static, so
- * the gateway server cannot reuse the symbol. Keep the two in sync. */
-static int
-ct_equal(const void *a, size_t alen, const void *b, size_t blen)
-{
-    const unsigned char *pa = (const unsigned char *)a;
-    const unsigned char *pb = (const unsigned char *)b;
-    volatile unsigned char acc = 0;
-    acc |= (unsigned char)((alen ^ blen) | ((alen ^ blen) >> 8) | ((alen ^ blen) >> 16) |
-                           ((alen ^ blen) >> 24));
-    size_t n = alen < blen ? alen : blen;
-    for (size_t i = 0; i < n; i++)
-        acc |= (unsigned char)(pa[i] ^ pb[i]);
-    return acc == 0;
-}
 
 /* ── small helpers ──────────────────────────────────────────────────────────*/
 
@@ -712,7 +696,7 @@ gw_dispatch(mq_gw_req_t *r)
         if (ok) {
             const char *tok = ctx.auth + pl;
             size_t tl = al - pl;
-            ok = ct_equal(tok, tl, s->token, s->token_len);
+            ok = mq_ct_equal(tok, tl, s->token, s->token_len);
         }
         if (!ok) {
             gw_send_error(r, "403", "auth-failed");

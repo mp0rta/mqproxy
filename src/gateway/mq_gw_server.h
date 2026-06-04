@@ -12,7 +12,7 @@
  *   - recv the request headers; extract the :method/:scheme/:authority/:path
  *     pseudo-headers + x-mq-auth + x-mq-class.
  *   - AUTH: x-mq-auth must be "Bearer <token>", constant-time compared to the
- *     configured token (mirrors mq_server.c's ct_equal). Failure → synthesized
+ *     configured token (shared mq_ct_equal, util/mq_ct.h). Failure → synthesized
  *     403 + x-mq-error: auth-failed (no origin contact).
  *   - validate the pseudo-headers (scheme http|https); bad → 400 + x-mq-error.
  *   - build origin URL = scheme://authority + path, forward the request headers

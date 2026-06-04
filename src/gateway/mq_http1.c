@@ -2,39 +2,19 @@
 // Copyright (c) 2026 mp0rta
 
 #include "gateway/mq_http1.h"
+
+#include "gateway/mq_gw_headers.h" /* mq_gw_is_tchar (shared token-char class) */
 #include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
  * Character classes (RFC 7230)
+ *
+ * tchar (token char) is shared with the header-policy / target-parsing layer;
+ * see mq_gw_is_tchar in mq_gw_headers.h. There is intentionally a single
+ * definition so the HTTP/1 field-name parser and the method/target validators
+ * can never drift apart.
  * ------------------------------------------------------------------------- */
-
-/* tchar: "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." / "^" / "_"
- *        / "`" / "|" / "~" / DIGIT / ALPHA */
-static int
-is_tchar(unsigned char c)
-{
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
-        return 1;
-    switch (c) {
-    case '!':
-    case '#':
-    case '$':
-    case '%':
-    case '&':
-    case '\'':
-    case '*':
-    case '+':
-    case '-':
-    case '.':
-    case '^':
-    case '_':
-    case '`':
-    case '|':
-    case '~': return 1;
-    default: return 0;
-    }
-}
 
 static char
 lc(char c)
@@ -148,7 +128,7 @@ mq_http1_parse_req(const uint8_t *buf, size_t len, mq_http1_req_t *out)
     if (m_end == 0 || m_end >= line_end) return MQ_HTTP1_BAD; /* no method/path */
     if (m_end > 15) return MQ_HTTP1_BAD;                      /* method too long */
     for (size_t i = 0; i < m_end; i++)
-        if (!is_tchar((unsigned char)p[i])) return MQ_HTTP1_BAD;
+        if (!mq_gw_is_tchar((unsigned char)p[i])) return MQ_HTTP1_BAD;
 
     size_t path_start = m_end + 1;
     size_t path_end = path_start;
@@ -171,7 +151,7 @@ mq_http1_parse_req(const uint8_t *buf, size_t len, mq_http1_req_t *out)
         if (b < 0x20 || b == 0x7f) return MQ_HTTP1_BAD;
     }
 
-    /* Method span: is_tchar() already rejects every byte < 0x20 and 0x7f
+    /* Method span: mq_gw_is_tchar() already rejects every byte < 0x20 and 0x7f
      * (including NUL), so no additional check is needed here. */
 
     /* Version field: validated only as "HTTP/"-prefixed and non-empty; the
@@ -214,7 +194,7 @@ mq_http1_parse_req(const uint8_t *buf, size_t len, mq_http1_req_t *out)
         if (colon >= le) return MQ_HTTP1_BAD;  /* no colon */
         if (colon == pos) return MQ_HTTP1_BAD; /* empty name */
         for (size_t i = pos; i < colon; i++)
-            if (!is_tchar((unsigned char)p[i])) return MQ_HTTP1_BAD;
+            if (!mq_gw_is_tchar((unsigned char)p[i])) return MQ_HTTP1_BAD;
 
         const char *nm = p + pos;
         size_t nml = colon - pos;

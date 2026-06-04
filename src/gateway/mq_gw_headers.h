@@ -56,6 +56,15 @@ typedef struct {
 int mq_gw_parse_target(const char *s, size_t len, mq_gw_target_t *out);
 
 /* ---------------------------------------------------------------------------
+ * Token-char classification
+ * ------------------------------------------------------------------------- */
+
+/* RFC 7230 token char (tchar): DIGIT / ALPHA / "!#$%&'*+-.^_`|~". Returns 1 if c
+ * is a valid token byte, 0 otherwise. Shared by the HTTP/1 request parser (field
+ * names) and the method/target validators. */
+int mq_gw_is_tchar(unsigned char c);
+
+/* ---------------------------------------------------------------------------
  * Method parsing
  * ------------------------------------------------------------------------- */
 

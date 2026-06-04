@@ -36,6 +36,7 @@
 #include "transport/mq_conn.h"
 #include "transport/mq_stream.h"
 #include "transport/mq_transport.h"
+#include "util/mq_ct.h"
 #include "util/mq_log.h"
 #include "wire/mq_wire.h"
 
@@ -100,25 +101,6 @@ struct mq_server_s {
     unsigned auth_attempts;
 };
 
-/* Constant-time comparison of two byte ranges. Returns 1 if equal (same length
- * AND same bytes), 0 otherwise. Length-independent over the compared bytes via
- * a volatile accumulator so the compiler cannot short-circuit. */
-static int
-ct_equal(const void *a, size_t alen, const void *b, size_t blen)
-{
-    const unsigned char *pa = (const unsigned char *)a;
-    const unsigned char *pb = (const unsigned char *)b;
-    volatile unsigned char acc = 0;
-    /* Fold the length difference into the accumulator so a mismatching length
-     * cannot pass even if the shorter is a prefix of the longer. */
-    acc |= (unsigned char)((alen ^ blen) | ((alen ^ blen) >> 8) | ((alen ^ blen) >> 16) |
-                           ((alen ^ blen) >> 24));
-    size_t n = alen < blen ? alen : blen;
-    for (size_t i = 0; i < n; i++) {
-        acc |= (unsigned char)(pa[i] ^ pb[i]);
-    }
-    return acc == 0;
-}
 
 static void
 srv_send_resp(mq_stream_t *s, mq_status_t status, mq_auth_err_t err)
@@ -182,7 +164,7 @@ srv_ctrl_readable(mq_stream_t *s, void *user)
     /* Constant-time token compare. auth_token is a fixed-size field; compare
      * over its NUL-terminated content length. */
     size_t tok_len = strnlen(req.auth_token, sizeof(req.auth_token));
-    int ok = ct_equal(req.auth_token, tok_len, srv->auth_token, srv->auth_token_len);
+    int ok = mq_ct_equal(req.auth_token, tok_len, srv->auth_token, srv->auth_token_len);
 
     if (ok) {
         sc->authed = 1;

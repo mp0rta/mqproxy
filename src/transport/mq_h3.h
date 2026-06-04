@@ -118,7 +118,9 @@ int mq_h3_conn_add_path(mq_h3_conn_t *c, const char *local_ip, uint16_t port);
 void mq_h3_conn_dump_stats(mq_h3_conn_t *c);
 
 /* Send CONNECTION_CLOSE. The mq_h3_conn is freed later via h3_conn_close_notify
- * (peer close / idle / error all flow there too — freeing is centralised). */
+ * (peer close / idle / error all flow there too — freeing is centralised).
+ * No production caller today — exercised by the fabric tests and reserved for
+ * future graceful-shutdown; kept deliberately rather than removed. */
 void mq_h3_conn_close(mq_h3_conn_t *c);
 
 /* ── Request ────────────────────────────────────────────────────────────── */

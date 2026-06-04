@@ -58,8 +58,8 @@ name_has_prefix(const char *n, size_t nl, const char *pfx)
 }
 
 /* RFC 7230 token char: tchar = "!#$%&'*+-.^_`|~" / DIGIT / ALPHA */
-static int
-is_tchar(unsigned char c)
+int
+mq_gw_is_tchar(unsigned char c)
 {
     if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
         return 1;
@@ -243,7 +243,7 @@ mq_gw_parse_method(const char *s, size_t len, char out[16])
     if (len == 0 || len > 15) return -1;
     char tmp[16];
     for (size_t i = 0; i < len; i++) {
-        if (!is_tchar((unsigned char)s[i])) return -1;
+        if (!mq_gw_is_tchar((unsigned char)s[i])) return -1;
         tmp[i] = uc(s[i]);
     }
     memcpy(out, tmp, len);

@@ -63,6 +63,16 @@
  *
  * This module knows nothing about xquic; it speaks libevent + sockets and the
  * mq_fetch_cbs_t boundary only.
+ *
+ * KNOWN LIMITATION — per-request vs per-process memory: each request's buffers
+ * are individually bounded (the request head is capped at MQ_HTTP1_MAX_HEAD, the
+ * download spill buffer at 256 KiB, and the per-connection output queue at the
+ * 4 MiB hard ceiling above), so no single request can grow memory without limit.
+ * The per-PROCESS SUM of those buffers across many concurrent requests is NOT
+ * bounded, however. This is acceptable for the Phase 2 single-trusted-client
+ * scope (one local app drives a small number of in-flight fetches); a global
+ * memory budget / concurrency cap is deferred to the multi-client hardening work
+ * (Phase 5).
  */
 #ifndef MQ_GATEWAY_MQ_FETCH_LISTENER_H
 #define MQ_GATEWAY_MQ_FETCH_LISTENER_H
