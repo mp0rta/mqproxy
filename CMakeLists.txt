@@ -22,6 +22,7 @@ add_library(mqproxy STATIC
     src/gateway/mq_gw_headers.c
     src/gateway/mq_fetch_listener.c
     src/gateway/mq_gw_client.c
+    src/gateway/mq_origin_curl.c
     src/transport/mq_conn.c
     src/transport/mq_h3.c
     src/transport/mq_stream.c
@@ -190,6 +191,24 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_gw_client PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_gw_client COMMAND test_gw_client)
+
+    # mq_origin_curl (Task 4.2): the libcurl-multi origin client on libevent.
+    # Drives the mq_origin_* API against an in-process evhttp origin over plain
+    # loopback HTTP/1.1. evhttp lives in libevent_extra (EVENT_EXTRA_LIB); curl
+    # propagates from mqproxy's PUBLIC CURL::libcurl link. Task 4.3 extends this
+    # file with the gateway-server replay cases.
+    add_executable(test_gw_server tests/integration/test_gw_server.c)
+    target_link_libraries(test_gw_server
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_gw_server PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_gw_server PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_gw_server COMMAND test_gw_server)
 
     add_executable(test_e2e_single_path tests/integration/test_e2e_single_path.c)
     target_link_libraries(test_e2e_single_path
