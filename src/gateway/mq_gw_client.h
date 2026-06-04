@@ -88,6 +88,13 @@ void *mq_gw_client_fetch_user(mq_gw_client_t *c);
  * bad args. */
 int mq_gw_client_add_paths(mq_gw_client_t *c, const char *const *ips, size_t n);
 
+/* Snapshot + log the gateway tunnel conn's per-path byte counters (spec §23.1),
+ * for e2e benchmarks that need to confirm both MPQUIC paths carried traffic on
+ * the GATEWAY conn (the mq_client TCP-core conn is dumped separately via
+ * mq_conn_dump_stats). Delegates to mq_h3_conn_dump_stats on the tunnel conn.
+ * No-op if the conn is not (yet) up. Smoke-safe on NULL. */
+void mq_gw_client_dump_stats(mq_gw_client_t *c);
+
 /* Free the gateway client: tear down any in-flight requests (detaching their H3
  * callbacks, resetting their H3 requests, aborting their local handles, dropping
  * their per-request state) and the mp-poll timer. Does NOT free t / rt / h3.

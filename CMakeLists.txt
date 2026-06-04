@@ -127,6 +127,28 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         endif()
     endif()
 
+    # Origin TLS cert/key for the gateway e2e (e2e_gateway.sh). UNLIKE test.crt
+    # this cert carries subjectAltName=IP:127.0.0.1 so the gateway server can
+    # verify the origin's hostname (we NEVER disable verification — the server
+    # gets --origin-ca pointed at this cert). Test-only; regenerated if missing.
+    set(MQ_ORIGIN_CERT_FILE "${MQ_CERT_DIR}/origin.crt")
+    set(MQ_ORIGIN_KEY_FILE "${MQ_CERT_DIR}/origin.key")
+    if(NOT EXISTS "${MQ_ORIGIN_CERT_FILE}" OR NOT EXISTS "${MQ_ORIGIN_KEY_FILE}")
+        find_program(OPENSSL_BIN openssl REQUIRED)
+        file(MAKE_DIRECTORY "${MQ_CERT_DIR}")
+        message(STATUS "Generating self-signed origin cert (SAN=IP:127.0.0.1) in ${MQ_CERT_DIR}")
+        execute_process(
+            COMMAND ${OPENSSL_BIN} req -x509 -newkey rsa:2048 -nodes
+                    -keyout "${MQ_ORIGIN_KEY_FILE}" -out "${MQ_ORIGIN_CERT_FILE}"
+                    -days 3650 -subj "/CN=mqproxy-origin"
+                    -addext "subjectAltName=IP:127.0.0.1"
+            RESULT_VARIABLE _origin_cert_rc
+            OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _origin_cert_rc EQUAL 0)
+            message(FATAL_ERROR "openssl failed to generate origin test cert")
+        endif()
+    endif()
+
     add_executable(test_conn_handshake tests/integration/test_conn_handshake.c)
     target_link_libraries(test_conn_handshake
         mqproxy
@@ -337,4 +359,22 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_KEY=${MQ_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_multipath.sh)
     set_tests_properties(e2e_multipath PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ---- Phase 2 Task 5.1: full-chain HTTP-gateway e2e ----
+    # Drives the whole fetch path against a real python3 TLS origin: 8MB
+    # download/upload byte-exact, the 4xx/502/504 error surface (with x-mq-error
+    # / x-mq-origin-protocol assertions), and a NET_ADMIN-gated 2-path
+    # aggregation smoke. Cases 1-7 run anywhere; case 8 needs tc on lo and is
+    # skipped (a note) without it. The WHOLE script exits 77 (SKIP) ONLY when the
+    # python3 TLS origin can't start. The mqproxy binary, the tunnel cert/key,
+    # and the SAN'd origin cert/key are passed via env.
+    add_test(NAME e2e_gateway
+        COMMAND ${CMAKE_COMMAND} -E env
+            MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+            MQPROXY_CERT=${MQ_CERT_FILE}
+            MQPROXY_KEY=${MQ_KEY_FILE}
+            MQPROXY_ORIGIN_CERT=${MQ_ORIGIN_CERT_FILE}
+            MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
+            bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_gateway.sh)
+    set_tests_properties(e2e_gateway PROPERTIES SKIP_RETURN_CODE 77)
 endif()

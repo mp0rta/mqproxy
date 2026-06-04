@@ -770,6 +770,12 @@ cmd_client(int argc, char **argv)
         if (dump_conn) {
             mq_conn_dump_stats(dump_conn);
         }
+        /* The gateway tunnel is an INDEPENDENT conn (mq_gw_client's own mq_h3
+         * conn), so dump its per-path counters too — e2e_gateway's 2-path smoke
+         * greps these to confirm both MPQUIC paths carried gateway traffic. */
+        if (gwc) {
+            mq_gw_client_dump_stats(gwc);
+        }
     }
 
 out:
