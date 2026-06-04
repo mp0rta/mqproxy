@@ -796,6 +796,7 @@ enum {
     SC_ECHO_UPLOAD = 2, /* 200 + echo the received upload body back (CL) */
     SC_RESET_MID = 3,   /* headers + partial body then reset (mid-download trunc) */
     SC_HANG = 4,        /* receive everything but NEVER respond (request stays live) */
+    SC_BAD_STATUS = 5,  /* reply with a hostile out-of-range :status ("99999999999") */
 };
 
 static gw_srv_t g_srv; /* one in-flight request at a time in these tests */
@@ -862,6 +863,17 @@ srv_respond(gw_srv_t *s)
     }
 
     s->responded = 1;
+
+    if (s->scenario == SC_BAD_STATUS) {
+        /* Hostile peer: a :status far outside the 3-digit/[100,599] range. The
+         * client-side :status parser must NOT accumulate this into a signed int
+         * (overflow UB) — it must reject the response as an upstream-protocol
+         * failure. fin on headers (no body). */
+        mq_h3_header_t h[] = {{":status", "99999999999"}};
+        mq_h3_req_send_headers(s->req, h, 1, /*fin=*/1);
+        s->snd_fin_done = 1;
+        return;
+    }
 
     if (s->scenario == SC_RESET_MID) {
         /* Headers (no CL) + a partial body chunk, then reset → the downstream
@@ -1315,6 +1327,43 @@ test_gw_upload(void)
     gw_fixture_down(&f);
 }
 
+/* ── Case 3b: hostile origin :status → 502-class, NO overflow UB ─────────────
+ *
+ * A malicious gateway server replies with ":status: 99999999999". The client's
+ * :status parser must not accumulate that into a signed int (overflow UB →
+ * UBSan abort); it must treat the response as an upstream-protocol failure and
+ * synthesize a 502 to the local client. Under the sanitized build this test is
+ * the RED evidence: pre-fix the parse overflows and aborts. */
+static void
+test_gw_bad_status(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up(&f, "sekrit") != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    g_srv.scenario = SC_BAD_STATUS;
+
+    const char *req = "POST /_mqproxy/fetch HTTP/1.1\r\n"
+                      "Host: x\r\n"
+                      "X-Mq-Auth: Bearer sekrit\r\n"
+                      "X-Mq-Target: https://example.test/badstatus\r\n"
+                      "Content-Length: 0\r\n\r\n";
+    uint8_t reply[1024] = {0};
+    size_t got =
+        fetch_roundtrip(f.base, f.lport, req, strlen(req), reply, sizeof(reply), 6000);
+
+    /* No crash under UBSan; the bridge fails the response closed as a 502. */
+    MQ_CHECK(got > 0);
+    MQ_CHECK_MEM(reply, "HTTP/1.1 502", 12);
+    MQ_CHECK(contains(reply, got, "X-Mq-Error: upstream-protocol"));
+    /* The request WAS forwarded (the server replied). */
+    MQ_CHECK_EQ_INT(g_srv.request_count, 1);
+
+    gw_fixture_down(&f);
+}
+
 /* ── Case 4: 400 family (client-owned) — server never sees a request ─────────*/
 static void
 test_gw_400_family(void)
@@ -1572,6 +1621,7 @@ run_all(void)
     /* Gateway-client (Task 3.2) cases — each owns its own base + transports. */
     test_gw_get_cl();
     test_gw_chunked();
+    test_gw_bad_status();
     test_gw_upload();
     test_gw_400_family();
     test_gw_oversized_header();

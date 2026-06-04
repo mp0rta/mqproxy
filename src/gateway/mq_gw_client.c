@@ -742,11 +742,18 @@ dl_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
     dl_hdr_ctx_t *ctx = (dl_hdr_ctx_t *)u;
     if (!ctx->ok) return;
 
-    /* :status pseudo-header → status line. */
+    /* :status pseudo-header → status line. An H3 :status is EXACTLY three ASCII
+     * digits (RFC 9114/9113 response semantics). A hostile peer that sends e.g.
+     * ":status: 99999999999" must not be accumulated into a signed int (overflow
+     * is UB → UBSan abort); reject anything that is not 3 digits as an
+     * upstream-protocol failure (ctx->ok=0 → caller synthesizes 502). */
     if (nl == 7 && memcmp(n, ":status", 7) == 0) {
-        int code = 0;
-        for (size_t i = 0; i < vl && v[i] >= '0' && v[i] <= '9'; i++)
-            code = code * 10 + (v[i] - '0');
+        if (vl != 3 || v[0] < '0' || v[0] > '9' || v[1] < '0' || v[1] > '9' ||
+            v[2] < '0' || v[2] > '9') {
+            ctx->ok = 0;
+            return;
+        }
+        int code = (v[0] - '0') * 100 + (v[1] - '0') * 10 + (v[2] - '0');
         if (code < 100 || code > 599) code = 502;
         ctx->status = code;
         int n2 = mq_http1_write_status(ctx->head + ctx->head_len,

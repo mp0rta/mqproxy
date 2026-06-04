@@ -101,6 +101,11 @@ typedef struct mq_gw_req_s {
     } hdrs[MQ_GWS_MAX_HDRS];
     int n_hdrs;
     int hdrs_overflow; /* dropped a header (capacity) — diagnostic only */
+    int hdr_oversized; /* an ORIGIN response header NAME/VALUE did not fit its
+                        * arena slot (>127 name / >1023 value). Fail closed:
+                        * checked in download_send_headers before any response
+                        * header reaches the H3 client (a silently clipped
+                        * origin header would corrupt the downstream response). */
 
     /* Pending download body byte that curl handed us but H3 could not accept
      * (send returned 0). We hold ONE chunk and resume the curl download via
@@ -326,6 +331,16 @@ download_send_headers(mq_gw_req_t *r)
     if (r->resp_headers_sent) return 0;
     if (r->h3_dead || !r->req) return -1;
 
+    /* Fail closed on an oversized ORIGIN response header (recorded in on_header).
+     * No header has reached the H3 client yet, so synthesize a clean 502 +
+     * x-mq-error: upstream-protocol instead of corrupting the response with a
+     * clipped header. gw_send_error sends the fin and sets finished; the caller
+     * must NOT also reset (it guards the reset on !r->finished). */
+    if (r->hdr_oversized) {
+        gw_send_error(r, "502", "upstream-protocol");
+        return -1;
+    }
+
     mq_h3_header_t hs[MQ_GWS_MAX_HDRS + 2];
     size_t nh = 0;
 
@@ -417,17 +432,28 @@ origin_on_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
      * be confusing. */
     if (slice_ieq(n, nl, "x-mq-origin-protocol")) return;
 
+    /* An origin response header NAME or VALUE that would not fit its arena slot
+     * must FAIL the response (download_send_headers turns this into a 502
+     * upstream-protocol before any header reaches the H3 client), NOT be silently
+     * clamped: a clipped value corrupts the downstream response, and origin
+     * headers this large are pathological — failing closed beats corrupting.
+     * Mirrors the client-side dl_each_header fail-closed posture. on_header is a
+     * void curl callback, so we cannot signal here; record the condition and act
+     * at the next safe point (download_send_headers). */
+    if (nl >= sizeof(r->hdrs[0].name) || vl >= sizeof(r->hdrs[0].value)) {
+        r->hdr_oversized = 1;
+        return;
+    }
     int i = r->n_hdrs++;
-    size_t cnl = nl < sizeof(r->hdrs[i].name) - 1 ? nl : sizeof(r->hdrs[i].name) - 1;
+    size_t cnl = nl;
     for (size_t j = 0; j < cnl; j++) {
         char ch = n[j];
         if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
         r->hdrs[i].name[j] = ch;
     }
     r->hdrs[i].name[cnl] = '\0';
-    size_t cvl = vl < sizeof(r->hdrs[i].value) - 1 ? vl : sizeof(r->hdrs[i].value) - 1;
-    memcpy(r->hdrs[i].value, v, cvl);
-    r->hdrs[i].value[cvl] = '\0';
+    memcpy(r->hdrs[i].value, v, vl);
+    r->hdrs[i].value[vl] = '\0';
 }
 
 /* curl on_body: send response headers (if not yet) then the body chunk over H3.
@@ -445,7 +471,10 @@ origin_on_body(const uint8_t *p, size_t len, void *u)
 
     if (!r->resp_headers_sent) {
         if (download_send_headers(r) != 0) {
-            mq_h3_req_reset(r->req);
+            /* download_send_headers may have already synthesized a clean error
+             * response (oversized origin header → 502 + fin); only reset if it
+             * did NOT finish cleanly. */
+            if (!r->finished) mq_h3_req_reset(r->req);
             return 0;
         }
     }
@@ -511,7 +540,9 @@ origin_on_done(int curl_result, long http_ver, void *u)
         /* Success. Send headers if we never got a body (no-body response). */
         if (!r->resp_headers_sent) {
             if (download_send_headers(r) != 0) {
-                mq_h3_req_reset(r->req);
+                /* May have synthesized a clean error (oversized origin header →
+                 * 502 + fin); only reset if it did NOT finish cleanly. */
+                if (!r->finished) mq_h3_req_reset(r->req);
                 gw_req_maybe_free(r);
                 return;
             }
@@ -726,6 +757,13 @@ gw_dispatch(mq_gw_req_t *r)
     /* A forwarded header carried control bytes → reject (smuggling posture). */
     if (ctx.bad_header) {
         gw_send_error(r, "400", "bad-header");
+        return;
+    }
+    /* The forwardable-header COUNT exceeded the per-request arena (ctx.bad set in
+     * req_each_header). Forwarding now would replay a SILENTLY TRUNCATED header
+     * set to the origin — fail closed with 400 rather than corrupt the request. */
+    if (ctx.bad) {
+        gw_send_error(r, "400", "bad-request");
         return;
     }
     /* content-length was empty / non-digit / overflowed / duplicated → reject

@@ -211,6 +211,20 @@ origin_cb_up(struct evhttp_request *req, void *arg)
     evbuffer_free(out);
 }
 
+/* GET /bighdr: reply 200 with a pathologically large response header VALUE
+ * (1500 bytes). Used to drive the gw_server's fail-closed path for an oversized
+ * ORIGIN response header (>1023 = the per-request arena value slot). */
+static void
+origin_cb_bighdr(struct evhttp_request *req, void *arg)
+{
+    (void)arg;
+    char big[1501];
+    memset(big, 'B', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    evhttp_add_header(evhttp_request_get_output_headers(req), "x-origin-big", big);
+    evhttp_send_reply(req, 200, "OK", NULL);
+}
+
 static void
 origin_cb_404(struct evhttp_request *req, void *arg)
 {
@@ -229,6 +243,7 @@ origin_up(struct event_base *base, origin_t *o, size_t blob_len)
     evhttp_set_cb(o->http, "/blob", origin_cb_blob, o);
     evhttp_set_cb(o->http, "/slow", origin_cb_slow, o);
     evhttp_set_cb(o->http, "/up", origin_cb_up, o);
+    evhttp_set_cb(o->http, "/bighdr", origin_cb_bighdr, o);
     evhttp_set_gencb(o->http, origin_cb_404, o);
 
     struct evhttp_bound_socket *bs =
@@ -1456,6 +1471,77 @@ test_gws_method_validation(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 11b: forwarded-header COUNT overflow rejected ────────────
+ *
+ * More forwardable headers than the per-request arena holds (MQ_GWS_MAX_HDRS=64)
+ * sets ctx.bad in req_each_header — but pre-fix that flag was never read, so the
+ * request was forwarded to the origin with a SILENTLY TRUNCATED header set. The
+ * gw_server must instead reject with 400 bad-request and never contact the
+ * origin. We send 70 distinct forwardable headers, one of them an identifiable
+ * x-custom-hdr: the origin must NOT see it (request uncontacted). */
+static void
+test_gws_header_count_overflow(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(4096);
+    c.body_cap = 4096;
+
+    /* Build pseudo + auth + 70 forwardable headers directly (gws_send_request
+     * caps at CLI_MAX_HDRS=32, too small here). */
+    const int NEXTRA = 70;
+    enum { NAMES_CAP = 4 + 5 + 70 };
+    mq_h3_header_t hs[NAMES_CAP];
+    static char names[70][32];
+    size_t nh = 0;
+    hs[nh].name = ":method";
+    hs[nh++].value = "GET";
+    hs[nh].name = ":scheme";
+    hs[nh++].value = "http";
+    hs[nh].name = ":authority";
+    hs[nh++].value = origin_authority(&f.origin);
+    hs[nh].name = ":path";
+    hs[nh++].value = "/blob";
+    hs[nh].name = "x-mq-auth";
+    hs[nh++].value = "Bearer sekrit";
+    for (int i = 0; i < NEXTRA; i++) {
+        if (i == 0) {
+            hs[nh].name = "x-custom-hdr";
+            hs[nh++].value = "keepme";
+        } else {
+            snprintf(names[i], sizeof(names[i]), "x-fill-hdr-%02d", i);
+            hs[nh].name = names[i];
+            hs[nh++].value = "v";
+        }
+    }
+
+    mq_h3_req_t *hr = mq_h3_req_open(f.cli_conn);
+    MQ_CHECK(hr != NULL);
+    c.req = hr;
+    mq_h3_req_set_cbs(hr, cli_on_read, cli_on_write, cli_on_close, &c);
+    long sh = mq_h3_req_send_headers(hr, hs, nh, /*fin=*/1);
+    MQ_CHECK(sh > 0);
+
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 400);
+    const char *err = cli_find_hdr(&c, "x-mq-error");
+    MQ_CHECK(err && strcmp(err, "bad-request") == 0);
+    /* Origin uncontacted: it never saw the forwardable custom header. */
+    MQ_CHECK_EQ_INT(f.origin.saw_custom, 0);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 12: oversized forwarded header rejected (not truncated) ──
  *
  * A forwarded header VALUE >= 1024 bytes (the arena slot) would be silently
@@ -1561,6 +1647,45 @@ test_gws_content_length_strict(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 12b: oversized ORIGIN response header → 502 fail-closed ──
+ *
+ * Symmetric to the client-side dl_each_header fail-closed: an origin RESPONSE
+ * header whose name (>127) or value (>1023) overflows the per-request arena slot
+ * must NOT be silently clamped (a clipped header corrupts the downstream
+ * response). The gw_server must fail the response closed — synthesize 502 +
+ * x-mq-error: upstream-protocol — since no response header has reached the H3
+ * client yet. The origin /bighdr route emits a 1500-byte response header value. */
+static void
+test_gws_oversized_origin_header(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 0) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(4096);
+    c.body_cap = 4096;
+
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin),
+                              "/bighdr", "Bearer sekrit", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 502);
+    const char *err = cli_find_hdr(&c, "x-mq-error");
+    MQ_CHECK(err && strcmp(err, "upstream-protocol") == 0);
+    /* The oversized origin header was NOT forwarded (truncated) to the client. */
+    MQ_CHECK(cli_find_hdr(&c, "x-origin-big") == NULL);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 9: rejected requests reclaim per-request state ──────────
  *
  * Regression for the no-origin reject state leak: a request rejected BEFORE the
@@ -1661,7 +1786,9 @@ main(void)
     test_gws_reject_no_leak();
     test_gws_method_validation();
     test_gws_content_length_strict();
+    test_gws_header_count_overflow();
     test_gws_oversized_header();
+    test_gws_oversized_origin_header();
     test_gws_teardown_inflight();
 
     if (mq_test_failures) {
