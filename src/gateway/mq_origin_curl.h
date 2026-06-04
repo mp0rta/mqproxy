@@ -38,6 +38,33 @@
  *     origin (free does not walk live requests — it asserts none remain in the
  *     sense that the multi handle is torn down; outstanding easy handles would
  *     leak, so the gateway server tracks and aborts them).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CALLBACK RE-ENTRANCY CONTRACT  (which control ops are legal from inside a cb)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   - mq_origin_resume_body / mq_origin_resume_pull: ALWAYS safe from inside any
+ *     callback (on_status / on_header / on_body / pull_body / on_done) AND from
+ *     outside. They never call curl_easy_pause synchronously — they only set a
+ *     flag and arm a 0-delay event, so the actual unpause runs on the next loop
+ *     turn, outside every curl callback. (Calling resume from on_done is a no-op
+ *     race-loser but harmless: the request is torn down right after on_done.)
+ *
+ *   - mq_origin_abort: may be called from inside on_status / on_header / on_body
+ *     / pull_body — i.e. a SELF-abort of the request whose callback is running.
+ *     Curl supports curl_multi_remove_handle from within a transfer callback, and
+ *     mq_origin_abort performs exactly that (synchronously freeing the request).
+ *     HARD RULE: after a self-abort the callback MUST return IMMEDIATELY and must
+ *     NOT touch the request pointer `r` or its owner context `u` again — both are
+ *     freed the instant mq_origin_abort returns. (on_body should return the value
+ *     it intends; the safest is to abort then `return len` so curl does not also
+ *     flag a short write, but since the handle is already removed the return value
+ *     is moot.) Do NOT call mq_origin_abort from inside on_done — on_done already
+ *     IS the terminal teardown (the request is freed right after it returns); a
+ *     second abort would be a double free.
+ *
+ *   - mq_origin_start: NOT re-entrancy-special, but note it may be called from
+ *     inside on_done (e.g. to chain a follow-up request) since the completing
+ *     request is fully destroyed before on_done runs.
  */
 #ifndef MQ_GATEWAY_MQ_ORIGIN_CURL_H
 #define MQ_GATEWAY_MQ_ORIGIN_CURL_H

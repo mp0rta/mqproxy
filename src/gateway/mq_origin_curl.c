@@ -552,13 +552,34 @@ mq_origin_start(mq_origin_t *o, const char *url, const char *method,
      * dance breaks streaming uploads (curl would wait for a 100 before sending
      * the body, stalling the pull source). Headers are forwarded verbatim. */
     struct curl_slist *hdrs = NULL;
+    /* A small stack buffer covers the common case; oversize lines (a big
+     * Authorization / Cookie the gateway must forward verbatim) heap-allocate
+     * exactly the needed size rather than being silently dropped. */
+    char stackline[1024];
     for (size_t i = 0; i < n; i++) {
         if (!hs[i].name) continue;
-        char line[1024];
         const char *v = hs[i].value ? hs[i].value : "";
-        int wn = snprintf(line, sizeof(line), "%s: %s", hs[i].name, v);
-        if (wn <= 0 || (size_t)wn >= sizeof(line)) continue; /* skip oversize */
+        /* Compute the exact length: strlen(name) + ": " + strlen(value). */
+        size_t need = strlen(hs[i].name) + 2 + strlen(v) + 1; /* +1 for NUL */
+        char *line = stackline;
+        char *heapline = NULL;
+        if (need > sizeof(stackline)) {
+            heapline = (char *)malloc(need);
+            if (!heapline) {
+                curl_slist_free_all(hdrs);
+                curl_easy_cleanup(r->easy);
+                free(r);
+                return NULL;
+            }
+            line = heapline;
+        }
+        int wn = snprintf(line, need, "%s: %s", hs[i].name, v);
+        if (wn <= 0 || (size_t)wn >= need) {
+            free(heapline);
+            continue; /* defensive: should not happen given `need` is exact */
+        }
         struct curl_slist *nl = curl_slist_append(hdrs, line);
+        free(heapline);
         if (!nl) {
             curl_slist_free_all(hdrs);
             curl_easy_cleanup(r->easy);
