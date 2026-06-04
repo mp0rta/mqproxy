@@ -45,7 +45,7 @@ done
 out=$("$BIN" server --help 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] || fail "'server --help' exited $rc (want 0)"
-for flag in "--listen" "--token"; do
+for flag in "--listen" "--token" "--origin-ca" "--no-gateway"; do
     echo "$out" | grep -q -- "$flag" || fail "'server --help' output missing '$flag'"
 done
 

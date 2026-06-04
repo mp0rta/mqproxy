@@ -5,6 +5,7 @@
  *
  * Usage:
  *   mqproxy server --listen <udp ip:port> --token <t> [--cert <path> --key <path>]
+ *                  [--origin-ca <pem>] [--no-gateway]
  *   mqproxy client --server <udp ip:port> --token <t>
  *                  [--socks5 <tcp ip:port>] [--http-connect <tcp ip:port>]
  *                  [--gateway <tcp ip:port>] [--path <local ip>]...
@@ -14,6 +15,10 @@
  *   --gateway. --socks5 / --http-connect drive the TCP-proxy core (mq_client);
  *   --gateway runs the independent HTTP-gateway fetch ingress (mq_gw_client over
  *   its own H3 tunnel) and may be used on its own.
+ *
+ *   The server runs the HTTP-gateway origin bridge (mq_gw_server: H3→curl→origin)
+ *   by DEFAULT alongside the TCP-proxy server core. --no-gateway disables it;
+ *   --origin-ca overrides the CA bundle used to verify origin TLS.
  *
  * Dispatch is on argv[1] (`client` / `server`). `--help`/`-h` at the top level
  * and per subcommand prints usage and exits 0. An unknown subcommand or a
@@ -39,6 +44,7 @@
 
 #include "gateway/mq_fetch_listener.h"
 #include "gateway/mq_gw_client.h"
+#include "gateway/mq_gw_server.h"
 #include "ingress/mq_listener.h"
 #include "proxy/mq_client.h"
 #include "proxy/mq_server.h"
@@ -83,6 +89,7 @@ usage_server(FILE *out)
 {
     fprintf(out, "Usage: mqproxy server --listen <ip:port> --token <token>\n"
                  "                      [--cert <path>] [--key <path>]\n"
+                 "                      [--origin-ca <pem>] [--no-gateway]\n"
                  "\n"
                  "Options:\n"
                  "  --listen <ip:port>  UDP address to accept MPQUIC connections on "
@@ -93,6 +100,14 @@ usage_server(FILE *out)
                  "                      test cert when omitted.\n"
                  "  --key    <path>     TLS private key (PEM). Defaults to the bundled\n"
                  "                      test key when omitted.\n"
+                 "  --origin-ca <pem>   CA bundle (PEM) used to verify origin TLS for "
+                 "the\n"
+                 "                      HTTP gateway. Defaults to the system trust "
+                 "store.\n"
+                 "  --no-gateway        Disable the HTTP gateway origin bridge "
+                 "(enabled by\n"
+                 "                      default; the server still serves the TCP-proxy "
+                 "core).\n"
                  "  --qlog   <dir>      Write xquic qlog (EXTRA importance) to "
                  "<dir>/server.qlog.\n"
                  "  --cc     <algo>     Congestion control: bbr (default) | bbr2 | "
@@ -223,6 +238,31 @@ install_signal_handlers(struct event_base *base, mq_runtime_t *rt, struct event 
 
 /* ── server subcommand ──────────────────────────────────────────────────────*/
 
+/* Default origin connect timeout (seconds) for the gateway bridge. */
+#define MQ_GW_ORIGIN_CONNECT_TIMEOUT_DEFAULT_S 10L
+
+/* Resolve the origin connect timeout. The default is
+ * MQ_GW_ORIGIN_CONNECT_TIMEOUT_DEFAULT_S; the env var
+ * MQ_GW_ORIGIN_CONNECT_TIMEOUT_S is a TEST-ONLY knob (NOT documented in --help)
+ * that lets e2e tests force a short timeout so a black-holed origin yields a
+ * deterministic 504. Parsed with strtol, clamped to [1, 600]; anything invalid
+ * (non-numeric, trailing junk, empty, out of range) is ignored and the default
+ * stands. */
+static long
+gw_origin_connect_timeout_s(void)
+{
+    const char *env = getenv("MQ_GW_ORIGIN_CONNECT_TIMEOUT_S");
+    if (!env || env[0] == '\0') return MQ_GW_ORIGIN_CONNECT_TIMEOUT_DEFAULT_S;
+    char *endp = NULL;
+    errno = 0;
+    long v = strtol(env, &endp, 10);
+    if (errno != 0 || endp == env || *endp != '\0') {
+        return MQ_GW_ORIGIN_CONNECT_TIMEOUT_DEFAULT_S;
+    }
+    if (v < 1 || v > 600) return MQ_GW_ORIGIN_CONNECT_TIMEOUT_DEFAULT_S;
+    return v;
+}
+
 static int
 cmd_server(int argc, char **argv)
 {
@@ -230,16 +270,29 @@ cmd_server(int argc, char **argv)
     const char *token = NULL;
     const char *cert = NULL;
     const char *key = NULL;
+    const char *origin_ca = NULL; /* nullable: NULL = system trust store */
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
     mq_cc_t cc = MQ_CC_DEFAULT;
+    int gateway_enabled = 1; /* gateway on by default; --no-gateway opts out */
 
-    enum { OPT_LISTEN = 256, OPT_TOKEN, OPT_CERT, OPT_KEY, OPT_QLOG, OPT_CC };
+    enum {
+        OPT_LISTEN = 256,
+        OPT_TOKEN,
+        OPT_CERT,
+        OPT_KEY,
+        OPT_ORIGIN_CA,
+        OPT_NO_GATEWAY,
+        OPT_QLOG,
+        OPT_CC,
+    };
     static const struct option longopts[] = {
         {"listen", required_argument, NULL, OPT_LISTEN},
         {"token", required_argument, NULL, OPT_TOKEN},
         {"cert", required_argument, NULL, OPT_CERT},
         {"key", required_argument, NULL, OPT_KEY},
+        {"origin-ca", required_argument, NULL, OPT_ORIGIN_CA},
+        {"no-gateway", no_argument, NULL, OPT_NO_GATEWAY},
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
         {"help", no_argument, NULL, 'h'},
@@ -254,6 +307,8 @@ cmd_server(int argc, char **argv)
         case OPT_TOKEN: token = optarg; break;
         case OPT_CERT: cert = optarg; break;
         case OPT_KEY: key = optarg; break;
+        case OPT_ORIGIN_CA: origin_ca = optarg; break;
+        case OPT_NO_GATEWAY: gateway_enabled = 0; break;
         case OPT_QLOG: qlog_dir = optarg; break;
         case OPT_CC: cc_name = optarg; break;
         case 'h': usage_server(stdout); return 0;
@@ -303,6 +358,7 @@ cmd_server(int argc, char **argv)
     mq_transport_t *transport = NULL;
     mq_runtime_t *rt = NULL;
     mq_server_t *server = NULL;
+    mq_gw_server_t *gws = NULL;
     struct event *sint = NULL, *sterm = NULL;
 
     base = event_base_new();
@@ -339,32 +395,76 @@ cmd_server(int argc, char **argv)
         MQ_LOGE("failed to create server");
         goto out;
     }
+    /* HTTP gateway origin bridge (mq_gw_server: H3 request → curl → origin). On
+     * by default; --no-gateway opts out. Because it is default-on, a failure to
+     * stand it up is FATAL (exit non-zero) rather than a silent degrade — a
+     * server that was meant to gateway but isn't is worse than a loud failure.
+     * mq_gw_server_new calls mq_h3_init internally and owns the H3 hooks; the
+     * created mq_h3 is reclaimed in the teardown block per the header contract. */
+    if (gateway_enabled) {
+        long connect_timeout_s = gw_origin_connect_timeout_s();
+        gws = mq_gw_server_new(transport, rt, token, origin_ca, connect_timeout_s);
+        if (!gws) {
+            MQ_LOGE("failed to create HTTP gateway server (origin_ca=%s, "
+                    "connect_timeout=%lds)",
+                    origin_ca ? origin_ca : "(system)", connect_timeout_s);
+            goto out;
+        }
+    }
     if (install_signal_handlers(base, rt, &sint, &sterm) != 0) {
         MQ_LOGE("failed to install signal handlers");
         goto out;
     }
 
-    MQ_LOGI("mqproxy server listening on %s:%u (cc=%s)", listen_ip, listen_port,
-            mq_cc_name(cc));
+    MQ_LOGI("mqproxy server listening on %s:%u (cc=%s, gateway=%s)", listen_ip,
+            listen_port, mq_cc_name(cc), gateway_enabled ? "on" : "off");
     mq_runtime_run(rt);
     rc = 0;
 
 out:
-    /* Teardown order (see cmd_client for the rationale): the server's per-conn
-     * state + the runtime are both touched by conn-close callbacks fired while
-     * the engine tears down its connections (inside mq_transport_free):
-     *   - the transport's send_udp callback (the runtime, as cbs.user) may be
-     *     invoked for a final CONNECTION_CLOSE — so the RUNTIME must outlive
-     *     mq_transport_free;
-     *   - conn-close fires the server's on_state(CLOSED) which reaps flows and
-     *     reads mq_runtime_base(rt) — so the SERVER and the RUNTIME must both be
-     *     alive during mq_transport_free.
-     * Therefore free the TRANSPORT first (engine destroy, callbacks land on the
-     * live runtime + server), then the runtime (closes sockets/timer; does not
-     * free base), then the server. The CLI owns base, so it frees it last.
-     * Order: signal events -> transport -> runtime -> server -> base. */
+    /* Teardown order — the TCP-proxy server core and the HTTP-gateway origin
+     * bridge have ordering contracts that pull in OPPOSITE directions across
+     * mq_transport_free; both are honored below.
+     *
+     * (A) TCP-proxy server core (mq_server + runtime): the server's per-conn
+     *     state + the runtime are both touched by conn-close callbacks fired
+     *     while the engine tears down its connections (inside mq_transport_free):
+     *       - the transport's send_udp callback (the runtime, as cbs.user) may be
+     *         invoked for a final CONNECTION_CLOSE — so the RUNTIME must outlive
+     *         mq_transport_free;
+     *       - conn-close fires the server's on_state(CLOSED) which reaps flows and
+     *         reads mq_runtime_base(rt) — so the SERVER and the RUNTIME must both
+     *         be alive during mq_transport_free.
+     *     Therefore free the TRANSPORT first (engine destroy, callbacks land on
+     *     the live runtime + server), then the runtime (closes sockets/timer;
+     *     does not free base), then the server.
+     *
+     * (B) HTTP-gateway bridge (mq_gw_server + the mq_h3 it created): the
+     *     SANCTIONED order (mq_gw_server.h) is gw_server_free → mq_h3_free →
+     *     mq_transport_free. gw_server_free MUST run while the H3 engine is STILL
+     *     LIVE (it touches r->req on live in-flight requests via
+     *     mq_h3_req_set_cbs(NULL,...)); mq_h3_free MUST precede mq_transport_free.
+     *     Capture the h3 handle BEFORE gw_server_free — the accessor reads the
+     *     gw_server struct, which free() releases.
+     *
+     * Combined order:
+     *   signal events
+     *   -> gw_server_free   (engine live; detaches in-flight H3 req cbs, aborts
+     *                        origin requests, frees the origin client)
+     *   -> mq_h3_free       (the gw_server's H3 engine; gateway/tcp ALPN conn
+     *                        graphs are independent, so this does not disturb the
+     *                        tcp conns mq_transport_free later tears down)
+     *   -> mq_transport_free (fires graph-A conn-close cbs into live runtime+server)
+     *   -> runtime free
+     *   -> mq_server_free
+     *   -> base free (CLI owns base). */
     if (sint) event_free(sint);
     if (sterm) event_free(sterm);
+    {
+        mq_h3_t *gw_h3 = gws ? mq_gw_server_h3(gws) : NULL;
+        if (gws) mq_gw_server_free(gws);
+        if (gw_h3) mq_h3_free(gw_h3);
+    }
     if (transport) mq_transport_free(transport);
     if (rt) mq_runtime_free(rt);
     if (server) mq_server_free(server);
