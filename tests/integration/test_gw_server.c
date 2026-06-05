@@ -225,6 +225,22 @@ origin_cb_bighdr(struct evhttp_request *req, void *arg)
     evhttp_send_reply(req, 200, "OK", NULL);
 }
 
+/* GET /manyhdr: reply 200 with 70 distinct small response headers (x-h-00 ..
+ * x-h-69). Used to drive the gw_server's fail-closed path for a response
+ * header-COUNT overflow (> MQ_GWS_MAX_HDRS = 64). */
+static void
+origin_cb_manyhdr(struct evhttp_request *req, void *arg)
+{
+    (void)arg;
+    struct evkeyvalq *outh = evhttp_request_get_output_headers(req);
+    for (int i = 0; i < 70; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "x-h-%02d", i);
+        evhttp_add_header(outh, name, "v");
+    }
+    evhttp_send_reply(req, 200, "OK", NULL);
+}
+
 static void
 origin_cb_404(struct evhttp_request *req, void *arg)
 {
@@ -244,6 +260,7 @@ origin_up(struct event_base *base, origin_t *o, size_t blob_len)
     evhttp_set_cb(o->http, "/slow", origin_cb_slow, o);
     evhttp_set_cb(o->http, "/up", origin_cb_up, o);
     evhttp_set_cb(o->http, "/bighdr", origin_cb_bighdr, o);
+    evhttp_set_cb(o->http, "/manyhdr", origin_cb_manyhdr, o);
     evhttp_set_gencb(o->http, origin_cb_404, o);
 
     struct evhttp_bound_socket *bs =
@@ -1686,6 +1703,53 @@ test_gws_oversized_origin_header(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 12c: origin response header-COUNT overflow → 502 fail-closed
+ *
+ * When an origin replies with more than MQ_GWS_MAX_HDRS (64) non-hop-by-hop
+ * response headers, origin_on_header sets r->hdrs_overflow after the 64th.
+ * download_send_headers MUST check hdrs_overflow (symmetric to hdr_oversized)
+ * and fail closed with 502 + x-mq-error: upstream-protocol before any header
+ * reaches the H3 client.
+ *
+ * The origin /manyhdr route returns 200 with 70 distinct x-h-NN headers.
+ * Expected: gateway returns 502 + x-mq-error: upstream-protocol; no x-h-*
+ * header forwarded to the client. */
+static void
+test_gws_resp_header_count_overflow(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 0) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(4096);
+    c.body_cap = 4096;
+
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin),
+                              "/manyhdr", "Bearer sekrit", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    /* Fail closed: gateway must synthesize 502 + x-mq-error: upstream-protocol.
+     * No x-h-* origin headers must reach the H3 client. */
+    MQ_CHECK_EQ_INT(c.status, 502);
+    const char *err = cli_find_hdr(&c, "x-mq-error");
+    MQ_CHECK(err && strcmp(err, "upstream-protocol") == 0);
+    /* Confirm that none of the 70 origin x-h-NN headers were forwarded. */
+    MQ_CHECK(cli_find_hdr(&c, "x-h-00") == NULL);
+    MQ_CHECK(cli_find_hdr(&c, "x-h-63") == NULL);
+    MQ_CHECK(cli_find_hdr(&c, "x-h-64") == NULL);
+    MQ_CHECK(cli_find_hdr(&c, "x-h-69") == NULL);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 9: rejected requests reclaim per-request state ──────────
  *
  * Regression for the no-origin reject state leak: a request rejected BEFORE the
@@ -1789,6 +1853,7 @@ main(void)
     test_gws_header_count_overflow();
     test_gws_oversized_header();
     test_gws_oversized_origin_header();
+    test_gws_resp_header_count_overflow();
     test_gws_teardown_inflight();
 
     if (mq_test_failures) {

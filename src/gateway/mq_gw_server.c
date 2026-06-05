@@ -100,7 +100,13 @@ typedef struct mq_gw_req_s {
         char value[1024];
     } hdrs[MQ_GWS_MAX_HDRS];
     int n_hdrs;
-    int hdrs_overflow; /* dropped a header (capacity) — diagnostic only */
+    int hdrs_overflow; /* dropped a header (response header count > MQ_GWS_MAX_HDRS).
+                        * Fail closed: checked in download_send_headers alongside
+                        * hdr_oversized — synthesize 502 + x-mq-error: upstream-protocol
+                        * before any response header reaches the H3 client. Post-body
+                        * trailers may set this after resp_headers_sent, but that path is
+                        * already gated by `if (!r->resp_headers_sent)` (same as
+                        * hdr_oversized), so trailers cannot trigger a spurious 502. */
     int hdr_oversized; /* an ORIGIN response header NAME/VALUE did not fit its
                         * arena slot (>127 name / >1023 value). Fail closed:
                         * checked in download_send_headers before any response
@@ -331,12 +337,14 @@ download_send_headers(mq_gw_req_t *r)
     if (r->resp_headers_sent) return 0;
     if (r->h3_dead || !r->req) return -1;
 
-    /* Fail closed on an oversized ORIGIN response header (recorded in on_header).
-     * No header has reached the H3 client yet, so synthesize a clean 502 +
-     * x-mq-error: upstream-protocol instead of corrupting the response with a
-     * clipped header. gw_send_error sends the fin and sets finished; the caller
-     * must NOT also reset (it guards the reset on !r->finished). */
-    if (r->hdr_oversized) {
+    /* Fail closed on an oversized ORIGIN response header (recorded in on_header)
+     * or a response header-count overflow (> MQ_GWS_MAX_HDRS, also recorded in
+     * on_header). In both cases no header has reached the H3 client yet, so we
+     * synthesize a clean 502 + x-mq-error: upstream-protocol instead of
+     * forwarding a corrupted/truncated header set. gw_send_error sends the fin
+     * and sets finished; the caller must NOT also reset (it guards the reset on
+     * !r->finished). */
+    if (r->hdr_oversized || r->hdrs_overflow) {
         gw_send_error(r, "502", "upstream-protocol");
         return -1;
     }
