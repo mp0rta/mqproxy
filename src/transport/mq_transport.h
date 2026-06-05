@@ -118,11 +118,21 @@ int mq_transport_open_path(mq_transport_t *t, uint64_t path, const char *local_i
 void mq_transport_close_path(mq_transport_t *t, uint64_t path);
 
 /* Multipath readiness hook: invoked once cids are exchanged on a connection
- * (the precondition for xqc_conn_create_path). scid is copied out by xquic and
- * valid only for the callback duration. */
+ * (the precondition for xqc_conn_create_path). scid identifies the connection
+ * that became ready; it is owned by xquic and valid only for the callback
+ * duration (copy it out if needed). */
 typedef void (*mq_transport_mp_ready_fn)(const xqc_cid_t *scid, void *user);
-void mq_transport_set_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn,
-                                  void *user);
+
+/* Subscribe to ready_to_create_path notifications. Broadcast: every subscriber
+ * fires for every conn's readiness; subscribers MUST filter by scid. Returns
+ * 0, or -1 when the (small, fixed) subscriber table is full. */
+int mq_transport_add_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn,
+                                 void *user);
+
+/* Remove a previously-registered mp-ready subscriber (matched by fn+user pair).
+ * No-op if not found. Compacts the table. */
+void mq_transport_remove_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn,
+                                     void *user);
 
 /* Enable xquic's qlog sink, writing to "<dir>/<role>.qlog". Returns 0 on
  * success, -1 on bad args / open failure. *out_path (if non-NULL) receives the

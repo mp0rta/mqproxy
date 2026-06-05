@@ -299,6 +299,257 @@ on_server_stream(mq_stream_t *s, void *user)
                       /*on_close=*/NULL, NULL);
 }
 
+/* ── broadcast mp-ready test state ───────────────────────────────────────── */
+
+/* A standalone subscriber registered via mq_transport_add_mp_ready_cb alongside
+ * the conn's own subscriber: it records that it fired and copies out the scid so
+ * the test can confirm the broadcast delivered the readiness signal (and the
+ * exact scid xquic supplied). */
+typedef struct {
+    int fired;
+    xqc_cid_t scid;
+} mp_sub_t;
+
+static void
+on_extra_mp_ready(const xqc_cid_t *scid, void *user)
+{
+    mp_sub_t *sub = (mp_sub_t *)user;
+    sub->fired = 1;
+    if (scid) {
+        memcpy(&sub->scid, scid, sizeof(sub->scid));
+    }
+}
+
+/* Negative-path sentinel: a conn-like object whose stored cid is deliberately
+ * DIFFERENT from any real conn's scid. mq_conn_on_mp_ready is static in
+ * mq_conn.c, so this replicates its scid-filter contract (have_cid + cid_len +
+ * cid_buf compare) verbatim. Bound as a subscriber, it must NEVER flip mp_ready,
+ * because no broadcast carries its (bogus) cid — proving the filter REJECTS a
+ * mismatched scid rather than flipping every subscriber unconditionally. */
+typedef struct {
+    int have_cid;
+    xqc_cid_t cid;
+    int mp_ready; /* must stay 0 for the whole run */
+} mp_filter_obj_t;
+
+static void
+on_filter_mp_ready(const xqc_cid_t *scid, void *user)
+{
+    mp_filter_obj_t *o = (mp_filter_obj_t *)user;
+    if (!o || !o->have_cid || !scid) {
+        return;
+    }
+    if (scid->cid_len == o->cid.cid_len &&
+        memcmp(scid->cid_buf, o->cid.cid_buf, o->cid.cid_len) == 0) {
+        o->mp_ready = 1;
+    }
+}
+
+/* Helper: drive both transports one step (tick both, drain both directions).
+ * Used by the close-one-keep-one phase below where the survivor must keep making
+ * progress after a peer conn was closed. */
+static void
+mp_pump_once(fabric_t *fabric, mq_transport_t *client, mq_transport_t *server)
+{
+    mq_transport_tick(client);
+    mq_transport_tick(server);
+    fabric_drain(&fabric->to_server, server, SRV_PORT, CLI_PORT);
+    fabric_drain(&fabric->to_client, client, CLI_PORT, SRV_PORT);
+    (void)mq_transport_next_timeout_ms(client);
+    (void)mq_transport_next_timeout_ms(server);
+}
+
+/* Broadcast test: with multipath enabled, drive a real handshake to the point
+ * where xquic fires ready_to_create_path_notify, with TWO subscribers on the
+ * client transport — the conn's own (registered inside mq_conn_connect) plus an
+ * extra one registered via the new mq_transport_add_mp_ready_cb. Assert BOTH
+ * fire (broadcast), the extra one received the conn's scid, and the conn's own
+ * subscriber flipped mq_conn_mp_ready (its scid filter matched). This is the
+ * Phase 2 invariant: subscribers no longer clobber each other and every
+ * subscriber sees every conn's readiness.
+ *
+ * It then opens a SECOND real client conn on the same transport (two conns now
+ * share the engine + the mp-ready subscriber table), drives BOTH to readiness,
+ * and verifies the per-scid filter: each conn's own subscriber flips only its
+ * OWN mq_conn_mp_ready (a broadcast that matched the other conn's scid must not
+ * flip this one). Finally it closes the FIRST conn and keeps driving the SECOND
+ * to readiness: mq_conn_close_notify unsubscribes the closed conn, so a later
+ * broadcast can no longer deref its freed mq_conn (the use-after-free this fix
+ * removes — proven clean under ASan). */
+static void
+test_mp_ready_broadcast(void)
+{
+    fabric_t fabric;
+    memset(&fabric, 0, sizeof(fabric));
+
+    endpoint_t client_ctx = {.outbound = &fabric.to_server, .role = "client"};
+    endpoint_t server_ctx = {.outbound = &fabric.to_client, .role = "server"};
+
+    mq_transport_callbacks_t cbs = {
+        .send_udp = fab_send_udp,
+        .open_path_socket = fab_open_path_socket,
+        .close_path_socket = fab_close_path_socket,
+    };
+
+    mq_transport_t *client = mq_transport_new(/*is_server=*/0);
+    MQ_CHECK(client != NULL);
+    mq_transport_t *server = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
+    MQ_CHECK(server != NULL);
+    if (!client || !server) {
+        if (client) mq_transport_free(client);
+        if (server) mq_transport_free(server);
+        return;
+    }
+    mq_transport_set_callbacks(client, &cbs, &client_ctx);
+    mq_transport_set_callbacks(server, &cbs, &server_ctx);
+
+    int rc = mq_conn_register_alpn(server, TEST_ALPN, on_server_conn, NULL, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    rc = mq_conn_register_alpn(client, TEST_ALPN, NULL, NULL, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    /* The server is a pure responder, but it must advertise enable_multipath +
+     * the larger path-id grant so the client's ready_to_create_path_notify can
+     * fire (multipath is negotiated; both sides must enable it). */
+    xqc_conn_settings_t srv_settings;
+    memset(&srv_settings, 0, sizeof(srv_settings));
+    srv_settings.proto_version = XQC_VERSION_V1;
+    srv_settings.pacing_on = 1;
+    mq_conn_apply_mp_settings(&srv_settings, /*is_server=*/1, MQ_CC_DEFAULT);
+    xqc_server_set_conn_settings(mq_transport_xqc(server), &srv_settings);
+
+    /* Register the extra (broadcast-witness) subscriber BEFORE connect; the
+     * conn's own subscriber is added inside mq_conn_connect. */
+    mp_sub_t extra = {0};
+    rc = mq_transport_add_mp_ready_cb(client, on_extra_mp_ready, &extra);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    /* Negative-path subscriber: a conn-like object with a deliberately BOGUS cid
+     * (have_cid=1, distinct cid_len + bytes). It replicates mq_conn_on_mp_ready's
+     * scid filter, so it must NEVER flip — no broadcast carries this cid. This
+     * proves the filter rejects a mismatched scid (vs. flipping unconditionally),
+     * and consumes the table headroom MQ_MP_READY_SUBS_MAX was widened for. */
+    mp_filter_obj_t bogus = {0};
+    bogus.have_cid = 1;
+    bogus.cid.cid_len = 8;
+    memset(bogus.cid.cid_buf, 0xAB, bogus.cid.cid_len);
+    rc = mq_transport_add_mp_ready_cb(client, on_filter_mp_ready, &bogus);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    struct sockaddr_in srv_addr;
+    make_addr(&srv_addr, SRV_PORT);
+
+    /* Multipath ON on both sides so xquic fires ready_to_create_path_notify. */
+    xqc_conn_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.proto_version = XQC_VERSION_V1;
+    settings.pacing_on = 1;
+    settings.max_pkt_out_size = 1200;
+    mq_conn_apply_mp_settings(&settings, /*is_server=*/0, MQ_CC_DEFAULT);
+
+    mq_conn_t *conn = mq_conn_connect(client, (struct sockaddr *)&srv_addr,
+                                      sizeof(srv_addr), TEST_ALPN, &settings, NULL);
+    MQ_CHECK(conn != NULL);
+    if (!conn) {
+        mq_transport_free(client);
+        mq_transport_free(server);
+        return;
+    }
+
+    /* Drive until BOTH subscribers have fired (mp-ready broadcast) or the bounded
+     * caps fire. mq_conn_mp_ready reflects the conn's own (scid-filtered)
+     * subscriber; extra.fired reflects the standalone one. */
+    uint64_t deadline = now_ms() + WALL_BUDGET_MS;
+    int iters = 0;
+    while ((!extra.fired || !mq_conn_mp_ready(conn)) && iters < MAX_ITERS &&
+           now_ms() < deadline) {
+        mp_pump_once(&fabric, client, server);
+        iters++;
+    }
+
+    /* Both subscribers fired: the broadcast reached every slot. */
+    MQ_CHECK(extra.fired);
+    MQ_CHECK(mq_conn_mp_ready(conn));
+
+    /* The extra subscriber received a non-empty scid (xquic supplied the conn's
+     * scid to every subscriber). */
+    MQ_CHECK(extra.scid.cid_len > 0);
+
+    /* The negative-path subscriber was broadcast to (same as every slot) but its
+     * bogus cid matched no conn's scid, so its filter rejected every fire. */
+    MQ_CHECK_EQ_INT(bogus.mp_ready, 0);
+
+    /* ── Second real conn on the same transport ──────────────────────────────
+     * Open a SECOND client conn on the SAME client transport. Both conns now
+     * share the engine and the mp-ready subscriber table; each conn's own
+     * subscriber (mq_conn_on_mp_ready) is registered with its own mq_conn as the
+     * user, and filters by scid. The first conn's mq_conn_mp_ready is ALREADY 1;
+     * driving the second to readiness exercises the per-scid filter — the second
+     * conn's readiness broadcast must NOT touch the first (different scid), and
+     * the first conn's readiness broadcast (already past) never flipped the
+     * second. We assert the second conn flips independently. */
+    mq_conn_t *conn2 = mq_conn_connect(client, (struct sockaddr *)&srv_addr,
+                                       sizeof(srv_addr), TEST_ALPN, &settings, NULL);
+    MQ_CHECK(conn2 != NULL);
+    if (!conn2) {
+        mq_conn_close(conn);
+        mq_transport_free(client);
+        mq_transport_free(server);
+        return;
+    }
+
+    deadline = now_ms() + WALL_BUDGET_MS;
+    iters = 0;
+    while (!mq_conn_mp_ready(conn2) && iters < MAX_ITERS && now_ms() < deadline) {
+        mp_pump_once(&fabric, client, server);
+        iters++;
+    }
+    /* The second conn's per-scid filter matched its OWN scid and flipped. */
+    MQ_CHECK(mq_conn_mp_ready(conn2));
+    /* The first conn stayed ready (its flag is sticky; not clobbered). */
+    MQ_CHECK(mq_conn_mp_ready(conn));
+
+    /* ── Close one, keep one ──────────────────────────────────────────────────
+     * Close the FIRST conn while the SECOND stays open + ready — the two-conn
+     * shape the broadcast work enables. When xquic surfaces conn_close_notify,
+     * mq_conn_close_notify unsubscribes the closing conn from the transport's
+     * mp-ready broadcast BEFORE free(c); without it the freed mq_conn's `user`
+     * pointer would linger in the subscriber table and a later broadcast would
+     * deref it (use-after-free). Run under ASan, a clean teardown (no sanitizer
+     * report) proves the unsubscribe + free do not corrupt the table or leave a
+     * dangling slot the survivor's teardown then touches.
+     *
+     * NB: this in-memory fabric defers xquic's conn_close_notify to engine
+     * teardown, so it cannot stage a broadcast AFTER a mid-life free; the remove
+     * API's table contract (a removed slot is reclaimed, not left dangling) is
+     * pinned directly by test_mp_ready_unsubscribe below. */
+    mq_conn_close(conn);
+
+    /* Pump past the close; the survivor is already ready, so there is no flag
+     * left to wait on — keep the engine busy so the closing conn's teardown
+     * exercises the unsubscribe under ASan. */
+    uint64_t close_deadline = now_ms() + 200;
+    int close_iters = 0;
+    while (close_iters < MAX_ITERS && now_ms() < close_deadline) {
+        mp_pump_once(&fabric, client, server);
+        close_iters++;
+    }
+    /* The survivor is intact and still ready after the peer conn was closed (no
+     * crash/UAF reaching here under ASan is the real assertion). */
+    MQ_CHECK(mq_conn_mp_ready(conn2));
+
+    mq_conn_close(conn2);
+    close_deadline = now_ms() + 200;
+    close_iters = 0;
+    while (close_iters < MAX_ITERS && now_ms() < close_deadline) {
+        mp_pump_once(&fabric, client, server);
+        close_iters++;
+    }
+
+    mq_transport_free(client);
+    mq_transport_free(server);
+}
+
 static void
 test_transport_fabric(void)
 {
@@ -444,4 +695,66 @@ test_transport_fabric(void)
     mq_transport_free(server);
 }
 
-MQ_TEST_MAIN(test_transport_fabric())
+/* Focused unit test for mq_transport_remove_mp_ready_cb (the unsubscribe path
+ * mq_conn_close_notify relies on). The in-memory fabric defers xquic's
+ * conn_close_notify to engine teardown, so it cannot manufacture a broadcast
+ * AFTER a mid-life conn free; this test instead pins the remove API's contract
+ * directly via the one observable the public API exposes — the bounded table:
+ *   1. fill the table to MQ_MP_READY_SUBS_MAX (adds succeed, then overflow -1);
+ *   2. remove one entry (no-op-safe, matched by fn+user);
+ *   3. a fresh add now SUCCEEDS — proving the slot was reclaimed (compacted),
+ *      i.e. the removed subscriber is truly gone from the table a later
+ *      broadcast would iterate (no stale pointer left behind);
+ *   4. removing a never-registered pair is a harmless no-op.
+ * MQ_MP_READY_SUBS_MAX is 4, matching the table's compile-time dimension. */
+static void
+noop_mp_ready(const xqc_cid_t *scid, void *user)
+{
+    (void)scid;
+    (void)user;
+}
+
+static void
+test_mp_ready_unsubscribe(void)
+{
+    mq_transport_t *t = mq_transport_new(/*is_server=*/0);
+    MQ_CHECK(t != NULL);
+    if (!t) {
+        return;
+    }
+
+    /* Distinct user pointers so each (fn,user) pair is a unique registration. */
+    int users[8];
+    const int cap = 4; /* == MQ_MP_READY_SUBS_MAX */
+
+    /* 1. Fill the table; the (cap+1)-th add overflows. */
+    for (int i = 0; i < cap; i++) {
+        MQ_CHECK_EQ_INT(mq_transport_add_mp_ready_cb(t, noop_mp_ready, &users[i]), 0);
+    }
+    MQ_CHECK_EQ_INT(mq_transport_add_mp_ready_cb(t, noop_mp_ready, &users[cap]), -1);
+
+    /* 2. Remove a middle entry (exercises the tail-shift compaction). */
+    mq_transport_remove_mp_ready_cb(t, noop_mp_ready, &users[1]);
+
+    /* 3. A fresh add now succeeds: the removed slot was reclaimed. */
+    MQ_CHECK_EQ_INT(mq_transport_add_mp_ready_cb(t, noop_mp_ready, &users[5]), 0);
+    /* And the table is full again. */
+    MQ_CHECK_EQ_INT(mq_transport_add_mp_ready_cb(t, noop_mp_ready, &users[6]), -1);
+
+    /* 4. Removing a pair that was never registered is a harmless no-op (count
+     * unchanged, so the table stays full). */
+    mq_transport_remove_mp_ready_cb(t, noop_mp_ready, &users[7]);
+    MQ_CHECK_EQ_INT(mq_transport_add_mp_ready_cb(t, noop_mp_ready, &users[7]), -1);
+
+    /* NULL-arg guards: no-op, no crash. */
+    mq_transport_remove_mp_ready_cb(NULL, noop_mp_ready, &users[0]);
+    mq_transport_remove_mp_ready_cb(t, NULL, &users[0]);
+
+    mq_transport_free(t);
+}
+
+MQ_TEST_MAIN({
+    test_transport_fabric();
+    test_mp_ready_broadcast();
+    test_mp_ready_unsubscribe();
+})

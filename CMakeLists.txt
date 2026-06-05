@@ -3,6 +3,7 @@ project(mqproxy VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 include(cmake/BuildSetup.cmake)
+find_package(CURL REQUIRED)
 
 add_library(mqproxy STATIC
     src/util/mq_log.c
@@ -17,10 +18,18 @@ add_library(mqproxy STATIC
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
     src/ingress/mq_listener.c
+    src/gateway/mq_http1.c
+    src/gateway/mq_gw_headers.c
+    src/gateway/mq_fetch_listener.c
+    src/gateway/mq_gw_client.c
+    src/gateway/mq_gw_server.c
+    src/gateway/mq_origin_curl.c
     src/transport/mq_conn.c
+    src/transport/mq_h3.c
     src/transport/mq_stream.c
     src/transport/mq_transport.c
     src/runtime/mq_runtime_libevent.c)
+target_link_libraries(mqproxy PUBLIC CURL::libcurl)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 enable_testing()
@@ -57,6 +66,16 @@ add_executable(test_http_connect tests/test_http_connect.c)
 target_link_libraries(test_http_connect mqproxy)
 target_include_directories(test_http_connect PRIVATE tests)
 add_test(NAME test_http_connect COMMAND test_http_connect)
+
+add_executable(test_http1 tests/test_http1.c)
+target_link_libraries(test_http1 mqproxy)
+target_include_directories(test_http1 PRIVATE tests)
+add_test(NAME test_http1 COMMAND test_http1)
+
+add_executable(test_gw_headers tests/test_gw_headers.c)
+target_link_libraries(test_gw_headers mqproxy)
+target_include_directories(test_gw_headers PRIVATE tests)
+add_test(NAME test_gw_headers COMMAND test_gw_headers)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
@@ -108,6 +127,28 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         endif()
     endif()
 
+    # Origin TLS cert/key for the gateway e2e (e2e_gateway.sh). UNLIKE test.crt
+    # this cert carries subjectAltName=IP:127.0.0.1 so the gateway server can
+    # verify the origin's hostname (we NEVER disable verification — the server
+    # gets --origin-ca pointed at this cert). Test-only; regenerated if missing.
+    set(MQ_ORIGIN_CERT_FILE "${MQ_CERT_DIR}/origin.crt")
+    set(MQ_ORIGIN_KEY_FILE "${MQ_CERT_DIR}/origin.key")
+    if(NOT EXISTS "${MQ_ORIGIN_CERT_FILE}" OR NOT EXISTS "${MQ_ORIGIN_KEY_FILE}")
+        find_program(OPENSSL_BIN openssl REQUIRED)
+        file(MAKE_DIRECTORY "${MQ_CERT_DIR}")
+        message(STATUS "Generating self-signed origin cert (SAN=IP:127.0.0.1) in ${MQ_CERT_DIR}")
+        execute_process(
+            COMMAND ${OPENSSL_BIN} req -x509 -newkey rsa:2048 -nodes
+                    -keyout "${MQ_ORIGIN_KEY_FILE}" -out "${MQ_ORIGIN_CERT_FILE}"
+                    -days 3650 -subj "/CN=mqproxy-origin"
+                    -addext "subjectAltName=IP:127.0.0.1"
+            RESULT_VARIABLE _origin_cert_rc
+            OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _origin_cert_rc EQUAL 0)
+            message(FATAL_ERROR "openssl failed to generate origin test cert")
+        endif()
+    endif()
+
     add_executable(test_conn_handshake tests/integration/test_conn_handshake.c)
     target_link_libraries(test_conn_handshake
         mqproxy
@@ -153,6 +194,50 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_socks5_listener COMMAND test_socks5_listener)
 
+    # Fetch-API listener (Task 2.2) + gateway client fetch→H3 bridge (Task 3.2).
+    # The listener cases drive the loopback HTTP/1.1 accept loop with fake gateway
+    # callbacks over real sockets; the gateway-client cases stand up real
+    # client+server transports + runtimes + mq_h3 over loopback UDP, so this test
+    # now needs the cert/key defines (mirrors test_e2e_single_path).
+    add_executable(test_gw_client tests/integration/test_gw_client.c)
+    target_link_libraries(test_gw_client
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_gw_client PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_gw_client PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_gw_client PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_gw_client COMMAND test_gw_client)
+
+    # mq_origin_curl (Task 4.2): the libcurl-multi origin client on libevent.
+    # Drives the mq_origin_* API against an in-process evhttp origin over plain
+    # loopback HTTP/1.1. evhttp lives in libevent_extra (EVENT_EXTRA_LIB); curl
+    # propagates from mqproxy's PUBLIC CURL::libcurl link. Task 4.3 extends this
+    # file with the gateway-server replay cases.
+    add_executable(test_gw_server tests/integration/test_gw_server.c)
+    target_link_libraries(test_gw_server
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_gw_server PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    # Task 4.3 extends this test with gw_server cases that stand up a real H3
+    # client+server over loopback UDP, so it needs the cert/key defines.
+    target_compile_definitions(test_gw_server PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_gw_server PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_gw_server COMMAND test_gw_server)
+
     add_executable(test_e2e_single_path tests/integration/test_e2e_single_path.c)
     target_link_libraries(test_e2e_single_path
         mqproxy
@@ -184,6 +269,22 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_transport_fabric PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_transport_fabric COMMAND test_transport_fabric)
+
+    add_executable(test_h3_fabric tests/integration/test_h3_fabric.c)
+    target_link_libraries(test_h3_fabric
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_h3_fabric PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_h3_fabric PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_h3_fabric PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_h3_fabric COMMAND test_h3_fabric)
 
     add_executable(test_two_paths tests/integration/test_two_paths.c)
     target_link_libraries(test_two_paths
@@ -258,4 +359,22 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_KEY=${MQ_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_multipath.sh)
     set_tests_properties(e2e_multipath PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ---- Phase 2 Task 5.1: full-chain HTTP-gateway e2e ----
+    # Drives the whole fetch path against a real python3 TLS origin: 8MB
+    # download/upload byte-exact, the 4xx/502/504 error surface (with x-mq-error
+    # / x-mq-origin-protocol assertions), and a NET_ADMIN-gated 2-path
+    # aggregation smoke. Cases 1-7 run anywhere; case 8 needs tc on lo and is
+    # skipped (a note) without it. The WHOLE script exits 77 (SKIP) ONLY when the
+    # python3 TLS origin can't start. The mqproxy binary, the tunnel cert/key,
+    # and the SAN'd origin cert/key are passed via env.
+    add_test(NAME e2e_gateway
+        COMMAND ${CMAKE_COMMAND} -E env
+            MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+            MQPROXY_CERT=${MQ_CERT_FILE}
+            MQPROXY_KEY=${MQ_KEY_FILE}
+            MQPROXY_ORIGIN_CERT=${MQ_ORIGIN_CERT_FILE}
+            MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
+            bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_gateway.sh)
+    set_tests_properties(e2e_gateway PROPERTIES SKIP_RETURN_CODE 77)
 endif()

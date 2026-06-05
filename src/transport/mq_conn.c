@@ -80,6 +80,9 @@ struct mq_conn_s {
 };
 
 static mq_alpn_ctx_t *mq_conn_actx(void *conn_user_data);
+/* Defined under "Multipath" below; forward-declared so mq_conn_close_notify can
+ * unsubscribe this conn from the transport's mp-ready broadcast before free(c). */
+static void mq_conn_on_mp_ready(const xqc_cid_t *scid, void *user);
 
 /* ── ALP connection callbacks ───────────────────────────────────────────── */
 
@@ -161,6 +164,13 @@ mq_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_us
     if (c->on_state) {
         c->on_state(c, MQ_CONN_CLOSED, c->on_state_user);
     }
+    /* Unsubscribe from the transport's mp-ready broadcast BEFORE free(c).
+     * mq_conn_connect registered mq_conn_on_mp_ready with `c` as the user
+     * pointer; with multiple conns on one transport (Phase 2: tcp + h3) the
+     * subscriber table outlives this conn, and a later readiness broadcast would
+     * deref the freed `c` (use-after-free). A no-op for server conns, which never
+     * subscribed (matched by fn+user, not found). */
+    mq_transport_remove_mp_ready_cb(c->transport, mq_conn_on_mp_ready, c);
     /* Release any secondary paths this conn owns (the runtime frees the read
      * event + socket via close_path_socket). */
     for (int i = 0; i < c->n_extra_paths; i++) {
@@ -274,14 +284,21 @@ mq_conn_register_alpn(mq_transport_t *t, const char *alpn, mq_conn_on_new_fn on_
 
 /* ── Multipath ──────────────────────────────────────────────────────────── */
 
-/* Engine mp-ready hook: xquic signalled this conn can create a path. The user
- * pointer is the client mq_conn registered in mq_conn_connect. */
+/* Engine mp-ready hook: xquic signalled that the conn identified by scid can
+ * create a path. The user pointer is the client mq_conn registered in
+ * mq_conn_connect. The notification is broadcast to every subscriber on the
+ * transport, so filter by scid (cid_len + cid_buf) and only flip OUR conn.
+ * scid points at an aligned copy made by the transport dispatch point (xquic
+ * may hand it an unaligned cid pointer), so plain member access is safe here. */
 static void
 mq_conn_on_mp_ready(const xqc_cid_t *scid, void *user)
 {
-    (void)scid;
     mq_conn_t *c = (mq_conn_t *)user;
-    if (c) {
+    if (!c || !c->have_cid || !scid) {
+        return;
+    }
+    if (scid->cid_len == c->cid.cid_len &&
+        memcmp(scid->cid_buf, c->cid.cid_buf, c->cid.cid_len) == 0) {
         c->mp_ready = 1;
     }
 }
@@ -411,13 +428,22 @@ mq_conn_path_bytes(const mq_conn_t *c, uint64_t path_id, uint64_t *sent, uint64_
 }
 
 void
-mq_conn_dump_stats(mq_conn_t *c)
+mq_conn_dump_stats_cid(mq_transport_t *t, const xqc_cid_t *cid)
 {
-    xqc_conn_stats_t st;
-    if (mq_conn_stats_snapshot(c, &st) != 0) {
+    if (!t || !cid) {
         MQ_LOGI("mq_conn stats: no connection");
         return;
     }
+    xqc_engine_t *xeng = mq_transport_xqc(t);
+    if (!xeng) {
+        MQ_LOGI("mq_conn stats: no connection");
+        return;
+    }
+    /* xqc_conn_get_stats returns a snapshot whose heap-allocated paths_info MUST
+     * be released with libc free() — NOT xqc_free — and may be NULL with count 0
+     * (no free needed, free(NULL) is safe). Mirrors mq_conn_stats_snapshot's
+     * ownership contract for the cid-keyed callers (mq_h3). */
+    xqc_conn_stats_t st = xqc_conn_get_stats(xeng, cid);
     if (!st.paths_info || st.paths_info_count == 0) {
         MQ_LOGI("mq_conn stats: no path metrics");
         free(st.paths_info); /* free(NULL) is safe; count 0 may carry a buffer */
@@ -431,6 +457,16 @@ mq_conn_dump_stats(mq_conn_t *c)
                 (unsigned long long)st.paths_info[i].path_recv_bytes);
     }
     free(st.paths_info);
+}
+
+void
+mq_conn_dump_stats(mq_conn_t *c)
+{
+    if (!c || !c->have_cid) {
+        MQ_LOGI("mq_conn stats: no connection");
+        return;
+    }
+    mq_conn_dump_stats_cid(c->transport, &c->cid);
 }
 
 mq_cc_t
@@ -550,10 +586,16 @@ mq_conn_connect(mq_transport_t *t, const struct sockaddr *peer, socklen_t peerle
     c->is_server = 0;
     c->owner = owner;
 
-    /* Route xquic's ready_to_create_path_notify (delivered to the transport) to
-     * this conn so mq_conn_mp_ready flips once paths can be created. One conn
-     * per client transport, so a single slot suffices. */
-    mq_transport_set_mp_ready_cb(t, mq_conn_on_mp_ready, c);
+    /* Subscribe to xquic's ready_to_create_path_notify (delivered to the
+     * transport) so mq_conn_mp_ready flips once paths can be created. The
+     * notification is broadcast to every subscriber on the transport (Phase 2:
+     * a tcp conn and an h3 conn share one engine), so mq_conn_on_mp_ready
+     * filters by scid to flip only THIS conn. */
+    if (mq_transport_add_mp_ready_cb(t, mq_conn_on_mp_ready, c) != 0) {
+        MQ_LOGE("mq_conn: mp-ready subscriber table full");
+        free(c);
+        return NULL;
+    }
 
     xqc_conn_ssl_config_t conn_ssl;
     memset(&conn_ssl, 0, sizeof(conn_ssl));

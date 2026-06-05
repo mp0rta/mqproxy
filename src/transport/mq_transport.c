@@ -28,15 +28,28 @@
 
 #include "util/mq_log.h"
 
+/* Dimension of the mp-ready subscriber table. Production subscribers are exactly
+ * two — the tcp conn and the h3 conn — but the table carries headroom so a test
+ * can register an extra (negative-path filter) subscriber alongside the real
+ * conns, and to absorb a future third proto without a struct change. The
+ * overflow guard in mq_transport_add_mp_ready_cb stays regardless. */
+#define MQ_MP_READY_SUBS_MAX 4
+
 struct mq_transport_s {
     xqc_engine_t *engine;
     mq_transport_callbacks_t cbs;
     void *user;
     int is_server;
 
-    /* Multipath readiness hook (set via mq_transport_set_mp_ready_cb). */
-    mq_transport_mp_ready_fn mp_ready_fn;
-    void *mp_ready_user;
+    /* Multipath readiness subscribers (added via mq_transport_add_mp_ready_cb).
+     * Fixed table: production subscribers are the tcp conn and the h3 conn;
+     * MQ_MP_READY_SUBS_MAX carries headroom for tests/futures (see its comment).
+     * ready_to_create_path is broadcast to every populated slot. */
+    struct {
+        mq_transport_mp_ready_fn fn;
+        void *user;
+    } mp_ready_subs[MQ_MP_READY_SUBS_MAX];
+    int n_mp_ready_subs;
 
     /* qlog sink. qlog_fd < 0 == disabled (default). The xquic qlog callback
      * writes rendered lines here when armed via mq_transport_enable_qlog. */
@@ -187,14 +200,22 @@ mq_transport_server_refuse(xqc_engine_t *engine, xqc_connection_t *conn,
 
 /* Multipath ready-to-create-path notify. xquic fires this once cids are
  * exchanged (precondition for xqc_conn_create_path). conn_user_data is the
- * connection's transport user_data == the mq_transport. Route to the registered
- * mp_ready hook so mq_conn can flip its flag. */
+ * connection's transport user_data == the mq_transport. Broadcast to every
+ * subscriber: with multiple conns on one transport (Phase 2: tcp + h3) the scid
+ * identifies WHICH conn became ready, so each subscriber filters by scid. */
 static void
 mq_transport_ready_to_create_path(const xqc_cid_t *scid, void *conn_user_data)
 {
     mq_transport_t *t = (mq_transport_t *)conn_user_data;
-    if (t && t->mp_ready_fn) {
-        t->mp_ready_fn(scid, t->mp_ready_user);
+    if (!t || !scid) {
+        return;
+    }
+    /* xquic may hand an unaligned scid pointer; copy into an aligned local once
+     * here so every subscriber can read its members via plain field access. */
+    xqc_cid_t aligned;
+    memcpy(&aligned, scid, sizeof(aligned));
+    for (int i = 0; i < t->n_mp_ready_subs; i++) {
+        t->mp_ready_subs[i].fn(&aligned, t->mp_ready_subs[i].user);
     }
 }
 
@@ -487,14 +508,43 @@ mq_transport_close_path(mq_transport_t *t, uint64_t path)
     t->cbs.close_path_socket(path, t->user);
 }
 
-void
-mq_transport_set_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn, void *user)
+int
+mq_transport_add_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn, void *user)
 {
-    if (!t) {
+    if (!t || !fn) {
+        return -1;
+    }
+    if (t->n_mp_ready_subs >= MQ_MP_READY_SUBS_MAX) {
+        return -1; /* fixed table full (MQ_MP_READY_SUBS_MAX slots) */
+    }
+    t->mp_ready_subs[t->n_mp_ready_subs].fn = fn;
+    t->mp_ready_subs[t->n_mp_ready_subs].user = user;
+    t->n_mp_ready_subs++;
+    return 0;
+}
+
+void
+mq_transport_remove_mp_ready_cb(mq_transport_t *t, mq_transport_mp_ready_fn fn,
+                                void *user)
+{
+    if (!t || !fn) {
         return;
     }
-    t->mp_ready_fn = fn;
-    t->mp_ready_user = user;
+    /* Match by fn+user pair and compact the table (shift the tail down) so the
+     * broadcast loop never indexes a removed slot. The pair is the registration
+     * identity: the same fn may be registered for several conns, each with a
+     * distinct user (the mq_conn), so user must match too. */
+    for (int i = 0; i < t->n_mp_ready_subs; i++) {
+        if (t->mp_ready_subs[i].fn == fn && t->mp_ready_subs[i].user == user) {
+            for (int j = i; j < t->n_mp_ready_subs - 1; j++) {
+                t->mp_ready_subs[j] = t->mp_ready_subs[j + 1];
+            }
+            t->n_mp_ready_subs--;
+            t->mp_ready_subs[t->n_mp_ready_subs].fn = NULL;
+            t->mp_ready_subs[t->n_mp_ready_subs].user = NULL;
+            return;
+        }
+    }
 }
 
 int
