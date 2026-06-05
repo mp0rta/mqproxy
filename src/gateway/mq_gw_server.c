@@ -430,15 +430,17 @@ static void
 origin_on_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
 {
     mq_gw_req_t *r = (mq_gw_req_t *)u;
+    /* Drop-class checks must run BEFORE the capacity check: a dropped header
+     * must not count toward the capacity limit. */
     if (mq_gw_strip_hop(n, nl)) return;
-    if (r->n_hdrs >= MQ_GWS_MAX_HDRS) {
-        r->hdrs_overflow = 1;
-        return;
-    }
     /* Drop any x-mq-origin-protocol the origin itself sent — we synthesize ours
      * from the negotiated http_ver, and a duplicate pseudo-ish diagnostic would
      * be confusing. */
     if (slice_ieq(n, nl, "x-mq-origin-protocol")) return;
+    if (r->n_hdrs >= MQ_GWS_MAX_HDRS) {
+        r->hdrs_overflow = 1;
+        return;
+    }
 
     /* An origin response header NAME or VALUE that would not fit its arena slot
      * must FAIL the response (download_send_headers turns this into a 502

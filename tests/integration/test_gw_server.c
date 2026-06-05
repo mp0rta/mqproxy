@@ -241,6 +241,49 @@ origin_cb_manyhdr(struct evhttp_request *req, void *arg)
     evhttp_send_reply(req, 200, "OK", NULL);
 }
 
+/* GET /boundary64: reply 200 with exactly MQ_GWS_MAX_HDRS(64) forwardable
+ * headers followed by an x-mq-origin-protocol header.
+ *
+ * The 64 forwardable headers are composed of:
+ *   3 explicitly pre-set standard headers that would otherwise be auto-added by
+ *   evhttp (Date, Content-Length, Content-Type) — pre-setting them ensures they
+ *   appear FIRST in the wire order, before the x-h-NN set, and prevents evhttp
+ *   from appending duplicates.
+ *   61 custom x-h-NN headers.
+ * Together that is exactly 64 forwardable (non-hop-by-hop, non-x-mq-origin-
+ * protocol) headers.  Then x-mq-origin-protocol: fake is added AFTER the 64.
+ *
+ * evhttp still appends "Connection: close" automatically; that header is in the
+ * hop-by-hop strip list and is therefore not counted.
+ *
+ * Before the fix: origin_on_header checks the count (n_hdrs >= 64) BEFORE the
+ * x-mq-origin-protocol drop, so the 65th call with x-mq-origin-protocol trips
+ * hdrs_overflow = 1 → gateway returns 502 (false positive).
+ * After the fix: x-mq-origin-protocol is dropped first; the 64 forwardable
+ * headers fit exactly; gateway returns 200 with x-mq-origin-protocol set to
+ * "http/1.1" (the gateway's own synthesis) and all 64 headers forwarded. */
+static void
+origin_cb_boundary64(struct evhttp_request *req, void *arg)
+{
+    (void)arg;
+    struct evkeyvalq *outh = evhttp_request_get_output_headers(req);
+    /* Pre-set the 3 headers evhttp would auto-add so they appear first and
+     * are not duplicated; they count toward the 64 forwardable total. */
+    evhttp_add_header(outh, "Date", "Thu, 01 Jan 2026 00:00:00 GMT");
+    evhttp_add_header(outh, "Content-Length", "0");
+    evhttp_add_header(outh, "Content-Type", "text/plain");
+    /* 61 custom x-h-NN headers (3 + 61 = 64 forwardable total). */
+    for (int i = 0; i < 61; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "x-h-%02d", i);
+        evhttp_add_header(outh, name, "v");
+    }
+    /* This is the (would-be) 65th header in the current buggy order; it must be
+     * dropped without being counted against the capacity. */
+    evhttp_add_header(outh, "x-mq-origin-protocol", "fake");
+    evhttp_send_reply(req, 200, "OK", NULL);
+}
+
 static void
 origin_cb_404(struct evhttp_request *req, void *arg)
 {
@@ -261,6 +304,7 @@ origin_up(struct event_base *base, origin_t *o, size_t blob_len)
     evhttp_set_cb(o->http, "/up", origin_cb_up, o);
     evhttp_set_cb(o->http, "/bighdr", origin_cb_bighdr, o);
     evhttp_set_cb(o->http, "/manyhdr", origin_cb_manyhdr, o);
+    evhttp_set_cb(o->http, "/boundary64", origin_cb_boundary64, o);
     evhttp_set_gencb(o->http, origin_cb_404, o);
 
     struct evhttp_bound_socket *bs =
@@ -1750,6 +1794,71 @@ test_gws_resp_header_count_overflow(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 12d: x-mq-origin-protocol from origin dropped before count
+ *
+ * Bug: origin_on_header checked the header-count overflow BEFORE dropping
+ * x-mq-origin-protocol.  When the origin replied with exactly 64 forwardable
+ * headers (fitting within MQ_GWS_MAX_HDRS) followed by x-mq-origin-protocol,
+ * the count was already 64 when x-mq-origin-protocol arrived, so the overflow
+ * check tripped even though that header would merely be dropped — producing a
+ * false-positive 502.
+ *
+ * Fix: move the x-mq-origin-protocol drop ABOVE the count check so that drop-
+ * class checks run before capacity checks; dropped headers must not count
+ * toward capacity.
+ *
+ * The /boundary64 origin route emits exactly 64 forwardable headers (3 pre-set
+ * standard headers + 61 x-h-NN) followed by x-mq-origin-protocol: fake.
+ * Expected post-fix: 200, all 64 headers forwarded, x-mq-origin-protocol
+ * overwritten to "http/1.1" (the gateway's synthesis). */
+static void
+test_gws_xmq_origin_protocol_drop_before_count(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 0) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(4096);
+    c.body_cap = 4096;
+
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin),
+                              "/boundary64", "Bearer sekrit", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    /* Post-fix: the 64 forwardable headers fit; x-mq-origin-protocol is dropped
+     * (not counted) → no overflow → 200.  Pre-fix: 502 + upstream-protocol. */
+    MQ_CHECK_EQ_INT(c.status, 200);
+
+    /* x-mq-origin-protocol must be the gateway's own synthesis ("http/1.1"),
+     * NOT the origin's "fake" value, confirming the drop + re-synthesis.
+     * Guard the strcmp to avoid a crash on the NULL that the bug produces. */
+    const char *prot = cli_find_hdr(&c, "x-mq-origin-protocol");
+    MQ_CHECK(prot != NULL);
+    if (prot) MQ_CHECK(strcmp(prot, "http/1.1") == 0);
+
+    /* Spot-check that x-h-NN headers are forwarded.  CLI_MAX_HDRS=32 limits the
+     * client-side capture to 32 non-status headers (x-mq-origin-protocol, Date,
+     * Content-Length, Content-Type occupy slots 0-3; x-h-00..x-h-27 fill 4-31).
+     * We check x-h-00 (first custom) and x-h-27 (last in the capture window);
+     * headers beyond x-h-27 are silently capped by the test fixture, but the
+     * 200 status already confirms no overflow was triggered. */
+    MQ_CHECK(cli_find_hdr(&c, "x-h-00") != NULL);
+    MQ_CHECK(cli_find_hdr(&c, "x-h-27") != NULL);
+
+    /* No x-mq-error (was "upstream-protocol" under the bug). */
+    MQ_CHECK(cli_find_hdr(&c, "x-mq-error") == NULL);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 9: rejected requests reclaim per-request state ──────────
  *
  * Regression for the no-origin reject state leak: a request rejected BEFORE the
@@ -1854,6 +1963,7 @@ main(void)
     test_gws_oversized_header();
     test_gws_oversized_origin_header();
     test_gws_resp_header_count_overflow();
+    test_gws_xmq_origin_protocol_drop_before_count();
     test_gws_teardown_inflight();
 
     if (mq_test_failures) {
