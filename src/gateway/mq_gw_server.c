@@ -226,7 +226,9 @@ static void
 gw_send_error(mq_gw_req_t *r, const char *status, const char *xmq_error)
 {
     if (r->h3_dead || !r->req) return;
-    char st[8];
+    /* :status is always 3 digits in practice; 32 keeps gcc's -Wformat-truncation
+     * (which sizes this by the longest caller literal at -O2) satisfied. */
+    char st[32];
     snprintf(st, sizeof(st), "%s", status);
     mq_h3_header_t hs[] = {
         {":status", st},
