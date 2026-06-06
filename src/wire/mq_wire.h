@@ -54,11 +54,11 @@ typedef struct {
     size_t message_len;
 } mq_connect_tcp_resp_t;
 
-/* data stream 先頭の型識別子 (varint)。design §5.2 */
+/* Type discriminator (varint) at the head of a data stream. design §5.2 */
 enum { MQ_STREAM_TYPE_CONNECT_TCP = 0x01, MQ_STREAM_TYPE_UDP_SESSION = 0x02 };
 
-/* AUTH_RESPONSE.features のビット定義 (既存 u64 フィールドの初利用)。
- * server が UDP relay を提供する場合に立てる (--no-udp で落とす)。 */
+/* Bit definition for AUTH_RESPONSE.features (first use of the existing u64
+ * field). Set by the server when UDP relay is available; cleared by --no-udp. */
 #define MQ_FEAT_UDP_RELAY ((uint64_t)1 << 0)
 
 typedef enum {
@@ -67,12 +67,13 @@ typedef enum {
     MQ_UDP_SOCKET_FAILED = 2,
     MQ_UDP_POLICY_DENIED = 3,
     MQ_UDP_SESSION_LIMIT = 4,
-    /* boundary 専用 (wire RESP には載せない): idle timeout / normal stream
-     * close / conn close による session 終了。OPEN 失敗ではないので負キャッシュ
-     * 対象外。codec 契約: encoder は CLOSED を -1 で拒否、decoder は
-     * wire の error_code >= 5 を reject。status×error_code の組も固定 —
-     * MQ_STATUS_OK ⇔ MQ_UDP_OK のみ / MQ_STATUS_ERROR ⇔ 1-4 のみ、違反は
-     * encode/decode とも -1。 */
+    /* Boundary-only value (never placed on the wire in a RESP frame): signals
+     * session termination due to idle timeout, normal stream close, or conn
+     * close. Not an OPEN failure, so it does not feed the negative cache.
+     * Codec contract: the encoder rejects CLOSED with -1; the decoder rejects
+     * any wire error_code >= 5. The status×error_code pairing is fixed —
+     * MQ_STATUS_OK only with MQ_UDP_OK; MQ_STATUS_ERROR only with 1-4;
+     * violations cause both encoder and decoder to return -1. */
     MQ_UDP_CLOSED = 5
 } mq_udp_err_t;
 
@@ -83,7 +84,7 @@ typedef struct {
     uint8_t host[MQ_MAX_HOST];
     size_t host_len;
     uint16_t port;
-    uint64_t idle_timeout_ms; /* 0 = server default */
+    uint64_t idle_timeout_ms; /* 0 = use server default */
 } mq_udp_session_open_t;
 
 typedef struct {
@@ -91,7 +92,7 @@ typedef struct {
     mq_udp_err_t error_code;
     char message[256];
     size_t message_len;
-    uint64_t idle_timeout_ms; /* server が適用する実効値 */
+    uint64_t idle_timeout_ms; /* effective value applied by the server */
 } mq_udp_session_resp_t;
 
 /* Each returns bytes written (encode) / consumed (decode), or -1 on error.

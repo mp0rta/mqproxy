@@ -483,7 +483,7 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     }
 
     /* content-length: re-emit the recomputed value over the tunnel when the
-     * request has a known body length (CL > 0). Design §7.1 ("再計算"): the
+     * request has a known body length (CL > 0). Design §7.1 ("recompute"): the
      * ORIGINAL Content-Length header is stripped (mq_gw_strip_client) and we
      * emit our own validated value (req->content_length), so the value the
      * server sees is the one this client actually committed to streaming — not

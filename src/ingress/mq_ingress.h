@@ -22,22 +22,27 @@ typedef void (*mq_tcp_open_fn)(void *core, const uint8_t *host, size_t host_len,
                                const uint8_t *prebuf, size_t prebuf_len, void *user,
                                mq_tcp_open_cb cb);
 
-/* UDP セッション境界。ingress (mq_udp_assoc) は xquic を知らない。
+/* UDP session boundary. The ingress layer (mq_udp_assoc) has no knowledge of
+ * xquic; all QUIC interaction is hidden behind these function-pointer hooks.
  *
- * open は session handle を【同期返却】する (local allocation のみ — auth /
- * RESP は待たない)。NULL = 即時失敗 (session 上限 / 負キャッシュ / pre-auth
- * キュー満杯)。返った handle へは直ちに send してよい (楽観送信)。
- * リモート起因の失敗・終了 (RESP error / stream close / idle timeout) は
- * on_err で【最大 1 回】後報され、以後 handle は無効 (caller は send/close を
- * 呼ばない。close 不要 — core が解放済み)。caller 起点の終了は close。
+ * open returns a session handle SYNCHRONOUSLY (local allocation only — it does
+ * not wait for auth or RESP). NULL means immediate failure (session limit hit /
+ * negative-cache hit / pre-auth queue full). A non-NULL handle may be passed to
+ * send immediately (optimistic send).
+ * Remote-side failures and terminations (RESP error / stream close / idle
+ * timeout) are reported back via on_err AT MOST ONCE; after that the handle is
+ * invalid (the caller MUST NOT call send or close — close is unnecessary because
+ * the core has already freed the session). Caller-initiated termination uses
+ * close.
  *
- * 【callback 抑止契約 — UAF 防止の要】
- *   - close が return した後、その session への on_rx / on_err は【二度と】
- *     呼ばれない (close は callback detach を同期的に完了する)。
- *   - on_err / on_rx の dispatch 中に close が再入した場合も同様 (core は
- *     session を closing state にして以降の user callback を抑止する)。
- *   - 遅延イベント (close 直後に届く RESP error / idle 満了 / stream close
- *     notify) は core 内で握り潰す。 */
+ * CALLBACK SUPPRESSION CONTRACT — required to prevent use-after-free:
+ *   - After close returns, on_rx and on_err for that session are NEVER called
+ *     again (close completes callback detachment synchronously).
+ *   - The same guarantee holds if close is called re-entrantly during an on_err
+ *     or on_rx dispatch (the core marks the session as closing and suppresses
+ *     all further user callbacks for it).
+ *   - Deferred events that arrive immediately after close (RESP error, idle
+ *     expiry, stream close notify) are silently discarded inside the core. */
 typedef void (*mq_udp_rx_fn)(const uint8_t *payload, size_t len, void *user);
 typedef void (*mq_udp_err_fn)(void *session, mq_udp_err_t err, void *user);
 typedef void *(*mq_udp_open_fn)(void *core, const uint8_t *host, size_t host_len,

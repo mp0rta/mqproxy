@@ -1303,7 +1303,7 @@ test_gw_upload(void)
     const char *m = srv_find_hdr(&g_srv, ":method");
     MQ_CHECK(m && strcmp(m, "POST") == 0);
     /* The known request Content-Length must be re-emitted over the tunnel
-     * (design §7.1 "再計算"): the gw client strips the client's original CL and
+     * (design §7.1 "recompute"): the gw client strips the client's original CL and
      * sends its own validated value, so the server frames the upload by CL. */
     {
         const char *cl = srv_find_hdr(&g_srv, "content-length");
