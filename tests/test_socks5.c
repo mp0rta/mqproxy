@@ -509,6 +509,17 @@ test_parse_udp_hdr_truncation_sweep_domain(void)
     }
 }
 
+/* Truncation sweep: feed 0..N-1 bytes of a valid IPv6 header, all must return -1 */
+static void
+test_parse_udp_hdr_truncation_sweep_ipv6(void)
+{
+    mq_socks5_udp_hdr_t h;
+    for (size_t i = 0; i < sizeof UDP_HDR_IPV6; i++) {
+        int n = mq_socks5_parse_udp_hdr(UDP_HDR_IPV6, i, &h);
+        MQ_CHECK_EQ_INT(n, -1);
+    }
+}
+
 /* Bad ATYP in UDP header */
 static void
 test_parse_udp_hdr_bad_atyp(void)
@@ -665,6 +676,7 @@ MQ_TEST_MAIN({
     test_parse_udp_hdr_rsv_high_nonzero();
     test_parse_udp_hdr_truncation_sweep_ipv4();
     test_parse_udp_hdr_truncation_sweep_domain();
+    test_parse_udp_hdr_truncation_sweep_ipv6();
     test_parse_udp_hdr_bad_atyp();
     /* build_udp_hdr */
     test_build_udp_hdr_ipv4_roundtrip();
