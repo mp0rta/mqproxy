@@ -470,6 +470,13 @@ srv_open_readable_cb(mq_stream_t *s, void *user)
         return; /* need more bytes */
     }
 
+    /* Invariant: the 0x02 control stream carries exactly ONE OPEN message.
+     * After that single frame, this stream is a pure control handle — any
+     * trailing or subsequent bytes are intentionally ignored.  UDP payload
+     * rides DATAGRAM frames, not this stream; stream close signals session
+     * close.  `consumed` therefore need not be acted upon. */
+    (void)consumed;
+
     /* OPEN decoded — this stream is now settled regardless of outcome. */
     op->settled = 1;
     mq_udp_srv_t *u = op->u;
