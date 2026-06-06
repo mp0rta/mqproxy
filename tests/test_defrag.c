@@ -364,6 +364,182 @@ test_single_frag_zero_len(void)
     mq_defrag_free(d);
 }
 
+/* ---- T1. Payload-copy proof ---------------------------------------------- */
+/* Feed frag 0, clobber the source buffer, feed frag 1, clobber that buffer
+ * too, then verify the assembled output still has the ORIGINAL bytes.      */
+static void
+test_payload_copy_proof(void)
+{
+    mq_defrag_t *d = mq_defrag_new();
+    MQ_CHECK(d != NULL);
+
+    uint8_t src0[] = {0x11, 0x22, 0x33};
+    uint8_t src1[] = {0x44, 0x55, 0x66};
+    uint8_t expected[] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+
+    mq_udp_msg_hdr_t h0 = make_hdr(400, 0, 2);
+    mq_udp_msg_hdr_t h1 = make_hdr(400, 1, 2);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+
+    /* Feed frag 0, then clobber the source buffer */
+    MQ_CHECK_EQ_INT(mq_defrag_feed(d, &h0, src0, sizeof src0, &out, &out_len), 0);
+    memset(src0, 0xFF, sizeof src0);
+
+    /* Feed frag 1 (completing), then clobber that buffer too */
+    int r = mq_defrag_feed(d, &h1, src1, sizeof src1, &out, &out_len);
+    memset(src1, 0xFF, sizeof src1);
+
+    MQ_CHECK_EQ_INT(r, 1);
+    MQ_CHECK(out != NULL);
+    MQ_CHECK_EQ_INT((long long)out_len, 6LL);
+    /* Output must still contain the original bytes, not 0xFF */
+    MQ_CHECK_MEM(out, expected, 6);
+    free(out);
+
+    mq_defrag_free(d);
+}
+
+/* ---- T2. LRU survivors complete with correct content --------------------- */
+/* After the 5th packet_id evicts the LRU slot (id=100), the three surviving
+ * non-evicted slots (ids 101, 102, 103) should each complete correctly.    */
+static void
+test_lru_survivors_complete(void)
+{
+    mq_defrag_t *d = mq_defrag_new();
+    MQ_CHECK(d != NULL);
+
+    /* Each packet_id i gets frag 0 with payload {i_lo, i_hi}. */
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+
+    /* Fill all 4 slots with ids 100..103, frag 0 of 2. */
+    for (uint16_t id = 100; id <= 103; id++) {
+        uint8_t p[2] = {(uint8_t)(id & 0xFF), 0xF0};
+        mq_udp_msg_hdr_t h = make_hdr(id, 0, 2);
+        MQ_CHECK_EQ_INT(mq_defrag_feed(d, &h, p, 2, &out, &out_len), 0);
+    }
+
+    /* Touch id=101 so id=100 stays LRU. */
+    {
+        uint8_t p[2] = {0x65, 0xF0}; /* duplicate frag → ignored */
+        mq_udp_msg_hdr_t h = make_hdr(101, 0, 2);
+        MQ_CHECK_EQ_INT(mq_defrag_feed(d, &h, p, 2, &out, &out_len), 0);
+    }
+
+    /* id=104 evicts id=100. */
+    {
+        uint8_t p[2] = {0x68, 0xF1};
+        mq_udp_msg_hdr_t h = make_hdr(104, 0, 2);
+        MQ_CHECK_EQ_INT(mq_defrag_feed(d, &h, p, 2, &out, &out_len), 0);
+    }
+
+    /* Complete surviving ids 101, 102, 103 and check content. */
+    for (uint16_t id = 101; id <= 103; id++) {
+        uint8_t completing[2] = {0xA0, (uint8_t)(id & 0xFF)};
+        mq_udp_msg_hdr_t h = make_hdr(id, 1, 2);
+        int r = mq_defrag_feed(d, &h, completing, 2, &out, &out_len);
+        MQ_CHECK_EQ_INT(r, 1);
+        MQ_CHECK(out != NULL);
+        MQ_CHECK_EQ_INT((long long)out_len, 4LL);
+        /* frag 0: {id_lo, 0xF0}, frag 1: {0xA0, id_lo} */
+        uint8_t expected[4] = {(uint8_t)(id & 0xFF), 0xF0, 0xA0, (uint8_t)(id & 0xFF)};
+        MQ_CHECK_MEM(out, expected, 4);
+        free(out);
+        out = NULL;
+    }
+
+    mq_defrag_free(d);
+}
+
+/* ---- T3. packet_id reuse via multi-frag ---------------------------------- */
+/* Same packet_id X completes a 2-frag assembly, then is reused for a NEW
+ * 2-frag assembly with DIFFERENT content and completes correctly.           */
+static void
+test_packet_id_wrap_multi_frag(void)
+{
+    mq_defrag_t *d = mq_defrag_new();
+    MQ_CHECK(d != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    const uint16_t PID = 500;
+
+    /* First assembly with packet_id=PID */
+    uint8_t a0[] = {0x01, 0x02};
+    uint8_t a1[] = {0x03, 0x04};
+    uint8_t expected_a[] = {0x01, 0x02, 0x03, 0x04};
+
+    mq_udp_msg_hdr_t ha0 = make_hdr(PID, 0, 2);
+    mq_udp_msg_hdr_t ha1 = make_hdr(PID, 1, 2);
+
+    MQ_CHECK_EQ_INT(mq_defrag_feed(d, &ha0, a0, sizeof a0, &out, &out_len), 0);
+    int r = mq_defrag_feed(d, &ha1, a1, sizeof a1, &out, &out_len);
+    MQ_CHECK_EQ_INT(r, 1);
+    MQ_CHECK(out != NULL);
+    MQ_CHECK_EQ_INT((long long)out_len, 4LL);
+    MQ_CHECK_MEM(out, expected_a, 4);
+    free(out);
+    out = NULL;
+
+    /* Second assembly with same packet_id=PID, different content */
+    uint8_t b0[] = {0xAA, 0xBB, 0xCC};
+    uint8_t b1[] = {0xDD, 0xEE};
+    uint8_t expected_b[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
+
+    mq_udp_msg_hdr_t hb0 = make_hdr(PID, 0, 2);
+    mq_udp_msg_hdr_t hb1 = make_hdr(PID, 1, 2);
+
+    MQ_CHECK_EQ_INT(mq_defrag_feed(d, &hb0, b0, sizeof b0, &out, &out_len), 0);
+    r = mq_defrag_feed(d, &hb1, b1, sizeof b1, &out, &out_len);
+    MQ_CHECK_EQ_INT(r, 1);
+    MQ_CHECK(out != NULL);
+    MQ_CHECK_EQ_INT((long long)out_len, 5LL);
+    MQ_CHECK_MEM(out, expected_b, 5);
+    free(out);
+
+    mq_defrag_free(d);
+}
+
+/* ---- T4. Exactly-65535 bytes → accepted ---------------------------------- */
+/* A 2-frag reassembly whose frags total exactly 65535 bytes must be ACCEPTED
+ * (65536 is already tested as a rejection boundary).                        */
+static void
+test_reassembled_exactly_65535(void)
+{
+    mq_defrag_t *d = mq_defrag_new();
+    MQ_CHECK(d != NULL);
+
+    /* frag 0: 32767 bytes; frag 1: 32768 bytes → total 65535 */
+    static uint8_t f0[32767];
+    static uint8_t f1[32768];
+    memset(f0, 0x5A, sizeof f0);
+    memset(f1, 0xA5, sizeof f1);
+
+    mq_udp_msg_hdr_t h0 = make_hdr(600, 0, 2);
+    mq_udp_msg_hdr_t h1 = make_hdr(600, 1, 2);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+
+    int r0 = mq_defrag_feed(d, &h0, f0, sizeof f0, &out, &out_len);
+    MQ_CHECK_EQ_INT(r0, 0);
+
+    int r1 = mq_defrag_feed(d, &h1, f1, sizeof f1, &out, &out_len);
+    MQ_CHECK_EQ_INT(r1, 1); /* must be accepted, not rejected */
+    MQ_CHECK(out != NULL);
+    MQ_CHECK_EQ_INT((long long)out_len, 65535LL);
+    /* Spot-check: first and last bytes of each segment */
+    MQ_CHECK_EQ_INT((long long)out[0], 0x5ALL);
+    MQ_CHECK_EQ_INT((long long)out[32766], 0x5ALL);
+    MQ_CHECK_EQ_INT((long long)out[32767], 0xA5LL);
+    MQ_CHECK_EQ_INT((long long)out[65534], 0xA5LL);
+    free(out);
+
+    mq_defrag_free(d);
+}
+
 MQ_TEST_MAIN({
     test_single_frag_passthrough();
     test_two_frag_in_order();
@@ -377,4 +553,8 @@ MQ_TEST_MAIN({
     test_reassembled_too_large();
     test_packet_id_wrap();
     test_single_frag_zero_len();
+    test_payload_copy_proof();
+    test_lru_survivors_complete();
+    test_packet_id_wrap_multi_frag();
+    test_reassembled_exactly_65535();
 })

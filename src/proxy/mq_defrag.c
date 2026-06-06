@@ -253,7 +253,10 @@ mq_defrag_feed(mq_defrag_t *d, const mq_udp_msg_hdr_t *h, const uint8_t *p, size
 
     /* Check if all fragments have arrived. */
     if (s->frags_received == s->frag_count) {
-        if (slot_assemble(s, out, out_len) != 0) return -1; /* OOM on final assembly */
+        if (slot_assemble(s, out, out_len) != 0) {
+            slot_reset(s); /* OOM: free all stored frags so slot doesn't get stuck */
+            return -1;
+        }
         return 1;
     }
 
