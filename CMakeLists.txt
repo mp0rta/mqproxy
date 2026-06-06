@@ -426,4 +426,19 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_gateway.sh)
     set_tests_properties(e2e_gateway PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ---- Phase 3 Task 7.1: e2e UDP relay test utilities ----
+    # These are standalone CLI helpers driven by e2e_udp.sh (Task 7.2).
+    # They are NOT registered as ctest tests (no add_test).
+
+    # udp_echo: binds 127.0.0.1:<port>, echoes every datagram back to sender.
+    # No mqproxy dependency — pure POSIX sockets.
+    add_executable(udp_echo tests/integration/udp_echo.c)
+    target_include_directories(udp_echo PRIVATE tests)
+
+    # udpsocks: SOCKS5 UDP ASSOCIATE client; links mqproxy for
+    # mq_socks5_build_udp_hdr / mq_socks5_parse_udp_hdr.
+    add_executable(udpsocks tests/integration/udpsocks.c)
+    target_link_libraries(udpsocks mqproxy)
+    target_include_directories(udpsocks PRIVATE tests src)
 endif()
