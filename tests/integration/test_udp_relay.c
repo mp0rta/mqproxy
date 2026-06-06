@@ -33,6 +33,13 @@
  *      the original session keeps echoing.
  *   9. enabled=0 + datagram → dropped (drops_preauth), pre-OPEN buffer stays
  *      empty (no eviction churn while every OPEN is denied).
+ *   z. (codex gap) zero-length UDP datagram relay: a target→tunnel recv()==0 is
+ *      a valid EMPTY datagram, not EOF — it must be relayed (on_rx len==0), not
+ *      dropped. Pins the mq_udp_session.c recv n==0 fix.
+ *   y. (codex gap) short client-requested idle timeout honored ACROSS activity:
+ *      client requests 150ms idle while server default is 60s; after two activity
+ *      bursts the session must still expire ~150ms after the last one (not at the
+ *      60s default). Pins the srv_idle_rearm per-session-value fix.
  *  10. (d2) pre-OPEN flush double-free: buffer datagrams for TWO distinct unknown
  *      sids, OPEN only one → srv_preopen_flush must MOVE (not shallow-copy) the
  *      surviving sid's entry; teardown runs srv_preopen_free_all over the
@@ -1015,6 +1022,120 @@ test_case10_preopen_flush_double_free(void)
     fixture_down(&f);
 }
 
+/* Case (z): zero-length UDP datagram relay (codex gap). Pins the fix that a
+ * target→tunnel recv() returning 0 is a legitimate EMPTY datagram, not EOF: it
+ * must be relayed, not dropped. We open a client-role session to the echo origin
+ * and send a ZERO-LENGTH payload through the relay; the echo reflects 0 bytes,
+ * the server's recv()==0 path relays it, and on_rx must fire with len==0
+ * (byte-exact empty round-trip). */
+static void
+test_casez_zero_len_datagram(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 60000, 1) != 0) {
+        fixture_down(&f);
+        return;
+    }
+    udp_echo_t echo;
+    uint16_t echo_port = 0;
+    MQ_CHECK_EQ_INT(udp_echo_up(&echo, f.base, &echo_port), 0);
+
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+    MQ_CHECK_EQ_INT(mq_client_udp_available(f.client), 1);
+
+    cli_rx_t cap;
+    memset(&cap, 0, sizeof(cap));
+    void *sess = cli_open_v4(f.client, echo_port, &cap);
+    MQ_CHECK(sess != NULL);
+
+    /* Zero-length datagram: tunnel→target sends 0 bytes to the echo, which
+     * reflects 0 bytes back; the server's target→tunnel recv() returns 0 and the
+     * fixed code relays it as an empty datagram. */
+    uint8_t dummy = 0;
+    mq_client_udp_send_fn()(sess, &dummy, 0);
+
+    pump_until(f.base, &cap.rx_done, 5000);
+    MQ_CHECK(cap.rx_done);              /* an empty datagram was delivered */
+    MQ_CHECK_EQ_INT((int)cap.rxlen, 0); /* byte-exact: 0 bytes round-tripped */
+    MQ_CHECK_EQ_INT(cap.err_fired, 0);
+    /* The echo origin actually saw + reflected the empty datagram. */
+    MQ_CHECK(echo.rx_count >= 1);
+
+    mq_client_udp_close_fn()(sess);
+    udp_echo_down(&echo);
+    fixture_down(&f);
+}
+
+/* Case (y): short CLIENT-requested idle timeout honored ACROSS activity (codex
+ * gap). Pins the srv_idle_rearm fix: the per-session effective idle timeout
+ * (= min(client requested, server default)) must be used on EVERY re-arm, not
+ * just the first. The client requests 150ms while the server default is 60000ms;
+ * after two bursts of activity (each re-arming) and then 250ms of silence the
+ * server must close the session — proving the re-arm used 150ms, not 60s. */
+static void
+test_casey_short_idle_across_activity(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 60000, 1) != 0) { /* server default idle = 60s */
+        fixture_down(&f);
+        return;
+    }
+    udp_echo_t echo;
+    uint16_t echo_port = 0;
+    MQ_CHECK_EQ_INT(udp_echo_up(&echo, f.base, &echo_port), 0);
+
+    mq_conn_t *conn = fixture_authed_conn(&f);
+
+    const uint32_t SID = 0x59595959u;
+    udpstream_t d;
+    memset(&d, 0, sizeof(d));
+    /* Client requests a SHORT 150ms idle timeout (hand-assembled OPEN). */
+    mq_stream_t *s = open_udp_v4(conn, SID, echo_port, 150, &d);
+    MQ_CHECK(s != NULL);
+    pump_until(f.base, &d.resp_seen, 4000);
+    MQ_CHECK(d.resp_seen);
+    MQ_CHECK_EQ_INT((int)d.resp.error_code, (int)MQ_UDP_OK);
+    /* RESP echoes the effective idle = min(150, 60000) = 150. */
+    MQ_CHECK_EQ_INT((int)d.resp.idle_timeout_ms, 150);
+
+    /* Activity burst #1: one datagram → defrag-complete send re-arms the timer. */
+    uint8_t p1[32];
+    for (int i = 0; i < 32; i++)
+        p1[i] = (uint8_t)(i + 1);
+    reset_dgm_capture(SID);
+    MQ_CHECK_EQ_INT(send_tunnel_datagram(conn, SID, 0, p1, sizeof(p1)), 0);
+    pump_until(f.base, &g_dgm_done, 2000);
+    MQ_CHECK(g_dgm_done);
+
+    /* Stay alive across ~80ms (< 150ms) — the session must NOT have expired. */
+    pump_for(f.base, 80);
+    MQ_CHECK_EQ_INT(d.closed, 0);
+
+    /* Activity burst #2: another datagram re-arms the (per-session 150ms) timer.
+     * With the OLD bug the re-arm would use the 60s server default here. */
+    uint8_t p2[32];
+    for (int i = 0; i < 32; i++)
+        p2[i] = (uint8_t)(100 + i);
+    reset_dgm_capture(SID);
+    MQ_CHECK_EQ_INT(send_tunnel_datagram(conn, SID, 1, p2, sizeof(p2)), 0);
+    pump_until(f.base, &g_dgm_done, 2000);
+    MQ_CHECK(g_dgm_done);
+    MQ_CHECK_EQ_INT(d.closed, 0); /* still alive immediately after activity */
+
+    /* Now go silent: the per-session idle timer must fire ~150ms after the last
+     * activity and the server closes the 0x02 stream; the close-notify then
+     * propagates to the client. Measured close latency is ~260ms (150ms idle +
+     * RESET round-trip + loop granularity), so a 400ms window catches it with
+     * margin while staying ORDERS of magnitude below the 60s server default — if
+     * the re-arm had used 60s, no close would arrive in this window. */
+    pump_until(f.base, &d.closed, 400);
+    MQ_CHECK(d.closed);
+
+    udp_echo_down(&echo);
+    fixture_down(&f);
+}
+
 /* Case 5: idle_timeout_ms=100 server, left idle → server closes the stream. */
 static void
 test_case5_idle_timeout(void)
@@ -1166,6 +1287,8 @@ test_udp_relay(void)
     test_case5_idle_timeout();
     test_case4_policy_denied();
     test_case9_disabled_datagram_drop();
+    test_casez_zero_len_datagram();
+    test_casey_short_idle_across_activity();
 }
 
 MQ_TEST_MAIN(test_udp_relay())

@@ -20,6 +20,11 @@
  *      tcp_open call.
  *   4. HTTP CONNECT smoke: a CONNECT line -> assert the mock saw the target and
  *      a 200 arrives.
+ *
+ * UDP ASSOCIATE scenarios (stub UDP relay core) cover establish/free, TCP-close
+ * teardown, mixed shutdown, no-close-after-err, availability sweep, REP 0x07
+ * refusals, and the dst_alloc reclaim sweep after destination churn (the last
+ * pins the codex-found mq_udp_assoc.c dst_alloc dead-entry reclaim fix).
  */
 #include "mqtest.h"
 
@@ -605,6 +610,10 @@ stub_send(void *session, const uint8_t *payload, size_t len)
     }
     if (s->force_err_on_send) {
         ss->errored = 1;
+        /* Per the boundary contract the handle is invalid after on_err: free the
+         * slot so the stub can admit a fresh open() for the next destination.
+         * (errored stays set so post_death_sends still catches any stray send.) */
+        ss->alive = 0;
         if (ss->on_err) ss->on_err(ss, s->forced_err, ss->user);
         return;
     }
@@ -1058,6 +1067,99 @@ test_assoc_refused_unavail(struct event_base *base)
     close(c);
 }
 
+/* ── ASSOCIATE Scenario: dst-entry reclaim after destination churn ───────────
+ * Pins the dst_alloc reclaim sweep (mq_udp_assoc.c dst_alloc): when no free DST
+ * slot exists, dst_alloc must reclaim a dead entry that is immediately
+ * reclaimable (dead && failed_at == 0, i.e. closed via MQ_UDP_CLOSED which is
+ * never negative-cached) instead of returning NULL and dropping the datagram.
+ *
+ * Drive MQ_UDP_ASSOC_MAX_DST (64) DISTINCT destinations through one established
+ * assoc; for each, the stub fires on_err(MQ_UDP_CLOSED) on the first send so the
+ * entry becomes dead with failed_at == 0 (immediately reclaimable). Then drive a
+ * 65th distinct destination and assert open_fn was invoked for it — proving the
+ * sweep reclaimed a dead slot rather than returning NULL. Without the sweep, the
+ * 65th open never happens (open_calls stays at 64). */
+static void
+test_assoc_dst_reclaim_churn(struct event_base *base)
+{
+    struct stub_udp s;
+    memset(&s, 0, sizeof(s));
+    s.force_err_on_send = 1;
+    s.forced_err = MQ_UDP_CLOSED; /* failed_at stays 0 → immediately reclaimable */
+
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, NULL,
+                                              stub_open, stub_send, stub_close, &s);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    uint16_t tport = mq_listener_local_port(l);
+
+    int c = dial(tport);
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        mq_listener_free(l);
+        return;
+    }
+    uint16_t uport = 0;
+    uint8_t rep = 0xff;
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep, NULL), 0);
+    MQ_CHECK_EQ_INT(rep, 0x00);
+    MQ_CHECK(uport != 0);
+
+    int u = udp_dial();
+    MQ_CHECK(u >= 0);
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dst.sin_port = htons(uport);
+
+    /* Fill all 64 DST slots: each distinct destination opens a session, the first
+     * send fires on_err(MQ_UDP_CLOSED) → the entry is marked dead (failed_at==0).
+     * Vary BOTH the DST.ADDR and DST.PORT so every encap header is distinct. */
+    const int MAXDST = 64; /* == MQ_UDP_ASSOC_MAX_DST */
+    uint8_t payload[] = "x";
+    for (int i = 0; i < MAXDST; i++) {
+        uint8_t dgram[64];
+        uint32_t dip = htonl(0x0A000000u + (uint32_t)i); /* 10.0.0.i (distinct addr) */
+        uint16_t dport = (uint16_t)(1000 + i);           /* distinct port too */
+        size_t dlen = build_udp_dgram(dgram, sizeof(dgram), dip, dport, payload,
+                                      sizeof(payload) - 1);
+        MQ_CHECK(dlen > 0);
+        sendto(u, dgram, dlen, 0, (struct sockaddr *)&dst, sizeof(dst));
+        /* Pump until this destination's open + on_err have been processed. */
+        int want = i + 1;
+        uint64_t deadline = now_ms() + 500;
+        while (s.open_calls < want && now_ms() < deadline) {
+            event_base_loop(base, EVLOOP_NONBLOCK);
+        }
+        MQ_CHECK_EQ_INT(s.open_calls, want);
+    }
+    /* All 64 DST entries are now dead-and-immediately-reclaimable. */
+    MQ_CHECK_EQ_INT(s.open_calls, MAXDST);
+
+    /* 65th DISTINCT destination: with no free slot, dst_alloc must reclaim a dead
+     * entry → open_fn is invoked again (open_calls advances to 65). */
+    uint8_t dgram65[64];
+    uint32_t dip65 = htonl(0x0A000000u + (uint32_t)MAXDST); /* 10.0.0.64 */
+    uint16_t dport65 = (uint16_t)(1000 + MAXDST);
+    size_t dlen65 = build_udp_dgram(dgram65, sizeof(dgram65), dip65, dport65, payload,
+                                    sizeof(payload) - 1);
+    MQ_CHECK(dlen65 > 0);
+    sendto(u, dgram65, dlen65, 0, (struct sockaddr *)&dst, sizeof(dst));
+    uint64_t deadline = now_ms() + 1000;
+    while (s.open_calls < MAXDST + 1 && now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    /* The load-bearing assertion: the 65th destination opened a session, proving
+     * dst_alloc reclaimed a dead slot instead of returning NULL/dropping. */
+    MQ_CHECK_EQ_INT(s.open_calls, MAXDST + 1);
+
+    close(u);
+    mq_listener_free(l);
+    MQ_CHECK_EQ_INT(s.post_death_sends, 0);
+    close(c);
+}
+
 static void
 run_all(void)
 {
@@ -1080,6 +1182,7 @@ run_all(void)
     test_assoc_availability_sweep(base); /* (e) */
     test_assoc_refused_no_udp(base);     /* REP 0x07 when no UDP boundary */
     test_assoc_refused_unavail(base);    /* REP 0x07 when availability == 0 */
+    test_assoc_dst_reclaim_churn(base);  /* dst_alloc reclaim sweep (codex gap) */
 
     event_base_free(base);
 }
