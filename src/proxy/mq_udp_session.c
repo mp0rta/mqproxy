@@ -1052,6 +1052,24 @@ mq_udp_srv_dump_stats(mq_udp_srv_t *u)
             u->defrag_drops, u->preopen_evictions, u->drops_preauth);
 }
 
+mq_udp_srv_counters_t
+mq_udp_srv_counters(const mq_udp_srv_t *u)
+{
+    mq_udp_srv_counters_t c;
+    memset(&c, 0, sizeof(c));
+    if (!u) {
+        return c;
+    }
+    c.frags_sent = u->frags_sent;
+    c.frags_reassembled = u->frags_reassembled;
+    c.drops_send_fail = u->drops_send_fail;
+    c.drops_oversize = u->drops_oversize;
+    c.defrag_drops = u->defrag_drops;
+    c.preopen_evictions = u->preopen_evictions;
+    c.drops_preauth = u->drops_preauth;
+    return c;
+}
+
 void
 mq_udp_srv_attach_stream(mq_udp_srv_t *u, mq_stream_t *s, const uint8_t *carry,
                          size_t carry_len)

@@ -83,4 +83,24 @@ void mq_udp_srv_set_authed(mq_udp_srv_t *u, int authed);
  * that e2e captures. */
 void mq_udp_srv_dump_stats(mq_udp_srv_t *u);
 
+/* ── Observability: drop / activity counters (design §9.2) ───────────────────
+ *
+ * A by-value snapshot of the per-connection UDP relay counters. These mirror
+ * the fields dumped by mq_udp_srv_dump_stats and are exposed for programmatic
+ * observation (in-process integration tests, future metrics export) without
+ * scraping the log line. Read on the libevent loop thread; no synchronisation
+ * needed (single-threaded relay). */
+typedef struct {
+    uint32_t frags_sent;        /* frags emitted from multi-frag splits only */
+    uint32_t frags_reassembled; /* completed multi-frag reassemblies */
+    uint32_t drops_send_fail;   /* datagram_send -1, or split/socket send failed */
+    uint32_t drops_oversize;    /* recv'd UDP payload too large to split (>255 frags) */
+    uint32_t defrag_drops;      /* mq_defrag_feed returned -1 */
+    uint32_t preopen_evictions; /* pre-OPEN buffer evictions (cap or byte overflow) */
+    uint32_t drops_preauth;     /* datagrams dropped because !authed or !enabled */
+} mq_udp_srv_counters_t;
+
+/* Snapshot the current counters by value. Returns a zeroed struct if u is NULL. */
+mq_udp_srv_counters_t mq_udp_srv_counters(const mq_udp_srv_t *u);
+
 #endif /* MQ_PROXY_MQ_UDP_SESSION_H */

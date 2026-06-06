@@ -17,6 +17,7 @@
 #ifndef MQ_PROXY_MQ_SERVER_H
 #define MQ_PROXY_MQ_SERVER_H
 
+#include "proxy/mq_udp_session.h" /* mq_udp_srv_t (observability accessor) */
 #include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h" /* mq_cc_t */
 #include "transport/mq_transport.h"
@@ -40,6 +41,15 @@ mq_server_t *mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth
 /* Total number of control-stream auth attempts processed across all
  * connections (test/observability hook). */
 unsigned mq_server_auth_attempts(const mq_server_t *s);
+
+/* Observability accessor: the UDP relay state of the most-recently-accepted
+ * connection (or NULL if none accepted yet / that conn had no UDP state / it
+ * has since closed). Intended for single-connection in-process observation
+ * (integration tests read its counters via mq_udp_srv_counters). With one
+ * client per server instance the "most recent" conn is unambiguous. The pointer
+ * is owned by the connection and dangles after that conn closes — do not retain
+ * it across a conn teardown. */
+mq_udp_srv_t *mq_server_last_udp_srv(const mq_server_t *s);
 
 /* Free the server. Safe on NULL. (Per-conn state is freed as conns close.) */
 void mq_server_free(mq_server_t *s);

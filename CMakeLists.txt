@@ -194,6 +194,25 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_client_server COMMAND test_client_server)
 
+    # UDP relay server-side full-path integration (Task 5.3): real client+server
+    # over loopback UDP + a local UDP echo socket; the test drives 0x02 streams
+    # and DATAGRAM frames directly on the client conn (no client UDP ingress yet).
+    add_executable(test_udp_relay tests/integration/test_udp_relay.c)
+    target_link_libraries(test_udp_relay
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_udp_relay PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_udp_relay PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_udp_relay PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_udp_relay COMMAND test_udp_relay)
+
     add_executable(test_socks5_listener tests/integration/test_socks5_listener.c)
     target_link_libraries(test_socks5_listener
         mqproxy

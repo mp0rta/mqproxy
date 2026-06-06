@@ -107,6 +107,10 @@ struct mq_server_s {
     unsigned auth_attempts;
     uint64_t udp_idle_timeout_ms; /* idle timeout for UDP relay sessions (Chunk 5) */
     int udp_enabled;              /* whether to advertise MQ_FEAT_UDP_RELAY */
+    /* Observability: the UDP relay state of the most-recently-accepted conn.
+     * Set in on_new_conn, cleared when that conn closes. Single-conn observation
+     * hook (see mq_server_last_udp_srv). */
+    mq_udp_srv_t *last_udp;
 };
 
 
@@ -626,6 +630,9 @@ srv_conn_state(mq_conn_t *c, mq_conn_state_t st, void *user)
          * the conn is closing so those streams are gone — mq_udp_srv_free reaps
          * each session's resources (it does NOT touch the dead streams beyond a
          * RESET that the closing conn drops). */
+        if (sc->server->last_udp == sc->udp) {
+            sc->server->last_udp = NULL;
+        }
         mq_udp_srv_free(sc->udp);
         sc->udp = NULL;
         free(sc);
@@ -660,6 +667,7 @@ srv_on_new_conn(mq_conn_t *c, void *user)
      * conn (sc->udp stays NULL ⇒ 0x02 streams get reset). */
     sc->udp = mq_udp_srv_new(c, mq_runtime_base(srv->rt), srv->udp_idle_timeout_ms,
                              srv->udp_enabled);
+    srv->last_udp = sc->udp; /* observability: most-recent conn's UDP relay state */
     mq_conn_set_user(c, sc);
     mq_conn_set_on_state(c, srv_conn_state, sc);
     /* Wire the connection-level DATAGRAM callback so tunnel→target datagrams
@@ -753,6 +761,12 @@ unsigned
 mq_server_auth_attempts(const mq_server_t *s)
 {
     return s ? s->auth_attempts : 0;
+}
+
+mq_udp_srv_t *
+mq_server_last_udp_srv(const mq_server_t *s)
+{
+    return s ? s->last_udp : NULL;
 }
 
 void
