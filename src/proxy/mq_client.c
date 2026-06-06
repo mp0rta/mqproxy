@@ -614,6 +614,10 @@ mq_client_start(mq_client_t *c)
     settings.proto_version = XQC_VERSION_V1;
     settings.pacing_on = 1;
     settings.max_pkt_out_size = 1200;
+    /* Enable QUIC DATAGRAM (Phase 3 UDP relay carrier) on this mqproxy-tcp/1
+     * conn. u16 field; max advertises the largest frame we accept (xquic caps
+     * the effective payload to the path MTU regardless). */
+    settings.max_datagram_frame_size = 65535;
     /* Multipath + aggregate-BDP flow-control windows (see mq_conn.h). */
     mq_conn_apply_mp_settings(&settings, /*is_server=*/0, c->cc);
 

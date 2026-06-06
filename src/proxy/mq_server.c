@@ -672,6 +672,9 @@ mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token, mq_cc
     memset(&settings, 0, sizeof(settings));
     settings.proto_version = XQC_VERSION_V1;
     settings.pacing_on = 1;
+    /* Enable QUIC DATAGRAM (Phase 3 UDP relay carrier) — symmetric with the
+     * client. u16 field (xquic.h). */
+    settings.max_datagram_frame_size = 65535;
     mq_conn_apply_mp_settings(&settings, /*is_server=*/1, cc);
     xqc_server_set_conn_settings(mq_transport_xqc(t), &settings);
 

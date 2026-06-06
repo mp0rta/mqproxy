@@ -192,6 +192,36 @@ void mq_conn_dump_stats_cid(mq_transport_t *t, const xqc_cid_t *cid);
 int mq_conn_path_bytes(const mq_conn_t *c, uint64_t path_id, uint64_t *sent,
                        uint64_t *recv);
 
+/* ── QUIC DATAGRAM (Phase 3: UDP relay) ─────────────────────────────────────
+ *
+ * Thin wrappers over xquic's DATAGRAM API for the UDP-relay carrier. UDP
+ * semantics: no retransmission, no ordering recovery — a lost/dropped datagram
+ * is simply counted and the caller moves on (design §8/§9.2).
+ *
+ * Enabled by settings.max_datagram_frame_size on the mqproxy-tcp/1 conn (both
+ * client and server). The gateway h3 conn does NOT set it and so reports mss==0
+ * (peer-unsupported), which the wrappers below fail closed on. */
+
+/* DATAGRAM frame の受信通知。data は xquic 所有 (callback 中のみ有効) — 必要なら
+ * コピーする。 */
+typedef void (*mq_conn_on_datagram_fn)(mq_conn_t *c, const uint8_t *data, size_t len,
+                                       void *user);
+void mq_conn_set_on_datagram(mq_conn_t *c, mq_conn_on_datagram_fn fn, void *user);
+
+/* 送信。0 = 受理。-1 = drop 相当 (EAGAIN/TOO_LARGE/NOT_SUPPORTED/CLOSING を
+ * まとめる — 呼び出し側はカウンタを進めて継続する。design §9.2)。 */
+int mq_conn_datagram_send(mq_conn_t *c, const uint8_t *data, size_t len);
+
+/* 現在の datagram payload 上限 (QUIC レイヤ)。0 = peer 未対応 / 不明。
+ * MQ_UDP_MSG_HDR を引いた値が UDP payload の実効上限。
+ *
+ * Multipath: xqc_datagram_get_mss は connection-level の dgram_mss
+ * (conn->pkt_out_size ベース) を返すだけで active path の MTU 差を反映しない
+ * (xqc_datagram.c xqc_datagram_record_mss)。そこで active path を列挙し
+ * xqc_datagram_get_mss_on_path の min を取る (path が無ければ conn-level に
+ * フォールバック)。 */
+size_t mq_conn_datagram_mss(const mq_conn_t *c);
+
 /* Send CONNECTION_CLOSE. The mq_conn is freed later via conn_close_notify. */
 void mq_conn_close(mq_conn_t *c);
 

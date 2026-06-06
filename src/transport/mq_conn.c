@@ -67,6 +67,17 @@ struct mq_conn_s {
     mq_conn_on_state_fn on_state;
     void *on_state_user;
 
+    /* DATAGRAM receive hook (Phase 3 UDP relay). Set via
+     * mq_conn_set_on_datagram; dispatched from the dgram_read_notify, which
+     * recovers `this` from the dgram user_data (bound in conn_create_notify). */
+    mq_conn_on_datagram_fn on_datagram;
+    void *on_datagram_user;
+
+    /* DATAGRAM loss/ack counters. UDP semantics: we never retransmit or reorder
+     * — lost/acked notifies only bump these (+ DEBUG log). Observability only. */
+    uint64_t dgram_lost;
+    uint64_t dgram_acked;
+
     void *owner;
 
     /* Multipath: set once xquic fires ready_to_create_path_notify. */
@@ -106,6 +117,10 @@ mq_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_u
         memcpy(&c->cid, (const void *)cid, sizeof(c->cid));
         c->have_cid = 1;
         xqc_conn_set_alp_user_data(conn, c);
+        /* Bind the dgram user_data slot to the mq_conn so the dgram callbacks
+         * recover it. Distinct from alp/transport user_data — does not clobber
+         * either (Phase 2 H3 user_data trap). */
+        xqc_datagram_set_user_data(conn, c);
         return 0;
     }
 
@@ -121,6 +136,8 @@ mq_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_u
     c->have_cid = 1;
 
     xqc_conn_set_alp_user_data(conn, c);
+    /* Bind the dgram user_data slot to the mq_conn (see client path above). */
+    xqc_datagram_set_user_data(conn, c);
     if (actx) {
         actx->active_server_conn = c;
     }
@@ -234,6 +251,63 @@ mq_conn_stream_create_notify(xqc_stream_t *stream, void *strm_user_data)
     return 0;
 }
 
+/* ── ALP datagram callbacks (Phase 3 UDP relay) ─────────────────────────────
+ *
+ * The dgram callbacks receive `user_data` = the dgram_data slot, which is the
+ * mq_conn_t* bound via xqc_datagram_set_user_data in conn_create_notify. This
+ * is a DISTINCT slot from the transport user_data (mq_transport_t*) and the
+ * app-proto user_data (also mq_conn_t* but a different slot) — so binding it
+ * does NOT clobber either (cf. the Phase 2 H3 user_data trap). */
+
+static void
+mq_conn_datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data,
+                             size_t data_len, uint64_t unix_ts)
+{
+    (void)conn;
+    (void)unix_ts;
+    mq_conn_t *c = (mq_conn_t *)user_data;
+    if (c && c->on_datagram) {
+        c->on_datagram(c, (const uint8_t *)data, data_len, c->on_datagram_user);
+    }
+}
+
+/* No-op: the proxy never blocks on the dgram write path (a full send queue is
+ * reported as EAGAIN-drop by mq_conn_datagram_send, and UDP semantics mean we
+ * just drop rather than re-arm a write). */
+static void
+mq_conn_datagram_write_notify(xqc_connection_t *conn, void *user_data)
+{
+    (void)conn;
+    (void)user_data;
+}
+
+/* UDP semantics: never retransmit. Returning 0 tells xquic NOT to retransmit
+ * (XQC_DGRAM_RETX_ASKED_BY_APP would). Count + DEBUG-log only. */
+static xqc_int_t
+mq_conn_datagram_lost_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data)
+{
+    (void)conn;
+    mq_conn_t *c = (mq_conn_t *)user_data;
+    if (c) {
+        c->dgram_lost++;
+        MQ_LOGD("mq_conn: dgram lost: id=%llu total=%llu", (unsigned long long)dgram_id,
+                (unsigned long long)c->dgram_lost);
+    }
+    return 0;
+}
+
+static void
+mq_conn_datagram_acked_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data)
+{
+    (void)conn;
+    mq_conn_t *c = (mq_conn_t *)user_data;
+    if (c) {
+        c->dgram_acked++;
+        MQ_LOGD("mq_conn: dgram acked: id=%llu total=%llu", (unsigned long long)dgram_id,
+                (unsigned long long)c->dgram_acked);
+    }
+}
+
 /* ── ALP registration ───────────────────────────────────────────────────── */
 
 int
@@ -264,6 +338,15 @@ mq_conn_register_alpn(mq_transport_t *t, const char *alpn, mq_conn_on_new_fn on_
     actx->ap_cbs.stream_cbs.stream_write_notify = mq_stream_write_notify;
     actx->ap_cbs.stream_cbs.stream_create_notify = mq_conn_stream_create_notify;
     actx->ap_cbs.stream_cbs.stream_close_notify = mq_stream_close_notify;
+
+    /* DATAGRAM callbacks (Phase 3 UDP relay). Registered unconditionally; a conn
+     * whose peer never negotiates max_datagram_frame_size simply never fires
+     * them. The dgram user_data (mq_conn_t*) is bound per-conn in
+     * conn_create_notify, NOT here. */
+    actx->ap_cbs.dgram_cbs.datagram_read_notify = mq_conn_datagram_read_notify;
+    actx->ap_cbs.dgram_cbs.datagram_write_notify = mq_conn_datagram_write_notify;
+    actx->ap_cbs.dgram_cbs.datagram_lost_notify = mq_conn_datagram_lost_notify;
+    actx->ap_cbs.dgram_cbs.datagram_acked_notify = mq_conn_datagram_acked_notify;
 
     if (xqc_engine_register_alpn(xeng, alpn, strlen(alpn), &actx->ap_cbs, actx) !=
         XQC_OK) {
@@ -680,6 +763,101 @@ mq_conn_open_stream(mq_conn_t *c)
      * defensively so the wrapper is usable and freed via close_notify. */
     mq_stream_bind(s, xs);
     return s;
+}
+
+/* ── QUIC DATAGRAM (Phase 3 UDP relay) ──────────────────────────────────────
+ *
+ * The send/mss wrappers recover the raw xqc_connection_t* afresh on every call
+ * via xqc_engine_get_conn_by_scid (mq_conn keeps only transport + cid). After
+ * the conn closes the lookup returns NULL and the wrappers fail naturally
+ * (send=-1, mss=0) — we lean on that lifetime property rather than tracking
+ * close state separately. */
+
+void
+mq_conn_set_on_datagram(mq_conn_t *c, mq_conn_on_datagram_fn fn, void *user)
+{
+    if (!c) {
+        return;
+    }
+    c->on_datagram = fn;
+    c->on_datagram_user = user;
+}
+
+/* Recover the raw xqc_connection_t* for this conn's scid, or NULL if unknown
+ * (e.g. closed). Shared by the send/mss wrappers. */
+static xqc_connection_t *
+mq_conn_xqc(const mq_conn_t *c)
+{
+    if (!c || !c->have_cid) {
+        return NULL;
+    }
+    xqc_engine_t *xeng = mq_transport_xqc(c->transport);
+    if (!xeng) {
+        return NULL;
+    }
+    return xqc_engine_get_conn_by_scid(xeng, &c->cid);
+}
+
+int
+mq_conn_datagram_send(mq_conn_t *c, const uint8_t *data, size_t len)
+{
+    xqc_connection_t *conn = mq_conn_xqc(c);
+    if (!conn) {
+        return -1;
+    }
+    /* xqc_datagram_send takes void* (non-const) but does not mutate the buffer;
+     * cast away const. qos NORMAL, no dgram_id needed (design §8). Any negative
+     * return (EAGAIN / TOO_LARGE / NOT_SUPPORTED / CLOSING) collapses to -1: the
+     * caller bumps a drop counter and continues (UDP semantics, design §9.2). */
+    xqc_int_t rc =
+        xqc_datagram_send(conn, (void *)(uintptr_t)data, len, NULL, XQC_DATA_QOS_NORMAL);
+    return rc == XQC_OK ? 0 : -1;
+}
+
+size_t
+mq_conn_datagram_mss(const mq_conn_t *c)
+{
+    xqc_connection_t *conn = mq_conn_xqc(c);
+    if (!conn) {
+        return 0;
+    }
+    /* xqc_datagram_get_mss returns the connection-level dgram_mss, computed from
+     * conn->pkt_out_size (the default/primary path MTU) — it does NOT reflect a
+     * per-path MTU min across active paths (xqc_datagram.c
+     * xqc_datagram_record_mss). With multipath, a secondary path with a smaller
+     * path_max_pkt_out_size would let an oversized datagram through the conn-level
+     * check yet be too large for that path. So take the min over active paths via
+     * xqc_datagram_get_mss_on_path; fall back to the conn-level mss if no path is
+     * reported (single-path / pre-validation). */
+    size_t conn_mss = xqc_datagram_get_mss(conn);
+    if (conn_mss == 0) {
+        return 0; /* peer does not support datagram */
+    }
+
+    /* Enumerate active paths via the stats snapshot (same ownership contract as
+     * mq_conn_stats_snapshot). XQC_PATH_STATE_ACTIVE == 2 (mirrors mq_conn.h /
+     * mqvpn; the enum lives in the private xqc_multipath.h). */
+    xqc_conn_stats_t st;
+    if (mq_conn_stats_snapshot(c, &st) != 0) {
+        return conn_mss;
+    }
+    size_t min_mss = conn_mss;
+    int saw_active = 0;
+    for (uint32_t i = 0; st.paths_info && i < st.paths_info_count; i++) {
+        if (st.paths_info[i].path_state != 2 /* XQC_PATH_STATE_ACTIVE */) {
+            continue;
+        }
+        size_t path_mss = xqc_datagram_get_mss_on_path(conn, st.paths_info[i].path_id);
+        if (path_mss == 0) {
+            continue; /* path closing/unknown — skip, don't zero the result */
+        }
+        if (!saw_active || path_mss < min_mss) {
+            min_mss = path_mss;
+            saw_active = 1;
+        }
+    }
+    free(st.paths_info);
+    return min_mss;
 }
 
 void
