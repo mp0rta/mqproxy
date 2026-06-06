@@ -33,6 +33,10 @@
  *      the original session keeps echoing.
  *   9. enabled=0 + datagram → dropped (drops_preauth), pre-OPEN buffer stays
  *      empty (no eviction churn while every OPEN is denied).
+ *  10. (d2) pre-OPEN flush double-free: buffer datagrams for TWO distinct unknown
+ *      sids, OPEN only one → srv_preopen_flush must MOVE (not shallow-copy) the
+ *      surviving sid's entry; teardown runs srv_preopen_free_all over the
+ *      compacted ring. ASan-clean = no double-free (regression pin).
  *
  * Counter access (cases 6/7/9): the server exposes the most-recent conn's UDP
  * relay state via mq_server_last_udp_srv() (observability accessor) and the
@@ -939,6 +943,78 @@ test_case8_dup_sid(void)
     fixture_down(&f);
 }
 
+/* Case 10 (d2): pre-OPEN flush double-free regression. Buffer datagrams for TWO
+ * distinct unknown sids (A=0xAAA1, B=0xBBB2) BEFORE opening either, then OPEN
+ * ONLY A. srv_preopen_flush() drains A's entries and MOVES B's surviving entry
+ * into the compacted ring — it MUST clear the source slot's data pointer so B is
+ * not left double-owned. At teardown srv_preopen_free_all() walks all 16 physical
+ * slots; with the OLD bug (no source-slot clear) B's buffer is freed twice. The
+ * assertion is implicit: under ASan there must be NO double-free / NO leak over
+ * the compaction + free_all path. We also confirm A's buffered datagram was
+ * delivered by the flush (its echo round-trips). B (0xBBB2) is NEVER opened — its
+ * kept entry is freed only at teardown, which is the path under test. All
+ * payloads are < MQ_PREOPEN_MAX_BYTES and the open happens within the 250ms TTL
+ * (pumped non-blocking, no wall sleeps) so the entries survive to the flush. */
+static void
+test_case10_preopen_flush_double_free(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 60000, 1) != 0) {
+        fixture_down(&f);
+        return;
+    }
+    udp_echo_t echo;
+    uint16_t echo_port = 0;
+    MQ_CHECK_EQ_INT(udp_echo_up(&echo, f.base, &echo_port), 0);
+
+    mq_conn_t *conn = fixture_authed_conn(&f);
+
+    const uint32_t SID_A = 0x0000AAA1u; /* opened → flushed */
+    const uint32_t SID_B = 0x0000BBB2u; /* NEVER opened → kept, freed at teardown */
+
+    /* 1) Buffer a datagram for sid A WITHOUT opening it (lands in pre-OPEN buf). */
+    uint8_t payload_a[96];
+    for (int i = 0; i < (int)sizeof(payload_a); i++)
+        payload_a[i] = (uint8_t)((i * 11 + 3) & 0xff);
+    MQ_CHECK_EQ_INT(send_tunnel_datagram(conn, SID_A, 0, payload_a, sizeof(payload_a)),
+                    0);
+    /* Pump briefly (non-blocking, well under the 250ms TTL) so it's buffered. */
+    pump_for(f.base, 30);
+
+    /* 2) Buffer a datagram for the SECOND distinct sid B (also unopened). */
+    uint8_t payload_b[112];
+    for (int i = 0; i < (int)sizeof(payload_b); i++)
+        payload_b[i] = (uint8_t)((i * 29 + 7) & 0xff);
+    MQ_CHECK_EQ_INT(send_tunnel_datagram(conn, SID_B, 0, payload_b, sizeof(payload_b)),
+                    0);
+    pump_for(f.base, 30);
+
+    /* 3) OPEN ONLY sid A. The RESP-OK path runs srv_preopen_flush(A), which drains
+     * A's buffered datagram and MUST move B's entry while clearing the source
+     * slot. We capture A's flushed echo on the datagram channel. */
+    udpstream_t d;
+    memset(&d, 0, sizeof(d));
+    reset_dgm_capture(SID_A);
+    mq_stream_t *s = open_udp_v4(conn, SID_A, echo_port, 0, &d);
+    MQ_CHECK(s != NULL);
+    pump_until(f.base, &d.resp_seen, 4000);
+    MQ_CHECK(d.resp_seen);
+    MQ_CHECK_EQ_INT((int)d.resp.error_code, (int)MQ_UDP_OK);
+
+    /* The flush delivered A's buffered datagram → origin echo round-trips. */
+    pump_until(f.base, &g_dgm_done, 4000);
+    MQ_CHECK(g_dgm_done);
+    MQ_CHECK_EQ_INT((int)g_dgm_rxlen, (int)sizeof(payload_a));
+    if (g_dgm_done) MQ_CHECK_MEM(g_dgm_rx, payload_a, sizeof(payload_a));
+
+    /* 4) Tear down WITHOUT ever opening sid B. fixture_down → mq_server_free →
+     * mq_udp_srv_free → srv_preopen_free_all walks the compacted ring containing
+     * B's kept entry. With the fix this frees B exactly once; the OLD bug
+     * double-frees → ASan abort. */
+    udp_echo_down(&echo);
+    fixture_down(&f);
+}
+
 /* Case 5: idle_timeout_ms=100 server, left idle → server closes the stream. */
 static void
 test_case5_idle_timeout(void)
@@ -1086,6 +1162,7 @@ test_udp_relay(void)
     test_case6_preopen_evict();
     test_case7_preauth_drop_noflush();
     test_case8_dup_sid();
+    test_case10_preopen_flush_double_free();
     test_case5_idle_timeout();
     test_case4_policy_denied();
     test_case9_disabled_datagram_drop();
