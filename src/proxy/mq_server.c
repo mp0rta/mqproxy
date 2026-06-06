@@ -32,6 +32,7 @@
 
 #include "proxy/mq_flow.h"
 #include "proxy/mq_framebuf.h"
+#include "proxy/mq_udp_session.h"
 #include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h"
 #include "transport/mq_stream.h"
@@ -64,6 +65,10 @@ struct mq_srv_conn_s {
 
     /* Intrusive singly-linked list of active data streams / relays. */
     mq_srv_data_t *data_head;
+
+    /* Per-connection UDP relay state (Chunk 5). Created in on_new_conn from the
+     * server's udp settings; owns the session table + 0x02 OPEN handling. */
+    mq_udp_srv_t *udp;
 };
 
 /* Per-data-stream state: one CONNECT_TCP request + its origin fd + relay.
@@ -530,9 +535,32 @@ srv_data_header_readable(mq_stream_t *s, void *user)
         srv_data_dial(d, &req);
 
     } else if (stream_type == MQ_STREAM_TYPE_UDP_SESSION) {
-        /* UDP_SESSION handling: stub (Chunk 5 will implement). */
-        MQ_LOGW("mq_server: UDP_SESSION stream not yet implemented, resetting");
-        mq_stream_close(s);
+        /* UDP_SESSION (0x02): hand the stream to the per-conn UDP relay, which
+         * decodes OPEN → resolves → dials → sends RESP. The client sends the
+         * discriminator + OPEN in one send (mq_client), so mq_framebuf_fill
+         * above already drained the OPEN body out of the stream into d->rx; it
+         * now sits at d->rx.buf + disc_len. Forward it as carry-over so the
+         * relay's framebuf is seeded and a single-send OPEN is not stalled. */
+        mq_srv_conn_t *sc = d->sc;
+        const uint8_t *carry = d->rx.buf + disc_len;
+        size_t carry_len = d->rx.len - (size_t)disc_len;
+
+        /* Detach this node from the data-stream machinery: the UDP relay takes
+         * ownership of the stream. Drop our header callbacks, mark reaped, and
+         * unlink + free the node WITHOUT closing the stream (the relay owns it
+         * now). */
+        mq_stream_set_cbs(s, NULL, NULL, NULL, NULL);
+        d->stream = NULL;
+        d->reaped = 1;
+        srv_data_unlink(d);
+
+        if (sc->udp) {
+            mq_udp_srv_attach_stream(sc->udp, s, carry, carry_len);
+        } else {
+            MQ_LOGW("mq_server: UDP relay disabled (no udp state), resetting");
+            mq_stream_close(s);
+        }
+        free(d);
 
     } else {
         MQ_LOGW("mq_server: unknown stream type 0x%02x, resetting",
@@ -589,6 +617,13 @@ srv_conn_state(mq_conn_t *c, mq_conn_state_t st, void *user)
         while (sc->data_head) {
             srv_data_reap(sc->data_head);
         }
+        /* Tear down all UDP sessions (fd close + event free + defrag free) and
+         * free the per-conn UDP relay state. Sessions hold 0x02 stream pointers;
+         * the conn is closing so those streams are gone — mq_udp_srv_free reaps
+         * each session's resources (it does NOT touch the dead streams beyond a
+         * RESET that the closing conn drops). */
+        mq_udp_srv_free(sc->udp);
+        sc->udp = NULL;
         free(sc);
     }
 }
@@ -605,6 +640,12 @@ srv_on_new_conn(mq_conn_t *c, void *user)
         return;
     }
     sc->server = srv;
+    /* Per-conn UDP relay state (Chunk 5). enabled mirrors !--no-udp; the idle
+     * timeout is the server-configured value (per-session effective = min with
+     * the client's OPEN request). Allocation failure just disables UDP for this
+     * conn (sc->udp stays NULL ⇒ 0x02 streams get reset). */
+    sc->udp = mq_udp_srv_new(c, mq_runtime_base(srv->rt), srv->udp_idle_timeout_ms,
+                             srv->udp_enabled);
     mq_conn_set_user(c, sc);
     mq_conn_set_on_state(c, srv_conn_state, sc);
 }

@@ -17,6 +17,7 @@ add_library(mqproxy STATIC
     src/proxy/mq_defrag.c
     src/proxy/mq_client.c
     src/proxy/mq_server.c
+    src/proxy/mq_udp_session.c
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
     src/ingress/mq_listener.c

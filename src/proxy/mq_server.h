@@ -28,7 +28,9 @@ typedef struct mq_server_s mq_server_t;
  * ALPN + on_new_conn/on_new_stream hooks. The token string is copied.
  *
  * udp_idle_timeout_ms: idle timeout for UDP relay sessions in milliseconds
- *   (stored for Chunk 5 consumption; pass 60000 for the default).
+ *   (stored for Chunk 5 consumption; pass 60000 for the default). A value of 0
+ *   is NOT validated here (the CLI rejects 0 — Task 6.4); passing 0 yields a
+ *   degenerate immediately-expiring idle timer.
  * udp_enabled: if non-zero, advertise MQ_FEAT_UDP_RELAY in AUTH_RESPONSE.features.
  *
  * Returns NULL on bad args / OOM / ALPN registration failure. */
