@@ -696,10 +696,10 @@ srv_udp_readable_cb(evutil_socket_t evfd, short what, void *arg)
             u->drops_send_fail++;
             break;
         }
-        if (n == 0) {
-            break;
-        }
-
+        /* n == 0 is NOT EOF on a connected datagram socket — UDP has no EOF; it
+         * is a legitimate zero-length datagram. Relay it (mq_udp_msg_split emits
+         * one 0-byte frag), so empty UDP probes/keepalives reach the client.
+         * The loop is bounded by MQ_UDP_RECV_LOOP_MAX + the EAGAIN break above. */
         size_t plen = (size_t)n;
 
         /* Get (possibly cached) MSS payload capacity. */
