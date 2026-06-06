@@ -21,4 +21,33 @@ typedef void (*mq_tcp_open_fn)(void *core, const uint8_t *host, size_t host_len,
                                mq_addr_type_t atype, uint16_t port, int local_fd,
                                const uint8_t *prebuf, size_t prebuf_len, void *user,
                                mq_tcp_open_cb cb);
+
+/* UDP session boundary. The ingress layer (mq_udp_assoc) has no knowledge of
+ * xquic; all QUIC interaction is hidden behind these function-pointer hooks.
+ *
+ * open returns a session handle SYNCHRONOUSLY (local allocation only — it does
+ * not wait for auth or RESP). NULL means immediate failure (session limit hit /
+ * negative-cache hit / pre-auth queue full). A non-NULL handle may be passed to
+ * send immediately (optimistic send).
+ * Remote-side failures and terminations (RESP error / stream close / idle
+ * timeout) are reported back via on_err AT MOST ONCE; after that the handle is
+ * invalid (the caller MUST NOT call send or close — close is unnecessary because
+ * the core has already freed the session). Caller-initiated termination uses
+ * close.
+ *
+ * CALLBACK SUPPRESSION CONTRACT — required to prevent use-after-free:
+ *   - After close returns, on_rx and on_err for that session are NEVER called
+ *     again (close completes callback detachment synchronously).
+ *   - The same guarantee holds if close is called re-entrantly during an on_err
+ *     or on_rx dispatch (the core marks the session as closing and suppresses
+ *     all further user callbacks for it).
+ *   - Deferred events that arrive immediately after close (RESP error, idle
+ *     expiry, stream close notify) are silently discarded inside the core. */
+typedef void (*mq_udp_rx_fn)(const uint8_t *payload, size_t len, void *user);
+typedef void (*mq_udp_err_fn)(void *session, mq_udp_err_t err, void *user);
+typedef void *(*mq_udp_open_fn)(void *core, const uint8_t *host, size_t host_len,
+                                mq_addr_type_t atype, uint16_t port, mq_udp_rx_fn on_rx,
+                                mq_udp_err_fn on_err, void *user);
+typedef void (*mq_udp_send_fn)(void *session, const uint8_t *payload, size_t len);
+typedef void (*mq_udp_close_fn)(void *session);
 #endif

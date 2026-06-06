@@ -10,14 +10,18 @@ add_library(mqproxy STATIC
     src/util/mq_buf.c
     src/wire/mq_varint.c
     src/wire/mq_wire.c
+    src/wire/mq_udp_msg.c
     src/proxy/mq_relay.c
     src/proxy/mq_flow.c
     src/proxy/mq_framebuf.c
+    src/proxy/mq_defrag.c
     src/proxy/mq_client.c
     src/proxy/mq_server.c
+    src/proxy/mq_udp_session.c
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
     src/ingress/mq_listener.c
+    src/ingress/mq_udp_assoc.c
     src/gateway/mq_http1.c
     src/gateway/mq_gw_headers.c
     src/gateway/mq_fetch_listener.c
@@ -46,6 +50,11 @@ add_executable(test_wire tests/test_wire.c)
 target_link_libraries(test_wire mqproxy)
 target_include_directories(test_wire PRIVATE tests)
 add_test(NAME test_wire COMMAND test_wire)
+
+add_executable(test_udp_msg tests/test_udp_msg.c)
+target_link_libraries(test_udp_msg mqproxy)
+target_include_directories(test_udp_msg PRIVATE tests)
+add_test(NAME test_udp_msg COMMAND test_udp_msg)
 
 add_executable(test_buf tests/test_buf.c)
 target_link_libraries(test_buf mqproxy)
@@ -76,6 +85,11 @@ add_executable(test_gw_headers tests/test_gw_headers.c)
 target_link_libraries(test_gw_headers mqproxy)
 target_include_directories(test_gw_headers PRIVATE tests)
 add_test(NAME test_gw_headers COMMAND test_gw_headers)
+
+add_executable(test_defrag tests/test_defrag.c)
+target_link_libraries(test_defrag mqproxy)
+target_include_directories(test_defrag PRIVATE tests)
+add_test(NAME test_defrag COMMAND test_defrag)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
@@ -180,6 +194,25 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_client_server PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_client_server COMMAND test_client_server)
+
+    # UDP relay server-side full-path integration (Task 5.3): real client+server
+    # over loopback UDP + a local UDP echo socket; the test drives 0x02 streams
+    # and DATAGRAM frames directly on the client conn (no client UDP ingress yet).
+    add_executable(test_udp_relay tests/integration/test_udp_relay.c)
+    target_link_libraries(test_udp_relay
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_udp_relay PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_udp_relay PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_udp_relay PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_udp_relay COMMAND test_udp_relay)
 
     add_executable(test_socks5_listener tests/integration/test_socks5_listener.c)
     target_link_libraries(test_socks5_listener
@@ -318,6 +351,22 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_qlog_blocked COMMAND test_qlog_blocked)
 
+    add_executable(test_datagram_fabric tests/integration/test_datagram_fabric.c)
+    target_link_libraries(test_datagram_fabric
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_datagram_fabric PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_datagram_fabric PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_datagram_fabric PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_datagram_fabric COMMAND test_datagram_fabric)
+
     # ---- mqproxy CLI (client/server binaries) ----
     # The static library target is also named `mqproxy`; give the executable a
     # distinct target name but emit it as the `mqproxy` binary.
@@ -377,4 +426,40 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_gateway.sh)
     set_tests_properties(e2e_gateway PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ---- Phase 3 Task 7.1: e2e UDP relay test utilities ----
+    # These are standalone CLI helpers driven by e2e_udp.sh (Task 7.2).
+    # They are NOT registered as ctest tests (no add_test).
+
+    # udp_echo: binds 127.0.0.1:<port>, echoes every datagram back to sender.
+    # No mqproxy dependency — pure POSIX sockets.
+    add_executable(udp_echo tests/integration/udp_echo.c)
+    target_include_directories(udp_echo PRIVATE tests)
+
+    # udpsocks: SOCKS5 UDP ASSOCIATE client; links mqproxy for
+    # mq_socks5_build_udp_hdr / mq_socks5_parse_udp_hdr.
+    add_executable(udpsocks tests/integration/udpsocks.c)
+    target_link_libraries(udpsocks mqproxy)
+    target_include_directories(udpsocks PRIVATE tests src)
+
+    # ---- Phase 3 Task 7.2: e2e UDP relay end-to-end scenarios ----
+    # Drives the full UDP relay path against udp_echo using udpsocks:
+    #   case 1: 64-byte byte-exact echo.
+    #   case 2: 3000-byte echo + frags_reassembled > 0 from server stats.
+    #   case 3: two concurrent targets, both byte-exact.
+    #   case 4: idle-timeout 1s expiry → re-OPEN path.
+    #   case 5: kill udpsocks mid-flight → server reaps; health check.
+    #   case 6: (NET_ADMIN) 2-path smoke, both paths carried bytes.
+    # Cases 1-5 run anywhere; case 6 needs tc on lo and is skipped (a note)
+    # without NET_ADMIN. The WHOLE script exits 77 (SKIP) ONLY when required
+    # binaries (mqproxy, udpsocks, udp_echo) or certs are missing.
+    add_test(NAME e2e_udp
+        COMMAND ${CMAKE_COMMAND} -E env
+            MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+            UDPSOCKS_BIN=$<TARGET_FILE:udpsocks>
+            UDPECHO_BIN=$<TARGET_FILE:udp_echo>
+            MQPROXY_CERT=${MQ_CERT_FILE}
+            MQPROXY_KEY=${MQ_KEY_FILE}
+            bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_udp.sh)
+    set_tests_properties(e2e_udp PROPERTIES SKIP_RETURN_CODE 77)
 endif()

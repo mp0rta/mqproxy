@@ -140,7 +140,7 @@ fixture_up(fixture_t *f, const char *client_token)
     f->srv_rt = mq_runtime_new(f->srv_t, f->base);
     MQ_CHECK(f->srv_rt != NULL);
     if (!f->srv_rt) return -1;
-    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2);
+    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2, 60000, 1);
     MQ_CHECK(f->server != NULL);
     if (!f->server) return -1;
 
@@ -556,9 +556,11 @@ open_tcp_data_stream(mq_conn_t *conn, uint16_t port, datastream_t *d)
     req.port = port;
 
     uint8_t buf[512];
-    int n = mq_encode_connect_tcp_req(buf, sizeof(buf), &req);
+    /* Prefix the stream-type discriminator (design §5.2). */
+    buf[0] = (uint8_t)MQ_STREAM_TYPE_CONNECT_TCP;
+    int n = mq_encode_connect_tcp_req(buf + 1, sizeof(buf) - 1, &req);
     if (n < 0) return NULL;
-    (void)mq_stream_send(s, buf, (size_t)n, 0);
+    (void)mq_stream_send(s, buf, (size_t)(1 + n), 0);
     return s;
 }
 
@@ -701,7 +703,8 @@ test_data_stream_preauth_reset(void)
     mq_runtime_t *srv_rt = srv_t ? mq_runtime_new(srv_t, base) : NULL;
     MQ_CHECK(srv_rt != NULL);
     mq_server_t *server =
-        (srv_t && srv_rt) ? mq_server_new(srv_t, srv_rt, "secret", MQ_CC_BBR2) : NULL;
+        (srv_t && srv_rt) ? mq_server_new(srv_t, srv_rt, "secret", MQ_CC_BBR2, 60000, 1)
+                          : NULL;
     MQ_CHECK(server != NULL);
 
     int srv_bound = srv_rt ? mq_runtime_open_udp_path(srv_rt, "127.0.0.1", srv_port) : -1;
@@ -1227,14 +1230,16 @@ test_data_stream_coalesced_payload(void)
         req.host_len = 4;
         req.port = origin_port;
 
-        /* Encode the request and append "ping" so they go out in one write — the
-         * server reads request+payload in a single buffer fill. */
+        /* Encode the request (prefixed with stream-type discriminator) and
+         * append "ping" so they go out in one write — the server reads
+         * discriminator+request+payload in a single buffer fill. */
         uint8_t buf[512];
-        int n = mq_encode_connect_tcp_req(buf, sizeof(buf), &req);
+        buf[0] = (uint8_t)MQ_STREAM_TYPE_CONNECT_TCP;
+        int n = mq_encode_connect_tcp_req(buf + 1, sizeof(buf) - 1, &req);
         MQ_CHECK(n > 0);
-        if (n > 0 && (size_t)n + 4 <= sizeof(buf)) {
-            memcpy(buf + n, "ping", 4);
-            (void)mq_stream_send(s, buf, (size_t)n + 4, 0);
+        if (n > 0 && (size_t)(1 + n) + 4 <= sizeof(buf)) {
+            memcpy(buf + 1 + n, "ping", 4);
+            (void)mq_stream_send(s, buf, (size_t)(1 + n) + 4, 0);
         }
     }
 

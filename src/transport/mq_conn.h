@@ -192,6 +192,39 @@ void mq_conn_dump_stats_cid(mq_transport_t *t, const xqc_cid_t *cid);
 int mq_conn_path_bytes(const mq_conn_t *c, uint64_t path_id, uint64_t *sent,
                        uint64_t *recv);
 
+/* ── QUIC DATAGRAM (Phase 3: UDP relay) ─────────────────────────────────────
+ *
+ * Thin wrappers over xquic's DATAGRAM API for the UDP-relay carrier. UDP
+ * semantics: no retransmission, no ordering recovery — a lost/dropped datagram
+ * is simply counted and the caller moves on (design §8/§9.2).
+ *
+ * Enabled by settings.max_datagram_frame_size on the mqproxy-tcp/1 conn (both
+ * client and server). The gateway h3 conn does NOT set it and so reports mss==0
+ * (peer-unsupported), which the wrappers below fail closed on. */
+
+/* Receive notification for a DATAGRAM frame. data is owned by xquic and is
+ * valid only for the duration of the callback — copy if needed. */
+typedef void (*mq_conn_on_datagram_fn)(mq_conn_t *c, const uint8_t *data, size_t len,
+                                       void *user);
+void mq_conn_set_on_datagram(mq_conn_t *c, mq_conn_on_datagram_fn fn, void *user);
+
+/* Send a DATAGRAM frame. Returns 0 on acceptance, -1 on a drop-equivalent
+ * error (EAGAIN / TOO_LARGE / NOT_SUPPORTED / CLOSING are all collapsed into
+ * -1 — the caller increments its counter and moves on. design §9.2). */
+int mq_conn_datagram_send(mq_conn_t *c, const uint8_t *data, size_t len);
+
+/* Current datagram payload ceiling at the QUIC layer. 0 = peer does not
+ * support datagrams or the MSS is unknown. Subtract MQ_UDP_MSG_HDR to get the
+ * effective UDP payload limit.
+ *
+ * Multipath note: xqc_datagram_get_mss returns only the connection-level
+ * dgram_mss (based on conn->pkt_out_size) and does not reflect per-path MTU
+ * differences (xqc_datagram.c xqc_datagram_record_mss). This wrapper therefore
+ * enumerates active paths and takes the minimum of xqc_datagram_get_mss_on_path
+ * across them, falling back to the connection-level value if no paths are
+ * listed. */
+size_t mq_conn_datagram_mss(const mq_conn_t *c);
+
 /* Send CONNECTION_CLOSE. The mq_conn is freed later via conn_close_notify. */
 void mq_conn_close(mq_conn_t *c);
 

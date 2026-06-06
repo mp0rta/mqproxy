@@ -40,12 +40,14 @@ rc=$?
 for flag in "--server" "--token" "--socks5" "--http-connect" "--gateway" "--path"; do
     echo "$out" | grep -q -- "$flag" || fail "'client --help' output missing '$flag'"
 done
+echo "$out" | grep -q "UDP ASSOCIATE supported" || \
+    fail "'client --help' output missing 'UDP ASSOCIATE supported'"
 
 # ── server --help: exit 0, documents the server flags ─────────────────────────
 out=$("$BIN" server --help 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] || fail "'server --help' exited $rc (want 0)"
-for flag in "--listen" "--token" "--origin-ca" "--no-gateway"; do
+for flag in "--listen" "--token" "--origin-ca" "--no-gateway" "--udp-idle-timeout" "--no-udp"; do
     echo "$out" | grep -q -- "$flag" || fail "'server --help' output missing '$flag'"
 done
 

@@ -168,7 +168,7 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         # A request with a KNOWN Content-Length is forwarded to the origin with
         # Content-Length framing (the gw client re-emits the validated CL over
-        # the tunnel; design §7.1 "再計算"). The genuinely-lengthless path still
+        # the tunnel; design §7.1 "recompute"). The genuinely-lengthless path still
         # uses Transfer-Encoding: chunked, so handle BOTH framings and report
         # which one was seen via the x-framing response header so the harness can
         # assert it. Reply "len=<bytes received>".
@@ -349,7 +349,7 @@ code2="$(curl -s -o "${UP_RESP}" -D "${UP_HDR}" -w '%{http_code}' --max-time 30 
 cmp -s "${BIGFILE}" "${UPLOAD_SAVE}" || fail 2 "origin-saved upload differs from big.bin"
 grep -q '^len=8388608$' "${UP_RESP}" || fail 2 "upload response not 'len=8388608'; got: $(head -c 120 "${UP_RESP}")"
 # The known request Content-Length is re-emitted over the tunnel (design §7.1
-# "再計算"), so the origin must have seen Content-Length framing, NOT chunked.
+# "recompute"), so the origin must have seen Content-Length framing, NOT chunked.
 # The origin records which framing it saw in the x-framing response header.
 grep -qi '^x-framing:[[:space:]]*content-length' "${UP_HDR}" || \
     fail 2 "origin upload framing not content-length; got: $(grep -i x-framing "${UP_HDR}" || echo '<none>')"

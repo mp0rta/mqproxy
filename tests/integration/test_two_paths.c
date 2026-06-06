@@ -131,7 +131,7 @@ fixture_up(fixture_t *f)
     f->srv_rt = mq_runtime_new(f->srv_t, f->base);
     MQ_CHECK(f->srv_rt != NULL);
     if (!f->srv_rt) return -1;
-    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2);
+    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2, 60000, 1);
     MQ_CHECK(f->server != NULL);
     if (!f->server) return -1;
 
@@ -154,8 +154,8 @@ fixture_up(fixture_t *f)
     MQ_CHECK_EQ_INT(mq_client_start(f->client), 0);
 
     void *core = mq_client_tcp_open_core(f->client);
-    f->socks5 =
-        mq_socks5_listener_new(f->base, "127.0.0.1", 0, mq_client_tcp_open_fn(), core);
+    f->socks5 = mq_socks5_listener_new(f->base, "127.0.0.1", 0, mq_client_tcp_open_fn(),
+                                       core, NULL, NULL, NULL, NULL);
     MQ_CHECK(f->socks5 != NULL);
     if (!f->socks5) return -1;
     return 0;

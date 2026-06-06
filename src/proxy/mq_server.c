@@ -32,12 +32,14 @@
 
 #include "proxy/mq_flow.h"
 #include "proxy/mq_framebuf.h"
+#include "proxy/mq_udp_session.h"
 #include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h"
 #include "transport/mq_stream.h"
 #include "transport/mq_transport.h"
 #include "util/mq_ct.h"
 #include "util/mq_log.h"
+#include "wire/mq_varint.h"
 #include "wire/mq_wire.h"
 
 #define MQ_SERVER_ALPN "mqproxy-tcp/1"
@@ -63,6 +65,10 @@ struct mq_srv_conn_s {
 
     /* Intrusive singly-linked list of active data streams / relays. */
     mq_srv_data_t *data_head;
+
+    /* Per-connection UDP relay state (Chunk 5). Created in on_new_conn from the
+     * server's udp settings; owns the session table + 0x02 OPEN handling. */
+    mq_udp_srv_t *udp;
 };
 
 /* Per-data-stream state: one CONNECT_TCP request + its origin fd + relay.
@@ -99,17 +105,23 @@ struct mq_server_s {
     char auth_token[256];
     size_t auth_token_len;
     unsigned auth_attempts;
+    uint64_t udp_idle_timeout_ms; /* idle timeout for UDP relay sessions (Chunk 5) */
+    int udp_enabled;              /* whether to advertise MQ_FEAT_UDP_RELAY */
+    /* Observability: the UDP relay state of the most-recently-accepted conn.
+     * Set in on_new_conn, cleared when that conn closes. Single-conn observation
+     * hook (see mq_server_last_udp_srv). */
+    mq_udp_srv_t *last_udp;
 };
 
 
 static void
-srv_send_resp(mq_stream_t *s, mq_status_t status, mq_auth_err_t err)
+srv_send_resp(mq_stream_t *s, mq_status_t status, mq_auth_err_t err, uint64_t features)
 {
     mq_auth_resp_t resp;
     memset(&resp, 0, sizeof(resp));
     resp.status = status;
     resp.error_code = err;
-    resp.features = 0;
+    resp.features = features;
     snprintf(resp.server_id, sizeof(resp.server_id), "%s", MQ_SERVER_ID);
 
     uint8_t buf[512];
@@ -151,7 +163,7 @@ srv_ctrl_readable(mq_stream_t *s, void *user)
             srv->auth_attempts++;
             sc->auth_done = 1;
             MQ_LOGW("mq_server: AUTH_REQUEST malformed/oversized, rejecting");
-            srv_send_resp(s, MQ_STATUS_ERROR, MQ_AUTH_FAILED);
+            srv_send_resp(s, MQ_STATUS_ERROR, MQ_AUTH_FAILED, 0);
             mq_conn_close((mq_conn_t *)mq_stream_conn(s));
         }
         return; /* otherwise: need more bytes */
@@ -168,10 +180,15 @@ srv_ctrl_readable(mq_stream_t *s, void *user)
 
     if (ok) {
         sc->authed = 1;
-        srv_send_resp(s, MQ_STATUS_OK, MQ_AUTH_OK);
+        /* Open the datagram auth gate so mq_udp_srv_on_datagram accepts frames
+         * for this connection (DATAGRAM frames bypass the 0x02 stream pre-auth
+         * guard — this is the sole auth boundary for inbound datagrams). */
+        mq_udp_srv_set_authed(sc->udp, 1);
+        uint64_t feat = srv->udp_enabled ? MQ_FEAT_UDP_RELAY : 0;
+        srv_send_resp(s, MQ_STATUS_OK, MQ_AUTH_OK, feat);
         MQ_LOGI("mq_server: auth OK for client_id='%s'", req.client_id);
     } else {
-        srv_send_resp(s, MQ_STATUS_ERROR, MQ_AUTH_FAILED);
+        srv_send_resp(s, MQ_STATUS_ERROR, MQ_AUTH_FAILED, 0);
         MQ_LOGW("mq_server: auth FAILED for client_id='%s'", req.client_id);
         mq_conn_close((mq_conn_t *)mq_stream_conn(s));
     }
@@ -375,7 +392,7 @@ srv_connect_done_cb(evutil_socket_t fd, short what, void *arg)
 }
 
 /* Resolve the CONNECT_TCP target into a sockaddr. Returns 0 on success and
- * fills *ss/*sslen; on failure returns -1 and sets *err. */
+ * fills *ss / *sslen; on failure returns -1 and sets *err. */
 static int
 srv_resolve_target(const mq_connect_tcp_req_t *req, struct sockaddr_storage *ss,
                    socklen_t *sslen, mq_tcp_err_t *err)
@@ -481,7 +498,14 @@ srv_data_dial(mq_srv_data_t *d, const mq_connect_tcp_req_t *req)
     event_add(d->connect_ev, NULL);
 }
 
-/* Data stream readable while still buffering the CONNECT_TCP_REQUEST header. */
+/* Data stream readable while still buffering the CONNECT_TCP_REQUEST header.
+ *
+ * Wire layout (design §5.2):
+ *   [discriminator varint] [request frame...]
+ *
+ * The discriminator is decoded on every retry together with the request frame
+ * (cheap: always 1 byte for currently-defined values).  This avoids any extra
+ * per-stream state to track "discriminator already consumed". */
 static void
 srv_data_header_readable(mq_stream_t *s, void *user)
 {
@@ -489,22 +513,68 @@ srv_data_header_readable(mq_stream_t *s, void *user)
 
     mq_framebuf_fill(s, &d->rx, NULL);
 
-    mq_connect_tcp_req_t req;
-    int consumed = mq_decode_connect_tcp_req(d->rx.buf, d->rx.len, &req);
-    if (consumed < 0) {
+    /* Step 1: decode the stream-type discriminator. */
+    uint64_t stream_type = 0;
+    int disc_len = mq_varint_decode(d->rx.buf, d->rx.len, &stream_type);
+    if (disc_len < 0) {
+        /* Not even 1 byte yet (or buffer overflow without a discriminator). */
         if (d->rx.len >= sizeof(d->rx.buf)) {
-            MQ_LOGW("mq_server: CONNECT_TCP_REQUEST malformed/oversized, resetting");
+            MQ_LOGW("mq_server: data stream header malformed/oversized, resetting");
             srv_data_reap(d);
         }
-        return; /* otherwise need more bytes */
+        return; /* need more bytes */
     }
 
-    /* Header complete. Record how much of rx.buf the request occupied: any bytes
-     * the client sent PAST the request were already pulled into rx.buf by the
-     * fill above, so they must be handed to the flow's prebuffer at relay start
-     * (else they are lost — the relay reads fresh from the stream). Then dial. */
-    d->hdr_consumed = (size_t)consumed;
-    srv_data_dial(d, &req);
+    /* Step 2: dispatch on stream type. */
+    if (stream_type == MQ_STREAM_TYPE_CONNECT_TCP) {
+        mq_connect_tcp_req_t req;
+        int consumed = mq_decode_connect_tcp_req(d->rx.buf + disc_len,
+                                                 d->rx.len - (size_t)disc_len, &req);
+        if (consumed < 0) {
+            if (d->rx.len >= sizeof(d->rx.buf)) {
+                MQ_LOGW("mq_server: CONNECT_TCP_REQUEST malformed/oversized, resetting");
+                srv_data_reap(d);
+            }
+            return; /* need more bytes */
+        }
+
+        /* Header complete. hdr_consumed accounts for discriminator + request. */
+        d->hdr_consumed = (size_t)disc_len + (size_t)consumed;
+        srv_data_dial(d, &req);
+
+    } else if (stream_type == MQ_STREAM_TYPE_UDP_SESSION) {
+        /* UDP_SESSION (0x02): hand the stream to the per-conn UDP relay, which
+         * decodes OPEN → resolves → dials → sends RESP. The client sends the
+         * discriminator + OPEN in one send (mq_client), so mq_framebuf_fill
+         * above already drained the OPEN body out of the stream into d->rx; it
+         * now sits at d->rx.buf + disc_len. Forward it as carry-over so the
+         * relay's framebuf is seeded and a single-send OPEN is not stalled. */
+        mq_srv_conn_t *sc = d->sc;
+        const uint8_t *carry = d->rx.buf + disc_len;
+        size_t carry_len = d->rx.len - (size_t)disc_len;
+
+        /* Detach this node from the data-stream machinery: the UDP relay takes
+         * ownership of the stream. Drop our header callbacks, mark reaped, and
+         * unlink + free the node WITHOUT closing the stream (the relay owns it
+         * now). */
+        mq_stream_set_cbs(s, NULL, NULL, NULL, NULL);
+        d->stream = NULL;
+        d->reaped = 1;
+        srv_data_unlink(d);
+
+        if (sc->udp) {
+            mq_udp_srv_attach_stream(sc->udp, s, carry, carry_len);
+        } else {
+            MQ_LOGW("mq_server: UDP relay disabled (no udp state), resetting");
+            mq_stream_close(s);
+        }
+        free(d);
+
+    } else {
+        MQ_LOGW("mq_server: unknown stream type 0x%02x, resetting",
+                (unsigned)stream_type);
+        mq_stream_close(s);
+    }
 }
 
 /* Header-phase stream close: the stream closed before the relay started (no
@@ -555,8 +625,28 @@ srv_conn_state(mq_conn_t *c, mq_conn_state_t st, void *user)
         while (sc->data_head) {
             srv_data_reap(sc->data_head);
         }
+        /* Tear down all UDP sessions (fd close + event free + defrag free) and
+         * free the per-conn UDP relay state. Sessions hold 0x02 stream pointers;
+         * the conn is closing so those streams are gone — mq_udp_srv_free reaps
+         * each session's resources (it does NOT touch the dead streams beyond a
+         * RESET that the closing conn drops). */
+        if (sc->server->last_udp == sc->udp) {
+            sc->server->last_udp = NULL;
+        }
+        mq_udp_srv_free(sc->udp);
+        sc->udp = NULL;
         free(sc);
     }
+}
+
+/* Datagram callback trampoline: adapts mq_conn_on_datagram_fn (which carries
+ * the mq_conn_t* and a void* user) to mq_udp_srv_on_datagram (which takes the
+ * mq_udp_srv_t* as its first arg and has no conn pointer). */
+static void
+srv_on_datagram_cb(mq_conn_t *c, const uint8_t *data, size_t len, void *user)
+{
+    (void)c;
+    mq_udp_srv_on_datagram((mq_udp_srv_t *)user, data, len);
 }
 
 /* on_new_conn: allocate per-conn state, attach it to the conn owner slot. */
@@ -571,8 +661,22 @@ srv_on_new_conn(mq_conn_t *c, void *user)
         return;
     }
     sc->server = srv;
+    /* Per-conn UDP relay state (Chunk 5). enabled mirrors !--no-udp; the idle
+     * timeout is the server-configured value (per-session effective = min with
+     * the client's OPEN request). Allocation failure just disables UDP for this
+     * conn (sc->udp stays NULL ⇒ 0x02 streams get reset). */
+    sc->udp = mq_udp_srv_new(c, mq_runtime_base(srv->rt), srv->udp_idle_timeout_ms,
+                             srv->udp_enabled);
+    srv->last_udp = sc->udp; /* observability: most-recent conn's UDP relay state */
     mq_conn_set_user(c, sc);
     mq_conn_set_on_state(c, srv_conn_state, sc);
+    /* Wire the connection-level DATAGRAM callback so tunnel→target datagrams
+     * are dispatched to the UDP relay.  The auth gate inside
+     * mq_udp_srv_on_datagram drops all frames until mq_udp_srv_set_authed(1).
+     * If sc->udp is NULL (OOM) the callback is not registered (safe no-op). */
+    if (sc->udp) {
+        mq_conn_set_on_datagram(c, srv_on_datagram_cb, sc->udp);
+    }
 }
 
 /* on_new_stream: the FIRST stream on a connection is the control stream. */
@@ -612,7 +716,8 @@ srv_on_new_stream(mq_stream_t *s, void *user)
 }
 
 mq_server_t *
-mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token, mq_cc_t cc)
+mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token, mq_cc_t cc,
+              uint64_t udp_idle_timeout_ms, int udp_enabled)
 {
     if (!t || !rt || !auth_token) {
         return NULL;
@@ -625,6 +730,8 @@ mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token, mq_cc
     s->rt = rt;
     snprintf(s->auth_token, sizeof(s->auth_token), "%s", auth_token);
     s->auth_token_len = strnlen(s->auth_token, sizeof(s->auth_token));
+    s->udp_idle_timeout_ms = udp_idle_timeout_ms;
+    s->udp_enabled = udp_enabled;
 
     if (mq_conn_register_alpn(t, MQ_SERVER_ALPN, srv_on_new_conn, srv_on_new_stream, s) !=
         0) {
@@ -641,6 +748,9 @@ mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token, mq_cc
     memset(&settings, 0, sizeof(settings));
     settings.proto_version = XQC_VERSION_V1;
     settings.pacing_on = 1;
+    /* Enable QUIC DATAGRAM (Phase 3 UDP relay carrier) — symmetric with the
+     * client. u16 field (xquic.h). */
+    settings.max_datagram_frame_size = 65535;
     mq_conn_apply_mp_settings(&settings, /*is_server=*/1, cc);
     xqc_server_set_conn_settings(mq_transport_xqc(t), &settings);
 
@@ -651,6 +761,12 @@ unsigned
 mq_server_auth_attempts(const mq_server_t *s)
 {
     return s ? s->auth_attempts : 0;
+}
+
+mq_udp_srv_t *
+mq_server_last_udp_srv(const mq_server_t *s)
+{
+    return s ? s->last_udp : NULL;
 }
 
 void

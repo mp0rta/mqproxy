@@ -90,6 +90,7 @@ usage_server(FILE *out)
     fprintf(out, "Usage: mqproxy server --listen <ip:port> --token <token>\n"
                  "                      [--cert <path>] [--key <path>]\n"
                  "                      [--origin-ca <pem>] [--no-gateway]\n"
+                 "                      [--udp-idle-timeout <sec>] [--no-udp]\n"
                  "\n"
                  "Options:\n"
                  "  --listen <ip:port>  UDP address to accept MPQUIC connections on "
@@ -108,6 +109,11 @@ usage_server(FILE *out)
                  "(enabled by\n"
                  "                      default; the server still serves the TCP-proxy "
                  "core).\n"
+                 "  --udp-idle-timeout <sec>\n"
+                 "                      Idle timeout for UDP relay sessions in seconds\n"
+                 "                      (default: 60; must be > 0).\n"
+                 "  --no-udp            Disable UDP relay (do not advertise "
+                 "MQ_FEAT_UDP_RELAY).\n"
                  "  --qlog   <dir>      Write xquic qlog (EXTRA importance) to "
                  "<dir>/server.qlog.\n"
                  "  --cc     <algo>     Congestion control: bbr (default) | bbr2 | "
@@ -131,7 +137,8 @@ usage_client(FILE *out)
             "  --server       <ip:port>   UDP address of the mqproxy server "
             "(required).\n"
             "  --token        <token>     Shared auth token (required).\n"
-            "  --socks5       <ip:port>   Local TCP address for the SOCKS5 ingress.\n"
+            "  --socks5       <ip:port>   Local TCP address for the SOCKS5 ingress\n"
+            "                             (UDP ASSOCIATE supported).\n"
             "  --http-connect <ip:port>   Local TCP address for the HTTP CONNECT "
             "ingress.\n"
             "  --gateway      <ip:port>   Local TCP address for the HTTP gateway "
@@ -274,7 +281,9 @@ cmd_server(int argc, char **argv)
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
     mq_cc_t cc = MQ_CC_DEFAULT;
-    int gateway_enabled = 1; /* gateway on by default; --no-gateway opts out */
+    int gateway_enabled = 1;      /* gateway on by default; --no-gateway opts out */
+    long udp_idle_timeout_s = 60; /* --udp-idle-timeout <sec>, default 60 */
+    int udp_enabled = 1;          /* --no-udp clears this */
 
     enum {
         OPT_LISTEN = 256,
@@ -283,6 +292,8 @@ cmd_server(int argc, char **argv)
         OPT_KEY,
         OPT_ORIGIN_CA,
         OPT_NO_GATEWAY,
+        OPT_UDP_IDLE_TIMEOUT,
+        OPT_NO_UDP,
         OPT_QLOG,
         OPT_CC,
     };
@@ -293,6 +304,8 @@ cmd_server(int argc, char **argv)
         {"key", required_argument, NULL, OPT_KEY},
         {"origin-ca", required_argument, NULL, OPT_ORIGIN_CA},
         {"no-gateway", no_argument, NULL, OPT_NO_GATEWAY},
+        {"udp-idle-timeout", required_argument, NULL, OPT_UDP_IDLE_TIMEOUT},
+        {"no-udp", no_argument, NULL, OPT_NO_UDP},
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
         {"help", no_argument, NULL, 'h'},
@@ -309,6 +322,22 @@ cmd_server(int argc, char **argv)
         case OPT_KEY: key = optarg; break;
         case OPT_ORIGIN_CA: origin_ca = optarg; break;
         case OPT_NO_GATEWAY: gateway_enabled = 0; break;
+        case OPT_UDP_IDLE_TIMEOUT: {
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(optarg, &endp, 10);
+            if (errno != 0 || endp == optarg || *endp != '\0' || v <= 0) {
+                fprintf(
+                    stderr,
+                    "mqproxy server: invalid --udp-idle-timeout '%s' (must be > 0)\n\n",
+                    optarg);
+                usage_server(stderr);
+                return 2;
+            }
+            udp_idle_timeout_s = v;
+            break;
+        }
+        case OPT_NO_UDP: udp_enabled = 0; break;
         case OPT_QLOG: qlog_dir = optarg; break;
         case OPT_CC: cc_name = optarg; break;
         case 'h': usage_server(stdout); return 0;
@@ -390,7 +419,8 @@ cmd_server(int argc, char **argv)
         MQ_LOGE("failed to bind listen path %s:%u", listen_ip, listen_port);
         goto out;
     }
-    server = mq_server_new(transport, rt, token, cc);
+    server = mq_server_new(transport, rt, token, cc, (uint64_t)udp_idle_timeout_s * 1000u,
+                           udp_enabled);
     if (!server) {
         MQ_LOGE("failed to create server");
         goto out;
@@ -416,8 +446,10 @@ cmd_server(int argc, char **argv)
         goto out;
     }
 
-    MQ_LOGI("mqproxy server listening on %s:%u (cc=%s, gateway=%s)", listen_ip,
-            listen_port, mq_cc_name(cc), gateway_enabled ? "on" : "off");
+    MQ_LOGI(
+        "mqproxy server listening on %s:%u (cc=%s, gateway=%s, udp=%s, udp-idle=%lds)",
+        listen_ip, listen_port, mq_cc_name(cc), gateway_enabled ? "on" : "off",
+        udp_enabled ? "on" : "off", udp_idle_timeout_s);
     mq_runtime_run(rt);
     rc = 0;
 
@@ -473,6 +505,29 @@ out:
 }
 
 /* ── client subcommand ──────────────────────────────────────────────────────*/
+
+/* Context for the on_auth callback: carries the SOCKS5 listener handle so the
+ * callback can drive the UDP-availability tri-state after auth settles.
+ * socks5_l may be NULL (HTTP-only client); mq_listener_set_udp_availability
+ * is a no-op on NULL, so the glue is always safe to call. */
+struct client_auth_ctx {
+    mq_client_t *client;
+    mq_listener_t *socks5_l;
+};
+
+/* Called once by mq_client when the AUTH_RESPONSE arrives.  Drives the SOCKS5
+ * listener's UDP-availability tri-state (Task 6.3 supply point):
+ *   ok=1  → mq_client_udp_available() — 1 if server advertised the feature AND
+ *            datagram mss > 0, else 0.
+ *   ok=0  → 0 (auth failed; sweep any pre-auth ASSOCIATE sessions). */
+static void
+client_on_auth(int ok, mq_auth_err_t err, void *user)
+{
+    struct client_auth_ctx *ctx = (struct client_auth_ctx *)user;
+    (void)err;
+    int avail = ok ? mq_client_udp_available(ctx->client) : 0;
+    mq_listener_set_udp_availability(ctx->socks5_l, avail);
+}
 
 static int
 cmd_client(int argc, char **argv)
@@ -619,6 +674,7 @@ cmd_client(int argc, char **argv)
     mq_gw_client_t *gwc = NULL;
     mq_fetch_listener_t *fetch_l = NULL;
     struct event *sint = NULL, *sterm = NULL;
+    struct client_auth_ctx auth_ctx = {NULL, NULL};
 
     base = event_base_new();
     if (!base) {
@@ -682,8 +738,15 @@ cmd_client(int argc, char **argv)
         void *open_core = mq_client_tcp_open_core(client);
 
         if (socks5) {
-            socks5_l =
-                mq_socks5_listener_new(base, socks5_ip, socks5_port, open_fn, open_core);
+            /* SOCKS5 listener also services CMD UDP ASSOCIATE via the UDP relay
+             * boundary (mq_ingress.h). The UDP `core` is the relay table
+             * (mq_udp_cli_t*), distinct from the TCP `core` (mq_client_t*). The
+             * availability tri-state stays at its -1 default until the on_auth
+             * glue (Task 6.4) calls mq_listener_set_udp_availability. */
+            socks5_l = mq_socks5_listener_new(
+                base, socks5_ip, socks5_port, open_fn, open_core, mq_client_udp_open_fn(),
+                mq_client_udp_send_fn(), mq_client_udp_close_fn(),
+                mq_client_udp_open_core(client));
             if (!socks5_l) {
                 MQ_LOGE("failed to bind SOCKS5 listener on %s:%u", socks5_ip,
                         socks5_port);
@@ -691,14 +754,24 @@ cmd_client(int argc, char **argv)
             }
         }
         if (http_connect) {
+            /* HTTP CONNECT has no ASSOCIATE; pass the udp quad NULL. */
             http_l = mq_http_connect_listener_new(base, http_ip, http_port, open_fn,
-                                                  open_core);
+                                                  open_core, NULL, NULL, NULL, NULL);
             if (!http_l) {
                 MQ_LOGE("failed to bind HTTP CONNECT listener on %s:%u", http_ip,
                         http_port);
                 goto out;
             }
         }
+
+        /* Wire the auth-result callback: on auth settle, propagate the UDP
+         * relay availability tri-state to the SOCKS5 listener so it can
+         * admit or sweep ASSOCIATE sessions (Task 6.3 supply point).
+         * socks5_l may be NULL here (HTTP-only client) — that is safe because
+         * mq_listener_set_udp_availability(NULL, ...) is a no-op. */
+        auth_ctx.client = client;
+        auth_ctx.socks5_l = socks5_l;
+        mq_client_set_on_auth(client, client_on_auth, &auth_ctx);
     }
 
     /* HTTP gateway ingress (--gateway): an independent H3 tunnel to the same
@@ -797,6 +870,17 @@ out:
      *       - The transport's send_udp cb (the runtime, as cbs.user) may also
      *         fire during engine destroy (final CONNECTION_CLOSE), so the runtime
      *         must outlive mq_transport_free too.
+     *       - UDP ASSOCIATE (mq_udp_assoc, owned by the SOCKS5 listener's active
+     *         list) rides the SAME graph-A ordering. Three teardown paths:
+     *           1. TCP control-fd EOF → the assoc tears itself down (close_fn on
+     *              every live relay session) and self-removes from the list.
+     *           2. mq_transport_free (runs FIRST) → conn destroy → every live UDP
+     *              relay session's on_err lands on the still-live assoc, which
+     *              marks the DST entry dead (and, per the boundary contract, will
+     *              NOT call close_fn on a handle after on_err).
+     *           3. mq_listener_free (LAST) → reaps any surviving assoc shells
+     *              (UDP fd / TCP fd / events); their sessions are already dead
+     *              from path 2, so close_fn is a no-op. Order is unchanged.
      *
      * (B) HTTP-gateway ingress (mq_gw_client + mq_h3 + fetch listener) — the
      *     SANCTIONED order is the REVERSE: mq_gw_client_free must run while the

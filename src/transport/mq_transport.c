@@ -133,7 +133,11 @@ mq_transport_qlog_write(qlog_event_importance_t imp, const void *buf, size_t siz
         return;
     }
     static const char nl = '\n';
-    (void)write(t->qlog_fd, &nl, 1);
+    /* glibc marks write() warn_unused_result; a bare (void) cast does not
+     * silence it under -Werror. qlog is best-effort, so ignore via a named
+     * sink the same way as the payload write above. */
+    ssize_t w2 = write(t->qlog_fd, &nl, 1);
+    (void)w2;
 }
 
 /* Multipath send callback. Route the outbound packet through the runtime's
