@@ -1101,7 +1101,9 @@ mq_udp_srv_on_datagram(mq_udp_srv_t *u, const uint8_t *data, size_t len)
     /* Decode the 9-byte header. */
     mq_udp_msg_hdr_t hdr;
     if (mq_udp_msg_decode_hdr(data, len, &hdr) != 0) {
-        u->drops_preauth++; /* malformed — count as pre-auth since no sid */
+        /* Malformed framing: no session to attribute and §9.2 defines no
+         * counter for structurally unparseable input → silent drop per the
+         * §9.2 invalid-input pattern. */
         return;
     }
 
