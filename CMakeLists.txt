@@ -441,4 +441,25 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     add_executable(udpsocks tests/integration/udpsocks.c)
     target_link_libraries(udpsocks mqproxy)
     target_include_directories(udpsocks PRIVATE tests src)
+
+    # ---- Phase 3 Task 7.2: e2e UDP relay end-to-end scenarios ----
+    # Drives the full UDP relay path against udp_echo using udpsocks:
+    #   case 1: 64-byte byte-exact echo.
+    #   case 2: 3000-byte echo + frags_reassembled > 0 from server stats.
+    #   case 3: two concurrent targets, both byte-exact.
+    #   case 4: idle-timeout 1s expiry → re-OPEN path.
+    #   case 5: kill udpsocks mid-flight → server reaps; health check.
+    #   case 6: (NET_ADMIN) 2-path smoke, both paths carried bytes.
+    # Cases 1-5 run anywhere; case 6 needs tc on lo and is skipped (a note)
+    # without NET_ADMIN. The WHOLE script exits 77 (SKIP) ONLY when required
+    # binaries (mqproxy, udpsocks, udp_echo) or certs are missing.
+    add_test(NAME e2e_udp
+        COMMAND ${CMAKE_COMMAND} -E env
+            MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+            UDPSOCKS_BIN=$<TARGET_FILE:udpsocks>
+            UDPECHO_BIN=$<TARGET_FILE:udp_echo>
+            MQPROXY_CERT=${MQ_CERT_FILE}
+            MQPROXY_KEY=${MQ_KEY_FILE}
+            bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_udp.sh)
+    set_tests_properties(e2e_udp PROPERTIES SKIP_RETURN_CODE 77)
 endif()

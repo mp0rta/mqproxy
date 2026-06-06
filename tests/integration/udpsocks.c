@@ -431,7 +431,7 @@ main(int argc, char **argv)
 
     /* ── SOCKS5 ASSOCIATE request (CMD=0x03, DST=0.0.0.0:0) ────────────────*/
     {
-        /* VER RSV CMD RSV ATYP IPv4(0.0.0.0) PORT(0) */
+        /* VER CMD RSV ATYP IPv4(0.0.0.0) PORT(0) */
         uint8_t assoc_req[] = {0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
         if (write_all(tcp_fd, assoc_req, sizeof(assoc_req)) != 0) {
             fprintf(stderr, "udpsocks: send ASSOCIATE request failed\n");
