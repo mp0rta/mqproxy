@@ -319,10 +319,16 @@ ok 3 "two concurrent targets (ports ${ECHO_PORT_1} + ${ECHO_PORT_2}), both byte-
 # then kill -9 it after a brief pause. The TCP EOF tells the client, which
 # closes the session. Then assert the server is still healthy by running a
 # fresh udpsocks invocation that must succeed.
+
+# Snapshot BEFORE launching so earlier cases' closed-session lines are excluded.
+C5_PRE=$(grep -c 'mq_udp_srv: session .* closed' "${WORK}/server_a.log" 2>/dev/null || true)
+
+# Use --count 20000 so the process is still running when we kill it (~2s at
+# observed throughput; 0.5s sleep is well inside that window).
 "${UDPSOCKS_BIN}" \
     --proxy "127.0.0.1:${SOCKS_PORT_A}" \
     --target "127.0.0.1:${ECHO_PORT_1}" \
-    --send 64 --count 1000 --timeout-ms 5000 \
+    --send 64 --count 20000 --timeout-ms 30000 \
     >/dev/null 2>"${WORK}/c5_bg.err" &
 C5_BG_PID=$!
 
@@ -333,24 +339,20 @@ sleep 0.5
 kill -9 "${C5_BG_PID}" 2>/dev/null
 wait "${C5_BG_PID}" 2>/dev/null || true
 
-# Give the server time to detect the TCP EOF and reap the session.
-sleep 0.5
-
-# Assert server-side session cleanup: mq_udp_srv logs
-#   "mq_udp_srv: session <N> closed"
-# at INFO level (default) from srv_reap_session on stream close / idle expiry /
-# conn teardown. Wait up to 1 s for the line to appear (srv_reap_session fires
-# on the TCP-EOF close-notify, which may be one event-loop tick after the kill).
+# Poll up to ~2 s for the count to EXCEED $C5_PRE (the kill-induced reap).
+# srv_reap_session fires on the TCP-EOF close-notify, which may be one
+# event-loop tick after the kill.
 C5_REAP_SEEN=0
-for _ in $(seq 1 10); do
-    if grep -q 'mq_udp_srv: session .* closed' "${WORK}/server_a.log" 2>/dev/null; then
+for _ in $(seq 1 20); do
+    C5_NOW=$(grep -c 'mq_udp_srv: session .* closed' "${WORK}/server_a.log" 2>/dev/null || true)
+    if [ "${C5_NOW}" -gt "${C5_PRE}" ]; then
         C5_REAP_SEEN=1
         break
     fi
     sleep 0.1
 done
 if [ "${C5_REAP_SEEN}" -ne 1 ]; then
-    fail 5 "no 'mq_udp_srv: session N closed' in server_a.log after udpsocks kill; log tail: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
+    fail 5 "kill-induced reap not seen: 'mq_udp_srv: session N closed' count did not increase (pre=${C5_PRE}) after udpsocks kill; log tail: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
 fi
 
 # Server health check: a fresh udpsocks invocation must succeed.
