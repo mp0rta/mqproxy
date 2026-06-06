@@ -227,7 +227,25 @@ mq_defrag_feed(mq_defrag_t *d, const mq_udp_msg_hdr_t *h, const uint8_t *p, size
         if (!s) return -1; /* OOM */
     }
 
-    /* Duplicate check: if the bit is already set, ignore silently. */
+    /* Duplicate check: if the bit is already set, ignore silently.
+     *
+     * KNOWN LIMITATION (packet_id wrap): identity is the 16-bit packet_id only.
+     * If a sender leaves a fragment incomplete in a slot, that slot survives
+     * until LRU-evicted by 4 other *multi-frag* packet_ids (single-frag packets
+     * are passthrough and never touch slots). If the sender's packet_id counter
+     * wraps (65536 packets) before that happens AND a new fragmented packet
+     * reuses the stale slot's packet_id with the same frag_count, a fresh frag
+     * could be mistaken for a duplicate, mixing stale + fresh data on assembly.
+     * A length compare here would NOT help (frag 0 of any multi-frag packet is
+     * exactly mss_payload bytes, so lengths match). A robust fix needs a wire
+     * generation/nonce (the reserved `flags` byte) — deferred. Impact is bounded:
+     * client->server it is self-inflicted (a hostile client can only garble its
+     * own UDP, gaining nothing over just sending different bytes); server->client
+     * packet_id is mqproxy-assigned and not peer-controlled; and for honest
+     * traffic the LRU + the joint precondition (near-zero intervening
+     * fragmentation across a full 65536-packet wrap + exact id+frag_count match)
+     * makes it astronomically rare on an already-unreliable UDP transport.
+     * See docs/impl-notes/memos/2026-06-07-defrag-packet-id-wrap.md. */
     if (bitmap_test(s->bitmap, h->frag_id)) return 0;
 
     /* Incremental 65535 check: would adding this fragment overflow? */

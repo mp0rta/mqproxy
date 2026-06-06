@@ -476,7 +476,12 @@ srv_preopen_flush(mq_udp_srv_t *u, mq_udp_sess_t *sess)
  *           DROP the not-yet-flushed RESP (engine flush is deferred inside a read
  *           callback), so the client would see only RESET, never the error code.
  *           The FIN terminates the stream; the peer's close completes teardown. */
-static void
+/* Returns 1 if the full RESP frame was accepted by the stream, 0 otherwise
+ * (encode failure, flow-control EAGAIN, or short/failed send). Callers that
+ * rely on a graceful FIN to DELIVER the RESP must fall back to a RESET when
+ * this returns 0 — otherwise the client hangs waiting for a RESP that never
+ * went out. */
+static int
 srv_send_udp_resp(mq_stream_t *s, mq_status_t status, mq_udp_err_t err,
                   uint64_t idle_timeout_ms, int fin)
 {
@@ -492,12 +497,14 @@ srv_send_udp_resp(mq_stream_t *s, mq_status_t status, mq_udp_err_t err,
     int n = mq_encode_udp_session_resp(buf, sizeof(buf), &resp);
     if (n < 0) {
         MQ_LOGE("mq_udp_srv: encode UDP_SESSION_RESP failed");
-        return;
+        return 0;
     }
     long sent = mq_stream_send(s, buf, (size_t)n, fin);
     if (sent < 0 || (size_t)sent != (size_t)n) {
         MQ_LOGW("mq_udp_srv: UDP_SESSION_RESP send short/failed (%ld of %d)", sent, n);
+        return 0;
     }
+    return 1;
 }
 
 /* ── target resolution ───────────────────────────────────────────────────── */
@@ -807,9 +814,15 @@ static void
 srv_open_reject(mq_udp_open_t *op, int send_resp, mq_udp_err_t err)
 {
     if (send_resp) {
-        /* Graceful: FIN'd RESP, no RESET (would drop the un-acked RESP). */
-        srv_send_udp_resp(op->stream, MQ_STATUS_ERROR, err, 0, /*fin=*/1);
+        /* Graceful: FIN'd RESP, no RESET (would drop the un-acked RESP). But if
+         * the RESP could not be sent (flow-control/short), the FIN carries no
+         * RESP and the client would hang — fall back to a RESET so it gets a
+         * connection-level signal (cli_stream_closed_cb -> on_err -> assoc retry). */
+        int ok = srv_send_udp_resp(op->stream, MQ_STATUS_ERROR, err, 0, /*fin=*/1);
         mq_stream_set_cbs(op->stream, NULL, NULL, NULL, NULL);
+        if (!ok) {
+            mq_stream_close(op->stream);
+        }
     } else {
         /* Silent reset: no RESP owed, RESET the stream. */
         mq_stream_set_cbs(op->stream, NULL, NULL, NULL, NULL);
@@ -872,11 +885,12 @@ srv_open_success(mq_udp_open_t *op, const mq_udp_session_open_t *open,
          * detach them before reap so the later close-notify cannot fire
          * srv_open_closed_cb on the freed op. sess->graceful makes reap skip the
          * RESET; reap still closes fd + frees rd_ev + decrements live_count +
-         * nulls the stream + resets the slot. */
-        srv_send_udp_resp(op->stream, MQ_STATUS_ERROR, MQ_UDP_SOCKET_FAILED, 0,
-                          /*fin=*/1);
+         * nulls the stream + resets the slot. If the RESP could not be sent,
+         * graceful=0 so reap RESETs instead (client gets a signal, no hang). */
+        int ok = srv_send_udp_resp(op->stream, MQ_STATUS_ERROR, MQ_UDP_SOCKET_FAILED, 0,
+                                   /*fin=*/1);
         mq_stream_set_cbs(op->stream, NULL, NULL, NULL, NULL);
-        sess->graceful = 1;
+        sess->graceful = ok;
         srv_reap_session(sess);
         srv_open_free(op);
         return;
@@ -901,11 +915,12 @@ srv_open_success(mq_udp_open_t *op, const mq_udp_session_open_t *open,
              * Callbacks were just re-pointed at the live-session handlers (user =
              * sess); detach them before reap so the later close-notify cannot
              * fire srv_stream_closed_cb with a reaped sess. sess->graceful makes
-             * reap skip the RESET and just null the stream. */
-            srv_send_udp_resp(op->stream, MQ_STATUS_ERROR, MQ_UDP_SOCKET_FAILED, 0,
-                              /*fin=*/1);
+             * reap skip the RESET and just null the stream. If the RESP could not
+             * be sent, graceful=0 so reap RESETs instead (client gets a signal). */
+            int ok = srv_send_udp_resp(op->stream, MQ_STATUS_ERROR, MQ_UDP_SOCKET_FAILED,
+                                       0, /*fin=*/1);
             mq_stream_set_cbs(sess->stream, NULL, NULL, NULL, NULL);
-            sess->graceful = 1;
+            sess->graceful = ok;
             srv_reap_session(sess);
             srv_open_free(op);
             return;
