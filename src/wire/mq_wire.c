@@ -311,6 +311,7 @@ mq_decode_udp_session_open(const uint8_t *buf, size_t len, mq_udp_session_open_t
     uint64_t sid;
     int r = get_varint(buf, len, 0, &sid);
     if (r < 0) return -1;
+    if (sid > UINT32_MAX) return -1;
     out->session_id = (uint32_t)sid;
 
     r = get_varint(buf, len, (size_t)r, &out->flags);

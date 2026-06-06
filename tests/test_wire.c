@@ -452,6 +452,67 @@ test_udp_session_open_decode_host_too_long(void)
     MQ_CHECK_EQ_INT(mq_decode_udp_session_open(buf, off, &out), -1);
 }
 
+/* ---- Strict session_id decode: session_id > UINT32_MAX is rejected ---- */
+static void
+test_udp_session_open_session_id_overflow(void)
+{
+    /* Hand-craft an OPEN frame where session_id = 0x100000000 (UINT32_MAX+1).
+     * The decoder must reject this with -1 instead of silently truncating. */
+    uint8_t buf[128];
+    size_t off = 0;
+    int r;
+    r = mq_varint_encode(buf + off, sizeof buf - off,
+                         0x100000000ULL); /* session_id = UINT32_MAX + 1 */
+    off += (size_t)r;
+    r = mq_varint_encode(buf + off, sizeof buf - off, 0); /* flags */
+    off += (size_t)r;
+    buf[off++] = MQ_ADDR_IPV4;                            /* address_type */
+    r = mq_varint_encode(buf + off, sizeof buf - off, 4); /* host len */
+    off += (size_t)r;
+    buf[off++] = 1;
+    buf[off++] = 2;
+    buf[off++] = 3;
+    buf[off++] = 4;
+    buf[off++] = 0x00;
+    buf[off++] = 0x50;                                       /* port 80 */
+    r = mq_varint_encode(buf + off, sizeof buf - off, 5000); /* idle_timeout_ms */
+    off += (size_t)r;
+    r = mq_varint_encode(buf + off, sizeof buf - off, 0); /* padding_length */
+    off += (size_t)r;
+
+    mq_udp_session_open_t out;
+    MQ_CHECK_EQ_INT(mq_decode_udp_session_open(buf, off, &out), -1);
+}
+
+/* ---- Malformed: invalid address_type in UDP_SESSION_OPEN is rejected ---- */
+static void
+test_udp_session_open_bad_addr_type(void)
+{
+    uint8_t buf[64];
+    size_t off = 0;
+    int r;
+    r = mq_varint_encode(buf + off, sizeof buf - off, 1); /* session_id */
+    off += (size_t)r;
+    r = mq_varint_encode(buf + off, sizeof buf - off, 0); /* flags */
+    off += (size_t)r;
+    buf[off++] = 0x05;                                    /* invalid address_type */
+    r = mq_varint_encode(buf + off, sizeof buf - off, 4); /* host len */
+    off += (size_t)r;
+    buf[off++] = 10;
+    buf[off++] = 0;
+    buf[off++] = 0;
+    buf[off++] = 1;
+    buf[off++] = 0x01;                                    /* port hi */
+    buf[off++] = 0xBB;                                    /* port lo */
+    r = mq_varint_encode(buf + off, sizeof buf - off, 0); /* idle_timeout_ms */
+    off += (size_t)r;
+    r = mq_varint_encode(buf + off, sizeof buf - off, 0); /* padding_length */
+    off += (size_t)r;
+
+    mq_udp_session_open_t out;
+    MQ_CHECK_EQ_INT(mq_decode_udp_session_open(buf, off, &out), -1);
+}
+
 /* ---- Padding skip: UDP_SESSION_OPEN decoder accepts non-zero padding ---- */
 static void
 test_udp_session_open_padding_skipped(void)
@@ -637,6 +698,8 @@ MQ_TEST_MAIN({
     test_udp_session_resp_truncation();
     test_udp_session_open_host_too_long();
     test_udp_session_open_decode_host_too_long();
+    test_udp_session_open_session_id_overflow();
+    test_udp_session_open_bad_addr_type();
     test_udp_session_open_padding_skipped();
     test_udp_session_resp_padding_skipped();
     test_udp_resp_encode_closed_rejected();
