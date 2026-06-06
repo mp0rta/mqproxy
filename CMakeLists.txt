@@ -14,6 +14,7 @@ add_library(mqproxy STATIC
     src/proxy/mq_relay.c
     src/proxy/mq_flow.c
     src/proxy/mq_framebuf.c
+    src/proxy/mq_defrag.c
     src/proxy/mq_client.c
     src/proxy/mq_server.c
     src/ingress/mq_socks5.c
@@ -82,6 +83,11 @@ add_executable(test_gw_headers tests/test_gw_headers.c)
 target_link_libraries(test_gw_headers mqproxy)
 target_include_directories(test_gw_headers PRIVATE tests)
 add_test(NAME test_gw_headers COMMAND test_gw_headers)
+
+add_executable(test_defrag tests/test_defrag.c)
+target_link_libraries(test_defrag mqproxy)
+target_include_directories(test_defrag PRIVATE tests)
+add_test(NAME test_defrag COMMAND test_defrag)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
