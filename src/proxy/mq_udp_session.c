@@ -142,16 +142,17 @@ typedef struct {
 typedef struct {
     int used;
     uint32_t session_id;
-    mq_stream_t *stream;     /* 0x02 control stream (NULL after close-notify) */
-    int fd;                  /* connected UDP socket */
-    struct event *rd_ev;     /* persistent EV_READ on fd */
-    struct event *idle_ev;   /* idle evtimer (re-armed on bidirectional activity) */
-    mq_defrag_t *defrag;     /* lazy: allocated on first fragmented inbound packet */
-    uint16_t next_packet_id; /* server→client packet_id counter */
-    int reaped;              /* reap-once guard (Known risk 7) */
-    int graceful;            /* an arm-failure RESP(ERROR) was sent with FIN:
-                              * reap must NOT RESET (RESET drops the un-acked RESP) */
-    mq_udp_srv_t *owner;     /* back-pointer for callbacks */
+    mq_stream_t *stream;      /* 0x02 control stream (NULL after close-notify) */
+    int fd;                   /* connected UDP socket */
+    struct event *rd_ev;      /* persistent EV_READ on fd */
+    struct event *idle_ev;    /* idle evtimer (re-armed on bidirectional activity) */
+    mq_defrag_t *defrag;      /* lazy: allocated on first fragmented inbound packet */
+    uint64_t idle_timeout_ms; /* effective = min(client requested, server default) */
+    uint16_t next_packet_id;  /* server→client packet_id counter */
+    int reaped;               /* reap-once guard (Known risk 7) */
+    int graceful;             /* an arm-failure RESP(ERROR) was sent with FIN:
+                               * reap must NOT RESET (RESET drops the un-acked RESP) */
+    mq_udp_srv_t *owner;      /* back-pointer for callbacks */
 } mq_udp_sess_t;
 
 /* ── mq_udp_srv: per-connection UDP relay state ─────────────────────────── */
@@ -231,10 +232,13 @@ srv_idle_rearm(mq_udp_sess_t *sess)
     if (!sess->idle_ev) {
         return;
     }
-    mq_udp_srv_t *u = sess->owner;
+    /* Use the per-session effective timeout (= min(client requested, server
+     * default), set at open success), NOT the connection-wide server default —
+     * a client that negotiated a shorter idle timeout must keep it across every
+     * re-arm, not just the initial one. */
     struct timeval tv;
-    tv.tv_sec = (time_t)(u->idle_timeout_ms / 1000);
-    tv.tv_usec = (suseconds_t)((u->idle_timeout_ms % 1000) * 1000);
+    tv.tv_sec = (time_t)(sess->idle_timeout_ms / 1000);
+    tv.tv_usec = (suseconds_t)((sess->idle_timeout_ms % 1000) * 1000);
     /* evtimer_add on an already-pending timer re-arms it (libevent docs:
      * adding a pending event re-schedules it). */
     evtimer_add(sess->idle_ev, &tv);
@@ -288,9 +292,19 @@ srv_preopen_insert(mq_udp_srv_t *u, uint32_t sid, const uint8_t *data, size_t le
 {
     mq_preopen_buf_t *pb = &u->preopen;
 
-    /* Evict oldest entries until both caps are satisfied AFTER insertion. */
+    /* A single datagram larger than the whole byte cap can never fit; reject it
+     * outright (otherwise the eviction loop, gated on count > 0, would store it
+     * into an empty buffer and blow past the cap). */
+    if (len > MQ_PREOPEN_MAX_BYTES) {
+        u->preopen_evictions++;
+        return;
+    }
+
+    /* Evict oldest entries until both caps are satisfied AFTER insertion.
+     * The byte test is written overflow-safe (len <= cap is guaranteed above,
+     * so cap - len does not underflow). */
     while (pb->count > 0 && (pb->count >= MQ_PREOPEN_MAX_ENTRIES ||
-                             pb->total_bytes + len > MQ_PREOPEN_MAX_BYTES)) {
+                             pb->total_bytes > MQ_PREOPEN_MAX_BYTES - len)) {
         mq_preopen_entry_t *oldest = &pb->entries[pb->head];
         free(oldest->data);
         oldest->data = NULL;
@@ -425,10 +439,15 @@ srv_preopen_flush(mq_udp_srv_t *u, mq_udp_sess_t *sess)
             e->data = NULL;
             /* do not keep */
         } else {
-            /* Keep this entry (different sid). */
+            /* Keep this entry (different sid). MOVE ownership out of the source
+             * slot: kept[] takes the data pointer and the source slot is cleared
+             * so the duplicate owning pointer cannot be double-freed later by
+             * srv_preopen_free_all (which walks all physical slots). */
             kept[kept_count] = *e;
             kept_count++;
             kept_bytes += e->len;
+            e->data = NULL;
+            e->len = 0;
         }
     }
 
@@ -839,6 +858,7 @@ srv_open_success(mq_udp_open_t *op, const mq_udp_session_open_t *open,
     sess->stream = op->stream;
     sess->fd = fd;
     sess->next_packet_id = 0;
+    sess->idle_timeout_ms = eff_idle_ms; /* per-session effective (min) value */
     sess->owner = u;
     u->live_count++;
 
@@ -1604,8 +1624,21 @@ cli_issue_stream(mq_udp_cli_t *u, mq_udp_cli_sess_t *sess)
     sess->issued = 1;
     mq_stream_set_cbs(s, cli_stream_readable_cb, NULL, cli_stream_closed_cb, sess);
 
-    /* No FIN: keep the stream open for the RESP + as the control handle. */
-    (void)mq_stream_send(s, buf, (size_t)(1 + n), /*fin=*/0);
+    /* No FIN: keep the stream open for the RESP + as the control handle.
+     * The OPEN frame must be accepted in full: there is no on_writable retry
+     * path for the control handshake, and sending datagrams while the server
+     * never received OPEN would just leak them into its pre-OPEN buffer (where
+     * they expire) and leave a zombie session. If the send is short/blocked
+     * (EAGAIN -> 0) or fails (-1), fail closed with MQ_UDP_CLOSED. The assoc
+     * keeps no negative cache for MQ_UDP_CLOSED, so the next datagram naturally
+     * retries with a fresh session. */
+    long sent = mq_stream_send(s, buf, (size_t)(1 + n), /*fin=*/0);
+    if (sent != (long)(1 + n)) {
+        MQ_LOGW("mq_udp_cli: OPEN send short/failed (%ld of %d), failing session", sent,
+                1 + n);
+        cli_fail_session(sess, MQ_UDP_CLOSED);
+        return -1;
+    }
 
     /* Flush any payloads buffered while pending-auth (optimistic send). */
     cli_sendq_flush(u, sess);

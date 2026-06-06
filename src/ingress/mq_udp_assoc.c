@@ -158,19 +158,39 @@ dst_find(mq_udp_assoc_t *a, const mq_socks5_req_t *dst)
 static struct mq_dst_entry *
 dst_alloc(mq_udp_assoc_t *a, const mq_socks5_req_t *dst)
 {
+    struct mq_dst_entry *slot = NULL;
     for (size_t i = 0; i < MQ_UDP_ASSOC_MAX_DST; i++) {
         if (!a->dst[i].used) {
-            struct mq_dst_entry *e = &a->dst[i];
-            memset(e, 0, sizeof(*e));
-            e->used = 1;
-            e->atype = dst->atype;
-            e->host_len = dst->host_len;
-            if (dst->host_len) memcpy(e->host, dst->host, dst->host_len);
-            e->port = dst->port;
-            return e;
+            slot = &a->dst[i];
+            break;
         }
     }
-    return NULL; /* table full => caller drops the datagram */
+    /* No free slot: reclaim a dead entry whose negative-cache window has expired
+     * (failed_at == 0 means a non-OPEN-failure close, which is never cached).
+     * Without this sweep, an assoc that churns through > MQ_UDP_ASSOC_MAX_DST
+     * destinations could never open a new one even when all old entries are
+     * long dead. */
+    if (!slot) {
+        uint64_t now = now_ms();
+        for (size_t i = 0; i < MQ_UDP_ASSOC_MAX_DST; i++) {
+            struct mq_dst_entry *e = &a->dst[i];
+            if (e->dead &&
+                (e->failed_at == 0 || now - e->failed_at >= MQ_UDP_ASSOC_NEGCACHE_MS)) {
+                slot = e;
+                break;
+            }
+        }
+    }
+    if (!slot) {
+        return NULL; /* table full of live/cached entries => caller drops */
+    }
+    memset(slot, 0, sizeof(*slot));
+    slot->used = 1;
+    slot->atype = dst->atype;
+    slot->host_len = dst->host_len;
+    if (dst->host_len) memcpy(slot->host, dst->host, dst->host_len);
+    slot->port = dst->port;
+    return slot;
 }
 
 /* Map a relay session handle back to its DST entry (for on_rx/on_err). */
