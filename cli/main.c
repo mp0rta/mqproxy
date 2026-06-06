@@ -390,7 +390,7 @@ cmd_server(int argc, char **argv)
         MQ_LOGE("failed to bind listen path %s:%u", listen_ip, listen_port);
         goto out;
     }
-    server = mq_server_new(transport, rt, token, cc);
+    server = mq_server_new(transport, rt, token, cc, 60000, 1);
     if (!server) {
         MQ_LOGE("failed to create server");
         goto out;

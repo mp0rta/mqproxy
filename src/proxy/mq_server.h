@@ -25,10 +25,15 @@ typedef struct mq_server_s mq_server_t;
 
 /* Create a server bound to transport `t` (xquic/streams/conn) and runtime `rt`
  * (libevent base for origin-fd relays) that expects `auth_token`. Registers the
- * ALPN + on_new_conn/on_new_stream hooks. The token string is copied. Returns
- * NULL on bad args / OOM / ALPN registration failure. */
+ * ALPN + on_new_conn/on_new_stream hooks. The token string is copied.
+ *
+ * udp_idle_timeout_ms: idle timeout for UDP relay sessions in milliseconds
+ *   (stored for Chunk 5 consumption; pass 60000 for the default).
+ * udp_enabled: if non-zero, advertise MQ_FEAT_UDP_RELAY in AUTH_RESPONSE.features.
+ *
+ * Returns NULL on bad args / OOM / ALPN registration failure. */
 mq_server_t *mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token,
-                           mq_cc_t cc);
+                           mq_cc_t cc, uint64_t udp_idle_timeout_ms, int udp_enabled);
 
 /* Total number of control-stream auth attempts processed across all
  * connections (test/observability hook). */

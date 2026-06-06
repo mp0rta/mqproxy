@@ -100,17 +100,19 @@ struct mq_server_s {
     char auth_token[256];
     size_t auth_token_len;
     unsigned auth_attempts;
+    uint64_t udp_idle_timeout_ms; /* idle timeout for UDP relay sessions (Chunk 5) */
+    int udp_enabled;              /* whether to advertise MQ_FEAT_UDP_RELAY */
 };
 
 
 static void
-srv_send_resp(mq_stream_t *s, mq_status_t status, mq_auth_err_t err)
+srv_send_resp(mq_stream_t *s, mq_status_t status, mq_auth_err_t err, uint64_t features)
 {
     mq_auth_resp_t resp;
     memset(&resp, 0, sizeof(resp));
     resp.status = status;
     resp.error_code = err;
-    resp.features = 0;
+    resp.features = features;
     snprintf(resp.server_id, sizeof(resp.server_id), "%s", MQ_SERVER_ID);
 
     uint8_t buf[512];
@@ -152,7 +154,7 @@ srv_ctrl_readable(mq_stream_t *s, void *user)
             srv->auth_attempts++;
             sc->auth_done = 1;
             MQ_LOGW("mq_server: AUTH_REQUEST malformed/oversized, rejecting");
-            srv_send_resp(s, MQ_STATUS_ERROR, MQ_AUTH_FAILED);
+            srv_send_resp(s, MQ_STATUS_ERROR, MQ_AUTH_FAILED, 0);
             mq_conn_close((mq_conn_t *)mq_stream_conn(s));
         }
         return; /* otherwise: need more bytes */
@@ -169,10 +171,11 @@ srv_ctrl_readable(mq_stream_t *s, void *user)
 
     if (ok) {
         sc->authed = 1;
-        srv_send_resp(s, MQ_STATUS_OK, MQ_AUTH_OK);
+        uint64_t feat = srv->udp_enabled ? MQ_FEAT_UDP_RELAY : 0;
+        srv_send_resp(s, MQ_STATUS_OK, MQ_AUTH_OK, feat);
         MQ_LOGI("mq_server: auth OK for client_id='%s'", req.client_id);
     } else {
-        srv_send_resp(s, MQ_STATUS_ERROR, MQ_AUTH_FAILED);
+        srv_send_resp(s, MQ_STATUS_ERROR, MQ_AUTH_FAILED, 0);
         MQ_LOGW("mq_server: auth FAILED for client_id='%s'", req.client_id);
         mq_conn_close((mq_conn_t *)mq_stream_conn(s));
     }
@@ -643,7 +646,8 @@ srv_on_new_stream(mq_stream_t *s, void *user)
 }
 
 mq_server_t *
-mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token, mq_cc_t cc)
+mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token, mq_cc_t cc,
+              uint64_t udp_idle_timeout_ms, int udp_enabled)
 {
     if (!t || !rt || !auth_token) {
         return NULL;
@@ -656,6 +660,8 @@ mq_server_new(mq_transport_t *t, mq_runtime_t *rt, const char *auth_token, mq_cc
     s->rt = rt;
     snprintf(s->auth_token, sizeof(s->auth_token), "%s", auth_token);
     s->auth_token_len = strnlen(s->auth_token, sizeof(s->auth_token));
+    s->udp_idle_timeout_ms = udp_idle_timeout_ms;
+    s->udp_enabled = udp_enabled;
 
     if (mq_conn_register_alpn(t, MQ_SERVER_ALPN, srv_on_new_conn, srv_on_new_stream, s) !=
         0) {

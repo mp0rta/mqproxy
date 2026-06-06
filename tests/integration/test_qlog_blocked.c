@@ -133,7 +133,7 @@ fixture_up(fixture_t *f)
     f->srv_rt = mq_runtime_new(f->srv_t, f->base);
     MQ_CHECK(f->srv_rt != NULL);
     if (!f->srv_rt) return -1;
-    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2);
+    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2, 60000, 1);
     MQ_CHECK(f->server != NULL);
     if (!f->server) return -1;
 
