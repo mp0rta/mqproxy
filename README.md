@@ -2,7 +2,7 @@
 
 A **multipath application proxy/accelerator** built on [Multipath QUIC](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/), using a [fork of XQUIC](https://github.com/mp0rta/xquic). mqproxy maps application flows directly onto MPQUIC primitives — one TCP flow becomes one MPQUIC stream, one HTTP request becomes one H3 stream over MPQUIC, one UDP session becomes MPQUIC DATAGRAMs — so that applications get path diversity, seamless failover, and **bandwidth aggregation** without implementing MPQUIC themselves.
 
-> **Status: Phase 2 (HTTP Request Execution Gateway) — implemented.** On top of Phase 1's TCP proxy (SOCKS5 / HTTP CONNECT → MPQUIC → origin, ~2× aggregation over two shaped paths), mqproxy now executes delegated HTTP requests: a local `POST /_mqproxy/fetch` API carries each request as one H3 stream over MPQUIC to the server, which runs it against the origin via libcurl (h2→h1, TLS verification always on). Validated end-to-end including 2-path aggregation. Phases 3–7 (UDP relay, …) are on the [roadmap](#roadmap).
+> **Status: Phase 3 (UDP Relay) — implemented.** On top of Phase 1's TCP proxy (SOCKS5 / HTTP CONNECT → MPQUIC → origin, ~2× aggregation over two shaped paths) and Phase 2's HTTP Request Execution Gateway (delegated `POST /_mqproxy/fetch` requests carried as H3 streams over MPQUIC, run against origins via libcurl with TLS verification always on), mqproxy now relays UDP: SOCKS5 UDP ASSOCIATE → session-tagged MPQUIC DATAGRAMs → connected UDP socket, with fragmentation/reassembly and idle-timeout teardown. Validated end-to-end including 2-path aggregation. Phases 4–7 are on the [roadmap](#roadmap).
 
 mqproxy is the L4/L7 sibling of [mqvpn](https://github.com/mp0rta/mqvpn): where mqvpn is a standards-based L3 VPN that carries IP packets in QUIC DATAGRAMs (MASQUE CONNECT-IP), mqproxy works at the application-flow layer and is **MPQUIC-native**.
 
@@ -25,7 +25,7 @@ Because a QUIC **stream** is reassembled by offset, the STREAM frames of a singl
 |---|---|---|
 | **TCP Proxy** | 1 TCP flow → 1 MPQUIC bidi stream | ✅ Phase 1 |
 | **HTTP Request Execution Gateway** | 1 HTTP request → 1 H3 stream over MPQUIC | ✅ Phase 2 |
-| UDP Relay | 1 UDP session → MPQUIC DATAGRAM | 🚧 Phase 3 |
+| **UDP Relay** | 1 UDP session → MPQUIC DATAGRAMs | ✅ Phase 3 |
 | TLS MITM Ingress | terminate TLS → feed the Gateway | 🚧 Phase 7, optional |
 
 TCP Proxy Mode does **not** terminate TLS: for HTTPS, TLS stays end-to-end between the application and the origin. Only the WAN segment between mqproxy-client and mqproxy-server is carried over MPQUIC.
@@ -58,6 +58,21 @@ mqproxy-client ──────── HTTP/3 over MPQUIC (ALPN h3) ───�
 ```
 
 Instead of tunneling opaque bytes, the gateway **executes delegated HTTP requests**: the client validates `X-Mq-*` headers, maps the request onto a standard H3 request stream (QPACK, trailers and stream management come from the H3 stack — no custom HTTP framing on the wire), and the server authenticates each request (`X-Mq-Auth`, per-request), strips the `X-Mq-*` controls, and runs the request against the origin with full TLS verification. Errors map to HTTP statuses (DNS failure → 502, connect timeout → 504, bad token → 403, …) and responses carry an `X-Mq-Origin-Protocol` diagnostic header. Because each request is one MPQUIC stream, large downloads *and uploads* get within-stream multipath aggregation.
+
+### UDP Relay
+
+```text
+UDP app (DNS / game / VoIP / …)
+  │  SOCKS5 UDP ASSOCIATE
+  ▼
+mqproxy-client ──────── MPQUIC DATAGRAMs (multipath) ────────► mqproxy-server
+     1 UDP session = a bidi signalling stream + DATAGRAMs        │  connected
+     carrying session_id-tagged packets                          │  UDP socket
+                                                                 ▼
+                                                             UDP target
+```
+
+UDP relay carries non-QUIC UDP traffic (DNS, NTP, game, VoIP, app-specific UDP) over MPQUIC DATAGRAMs. The ingress is **SOCKS5 UDP ASSOCIATE** (RFC 1928 §7) on the same `--socks5` listener used for TCP. For each target the client opens a small bidi signalling stream (`UDP_SESSION_OPEN`/`RESP`, multiplexed alongside TCP on the one `mqproxy-tcp/1` connection), then sends packets as DATAGRAMs tagged with a session id; the server keeps a connected UDP socket per session and relays both ways. Packets larger than the path MTU are fragmented and reassembled (4-slot LRU, no retransmission — UDP stays lossy). Sessions are torn down on idle timeout (server-driven, `--udp-idle-timeout`), on stream close, or when the SOCKS5 control connection drops. The server advertises the capability at auth and can refuse all UDP with `--no-udp`. UDP relay rides the `mqproxy-tcp/1` connection, so a client running `--gateway` only (H3 connection) does not get it.
 
 ## Building from source
 
@@ -141,6 +156,28 @@ curl -X POST http://127.0.0.1:8080/_mqproxy/fetch \
 
 `--path` works the same way here: the gateway's MPQUIC connection aggregates each request across all bound paths.
 
+### UDP relay quick start
+
+UDP relay is exposed on the **same `--socks5` listener** — any SOCKS5 client that speaks UDP ASSOCIATE can use it. The server advertises the capability at auth; pass `--udp-idle-timeout <sec>` to tune session lifetime, or `--no-udp` to refuse UDP entirely.
+
+```bash
+# Server (UDP relay on by default; 30s idle timeout shown)
+./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+  --udp-idle-timeout 30
+
+# Client — the SOCKS5 listener handles both TCP and UDP
+./build/mqproxy client \
+  --server 127.0.0.1:4433 --token secret123 \
+  --socks5 127.0.0.1:1080
+```
+
+`curl` does not speak SOCKS5 UDP ASSOCIATE, so use a UDP-capable SOCKS5 client. The repo ships `udpsocks`, a minimal test client (built by the test suite), which is handy for a quick check:
+
+```bash
+# Relay a UDP packet to a target through the client's SOCKS5 listener
+./build/udpsocks --proxy 127.0.0.1:1080 --target 8.8.8.8:53 --send 32 --count 1
+```
+
 ### Server options
 
 | Flag | Description |
@@ -150,6 +187,8 @@ curl -X POST http://127.0.0.1:8080/_mqproxy/fetch \
 | `--cert <path>` / `--key <path>` | TLS cert/key (PEM); defaults to the bundled test cert |
 | `--origin-ca <pem>` | Extra CA bundle for origin TLS verification (private CAs / tests); verification itself is always on |
 | `--no-gateway` | Disable the HTTP gateway (enabled by default) |
+| `--udp-idle-timeout <sec>` | UDP session idle timeout (default 60); the effective value is `min(client request, this)` |
+| `--no-udp` | Disable UDP relay (do not advertise the capability; refuse all sessions) |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/server.qlog` |
 
 ### Client options
@@ -158,7 +197,7 @@ curl -X POST http://127.0.0.1:8080/_mqproxy/fetch \
 |---|---|
 | `--server <ip:port>` | UDP address of the mqproxy server (required) |
 | `--token <token>` | Shared auth token (required) |
-| `--socks5 <ip:port>` | Local TCP address for the SOCKS5 ingress |
+| `--socks5 <ip:port>` | Local address for the SOCKS5 ingress (TCP CONNECT + UDP ASSOCIATE) |
 | `--http-connect <ip:port>` | Local TCP address for the HTTP CONNECT ingress |
 | `--gateway <ip:port>` | Local TCP address for the HTTP gateway fetch API (`POST /_mqproxy/fetch`) |
 | `--path <local ip>` | Local IP to bind a path to (repeatable) |
@@ -177,6 +216,7 @@ The unit/integration suite covers wire framing, the relay/flow state machine, in
 
 - `tests/integration/e2e_multipath.sh` — TCP-proxy multipath aggregation benchmark (`tc`/`netem`); requires `NET_ADMIN` and **self-skips** otherwise.
 - `tests/integration/e2e_gateway.sh` — full gateway chain against a local TLS origin: 8 MB download/upload byte-exact, the whole error matrix (403/400/502/504), and a 2-path aggregation smoke (the 2-path case needs `NET_ADMIN`; the rest runs unprivileged).
+- `tests/integration/e2e_udp.sh` — UDP relay through SOCKS5 UDP ASSOCIATE against a local UDP echo (`udpsocks` + `udp_echo` helpers): byte-exact small + fragmented (3 KB) echo, concurrent sessions, idle-timeout re-OPEN, control-connection teardown, and a 2-path smoke (NET_ADMIN-gated; the rest runs unprivileged).
 
 ## Observability
 
@@ -188,7 +228,7 @@ Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts conf
 |---|---|
 | **1. TCP Proxy MVP** | ✅ MPQUIC client/server, auth, aggregate-BDP transport sizing, SOCKS5 / HTTP CONNECT, CONNECT_TCP, EAGAIN-safe relay |
 | **2. HTTP Request Execution Gateway** | ✅ `POST /_mqproxy/fetch` (header + raw body), H3-over-MPQUIC tunnel (ALPN `h3`), libcurl origin client (h2→h1, h3-ready), per-request auth, header policy, error mapping, up/download |
-| 3. UDP Relay | UDP session table, MPQUIC DATAGRAM send/recv, DNS / non-QUIC UDP |
+| **3. UDP Relay** | ✅ SOCKS5 UDP ASSOCIATE ingress, per-session bidi signalling, MPQUIC DATAGRAM send/recv, fragmentation + LRU reassembly, idle timeout, DNS / non-QUIC UDP |
 | 4. Controlled Web App Integration | mqcurl / SDK, browser upload/download UI, progress, request policy, CORS |
 | 5. Production Hardening | TCP half-close, reconnect/keepalive, metrics, masquerade mode, qlog, flow-control tuning, scheduler hints |
 | 6. Advanced HTTP Gateway | origin protocol selection, connection pooling, header filtering, cache integration |
