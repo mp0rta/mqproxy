@@ -556,9 +556,11 @@ open_tcp_data_stream(mq_conn_t *conn, uint16_t port, datastream_t *d)
     req.port = port;
 
     uint8_t buf[512];
-    int n = mq_encode_connect_tcp_req(buf, sizeof(buf), &req);
+    /* Prefix the stream-type discriminator (design §5.2). */
+    buf[0] = (uint8_t)MQ_STREAM_TYPE_CONNECT_TCP;
+    int n = mq_encode_connect_tcp_req(buf + 1, sizeof(buf) - 1, &req);
     if (n < 0) return NULL;
-    (void)mq_stream_send(s, buf, (size_t)n, 0);
+    (void)mq_stream_send(s, buf, (size_t)(1 + n), 0);
     return s;
 }
 
@@ -1227,14 +1229,16 @@ test_data_stream_coalesced_payload(void)
         req.host_len = 4;
         req.port = origin_port;
 
-        /* Encode the request and append "ping" so they go out in one write — the
-         * server reads request+payload in a single buffer fill. */
+        /* Encode the request (prefixed with stream-type discriminator) and
+         * append "ping" so they go out in one write — the server reads
+         * discriminator+request+payload in a single buffer fill. */
         uint8_t buf[512];
-        int n = mq_encode_connect_tcp_req(buf, sizeof(buf), &req);
+        buf[0] = (uint8_t)MQ_STREAM_TYPE_CONNECT_TCP;
+        int n = mq_encode_connect_tcp_req(buf + 1, sizeof(buf) - 1, &req);
         MQ_CHECK(n > 0);
-        if (n > 0 && (size_t)n + 4 <= sizeof(buf)) {
-            memcpy(buf + n, "ping", 4);
-            (void)mq_stream_send(s, buf, (size_t)n + 4, 0);
+        if (n > 0 && (size_t)(1 + n) + 4 <= sizeof(buf)) {
+            memcpy(buf + 1 + n, "ping", 4);
+            (void)mq_stream_send(s, buf, (size_t)(1 + n) + 4, 0);
         }
     }
 

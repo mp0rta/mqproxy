@@ -373,7 +373,13 @@ client_issue_open(mq_client_t *c, const uint8_t *host, size_t host_len,
     req.port = port;
 
     uint8_t buf[512];
-    int n = mq_encode_connect_tcp_req(buf, sizeof(buf), &req);
+    /* Prepend the data-stream type discriminator (design §5.2).  Byte 0 is
+     * MQ_STREAM_TYPE_CONNECT_TCP (0x01) encoded as a 1-byte varint; the
+     * CONNECT_TCP_REQUEST frame follows immediately at offset 1.  Both are
+     * sent in one mq_stream_send call so the server's header phase sees a
+     * contiguous buffer and does not have to handle a split discriminator. */
+    buf[0] = (uint8_t)MQ_STREAM_TYPE_CONNECT_TCP;
+    int n = mq_encode_connect_tcp_req(buf + 1, sizeof(buf) - 1, &req);
     if (n < 0) {
         MQ_LOGE("mq_client: encode CONNECT_TCP_REQUEST failed");
         client_data_report(d, 0, MQ_TCP_CONN_REFUSED);
@@ -381,7 +387,7 @@ client_issue_open(mq_client_t *c, const uint8_t *host, size_t host_len,
         return;
     }
     /* No FIN: keep the stream open for the response + bidirectional relay. */
-    (void)mq_stream_send(s, buf, (size_t)n, /*fin=*/0);
+    (void)mq_stream_send(s, buf, (size_t)(1 + n), /*fin=*/0);
 
     /* Bytes may already be buffered; try decoding now. */
     client_data_header_readable(s, d);

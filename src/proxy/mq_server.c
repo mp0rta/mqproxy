@@ -38,6 +38,7 @@
 #include "transport/mq_transport.h"
 #include "util/mq_ct.h"
 #include "util/mq_log.h"
+#include "wire/mq_varint.h"
 #include "wire/mq_wire.h"
 
 #define MQ_SERVER_ALPN "mqproxy-tcp/1"
@@ -375,7 +376,7 @@ srv_connect_done_cb(evutil_socket_t fd, short what, void *arg)
 }
 
 /* Resolve the CONNECT_TCP target into a sockaddr. Returns 0 on success and
- * fills *ss/*sslen; on failure returns -1 and sets *err. */
+ * fills *ss / *sslen; on failure returns -1 and sets *err. */
 static int
 srv_resolve_target(const mq_connect_tcp_req_t *req, struct sockaddr_storage *ss,
                    socklen_t *sslen, mq_tcp_err_t *err)
@@ -481,7 +482,14 @@ srv_data_dial(mq_srv_data_t *d, const mq_connect_tcp_req_t *req)
     event_add(d->connect_ev, NULL);
 }
 
-/* Data stream readable while still buffering the CONNECT_TCP_REQUEST header. */
+/* Data stream readable while still buffering the CONNECT_TCP_REQUEST header.
+ *
+ * Wire layout (design §5.2):
+ *   [discriminator varint] [request frame...]
+ *
+ * The discriminator is decoded on every retry together with the request frame
+ * (cheap: always 1 byte for currently-defined values).  This avoids any extra
+ * per-stream state to track "discriminator already consumed". */
 static void
 srv_data_header_readable(mq_stream_t *s, void *user)
 {
@@ -489,22 +497,45 @@ srv_data_header_readable(mq_stream_t *s, void *user)
 
     mq_framebuf_fill(s, &d->rx, NULL);
 
-    mq_connect_tcp_req_t req;
-    int consumed = mq_decode_connect_tcp_req(d->rx.buf, d->rx.len, &req);
-    if (consumed < 0) {
+    /* Step 1: decode the stream-type discriminator. */
+    uint64_t stream_type = 0;
+    int disc_len = mq_varint_decode(d->rx.buf, d->rx.len, &stream_type);
+    if (disc_len < 0) {
+        /* Not even 1 byte yet (or buffer overflow without a discriminator). */
         if (d->rx.len >= sizeof(d->rx.buf)) {
-            MQ_LOGW("mq_server: CONNECT_TCP_REQUEST malformed/oversized, resetting");
+            MQ_LOGW("mq_server: data stream header malformed/oversized, resetting");
             srv_data_reap(d);
         }
-        return; /* otherwise need more bytes */
+        return; /* need more bytes */
     }
 
-    /* Header complete. Record how much of rx.buf the request occupied: any bytes
-     * the client sent PAST the request were already pulled into rx.buf by the
-     * fill above, so they must be handed to the flow's prebuffer at relay start
-     * (else they are lost — the relay reads fresh from the stream). Then dial. */
-    d->hdr_consumed = (size_t)consumed;
-    srv_data_dial(d, &req);
+    /* Step 2: dispatch on stream type. */
+    if (stream_type == MQ_STREAM_TYPE_CONNECT_TCP) {
+        mq_connect_tcp_req_t req;
+        int consumed = mq_decode_connect_tcp_req(d->rx.buf + disc_len,
+                                                 d->rx.len - (size_t)disc_len, &req);
+        if (consumed < 0) {
+            if (d->rx.len >= sizeof(d->rx.buf)) {
+                MQ_LOGW("mq_server: CONNECT_TCP_REQUEST malformed/oversized, resetting");
+                srv_data_reap(d);
+            }
+            return; /* need more bytes */
+        }
+
+        /* Header complete. hdr_consumed accounts for discriminator + request. */
+        d->hdr_consumed = (size_t)disc_len + (size_t)consumed;
+        srv_data_dial(d, &req);
+
+    } else if (stream_type == MQ_STREAM_TYPE_UDP_SESSION) {
+        /* UDP_SESSION handling: stub (Chunk 5 will implement). */
+        MQ_LOGW("mq_server: UDP_SESSION stream not yet implemented, resetting");
+        mq_stream_close(s);
+
+    } else {
+        MQ_LOGW("mq_server: unknown stream type 0x%02x, resetting",
+                (unsigned)stream_type);
+        mq_stream_close(s);
+    }
 }
 
 /* Header-phase stream close: the stream closed before the relay started (no

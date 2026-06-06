@@ -842,7 +842,7 @@ cli_on_read(mq_h3_req_t *r, int flag, void *user)
         }
         long n = mq_h3_req_recv_body(r, dst, cap, &fin);
         if (n > 0 && c->body && room > 0)
-            c->body_len += (size_t)((size_t)n < room ? n : room);
+            c->body_len += ((size_t)n < room ? (size_t)n : room);
         if (fin) c->saw_fin = 1;
         /* Mid-download reset trigger (case 7). */
         if (c->reset_after > 0 && !c->did_reset &&
