@@ -324,6 +324,22 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_qlog_blocked COMMAND test_qlog_blocked)
 
+    add_executable(test_datagram_fabric tests/integration/test_datagram_fabric.c)
+    target_link_libraries(test_datagram_fabric
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_datagram_fabric PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_datagram_fabric PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_datagram_fabric PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_datagram_fabric COMMAND test_datagram_fabric)
+
     # ---- mqproxy CLI (client/server binaries) ----
     # The static library target is also named `mqproxy`; give the executable a
     # distinct target name but emit it as the `mqproxy` binary.
