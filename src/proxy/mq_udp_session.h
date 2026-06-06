@@ -62,8 +62,21 @@ void mq_udp_srv_free(mq_udp_srv_t *u);
 void mq_udp_srv_attach_stream(mq_udp_srv_t *u, mq_stream_t *s, const uint8_t *carry,
                               size_t carry_len);
 
-/* Connection-level datagram dispatch (from mq_server's on_datagram). Task 5.2
- * implements the relay; here it is a drop-everything stub. */
+/* Connection-level datagram dispatch (from mq_server's on_datagram callback).
+ * Routes tunnel→target: decode header → session lookup → defrag → send to UDP
+ * socket; or pre-OPEN buffer on session-miss. Drops silently before auth
+ * (`mq_udp_srv_set_authed` has not been called) or when UDP is disabled. */
 void mq_udp_srv_on_datagram(mq_udp_srv_t *u, const uint8_t *data, size_t len);
+
+/* Mark this connection as authenticated.  Call from the server's auth-success
+ * path so the datagram entry path opens the auth gate.  Thread-safe note: both
+ * the auth path and the datagram callback run on the same libevent loop —
+ * no mutex needed. */
+void mq_udp_srv_set_authed(mq_udp_srv_t *u, int authed);
+
+/* Dump per-connection UDP relay stats to the log (INFO level).  Called once
+ * from mq_udp_srv_free before teardown so the stats appear in the server log
+ * that e2e captures. */
+void mq_udp_srv_dump_stats(mq_udp_srv_t *u);
 
 #endif /* MQ_PROXY_MQ_UDP_SESSION_H */

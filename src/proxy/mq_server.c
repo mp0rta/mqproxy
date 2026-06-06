@@ -176,6 +176,10 @@ srv_ctrl_readable(mq_stream_t *s, void *user)
 
     if (ok) {
         sc->authed = 1;
+        /* Open the datagram auth gate so mq_udp_srv_on_datagram accepts frames
+         * for this connection (DATAGRAM frames bypass the 0x02 stream pre-auth
+         * guard — this is the sole auth boundary for inbound datagrams). */
+        mq_udp_srv_set_authed(sc->udp, 1);
         uint64_t feat = srv->udp_enabled ? MQ_FEAT_UDP_RELAY : 0;
         srv_send_resp(s, MQ_STATUS_OK, MQ_AUTH_OK, feat);
         MQ_LOGI("mq_server: auth OK for client_id='%s'", req.client_id);
@@ -628,6 +632,16 @@ srv_conn_state(mq_conn_t *c, mq_conn_state_t st, void *user)
     }
 }
 
+/* Datagram callback trampoline: adapts mq_conn_on_datagram_fn (which carries
+ * the mq_conn_t* and a void* user) to mq_udp_srv_on_datagram (which takes the
+ * mq_udp_srv_t* as its first arg and has no conn pointer). */
+static void
+srv_on_datagram_cb(mq_conn_t *c, const uint8_t *data, size_t len, void *user)
+{
+    (void)c;
+    mq_udp_srv_on_datagram((mq_udp_srv_t *)user, data, len);
+}
+
 /* on_new_conn: allocate per-conn state, attach it to the conn owner slot. */
 static void
 srv_on_new_conn(mq_conn_t *c, void *user)
@@ -648,6 +662,13 @@ srv_on_new_conn(mq_conn_t *c, void *user)
                              srv->udp_enabled);
     mq_conn_set_user(c, sc);
     mq_conn_set_on_state(c, srv_conn_state, sc);
+    /* Wire the connection-level DATAGRAM callback so tunnel→target datagrams
+     * are dispatched to the UDP relay.  The auth gate inside
+     * mq_udp_srv_on_datagram drops all frames until mq_udp_srv_set_authed(1).
+     * If sc->udp is NULL (OOM) the callback is not registered (safe no-op). */
+    if (sc->udp) {
+        mq_conn_set_on_datagram(c, srv_on_datagram_cb, sc->udp);
+    }
 }
 
 /* on_new_stream: the FIRST stream on a connection is the control stream. */
