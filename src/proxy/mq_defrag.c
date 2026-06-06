@@ -17,6 +17,8 @@
 /* Bitmap storage: 256 bits = 32 bytes covers all possible frag_id values
  * (0..254 for frag_count up to 255). */
 #define DEFRAG_BITMAP_BYTES 32
+_Static_assert(DEFRAG_BITMAP_BYTES * 8 >= DEFRAG_MAX_FRAGS,
+               "bitmap must cover all frag ids");
 
 /* ---- per-fragment storage ----------------------------------------------- */
 
@@ -248,7 +250,8 @@ mq_defrag_feed(mq_defrag_t *d, const mq_udp_msg_hdr_t *h, const uint8_t *p, size
     s->frags[h->frag_id].data = frag_copy;
     s->frags[h->frag_id].len = len;
     bitmap_set(s->bitmap, h->frag_id);
-    s->frags_received++;
+    s->frags_received++; /* counts DISTINCT frag_ids only: duplicate check above prevents
+                            increment */
     s->total_len += len;
 
     /* Check if all fragments have arrived. */
