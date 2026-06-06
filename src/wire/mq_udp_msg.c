@@ -45,8 +45,10 @@ mq_udp_msg_split(uint32_t sid, uint16_t packet_id, const uint8_t *payload, size_
     /* mss_payload == 0 is un-splittable */
     if (mss_payload == 0) return -1;
 
-    /* Compute fragment count.  len == 0 → 1 frag of 0 bytes. */
-    size_t nfrags = (len == 0) ? 1 : (len + mss_payload - 1) / mss_payload;
+    /* Compute fragment count.  len == 0 → 1 frag of 0 bytes.
+     * Use overflow-safe ceil-div: avoid len + mss_payload - 1 which wraps near
+     * SIZE_MAX and would silently return 0, bypassing the >255 guard. */
+    size_t nfrags = (len == 0) ? 1 : (len / mss_payload) + (len % mss_payload != 0);
 
     /* frag_count is u8: max 255 */
     if (nfrags > 255) return -1;

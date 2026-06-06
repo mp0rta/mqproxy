@@ -205,6 +205,23 @@ test_split_mss_zero_rejected(void)
     MQ_CHECK_EQ_INT((long long)log.count, 0LL);
 }
 
+/* ---- integer overflow in frag-count math: len near SIZE_MAX → -1, no emit ----
+ * len + mss_payload - 1 overflows size_t when len is near SIZE_MAX, wrapping
+ * nfrags to 0 and silently dropping the message.  Must return -1 instead. */
+static void
+test_split_len_size_max_rejected(void)
+{
+    /* Pass a small real buffer; the function must NOT dereference it on the
+     * rejection path — len is huge but the guard must fire before any emit. */
+    static uint8_t dummy[8];
+
+    frag_log_t log;
+    log.count = 0;
+    int r = mq_udp_msg_split(1U, 0U, dummy, SIZE_MAX, 8, collect_emit, &log);
+    MQ_CHECK_EQ_INT(r, -1);
+    MQ_CHECK_EQ_INT((long long)log.count, 0LL);
+}
+
 MQ_TEST_MAIN({
     test_hdr_roundtrip();
     test_hdr_byte_order();
@@ -215,4 +232,5 @@ MQ_TEST_MAIN({
     test_split_255frags_ok();
     test_split_256frags_rejected();
     test_split_mss_zero_rejected();
+    test_split_len_size_max_rejected();
 })
