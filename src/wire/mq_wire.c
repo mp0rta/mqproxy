@@ -276,3 +276,121 @@ mq_decode_connect_tcp_resp(const uint8_t *buf, size_t len, mq_connect_tcp_resp_t
 
     return skip_padding(buf, len, (size_t)r);
 }
+
+/* ---- UDP_SESSION_OPEN ----
+ * varint session_id | varint flags | uint8 address_type | string host
+ * | uint16 port | varint idle_timeout_ms | varint padding_length | padding
+ */
+int
+mq_encode_udp_session_open(uint8_t *buf, size_t cap, const mq_udp_session_open_t *f)
+{
+    if (f->host_len > MQ_MAX_HOST) return -1;
+    if (!addr_type_valid((unsigned)f->address_type)) return -1;
+
+    int r = put_varint(buf, cap, 0, (uint64_t)f->session_id);
+    if (r < 0) return -1;
+    r = put_varint(buf, cap, (size_t)r, f->flags);
+    if (r < 0) return -1;
+    size_t off = (size_t)r;
+    if (off + 1 > cap) return -1;
+    buf[off++] = (uint8_t)f->address_type;
+    r = put_string(buf, cap, off, f->host, f->host_len);
+    if (r < 0) return -1;
+    r = put_u16(buf, cap, (size_t)r, f->port);
+    if (r < 0) return -1;
+    r = put_varint(buf, cap, (size_t)r, f->idle_timeout_ms);
+    if (r < 0) return -1;
+    return put_zero_padding(buf, cap, (size_t)r);
+}
+
+int
+mq_decode_udp_session_open(const uint8_t *buf, size_t len, mq_udp_session_open_t *out)
+{
+    memset(out, 0, sizeof *out);
+
+    uint64_t sid;
+    int r = get_varint(buf, len, 0, &sid);
+    if (r < 0) return -1;
+    out->session_id = (uint32_t)sid;
+
+    r = get_varint(buf, len, (size_t)r, &out->flags);
+    if (r < 0) return -1;
+    size_t off = (size_t)r;
+    if (off + 1 > len) return -1;
+    uint8_t at = buf[off++];
+    if (!addr_type_valid((unsigned)at)) return -1;
+    out->address_type = (mq_addr_type_t)at;
+
+    r = get_string(buf, len, off, out->host, sizeof out->host, &out->host_len);
+    if (r < 0) return -1;
+    r = get_u16(buf, len, (size_t)r, &out->port);
+    if (r < 0) return -1;
+    r = get_varint(buf, len, (size_t)r, &out->idle_timeout_ms);
+    if (r < 0) return -1;
+    return skip_padding(buf, len, (size_t)r);
+}
+
+/* ---- UDP_SESSION_RESP ----
+ * uint8 status | varint error_code | string message | varint idle_timeout_ms
+ * | varint padding_length | padding
+ *
+ * Codec contract:
+ *   encode: MQ_UDP_CLOSED (5) is rejected (-1).
+ *           status×error_code must be consistent: OK⇔UDP_OK, ERROR⇔1-4.
+ *   decode: wire error_code >= 5 is rejected (-1).
+ *           status×error_code inconsistency is rejected (-1).
+ */
+static int
+udp_err_valid_for_wire(mq_udp_err_t e)
+{
+    return (unsigned)e <= 4; /* 0..4 only; 5 = MQ_UDP_CLOSED is boundary-only */
+}
+
+static int
+udp_status_err_consistent(mq_status_t s, mq_udp_err_t e)
+{
+    if (s == MQ_STATUS_OK) return e == MQ_UDP_OK;
+    if (s == MQ_STATUS_ERROR) return e != MQ_UDP_OK;
+    return 0;
+}
+
+int
+mq_encode_udp_session_resp(uint8_t *buf, size_t cap, const mq_udp_session_resp_t *f)
+{
+    if (!udp_err_valid_for_wire(f->error_code)) return -1;
+    if (!udp_status_err_consistent(f->status, f->error_code)) return -1;
+    if (cap < 1) return -1;
+    buf[0] = (uint8_t)f->status;
+    int r = put_varint(buf, cap, 1, (uint64_t)f->error_code);
+    if (r < 0) return -1;
+    r = put_string(buf, cap, (size_t)r, (const uint8_t *)f->message, f->message_len);
+    if (r < 0) return -1;
+    r = put_varint(buf, cap, (size_t)r, f->idle_timeout_ms);
+    if (r < 0) return -1;
+    return put_zero_padding(buf, cap, (size_t)r);
+}
+
+int
+mq_decode_udp_session_resp(const uint8_t *buf, size_t len, mq_udp_session_resp_t *out)
+{
+    memset(out, 0, sizeof *out);
+    if (len < 1) return -1;
+    out->status = (mq_status_t)buf[0];
+
+    uint64_t err;
+    int r = get_varint(buf, len, 1, &err);
+    if (r < 0) return -1;
+    if (err > 4) return -1; /* wire error_code >= 5 rejected */
+    out->error_code = (mq_udp_err_t)err;
+
+    if (!udp_status_err_consistent(out->status, out->error_code)) return -1;
+
+    r = get_string(buf, len, (size_t)r, (uint8_t *)out->message, sizeof out->message - 1,
+                   &out->message_len);
+    if (r < 0) return -1;
+    out->message[out->message_len] = '\0';
+
+    r = get_varint(buf, len, (size_t)r, &out->idle_timeout_ms);
+    if (r < 0) return -1;
+    return skip_padding(buf, len, (size_t)r);
+}
