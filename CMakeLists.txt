@@ -10,6 +10,7 @@ add_library(mqproxy STATIC
     src/util/mq_buf.c
     src/wire/mq_varint.c
     src/wire/mq_wire.c
+    src/wire/mq_udp_msg.c
     src/proxy/mq_relay.c
     src/proxy/mq_flow.c
     src/proxy/mq_framebuf.c
@@ -46,6 +47,11 @@ add_executable(test_wire tests/test_wire.c)
 target_link_libraries(test_wire mqproxy)
 target_include_directories(test_wire PRIVATE tests)
 add_test(NAME test_wire COMMAND test_wire)
+
+add_executable(test_udp_msg tests/test_udp_msg.c)
+target_link_libraries(test_udp_msg mqproxy)
+target_include_directories(test_udp_msg PRIVATE tests)
+add_test(NAME test_udp_msg COMMAND test_udp_msg)
 
 add_executable(test_buf tests/test_buf.c)
 target_link_libraries(test_buf mqproxy)
