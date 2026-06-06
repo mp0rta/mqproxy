@@ -682,8 +682,15 @@ cmd_client(int argc, char **argv)
         void *open_core = mq_client_tcp_open_core(client);
 
         if (socks5) {
-            socks5_l =
-                mq_socks5_listener_new(base, socks5_ip, socks5_port, open_fn, open_core);
+            /* SOCKS5 listener also services CMD UDP ASSOCIATE via the UDP relay
+             * boundary (mq_ingress.h). The UDP `core` is the relay table
+             * (mq_udp_cli_t*), distinct from the TCP `core` (mq_client_t*). The
+             * availability tri-state stays at its -1 default until the on_auth
+             * glue (Task 6.4) calls mq_listener_set_udp_availability. */
+            socks5_l = mq_socks5_listener_new(
+                base, socks5_ip, socks5_port, open_fn, open_core, mq_client_udp_open_fn(),
+                mq_client_udp_send_fn(), mq_client_udp_close_fn(),
+                mq_client_udp_open_core(client));
             if (!socks5_l) {
                 MQ_LOGE("failed to bind SOCKS5 listener on %s:%u", socks5_ip,
                         socks5_port);
@@ -691,8 +698,9 @@ cmd_client(int argc, char **argv)
             }
         }
         if (http_connect) {
+            /* HTTP CONNECT has no ASSOCIATE; pass the udp quad NULL. */
             http_l = mq_http_connect_listener_new(base, http_ip, http_port, open_fn,
-                                                  open_core);
+                                                  open_core, NULL, NULL, NULL, NULL);
             if (!http_l) {
                 MQ_LOGE("failed to bind HTTP CONNECT listener on %s:%u", http_ip,
                         http_port);
@@ -797,6 +805,17 @@ out:
      *       - The transport's send_udp cb (the runtime, as cbs.user) may also
      *         fire during engine destroy (final CONNECTION_CLOSE), so the runtime
      *         must outlive mq_transport_free too.
+     *       - UDP ASSOCIATE (mq_udp_assoc, owned by the SOCKS5 listener's active
+     *         list) rides the SAME graph-A ordering. Three teardown paths:
+     *           1. TCP control-fd EOF → the assoc tears itself down (close_fn on
+     *              every live relay session) and self-removes from the list.
+     *           2. mq_transport_free (runs FIRST) → conn destroy → every live UDP
+     *              relay session's on_err lands on the still-live assoc, which
+     *              marks the DST entry dead (and, per the boundary contract, will
+     *              NOT call close_fn on a handle after on_err).
+     *           3. mq_listener_free (LAST) → reaps any surviving assoc shells
+     *              (UDP fd / TCP fd / events); their sessions are already dead
+     *              from path 2, so close_fn is a no-op. Order is unchanged.
      *
      * (B) HTTP-gateway ingress (mq_gw_client + mq_h3 + fetch listener) — the
      *     SANCTIONED order is the REVERSE: mq_gw_client_free must run while the

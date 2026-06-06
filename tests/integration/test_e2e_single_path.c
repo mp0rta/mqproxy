@@ -162,12 +162,12 @@ fixture_up(fixture_t *f)
 
     /* Listeners wired to the real client core via the tcp_open boundary. */
     void *core = mq_client_tcp_open_core(f->client);
-    f->socks5 =
-        mq_socks5_listener_new(f->base, "127.0.0.1", 0, mq_client_tcp_open_fn(), core);
+    f->socks5 = mq_socks5_listener_new(f->base, "127.0.0.1", 0, mq_client_tcp_open_fn(),
+                                       core, NULL, NULL, NULL, NULL);
     MQ_CHECK(f->socks5 != NULL);
     if (!f->socks5) return -1;
-    f->http = mq_http_connect_listener_new(f->base, "127.0.0.1", 0,
-                                           mq_client_tcp_open_fn(), core);
+    f->http = mq_http_connect_listener_new(
+        f->base, "127.0.0.1", 0, mq_client_tcp_open_fn(), core, NULL, NULL, NULL, NULL);
     MQ_CHECK(f->http != NULL);
     if (!f->http) return -1;
     return 0;

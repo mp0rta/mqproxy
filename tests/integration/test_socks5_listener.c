@@ -35,6 +35,8 @@
 #include <event2/event.h>
 
 #include "ingress/mq_listener.h"
+#include "ingress/mq_socks5.h"
+#include "ingress/mq_udp_assoc.h"
 
 /* ── Mock tcp_open ──────────────────────────────────────────────────────────
  * Records the most recent call, fires cb(ok=1), and keeps local_fd to act as
@@ -208,7 +210,8 @@ test_socks5_happy(struct event_base *base)
     m.forced_ok = 1;
     m.local_fd = -1;
 
-    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m);
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m,
+                                              NULL, NULL, NULL, NULL);
     MQ_CHECK(l != NULL);
     if (!l) return;
     uint16_t port = mq_listener_local_port(l);
@@ -289,7 +292,8 @@ test_socks5_unsupported(struct event_base *base)
     m.forced_ok = 1;
     m.local_fd = -1;
 
-    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m);
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m,
+                                              NULL, NULL, NULL, NULL);
     MQ_CHECK(l != NULL);
     if (!l) return;
     uint16_t port = mq_listener_local_port(l);
@@ -334,7 +338,8 @@ test_socks5_malformed(struct event_base *base)
     m.forced_ok = 1;
     m.local_fd = -1;
 
-    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m);
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m,
+                                              NULL, NULL, NULL, NULL);
     MQ_CHECK(l != NULL);
     if (!l) return;
     uint16_t port = mq_listener_local_port(l);
@@ -367,8 +372,8 @@ test_http_connect_smoke(struct event_base *base)
     m.forced_ok = 1;
     m.local_fd = -1;
 
-    mq_listener_t *l =
-        mq_http_connect_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m);
+    mq_listener_t *l = mq_http_connect_listener_new(base, "127.0.0.1", 0, mock_tcp_open,
+                                                    &m, NULL, NULL, NULL, NULL);
     MQ_CHECK(l != NULL);
     if (!l) return;
     uint16_t port = mq_listener_local_port(l);
@@ -419,7 +424,8 @@ test_socks5_pipelined_prebuf(struct event_base *base)
     m.forced_ok = 1;
     m.local_fd = -1;
 
-    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m);
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m,
+                                              NULL, NULL, NULL, NULL);
     MQ_CHECK(l != NULL);
     if (!l) return;
     uint16_t port = mq_listener_local_port(l);
@@ -481,8 +487,8 @@ test_http_pipelined_prebuf(struct event_base *base)
     m.forced_ok = 1;
     m.local_fd = -1;
 
-    mq_listener_t *l =
-        mq_http_connect_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m);
+    mq_listener_t *l = mq_http_connect_listener_new(base, "127.0.0.1", 0, mock_tcp_open,
+                                                    &m, NULL, NULL, NULL, NULL);
     MQ_CHECK(l != NULL);
     if (!l) return;
     uint16_t port = mq_listener_local_port(l);
@@ -519,6 +525,518 @@ test_http_pipelined_prebuf(struct event_base *base)
     mq_listener_free(l);
 }
 
+/* ── Stub UDP relay core (the mq_udp_open_fn boundary) ───────────────────────
+ *
+ * Models the client-role relay table for ASSOCIATE tests. open() hands back a
+ * heap session and records the DST; send() optionally round-trips the payload
+ * back via on_rx (so the test can read it on the UDP socket); close() and on_err
+ * counters let us assert lifecycle. Forcing knobs:
+ *   - force_open_null: open() returns NULL (transient failure / unavailable)
+ *   - force_err_on_send: the FIRST send triggers an on_err(err) instead of rx
+ *
+ * The stub honors the boundary contract: after on_err for a session it never
+ * touches that handle again, and after close() it fires no callbacks. Test (d)
+ * is realized here: the stub records close_fn calls and, post-close, does not
+ * deliver on_rx/on_err — exactly the suppression the real core guarantees.
+ */
+struct stub_sess {
+    struct stub_udp *core;
+    mq_udp_rx_fn on_rx;
+    mq_udp_err_fn on_err;
+    void *user;
+    mq_addr_type_t atype;
+    uint8_t host[MQ_MAX_HOST];
+    size_t host_len;
+    uint16_t port;
+    int closed;  /* close_fn called */
+    int errored; /* on_err fired (handle invalid after) */
+    int alive;   /* slot in use */
+};
+
+struct stub_udp {
+    int open_calls;
+    int close_calls;
+    int send_calls;
+    int force_open_null;
+    int force_err_on_send;
+    mq_udp_err_t forced_err;
+    int echo; /* 1 => send() round-trips payload via on_rx */
+    struct stub_sess sessions[16];
+};
+
+static void *
+stub_open(void *core, const uint8_t *host, size_t host_len, mq_addr_type_t atype,
+          uint16_t port, mq_udp_rx_fn on_rx, mq_udp_err_fn on_err, void *user)
+{
+    struct stub_udp *s = (struct stub_udp *)core;
+    s->open_calls++;
+    if (s->force_open_null) return NULL;
+    for (size_t i = 0; i < 16; i++) {
+        if (!s->sessions[i].alive) {
+            struct stub_sess *ss = &s->sessions[i];
+            memset(ss, 0, sizeof(*ss));
+            ss->core = s;
+            ss->on_rx = on_rx;
+            ss->on_err = on_err;
+            ss->user = user;
+            ss->atype = atype;
+            ss->host_len = host_len < sizeof(ss->host) ? host_len : sizeof(ss->host);
+            if (ss->host_len) memcpy(ss->host, host, ss->host_len);
+            ss->port = port;
+            ss->alive = 1;
+            return ss;
+        }
+    }
+    return NULL;
+}
+
+static void
+stub_send(void *session, const uint8_t *payload, size_t len)
+{
+    struct stub_sess *ss = (struct stub_sess *)session;
+    struct stub_udp *s = ss->core;
+    s->send_calls++;
+    /* Contract: caller never sends after on_err or close. Assert defensively. */
+    if (ss->closed || ss->errored) return;
+    if (s->force_err_on_send) {
+        ss->errored = 1;
+        if (ss->on_err) ss->on_err(ss, s->forced_err, ss->user);
+        return;
+    }
+    if (s->echo && ss->on_rx) {
+        ss->on_rx(payload, len, ss->user); /* round-trip back to the client */
+    }
+}
+
+static void
+stub_close(void *session)
+{
+    struct stub_sess *ss = (struct stub_sess *)session;
+    struct stub_udp *s = ss->core;
+    s->close_calls++;
+    ss->closed = 1;
+    ss->alive = 0;
+}
+
+/* Dial a UDP socket bound to an ephemeral 127.0.0.1 port. */
+static int
+udp_dial(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Complete the SOCKS5 greeting + ASSOCIATE request on a TCP control socket and
+ * read the 10-byte reply. Returns the reply REP code and fills *udp_port (host
+ * order) from BND.PORT on success. */
+static int
+socks5_associate(struct event_base *base, int c, uint16_t *udp_port_out, uint8_t *rep_out)
+{
+    uint8_t greeting[] = {0x05, 0x01, 0x00};
+    send_all(c, greeting, sizeof(greeting));
+    uint8_t mreply[2] = {0};
+    if (pump_read(base, c, mreply, 2, 1000) != 2) return -1;
+
+    /* ASSOCIATE with DST 0.0.0.0:0 (client does not know its src yet). */
+    uint8_t req[] = {0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+    send_all(c, req, sizeof(req));
+
+    uint8_t reply[10] = {0};
+    if (pump_read(base, c, reply, 10, 1000) != 10) return -1;
+    if (rep_out) *rep_out = reply[1];
+    if (udp_port_out) *udp_port_out = (uint16_t)((reply[8] << 8) | reply[9]);
+    return 0;
+}
+
+/* Build a SOCKS5 UDP encapsulation header + payload into out; returns total len. */
+static size_t
+build_udp_dgram(uint8_t *out, size_t cap, uint32_t dst_ip_be, uint16_t dst_port,
+                const uint8_t *payload, size_t plen)
+{
+    mq_socks5_req_t dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.atype = MQ_ADDR_IPV4;
+    dst.host_len = 4;
+    memcpy(dst.host, &dst_ip_be, 4);
+    dst.port = dst_port;
+    int hlen = mq_socks5_build_udp_hdr(out, cap, &dst);
+    if (hlen < 0) return 0;
+    if ((size_t)hlen + plen > cap) return 0;
+    memcpy(out + hlen, payload, plen);
+    return (size_t)hlen + plen;
+}
+
+/* ── ASSOCIATE Scenario A: establish, free listener while TCP open ───────────
+ * (a) ASSOCIATE established → TCP kept open → listener free → no fd/session/
+ *     event leak (ASan). */
+static void
+test_assoc_establish_free(struct event_base *base)
+{
+    struct stub_udp s;
+    memset(&s, 0, sizeof(s));
+    s.echo = 1;
+
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, NULL,
+                                              stub_open, stub_send, stub_close, &s);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    uint16_t tport = mq_listener_local_port(l);
+
+    int c = dial(tport);
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        mq_listener_free(l);
+        return;
+    }
+
+    uint16_t uport = 0;
+    uint8_t rep = 0xff;
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(rep, 0x00); /* REP success */
+    MQ_CHECK(uport != 0);
+
+    /* Round-trip a UDP datagram: client → UDP socket → stub echo → back. */
+    int u = udp_dial();
+    MQ_CHECK(u >= 0);
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dst.sin_port = htons(uport);
+
+    uint8_t dgram[64];
+    uint8_t payload[] = "udp-ping";
+    uint32_t dst_ip = htonl(0x08080808); /* 8.8.8.8 */
+    size_t dlen =
+        build_udp_dgram(dgram, sizeof(dgram), dst_ip, 53, payload, sizeof(payload) - 1);
+    MQ_CHECK(dlen > 0);
+    sendto(u, dgram, dlen, 0, (struct sockaddr *)&dst, sizeof(dst));
+
+    /* Pump and read the echoed datagram back on the same UDP socket. */
+    uint8_t rxb[64] = {0};
+    int fl = fcntl(u, F_GETFL, 0);
+    fcntl(u, F_SETFL, fl | O_NONBLOCK);
+    ssize_t rn = -1;
+    uint64_t deadline = now_ms() + 1000;
+    while (now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+        rn = recv(u, rxb, sizeof(rxb), 0);
+        if (rn > 0) break;
+    }
+    MQ_CHECK(rn > 0);
+    MQ_CHECK_EQ_INT(s.open_calls, 1);
+    MQ_CHECK_EQ_INT(s.send_calls, 1);
+    /* The echoed datagram has the encap header (DST as src) + payload. */
+    mq_socks5_udp_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    int hr = mq_socks5_parse_udp_hdr(rxb, (size_t)rn, &hdr);
+    MQ_CHECK(hr > 0);
+    if (hr > 0) {
+        MQ_CHECK_EQ_INT(hdr.dst.port, 53);
+        MQ_CHECK_EQ_INT((size_t)rn - hdr.hdr_len, sizeof(payload) - 1);
+        MQ_CHECK_MEM(rxb + hdr.hdr_len, payload, sizeof(payload) - 1);
+    }
+
+    close(u);
+    /* Free the listener with the TCP control connection STILL open: the assoc
+     * shell (UDP fd / TCP fd / events) and the live stub session must all be
+     * reaped (close_fn called for the live session). */
+    mq_listener_free(l);
+    MQ_CHECK_EQ_INT(s.close_calls, 1); /* the live session was closed at reap */
+    close(c);
+}
+
+/* ── ASSOCIATE Scenario B: TCP close tears the assoc down ────────────────── */
+static void
+test_assoc_tcp_close_teardown(struct event_base *base)
+{
+    struct stub_udp s;
+    memset(&s, 0, sizeof(s));
+    s.echo = 1;
+
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, NULL,
+                                              stub_open, stub_send, stub_close, &s);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    uint16_t tport = mq_listener_local_port(l);
+
+    int c = dial(tport);
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        mq_listener_free(l);
+        return;
+    }
+    uint16_t uport = 0;
+    uint8_t rep = 0xff;
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(rep, 0x00);
+
+    /* Establish a live session via one datagram. */
+    int u = udp_dial();
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dst.sin_port = htons(uport);
+    uint8_t dgram[64];
+    uint8_t payload[] = "x";
+    size_t dlen = build_udp_dgram(dgram, sizeof(dgram), htonl(0x01020304), 99, payload,
+                                  sizeof(payload) - 1);
+    sendto(u, dgram, dlen, 0, (struct sockaddr *)&dst, sizeof(dst));
+    uint64_t deadline = now_ms() + 500;
+    while (s.open_calls == 0 && now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    MQ_CHECK_EQ_INT(s.open_calls, 1);
+    close(u);
+
+    /* Close the TCP control connection → assoc tears down → close_fn called. */
+    close(c);
+    deadline = now_ms() + 1000;
+    while (s.close_calls == 0 && now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    MQ_CHECK_EQ_INT(s.close_calls, 1);
+
+    mq_listener_free(l);
+    /* No double-close: the assoc already self-removed at TCP-EOF teardown. */
+    MQ_CHECK_EQ_INT(s.close_calls, 1);
+}
+
+/* ── ASSOCIATE Scenario C: mixed shutdown (in-flight CONNECT + live ASSOCIATE)
+ * The graph-A ordering (transport→runtime→client→listener) is exercised by the
+ * real-core e2e tests; here, with stub cores, we assert the listener-side
+ * structural half: an accepted-but-not-yet-handed-off CONNECT parse state AND a
+ * live UDP assoc co-exist, then mq_listener_free reaps BOTH without UAF/leak
+ * (ASan). The CONNECT conn is left mid-greeting so it is still a listener-owned
+ * conn_state at free time. */
+static void
+test_assoc_mixed_shutdown(struct event_base *base)
+{
+    struct stub_udp s;
+    memset(&s, 0, sizeof(s));
+    s.echo = 1;
+    struct mock_open m;
+    memset(&m, 0, sizeof(m));
+    m.base = base;
+    m.forced_ok = 1;
+    m.local_fd = -1;
+
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m,
+                                              stub_open, stub_send, stub_close, &s);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    uint16_t tport = mq_listener_local_port(l);
+
+    /* (1) A live ASSOCIATE with one open session. */
+    int ca = dial(tport);
+    MQ_CHECK(ca >= 0);
+    uint16_t uport = 0;
+    uint8_t rep = 0xff;
+    MQ_CHECK_EQ_INT(socks5_associate(base, ca, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(rep, 0x00);
+    int u = udp_dial();
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dst.sin_port = htons(uport);
+    uint8_t dgram[64];
+    uint8_t payload[] = "m";
+    size_t dlen = build_udp_dgram(dgram, sizeof(dgram), htonl(0x09090909), 1, payload,
+                                  sizeof(payload) - 1);
+    sendto(u, dgram, dlen, 0, (struct sockaddr *)&dst, sizeof(dst));
+    uint64_t deadline = now_ms() + 500;
+    while (s.open_calls == 0 && now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    MQ_CHECK_EQ_INT(s.open_calls, 1);
+    close(u);
+
+    /* (2) A second connection mid-greeting (accepted, parse state owned by the
+     * listener, NOT yet handed off). */
+    int cp = dial(tport);
+    MQ_CHECK(cp >= 0);
+    uint8_t partial[] = {0x05}; /* incomplete greeting */
+    send_all(cp, partial, sizeof(partial));
+    deadline = now_ms() + 200;
+    while (now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+
+    /* Free with both alive: assoc reaped (close_fn on the live session) + the
+     * pending CONNECT conn_state reaped (its fd closed by the listener). */
+    mq_listener_free(l);
+    MQ_CHECK_EQ_INT(s.close_calls, 1);
+    close(ca);
+    close(cp);
+}
+
+/* ── ASSOCIATE Scenario D: post-teardown callback suppression ────────────────
+ * Interpretation (see context): the stub IS the core, so this asserts the
+ * assoc-side half of the boundary contract — at teardown the assoc calls
+ * close_fn exactly once per live session, and after a session's on_err it never
+ * calls close_fn on that (now invalid) handle. We drive force_err_on_send so the
+ * single session dies via on_err, then tear down: close_fn must NOT be called for
+ * the dead session (else it would be a UAF in the real core). */
+static void
+test_assoc_no_close_after_err(struct event_base *base)
+{
+    struct stub_udp s;
+    memset(&s, 0, sizeof(s));
+    s.force_err_on_send = 1;
+    s.forced_err = MQ_UDP_DNS_FAILED;
+
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, NULL,
+                                              stub_open, stub_send, stub_close, &s);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    uint16_t tport = mq_listener_local_port(l);
+    int c = dial(tport);
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        mq_listener_free(l);
+        return;
+    }
+    uint16_t uport = 0;
+    uint8_t rep = 0xff;
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(rep, 0x00);
+
+    int u = udp_dial();
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dst.sin_port = htons(uport);
+    uint8_t dgram[64];
+    uint8_t payload[] = "q";
+    size_t dlen = build_udp_dgram(dgram, sizeof(dgram), htonl(0x05060708), 7, payload,
+                                  sizeof(payload) - 1);
+    sendto(u, dgram, dlen, 0, (struct sockaddr *)&dst, sizeof(dst));
+    uint64_t deadline = now_ms() + 500;
+    while (s.open_calls == 0 && now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    MQ_CHECK_EQ_INT(s.open_calls, 1);
+    MQ_CHECK_EQ_INT(s.send_calls, 1); /* the send triggered on_err */
+    close(u);
+
+    /* Tear down via listener free: the (dead) session must NOT be closed. */
+    mq_listener_free(l);
+    MQ_CHECK_EQ_INT(s.close_calls, 0); /* dead handle never closed (no UAF) */
+    close(c);
+}
+
+/* ── ASSOCIATE Scenario E: availability sweep ────────────────────────────────
+ * tri-state -1 optimistically admits ASSOCIATE (no UDP sent); a stub then sets
+ * availability 0 → the assoc's TCP control connection is closed (UDP-unused
+ * assoc must not survive). */
+static void
+test_assoc_availability_sweep(struct event_base *base)
+{
+    struct stub_udp s;
+    memset(&s, 0, sizeof(s));
+
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, NULL,
+                                              stub_open, stub_send, stub_close, &s);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    uint16_t tport = mq_listener_local_port(l);
+    int c = dial(tport);
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        mq_listener_free(l);
+        return;
+    }
+    uint16_t uport = 0;
+    uint8_t rep = 0xff;
+    /* -1 default → optimistic admit. */
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(rep, 0x00);
+    MQ_CHECK_EQ_INT(s.open_calls, 0); /* no UDP sent yet */
+
+    /* Server turns out not to support UDP → set availability 0 → sweep closes
+     * the control connection of the (UDP-unused) assoc. */
+    mq_listener_set_udp_availability(l, 0);
+
+    /* The client side sees EOF on the TCP control connection. */
+    MQ_CHECK(pump_until_eof(base, c, 1000));
+    MQ_CHECK_EQ_INT(s.close_calls, 0); /* no session was ever opened */
+
+    mq_listener_free(l);
+    close(c);
+}
+
+/* ── ASSOCIATE Scenario: REP 0x07 when no UDP boundary ───────────────────────
+ * A SOCKS5 listener with a NULL udp_open quad refuses ASSOCIATE unconditionally. */
+static void
+test_assoc_refused_no_udp(struct event_base *base)
+{
+    struct mock_open m;
+    memset(&m, 0, sizeof(m));
+    m.base = base;
+    m.forced_ok = 1;
+    m.local_fd = -1;
+
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, &m,
+                                              NULL, NULL, NULL, NULL);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    uint16_t tport = mq_listener_local_port(l);
+    int c = dial(tport);
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        mq_listener_free(l);
+        return;
+    }
+    uint16_t uport = 0;
+    uint8_t rep = 0xff;
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(rep, 0x07); /* command not supported */
+    MQ_CHECK(pump_until_eof(base, c, 1000));
+    mq_listener_free(l);
+    close(c);
+}
+
+/* ── ASSOCIATE Scenario: availability 0 refuses up front (REP 0x07) ──────── */
+static void
+test_assoc_refused_unavail(struct event_base *base)
+{
+    struct stub_udp s;
+    memset(&s, 0, sizeof(s));
+
+    mq_listener_t *l = mq_socks5_listener_new(base, "127.0.0.1", 0, mock_tcp_open, NULL,
+                                              stub_open, stub_send, stub_close, &s);
+    MQ_CHECK(l != NULL);
+    if (!l) return;
+    mq_listener_set_udp_availability(l, 0); /* server has no UDP */
+    uint16_t tport = mq_listener_local_port(l);
+    int c = dial(tport);
+    MQ_CHECK(c >= 0);
+    if (c < 0) {
+        mq_listener_free(l);
+        return;
+    }
+    uint16_t uport = 0;
+    uint8_t rep = 0xff;
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(rep, 0x07);
+    MQ_CHECK_EQ_INT(s.open_calls, 0);
+    mq_listener_free(l);
+    close(c);
+}
+
 static void
 run_all(void)
 {
@@ -532,6 +1050,15 @@ run_all(void)
     test_http_connect_smoke(base);
     test_socks5_pipelined_prebuf(base);
     test_http_pipelined_prebuf(base);
+
+    /* UDP ASSOCIATE edge (Task 6.3). */
+    test_assoc_establish_free(base);     /* (a) */
+    test_assoc_tcp_close_teardown(base); /* (b) */
+    test_assoc_mixed_shutdown(base);     /* (c) */
+    test_assoc_no_close_after_err(base); /* (d) */
+    test_assoc_availability_sweep(base); /* (e) */
+    test_assoc_refused_no_udp(base);     /* REP 0x07 when no UDP boundary */
+    test_assoc_refused_unavail(base);    /* REP 0x07 when availability == 0 */
 
     event_base_free(base);
 }

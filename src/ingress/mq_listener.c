@@ -10,7 +10,11 @@
  * open_fn, or reject + close. This keeps the socket/accept/lifetime machinery
  * in one place and the SOCKS5 vs HTTP differences small and isolated.
  *
- * See mq_listener.h for the fd-ownership contract.
+ * SOCKS5 CMD UDP ASSOCIATE is a fourth drive outcome: on MQ_SOCKS5_ASSOCIATE_DONE
+ * the accepted control fd is MOVED into a new mq_udp_assoc (which takes fd
+ * ownership) and the transient parse state is freed WITHOUT closing the fd; the
+ * listener keeps the assoc in an intrusive list (l->assocs) for sweep/reap. See
+ * mq_listener.h for the full fd-ownership contract (incl. the ASSOCIATE bullet).
  */
 #include "ingress/mq_listener.h"
 
@@ -18,6 +22,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -27,6 +32,7 @@
 
 #include "ingress/mq_http_connect.h"
 #include "ingress/mq_socks5.h"
+#include "ingress/mq_udp_assoc.h"
 #include "util/mq_log.h"
 
 /* Max bytes we buffer for a single request head before giving up (protects
@@ -58,11 +64,23 @@ struct mq_listener_s {
     int listen_fd;
     struct event *accept_ev;
     uint16_t local_port;
+    char bind_ip[46]; /* saved for ASSOCIATE UDP socket bind (INET6_ADDRSTRLEN) */
     mq_tcp_open_fn open_fn;
     void *core;
     mq_drive_fn drive;
+    /* UDP relay boundary (NULL open => no local ASSOCIATE support). The UDP
+     * `core` differs from the TCP `core` (it is the concrete relay table, the
+     * mq_udp_cli_t*), so it is stored separately. */
+    mq_udp_open_fn udp_open;
+    mq_udp_send_fn udp_send;
+    mq_udp_close_fn udp_close;
+    void *udp_core;
+    /* Remote UDP-relay availability tri-state (-1 undetermined / 0 no / 1 yes). */
+    int udp_avail;
     /* Live per-conn states, singly linked, so free() can reap them. */
     struct mq_conn_state *conns;
+    /* Live UDP associations (intrusive doubly-linked list head). */
+    mq_udp_assoc_t *assocs;
 };
 
 struct mq_conn_state {
@@ -172,6 +190,43 @@ drive_socks5(struct mq_conn_state *c)
             conn_detach_read(c);
             l->open_fn(l->core, req.host, req.host_len, req.atype, req.port, fd, prebuf,
                        prebuf_len, c, socks5_open_result);
+            return MQ_DRIVE_HANDOFF;
+        }
+
+        case MQ_SOCKS5_ASSOCIATE_DONE: {
+            /* CMD UDP ASSOCIATE. Admit only if this ingress has a UDP relay
+             * boundary (udp_open quad non-NULL) AND remote availability != 0.
+             * Otherwise REP 0x07 (command not supported) + close. */
+            if (!l->udp_open || l->udp_avail == 0) {
+                uint8_t cr[10];
+                size_t n = mq_socks5_build_connect_reply(cr, 0x07);
+                (void)send(c->fd, cr, n, MSG_NOSIGNAL);
+                return MQ_DRIVE_CLOSE;
+            }
+            /* Move the accepted (control) fd into a new assoc. The assoc owns
+             * the fd from here (its TCP-EOF watch tears the relay down); we drop
+             * our read interest and free the transient parse state WITHOUT
+             * closing the fd. The assoc writes the ASSOCIATE success reply. */
+            int fd = c->fd;
+            conn_detach_read(c);
+            mq_udp_assoc_t *a = mq_udp_assoc_new(l->base, fd, l->bind_ip, l->udp_open,
+                                                 l->udp_send, l->udp_close, l->udp_core);
+            if (!a) {
+                /* Bind/socket failure: reply general failure and close the fd. */
+                uint8_t cr[10];
+                size_t n = mq_socks5_build_connect_reply(cr, 0x01);
+                (void)send(fd, cr, n, MSG_NOSIGNAL);
+                close(fd);
+                c->fd = -1; /* already closed; conn_destroy must not re-close */
+                c->handed_off = 1;
+                conn_destroy(c, /*close_fd=*/0);
+                return MQ_DRIVE_HANDOFF;
+            }
+            mq_udp_assoc_list_push(&l->assocs, a);
+            /* The fd is now owned by the assoc; our state must not close it. */
+            c->handed_off = 1;
+            c->fd = -1;
+            conn_destroy(c, /*close_fd=*/0);
             return MQ_DRIVE_HANDOFF;
         }
 
@@ -382,7 +437,9 @@ on_accept(evutil_socket_t lfd, short what, void *user)
 
 static mq_listener_t *
 listener_new(struct event_base *base, const char *bind_ip, uint16_t port,
-             mq_tcp_open_fn open_fn, void *core, mq_drive_fn drive)
+             mq_tcp_open_fn open_fn, void *core, mq_drive_fn drive,
+             mq_udp_open_fn udp_open, mq_udp_send_fn udp_send, mq_udp_close_fn udp_close,
+             void *udp_core)
 {
     if (!base || !bind_ip || !open_fn || !drive) return NULL;
 
@@ -428,10 +485,17 @@ listener_new(struct event_base *base, const char *bind_ip, uint16_t port,
     l->base = base;
     l->listen_fd = fd;
     l->local_port = lport;
+    snprintf(l->bind_ip, sizeof(l->bind_ip), "%s", bind_ip);
     l->open_fn = open_fn;
     l->core = core;
     l->drive = drive;
+    l->udp_open = udp_open;
+    l->udp_send = udp_send;
+    l->udp_close = udp_close;
+    l->udp_core = udp_core;
+    l->udp_avail = -1; /* undetermined: optimistically admit ASSOCIATE */
     l->conns = NULL;
+    l->assocs = NULL;
 
     l->accept_ev = event_new(base, fd, EV_READ | EV_PERSIST, on_accept, l);
     if (!l->accept_ev) {
@@ -445,22 +509,54 @@ listener_new(struct event_base *base, const char *bind_ip, uint16_t port,
 
 mq_listener_t *
 mq_socks5_listener_new(struct event_base *base, const char *bind_ip, uint16_t port,
-                       mq_tcp_open_fn open_fn, void *core)
+                       mq_tcp_open_fn open_fn, void *core, mq_udp_open_fn udp_open,
+                       mq_udp_send_fn udp_send, mq_udp_close_fn udp_close, void *udp_core)
 {
-    return listener_new(base, bind_ip, port, open_fn, core, drive_socks5);
+    return listener_new(base, bind_ip, port, open_fn, core, drive_socks5, udp_open,
+                        udp_send, udp_close, udp_core);
 }
 
 mq_listener_t *
 mq_http_connect_listener_new(struct event_base *base, const char *bind_ip, uint16_t port,
-                             mq_tcp_open_fn open_fn, void *core)
+                             mq_tcp_open_fn open_fn, void *core, mq_udp_open_fn udp_open,
+                             mq_udp_send_fn udp_send, mq_udp_close_fn udp_close,
+                             void *udp_core)
 {
-    return listener_new(base, bind_ip, port, open_fn, core, drive_http);
+    /* HTTP CONNECT has no ASSOCIATE path; the udp quad is accepted for ctor
+     * symmetry and forced NULL. */
+    (void)udp_open;
+    (void)udp_send;
+    (void)udp_close;
+    (void)udp_core;
+    return listener_new(base, bind_ip, port, open_fn, core, drive_http, NULL, NULL, NULL,
+                        NULL);
 }
 
 uint16_t
 mq_listener_local_port(const mq_listener_t *l)
 {
     return l ? l->local_port : 0;
+}
+
+void
+mq_listener_set_udp_availability(mq_listener_t *l, int avail)
+{
+    if (!l) return; /* public contract: HTTP-only client leaves socks5_l NULL */
+    l->udp_avail = avail;
+    if (avail != 0) return;
+
+    /* Unavailable: relay can no longer proceed. Sweep every live assoc and tear
+     * it down — closing the TCP control connection is the relay-terminated
+     * signal (RFC 1928 §7). This also reaps pre-auth assocs that never sent UDP.
+     * mq_udp_assoc_free unlinks the assoc from l->assocs (self-removal), so we
+     * capture next before freeing. */
+    mq_udp_assoc_t *a = l->assocs;
+    while (a) {
+        mq_udp_assoc_t *next = mq_udp_assoc_list_next(a);
+        mq_udp_assoc_free(a); /* closes sessions + control fd + unlinks */
+        a = next;
+    }
+    /* assocs list is now empty (all self-removed). */
 }
 
 void
@@ -478,6 +574,13 @@ mq_listener_free(mq_listener_t *l)
     /* Reap any still-pending parse states (not yet handed off). */
     while (l->conns) {
         conn_destroy(l->conns, /*close_fd=*/1);
+    }
+    /* Reap any surviving UDP associations (graph A path 3): their tunnel
+     * sessions were already killed by mq_transport_free (on_err → dead), so
+     * close_fn is a no-op here; this frees the assoc shells (UDP/TCP fds,
+     * events). mq_udp_assoc_free self-removes from l->assocs. */
+    while (l->assocs) {
+        mq_udp_assoc_free(l->assocs);
     }
     free(l);
 }
