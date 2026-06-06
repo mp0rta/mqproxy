@@ -557,6 +557,7 @@ struct stub_udp {
     int open_calls;
     int close_calls;
     int send_calls;
+    int post_death_sends; /* sends on a closed/errored handle — contract violation */
     int force_open_null;
     int force_err_on_send;
     mq_udp_err_t forced_err;
@@ -596,8 +597,12 @@ stub_send(void *session, const uint8_t *payload, size_t len)
     struct stub_sess *ss = (struct stub_sess *)session;
     struct stub_udp *s = ss->core;
     s->send_calls++;
-    /* Contract: caller never sends after on_err or close. Assert defensively. */
-    if (ss->closed || ss->errored) return;
+    /* Contract: assoc must never send on a dead/closed handle. Record any
+     * violation so tests can assert post_death_sends == 0 at teardown. */
+    if (ss->closed || ss->errored) {
+        s->post_death_sends++;
+        return;
+    }
     if (s->force_err_on_send) {
         ss->errored = 1;
         if (ss->on_err) ss->on_err(ss, s->forced_err, ss->user);
@@ -638,9 +643,11 @@ udp_dial(void)
 
 /* Complete the SOCKS5 greeting + ASSOCIATE request on a TCP control socket and
  * read the 10-byte reply. Returns the reply REP code and fills *udp_port (host
- * order) from BND.PORT on success. */
+ * order) from BND.PORT on success. If reply_out is non-NULL, the full 10-byte
+ * reply is copied there. */
 static int
-socks5_associate(struct event_base *base, int c, uint16_t *udp_port_out, uint8_t *rep_out)
+socks5_associate(struct event_base *base, int c, uint16_t *udp_port_out, uint8_t *rep_out,
+                 uint8_t reply_out[10])
 {
     uint8_t greeting[] = {0x05, 0x01, 0x00};
     send_all(c, greeting, sizeof(greeting));
@@ -655,6 +662,7 @@ socks5_associate(struct event_base *base, int c, uint16_t *udp_port_out, uint8_t
     if (pump_read(base, c, reply, 10, 1000) != 10) return -1;
     if (rep_out) *rep_out = reply[1];
     if (udp_port_out) *udp_port_out = (uint16_t)((reply[8] << 8) | reply[9]);
+    if (reply_out) memcpy(reply_out, reply, 10);
     return 0;
 }
 
@@ -701,9 +709,16 @@ test_assoc_establish_free(struct event_base *base)
 
     uint16_t uport = 0;
     uint8_t rep = 0xff;
-    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    uint8_t areply[10] = {0};
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep, areply), 0);
     MQ_CHECK_EQ_INT(rep, 0x00); /* REP success */
     MQ_CHECK(uport != 0);
+    /* BND.ADDR must be IPv4 127.0.0.1 (listener bound to 127.0.0.1). */
+    MQ_CHECK_EQ_INT(areply[3], 0x01); /* ATYP = IPv4 */
+    MQ_CHECK_EQ_INT(areply[4], 127);  /* BND.ADDR[0] */
+    MQ_CHECK_EQ_INT(areply[5], 0);    /* BND.ADDR[1] */
+    MQ_CHECK_EQ_INT(areply[6], 0);    /* BND.ADDR[2] */
+    MQ_CHECK_EQ_INT(areply[7], 1);    /* BND.ADDR[3] */
 
     /* Round-trip a UDP datagram: client → UDP socket → stub echo → back. */
     int u = udp_dial();
@@ -753,6 +768,7 @@ test_assoc_establish_free(struct event_base *base)
      * reaped (close_fn called for the live session). */
     mq_listener_free(l);
     MQ_CHECK_EQ_INT(s.close_calls, 1); /* the live session was closed at reap */
+    MQ_CHECK_EQ_INT(s.post_death_sends, 0);
     close(c);
 }
 
@@ -778,7 +794,7 @@ test_assoc_tcp_close_teardown(struct event_base *base)
     }
     uint16_t uport = 0;
     uint8_t rep = 0xff;
-    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep, NULL), 0);
     MQ_CHECK_EQ_INT(rep, 0x00);
 
     /* Establish a live session via one datagram. */
@@ -811,6 +827,7 @@ test_assoc_tcp_close_teardown(struct event_base *base)
     mq_listener_free(l);
     /* No double-close: the assoc already self-removed at TCP-EOF teardown. */
     MQ_CHECK_EQ_INT(s.close_calls, 1);
+    MQ_CHECK_EQ_INT(s.post_death_sends, 0);
 }
 
 /* ── ASSOCIATE Scenario C: mixed shutdown (in-flight CONNECT + live ASSOCIATE)
@@ -843,7 +860,7 @@ test_assoc_mixed_shutdown(struct event_base *base)
     MQ_CHECK(ca >= 0);
     uint16_t uport = 0;
     uint8_t rep = 0xff;
-    MQ_CHECK_EQ_INT(socks5_associate(base, ca, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(socks5_associate(base, ca, &uport, &rep, NULL), 0);
     MQ_CHECK_EQ_INT(rep, 0x00);
     int u = udp_dial();
     struct sockaddr_in dst;
@@ -878,6 +895,7 @@ test_assoc_mixed_shutdown(struct event_base *base)
      * pending CONNECT conn_state reaped (its fd closed by the listener). */
     mq_listener_free(l);
     MQ_CHECK_EQ_INT(s.close_calls, 1);
+    MQ_CHECK_EQ_INT(s.post_death_sends, 0);
     close(ca);
     close(cp);
 }
@@ -910,7 +928,7 @@ test_assoc_no_close_after_err(struct event_base *base)
     }
     uint16_t uport = 0;
     uint8_t rep = 0xff;
-    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep, NULL), 0);
     MQ_CHECK_EQ_INT(rep, 0x00);
 
     int u = udp_dial();
@@ -935,6 +953,7 @@ test_assoc_no_close_after_err(struct event_base *base)
     /* Tear down via listener free: the (dead) session must NOT be closed. */
     mq_listener_free(l);
     MQ_CHECK_EQ_INT(s.close_calls, 0); /* dead handle never closed (no UAF) */
+    MQ_CHECK_EQ_INT(s.post_death_sends, 0);
     close(c);
 }
 
@@ -962,7 +981,7 @@ test_assoc_availability_sweep(struct event_base *base)
     uint16_t uport = 0;
     uint8_t rep = 0xff;
     /* -1 default → optimistic admit. */
-    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep, NULL), 0);
     MQ_CHECK_EQ_INT(rep, 0x00);
     MQ_CHECK_EQ_INT(s.open_calls, 0); /* no UDP sent yet */
 
@@ -973,6 +992,7 @@ test_assoc_availability_sweep(struct event_base *base)
     /* The client side sees EOF on the TCP control connection. */
     MQ_CHECK(pump_until_eof(base, c, 1000));
     MQ_CHECK_EQ_INT(s.close_calls, 0); /* no session was ever opened */
+    MQ_CHECK_EQ_INT(s.post_death_sends, 0);
 
     mq_listener_free(l);
     close(c);
@@ -1002,7 +1022,7 @@ test_assoc_refused_no_udp(struct event_base *base)
     }
     uint16_t uport = 0;
     uint8_t rep = 0xff;
-    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep, NULL), 0);
     MQ_CHECK_EQ_INT(rep, 0x07); /* command not supported */
     MQ_CHECK(pump_until_eof(base, c, 1000));
     mq_listener_free(l);
@@ -1030,9 +1050,10 @@ test_assoc_refused_unavail(struct event_base *base)
     }
     uint16_t uport = 0;
     uint8_t rep = 0xff;
-    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep), 0);
+    MQ_CHECK_EQ_INT(socks5_associate(base, c, &uport, &rep, NULL), 0);
     MQ_CHECK_EQ_INT(rep, 0x07);
     MQ_CHECK_EQ_INT(s.open_calls, 0);
+    MQ_CHECK_EQ_INT(s.post_death_sends, 0);
     mq_listener_free(l);
     close(c);
 }

@@ -43,10 +43,11 @@ mq_socks5_status_t mq_socks5_feed(mq_socks5_parser_t *p, const uint8_t *buf, siz
 /* reply builders */
 size_t mq_socks5_build_method_reply(uint8_t out[2], int accepted);
 size_t mq_socks5_build_connect_reply(uint8_t out[10], uint8_t rep);
-/* ASSOCIATE success reply: VER=5 REP=0 RSV=0 ATYP=1 BND.ADDR=bnd_ip_be BND.PORT=bnd_port.
-   bnd_ip_be is the IPv4 address in network byte order; bnd_port is the port in host
-   order. Always writes exactly 10 bytes. */
-size_t mq_socks5_build_associate_reply(uint8_t out[10], uint32_t bnd_ip_be,
+/* ASSOCIATE success reply: VER=5 REP=0 RSV=0 ATYP=1 BND.ADDR=bnd_ip_host
+   BND.PORT=bnd_port. bnd_ip_host is the IPv4 address in host byte order; caller converts
+   from network order with ntohl(). bnd_port is the port in host order. Always writes
+   exactly 10 bytes. */
+size_t mq_socks5_build_associate_reply(uint8_t out[10], uint32_t bnd_ip_host,
                                        uint16_t bnd_port);
 uint8_t mq_socks5_reply_code(mq_tcp_err_t err);
 

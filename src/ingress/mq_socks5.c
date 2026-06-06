@@ -134,9 +134,9 @@ mq_socks5_build_connect_reply(uint8_t out[10], uint8_t rep)
 }
 
 size_t
-mq_socks5_build_associate_reply(uint8_t out[10], uint32_t bnd_ip_be, uint16_t bnd_port)
+mq_socks5_build_associate_reply(uint8_t out[10], uint32_t bnd_ip_host, uint16_t bnd_port)
 {
-    return build_reply10(out, 0x00, bnd_ip_be, bnd_port);
+    return build_reply10(out, 0x00, bnd_ip_host, bnd_port);
 }
 
 uint8_t

@@ -203,6 +203,8 @@ on_rx(const uint8_t *payload, size_t len, void *user)
     if (rc->host_len) memcpy(src.host, rc->host, rc->host_len);
     src.port = rc->port;
 
+    /* 65535-byte stack: leaf event-callback frame; transient stack beats per-assoc
+     * resident scratch for many-idle-assoc deployments (deliberate divergence). */
     uint8_t out[MQ_UDP_ASSOC_DGRAM_CAP];
     int hlen = mq_socks5_build_udp_hdr(out, sizeof(out), &src);
     if (hlen < 0) return;
@@ -245,6 +247,8 @@ on_udp_readable(evutil_socket_t fd, short what, void *user)
     (void)what;
     mq_udp_assoc_t *a = (mq_udp_assoc_t *)user;
     for (;;) {
+        /* 65535-byte stack: leaf event-callback frame; transient stack beats per-assoc
+         * resident scratch for many-idle-assoc deployments (deliberate divergence). */
         uint8_t buf[MQ_UDP_ASSOC_DGRAM_CAP];
         struct sockaddr_in from;
         socklen_t flen = sizeof(from);
