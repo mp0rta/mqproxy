@@ -134,13 +134,14 @@ CLIENT_B_PID=""
 CLIENT_C_PID=""
 ECHO1_PID=""
 ECHO2_PID=""
+C5_BG_PID=""
 TC_ON=0
 
 cleanup() {
     set +e
     for pid in "${CLIENT_A_PID}" "${CLIENT_B_PID}" "${CLIENT_C_PID}" \
                "${SERVER_A_PID}" "${SERVER_B_PID}" "${SERVER_C_PID}" \
-               "${ECHO1_PID}" "${ECHO2_PID}"; do
+               "${ECHO1_PID}" "${ECHO2_PID}" "${C5_BG_PID}"; do
         [ -n "${pid}" ] && kill "${pid}" 2>/dev/null
     done
     [ "${TC_ON}" -eq 1 ] && tc qdisc del dev lo root 2>/dev/null
@@ -335,13 +336,30 @@ wait "${C5_BG_PID}" 2>/dev/null || true
 # Give the server time to detect the TCP EOF and reap the session.
 sleep 0.5
 
+# Assert server-side session cleanup: mq_udp_srv logs
+#   "mq_udp_srv: session <N> closed"
+# at INFO level (default) from srv_reap_session on stream close / idle expiry /
+# conn teardown. Wait up to 1 s for the line to appear (srv_reap_session fires
+# on the TCP-EOF close-notify, which may be one event-loop tick after the kill).
+C5_REAP_SEEN=0
+for _ in $(seq 1 10); do
+    if grep -q 'mq_udp_srv: session .* closed' "${WORK}/server_a.log" 2>/dev/null; then
+        C5_REAP_SEEN=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "${C5_REAP_SEEN}" -ne 1 ]; then
+    fail 5 "no 'mq_udp_srv: session N closed' in server_a.log after udpsocks kill; log tail: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
+fi
+
 # Server health check: a fresh udpsocks invocation must succeed.
 if "${UDPSOCKS_BIN}" \
         --proxy "127.0.0.1:${SOCKS_PORT_A}" \
         --target "127.0.0.1:${ECHO_PORT_1}" \
         --send 64 --count 1 --timeout-ms 3000 \
         >/dev/null 2>"${WORK}/c5_health.err"; then
-    ok 5 "kill udpsocks mid-flight → server reaps session; fresh send succeeds"
+    ok 5 "kill udpsocks mid-flight → server reaps session (log confirmed); fresh send succeeds"
 else
     fail 5 "server unhealthy after udpsocks kill; stderr: $(head -c 200 "${WORK}/c5_health.err"); server_a: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
 fi

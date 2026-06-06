@@ -562,6 +562,7 @@ srv_reap_session(mq_udp_sess_t *sess)
         return;
     }
     sess->reaped = 1;
+    MQ_LOGI("mq_udp_srv: session %u closed", sess->session_id);
 
     if (sess->idle_ev) {
         event_free(sess->idle_ev);

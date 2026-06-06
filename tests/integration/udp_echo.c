@@ -101,8 +101,17 @@ main(int argc, char **argv)
         fflush(stdout);
     }
 
-    signal(SIGTERM, sig_handler);
-    signal(SIGINT, sig_handler);
+    /* Use sigaction() WITHOUT SA_RESTART so that a signal during blocked
+     * recvfrom() returns EINTR instead of restarting the syscall.  The
+     * signal() wrapper in glibc sets SA_RESTART, which would cause SIGTERM to
+     * restart recvfrom and leave the process stuck. */
+    struct sigaction act;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = sig_handler;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0; /* no SA_RESTART */
+    sigaction(SIGTERM, &act, NULL);
+    sigaction(SIGINT, &act, NULL);
 
     uint8_t *buf = (uint8_t *)malloc((size_t)max_size);
     if (!buf) {
