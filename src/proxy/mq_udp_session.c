@@ -981,6 +981,19 @@ srv_open_readable_cb(mq_stream_t *s, void *user)
 
 /* ── public API ─────────────────────────────────────────────────────────── */
 
+static void
+mq_udp_srv_dump_stats(mq_udp_srv_t *u)
+{
+    if (!u) {
+        return;
+    }
+    MQ_LOGI("mq_udp_srv: stats frags_sent=%u frags_reassembled=%u "
+            "drops_send_fail=%u drops_oversize=%u defrag_drops=%u "
+            "preopen_evictions=%u drops_preauth=%u",
+            u->frags_sent, u->frags_reassembled, u->drops_send_fail, u->drops_oversize,
+            u->defrag_drops, u->preopen_evictions, u->drops_preauth);
+}
+
 mq_udp_srv_t *
 mq_udp_srv_new(mq_conn_t *c, struct event_base *base, uint64_t idle_timeout_ms,
                int enabled)
@@ -1045,19 +1058,6 @@ mq_udp_srv_set_authed(mq_udp_srv_t *u, int authed)
     if (u) {
         u->authed = authed;
     }
-}
-
-void
-mq_udp_srv_dump_stats(mq_udp_srv_t *u)
-{
-    if (!u) {
-        return;
-    }
-    MQ_LOGI("mq_udp_srv: stats frags_sent=%u frags_reassembled=%u "
-            "drops_send_fail=%u drops_oversize=%u defrag_drops=%u "
-            "preopen_evictions=%u drops_preauth=%u",
-            u->frags_sent, u->frags_reassembled, u->drops_send_fail, u->drops_oversize,
-            u->defrag_drops, u->preopen_evictions, u->drops_preauth);
 }
 
 mq_udp_srv_counters_t

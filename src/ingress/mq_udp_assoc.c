@@ -510,9 +510,3 @@ mq_udp_assoc_free(mq_udp_assoc_t *a)
     if (a->tcp_fd >= 0) close(a->tcp_fd);
     free(a);
 }
-
-uint16_t
-mq_udp_assoc_udp_port(const mq_udp_assoc_t *a)
-{
-    return a ? a->udp_port : 0;
-}

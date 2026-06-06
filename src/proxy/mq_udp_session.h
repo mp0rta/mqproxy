@@ -22,7 +22,7 @@
  * before the OPEN completes and flushes them at session creation.  The UDP
  * socket's EV_READ drives the target→tunnel path: split+send back to the
  * tunnel.  §9.2 drop/activity counters are maintained throughout; stats are
- * dumped to the log at conn close via mq_udp_srv_dump_stats.
+ * dumped to the log at conn close (internal, called from mq_udp_srv_free).
  */
 #ifndef MQ_PROXY_MQ_UDP_SESSION_H
 #define MQ_PROXY_MQ_UDP_SESSION_H
@@ -81,15 +81,10 @@ void mq_udp_srv_on_datagram(mq_udp_srv_t *u, const uint8_t *data, size_t len);
  * no mutex needed. */
 void mq_udp_srv_set_authed(mq_udp_srv_t *u, int authed);
 
-/* Dump per-connection UDP relay stats to the log (INFO level).  Called once
- * from mq_udp_srv_free before teardown so the stats appear in the server log
- * that e2e captures. */
-void mq_udp_srv_dump_stats(mq_udp_srv_t *u);
-
 /* ── Observability: drop / activity counters (design §9.2) ───────────────────
  *
  * A by-value snapshot of the per-connection UDP relay counters. These mirror
- * the fields dumped by mq_udp_srv_dump_stats and are exposed for programmatic
+ * the same fields logged at conn close and are exposed for programmatic
  * observation (in-process integration tests, future metrics export) without
  * scraping the log line. Read on the libevent loop thread; no synchronisation
  * needed (single-threaded relay). */

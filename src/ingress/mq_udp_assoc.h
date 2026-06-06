@@ -51,9 +51,6 @@ mq_udp_assoc_t *mq_udp_assoc_new(struct event_base *base, int tcp_fd, const char
  * Safe on NULL. */
 void mq_udp_assoc_free(mq_udp_assoc_t *a);
 
-/* The bound local UDP port in host byte order (tests). 0 if unknown. */
-uint16_t mq_udp_assoc_udp_port(const mq_udp_assoc_t *a);
-
 /* ── intrusive list (owned by the listener) ──────────────────────────────────
  * The listener keeps the head; the assoc owns the prev/next links and a
  * back-pointer to the head so it can self-remove on TCP-EOF teardown. */
