@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 mp0rta
 
-/* mq_udp_session.h — server-side UDP relay session table + OPEN handling.
+/* mq_udp_session.h — server-side UDP relay session table + OPEN handling;
+ * the client role (mq_udp_cli_*, Task 6.2) lives in the same module.
  *
  * One mq_udp_srv_t is owned per accepted mqproxy connection (created in
  * mq_server's on_new_conn, freed in the conn-close teardown). It owns:

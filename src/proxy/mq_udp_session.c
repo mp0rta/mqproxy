@@ -1506,7 +1506,8 @@ cli_stream_readable_cb(mq_stream_t *s, void *user)
         return;
     }
     if (sess->resp_decoded) {
-        /* RESP already settled (OK): drain to keep the stream from stalling. */
+        /* control stream carries only the RESP; no tail expected (design §6.1)
+         * — leftover rx bytes are intentionally abandoned. */
         uint8_t scratch[256];
         int fin = 0;
         while (mq_stream_recv(s, scratch, sizeof(scratch), &fin) > 0) {}

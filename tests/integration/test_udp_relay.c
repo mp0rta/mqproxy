@@ -21,6 +21,8 @@
  *   a. client-role open + send BEFORE auth → queued; flushed post-auth (startup
  *      race regression).
  *   b. client-role 3000B frag relay → byte-exact echo + frags_reassembled > 0.
+ *   c. client-role on_err path — open to nonexistent.invalid (DOMAIN atype) →
+ *      on_err fired once with MQ_UDP_DNS_FAILED; handle dead (no send/close).
  *   3. OPEN to a non-existent host (.invalid) → RESP MQ_UDP_DNS_FAILED + close.
  *   4. enabled=0 (--no-udp) → RESP MQ_UDP_POLICY_DENIED.
  *   5. idle_timeout_ms=100, left idle → server closes the 0x02 stream.
@@ -445,6 +447,17 @@ cli_on_err(void *session, mq_udp_err_t err, void *user)
     cli_rx_t *c = (cli_rx_t *)user;
     c->err_fired = 1;
     c->err = err;
+}
+
+/* Open a UDP relay session through the boundary (mq_client_udp_open_fn) using
+ * a domain atype. Returns the opaque session handle (or NULL). */
+static void *
+cli_open_domain(mq_client_t *client, const char *hostname, uint16_t port, cli_rx_t *cap)
+{
+    mq_udp_open_fn open_fn = mq_client_udp_open_fn();
+    void *core = mq_client_udp_open_core(client);
+    return open_fn(core, (const uint8_t *)hostname, strlen(hostname), MQ_ADDR_DOMAIN,
+                   port, cli_on_rx, cli_on_err, cap);
 }
 
 /* Open a UDP relay session through the boundary (mq_client_udp_open_fn) to the
@@ -1018,6 +1031,49 @@ test_case9_disabled_datagram_drop(void)
     fixture_down(&f);
 }
 
+/* Case (c): client-role on_err path — open to a non-resolvable domain via the
+ * mq_udp_open_fn boundary, pump, assert on_err fired exactly once with
+ * err == MQ_UDP_DNS_FAILED, and that the handle is dead afterwards (do NOT call
+ * send/close — per contract the core already freed it when on_err fired). */
+static void
+test_casec_client_on_err_dns_failed(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 60000, 1) != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    /* Wait for auth: the client must be authed so the 0x02 stream is issued
+     * immediately and the server sees the OPEN → DNS failure → RESP(ERROR). */
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+    MQ_CHECK_EQ_INT(mq_client_udp_available(f.client), 1);
+
+    cli_rx_t cap;
+    memset(&cap, 0, sizeof(cap));
+
+    /* Open a session to an unresolvable domain (atype = DOMAIN). Port 9 is the
+     * discard port — any port is fine since DNS fails before any socket dial. */
+    void *sess = cli_open_domain(f.client, "nonexistent.invalid", 9, &cap);
+    MQ_CHECK(sess != NULL); /* open itself succeeds locally; failure is async */
+
+    /* Pump until on_err fires or the budget expires. */
+    pump_until(f.base, &cap.err_fired, 5000);
+
+    /* on_err must fire exactly once with MQ_UDP_DNS_FAILED. */
+    MQ_CHECK(cap.err_fired);
+    MQ_CHECK_EQ_INT((int)cap.err, (int)MQ_UDP_DNS_FAILED);
+
+    /* on_rx must NOT have fired (no payload ever delivered on an error path). */
+    MQ_CHECK_EQ_INT(cap.rx_done, 0);
+
+    /* Per contract: the core freed the session inside on_err.  Do NOT call
+     * send/close here — sess is a dangling pointer at this point. */
+
+    fixture_down(&f);
+}
+
 static void
 test_udp_relay(void)
 {
@@ -1026,6 +1082,7 @@ test_udp_relay(void)
     test_caseA_preauth_open_send();
     test_caseB_frag_relay();
     test_case3_dns_failed();
+    test_casec_client_on_err_dns_failed();
     test_case6_preopen_evict();
     test_case7_preauth_drop_noflush();
     test_case8_dup_sid();
