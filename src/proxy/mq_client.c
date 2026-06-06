@@ -25,6 +25,7 @@
 
 #include "proxy/mq_flow.h"
 #include "proxy/mq_framebuf.h"
+#include "proxy/mq_udp_session.h"
 #include "transport/mq_stream.h"
 #include "util/mq_log.h"
 #include "wire/mq_wire.h"
@@ -120,6 +121,13 @@ struct mq_client_s {
     int auth_reported; /* on_auth fired exactly once */
     int closed;        /* connection reached CLOSED: no new opens */
 
+    /* AUTH_RESPONSE.features saved at auth time (for mq_client_udp_available). */
+    uint64_t auth_features;
+
+    /* Per-connection UDP relay session table (client role). Created in
+     * mq_client_start; driven on auth/conn-close; freed in mq_client_free. */
+    mq_udp_cli_t *udp;
+
     /* Pre-auth queue (FIFO) + count. */
     mq_client_open_t *queue_head;
     mq_client_open_t *queue_tail;
@@ -140,6 +148,18 @@ struct mq_client_s {
 /* Forward decl: the mp-ready deferral timer teardown is referenced from
  * client_on_state (CLOSED) but defined below near the other path-add helpers. */
 static void client_mp_timer_stop(mq_client_t *c);
+
+/* Bridge mq_conn's datagram callback (mq_conn_t* + user) to the UDP relay
+ * client role's dispatch (mq_udp_cli_t* first arg). user is the mq_client_t*. */
+static void
+client_on_datagram(mq_conn_t *conn, const uint8_t *data, size_t len, void *user)
+{
+    (void)conn;
+    mq_client_t *c = (mq_client_t *)user;
+    if (c && c->udp) {
+        mq_udp_cli_on_datagram(c->udp, data, len);
+    }
+}
 
 /* ── in-flight data-stream nodes ─────────────────────────────────────────── */
 
@@ -445,6 +465,15 @@ client_report_auth(mq_client_t *c, int ok, mq_auth_err_t err)
     } else {
         client_fail_queue(c, MQ_TCP_CONN_REFUSED);
     }
+
+    /* Drive the UDP relay glue with the now-known auth + capability outcome:
+     * issue pending sessions' streams (ok && available) or fail them closed
+     * (auth failure / capability denied). mq_client_udp_available() consults the
+     * saved features + datagram mss; here authed is already set above. */
+    if (c->udp) {
+        int avail = (mq_client_udp_available(c) == 1);
+        mq_udp_cli_on_auth(c->udp, ok, avail);
+    }
 }
 
 /* Control-stream readable: pull bytes, retry decode. */
@@ -467,6 +496,9 @@ client_ctrl_readable(mq_stream_t *s, void *user)
     int consumed = mq_decode_auth_resp(c->rx.buf, c->rx.len, &resp);
     if (consumed >= 0) {
         int ok = (resp.status == MQ_STATUS_OK);
+        /* Save the advertised features BEFORE reporting so mq_client_udp_available
+         * (and the UDP glue inside client_report_auth) sees them. */
+        c->auth_features = resp.features;
         client_report_auth(c, ok, resp.error_code);
         return;
     }
@@ -529,6 +561,15 @@ client_on_state(mq_conn_t *conn, mq_conn_state_t st, void *user)
             mq_client_data_t *d = c->data_head;
             client_data_report(d, 0, MQ_TCP_CONN_REFUSED);
             client_data_reap(d);
+        }
+
+        /* Fail every live/pending UDP relay session with MQ_UDP_CLOSED (a
+         * non-OPEN-failure close — the assoc must not negative-cache on it). If
+         * the conn died before auth, client_report_auth above already failed the
+         * pending UDP sessions with POLICY_DENIED (auth failure); on_conn_close is
+         * then a no-op (cli already settled). */
+        if (c->udp) {
+            mq_udp_cli_on_conn_close(c->udp);
         }
     }
 
@@ -628,6 +669,17 @@ mq_client_start(mq_client_t *c)
         return -1;
     }
     mq_conn_set_on_state(c->conn, client_on_state, c);
+
+    /* Per-connection UDP relay session table (client role) + datagram dispatch.
+     * Created here so opens may be queued pre-auth; freed in mq_client_free.
+     * Non-fatal on OOM: the client still serves TCP, and UDP opens fail with a
+     * NULL handle (mq_udp_cli_open on a NULL core returns NULL). */
+    c->udp = mq_udp_cli_new(c->conn, mq_runtime_base(c->rt));
+    if (c->udp) {
+        mq_conn_set_on_datagram(c->conn, client_on_datagram, c);
+    } else {
+        MQ_LOGW("mq_client: UDP relay session table alloc failed (TCP-only)");
+    }
     return 0;
 }
 
@@ -823,6 +875,61 @@ mq_client_tcp_open_core(mq_client_t *c)
     return c;
 }
 
+/* ── UDP relay boundary getters + capability ─────────────────────────────── */
+
+mq_udp_open_fn
+mq_client_udp_open_fn(void)
+{
+    return mq_udp_cli_open;
+}
+
+mq_udp_send_fn
+mq_client_udp_send_fn(void)
+{
+    return mq_udp_cli_send;
+}
+
+mq_udp_close_fn
+mq_client_udp_close_fn(void)
+{
+    return mq_udp_cli_close;
+}
+
+void *
+mq_client_udp_open_core(mq_client_t *c)
+{
+    /* The mq_udp_open_fn `core` is the mq_udp_cli_t* (the concrete relay table),
+     * not the mq_client_t* — open/send/close operate directly on the cli role.
+     * Returns NULL before mq_client_start (no conn / no table yet). */
+    return c ? c->udp : NULL;
+}
+
+int
+mq_client_udp_available(const mq_client_t *c)
+{
+    if (!c) {
+        return 0;
+    }
+    if (!c->authed) {
+        /* Pre-auth (or auth not yet settled): undetermined — admit optimistically.
+         * Once CLOSED without auth, authed stays 0 and we report unavailable via
+         * the auth-failure path; callers gate new opens on mq_client_conn() too. */
+        if (c->auth_reported) {
+            return 0; /* auth settled as failure */
+        }
+        return -1;
+    }
+    /* Authed: capability = server advertised MQ_FEAT_UDP_RELAY AND the conn's
+     * datagram channel is usable (mss > 0). */
+    if (!(c->auth_features & MQ_FEAT_UDP_RELAY)) {
+        return 0;
+    }
+    if (!c->conn || mq_conn_datagram_mss(c->conn) == 0) {
+        return 0;
+    }
+    return 1;
+}
+
 void
 mq_client_free(mq_client_t *c)
 {
@@ -840,5 +947,9 @@ mq_client_free(mq_client_t *c)
         client_data_report(c->data_head, 0, MQ_TCP_CONN_REFUSED);
         client_data_reap(c->data_head);
     }
+    /* Free the UDP relay session table (reaps any remaining sessions WITHOUT
+     * firing on_err — the owner is tearing down, not a remote failure). */
+    mq_udp_cli_free(c->udp);
+    c->udp = NULL;
     free(c);
 }

@@ -75,6 +75,13 @@
 #include "wire/mq_udp_msg.h"
 #include "wire/mq_wire.h"
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  ─── server role ───  (mq_udp_srv_*)
+ *
+ *  Per-accepted-connection session table + OPEN handling. See the file header
+ *  above. The client role (mq_udp_cli_*) lives at the bottom of this file.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 /* ── constants ─────────────────────────────────────────────────────────────── */
 
 /* pre-OPEN buffer caps per connection */
@@ -1144,4 +1151,697 @@ mq_udp_srv_on_datagram(mq_udp_srv_t *u, const uint8_t *data, size_t len)
         srv_preopen_sweep_ttl(&u->preopen, now_ms);
         srv_preopen_insert(u, hdr.session_id, data, len, now_ms);
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  ─── client role ───  (mq_udp_cli_*)
+ *
+ *  Per-client-connection session table behind the mq_udp_open_fn boundary
+ *  (mq_ingress.h). One mq_udp_cli_t per client mq_conn (mq_client owns it).
+ *  Mirrors the server role's session-table / mss-cache / defrag / reap-once
+ *  patterns, but the session is keyed by a client-assigned session_id and the
+ *  0x02 stream is locally opened (sending OPEN) rather than accepted.
+ *
+ *  See mq_udp_session.h "client role" block for the lifecycle contract.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Client-side session cap (design §6.1: 1024 per connection). */
+#define MQ_UDP_CLI_MAX_SESSIONS 1024
+
+/* Per-session pre-auth send queue bound (design §6.1: 8 datagrams / 8 KiB).
+ * Holds payloads enqueued before the 0x02 stream is issued; flushed on auth
+ * success. Overflow drops the OLDEST (UDP semantics) + counts. */
+#define MQ_UDP_CLI_SENDQ_MAX_MSGS  8
+#define MQ_UDP_CLI_SENDQ_MAX_BYTES (8 * 1024)
+
+/* ── per-session state (client) ──────────────────────────────────────────────
+ *
+ * Lives in the parent's `sessions` array; `used` marks a slot live.  State is
+ * implicit:
+ *   - stream == NULL && !issued  → pending-auth (OPEN not yet sent)
+ *   - stream != NULL             → open-sent (optimistic send allowed; RESP OK
+ *                                  merely confirms, RESP error → on_err)
+ * The `closing` flag is the callback-suppression latch (UAF prevention): once
+ * set, no further user on_rx / on_err fire and the slot is being reaped. */
+typedef struct {
+    uint8_t *data;
+    size_t len;
+} mq_cli_qmsg_t;
+
+typedef struct {
+    int used;
+    uint32_t session_id;
+    mq_stream_t *stream; /* 0x02 control stream (NULL until issued / after close) */
+    uint16_t next_packet_id;
+    mq_defrag_t *defrag; /* lazy: allocated on first fragmented inbound packet */
+
+    int issued;  /* the 0x02 stream was opened + OPEN sent */
+    int closing; /* callback-suppression latch (reap in progress) */
+    int reaped;  /* reap-once guard */
+
+    /* OPEN parameters captured at open() time (replayed at stream issuance). */
+    mq_addr_type_t atype;
+    uint8_t host[MQ_MAX_HOST];
+    size_t host_len;
+    uint16_t port;
+
+    /* RESP accumulation on the 0x02 stream (header phase, until RESP decodes). */
+    mq_framebuf_t rx;
+    int resp_decoded; /* RESP OK seen — further stream bytes ignored */
+
+    /* Pre-auth send queue (per-session ring; flushed at stream issuance). */
+    mq_cli_qmsg_t sendq[MQ_UDP_CLI_SENDQ_MAX_MSGS];
+    size_t sq_head;
+    size_t sq_count;
+    size_t sq_bytes;
+
+    /* User callbacks (the mq_udp_open_fn boundary). */
+    mq_udp_rx_fn on_rx;
+    mq_udp_err_fn on_err;
+    void *user;
+
+    struct mq_udp_cli *owner; /* back-pointer */
+} mq_udp_cli_sess_t;
+
+/* ── mq_udp_cli: per-connection client UDP relay state ───────────────────── */
+
+struct mq_udp_cli {
+    mq_conn_t *conn;
+    struct event_base *base;
+
+    int authed;    /* auth settled and succeeded */
+    int available; /* UDP relay capability confirmed (feature bit + mss > 0) */
+    int settled;   /* on_auth glue ran once (drain/fail done) */
+
+    uint32_t next_sid; /* client-assigned session_id counter */
+
+    mq_udp_cli_sess_t sessions[MQ_UDP_CLI_MAX_SESSIONS];
+    size_t live_count;
+
+    /* MSS cache (conn-level; see server-role policy — identical rationale:
+     * mq_conn_datagram_mss() does a per-call calloc/free, never call per send). */
+    size_t cached_mss;
+    unsigned mss_emit_countdown;
+
+    /* Per-conn split scratch (allocated once; reused per frag emit). */
+    uint8_t *emit_buf; /* MQ_UDP_MSG_HDR + MQ_UDP_MAX_PAYLOAD bytes */
+
+    /* Drop / activity counters (design §9.2; client-side observability). */
+    uint32_t drops_send_fail;
+    uint32_t drops_oversize;
+    uint32_t defrag_drops;
+    uint32_t sendq_evictions; /* pre-auth send-queue overflow drops */
+    uint32_t frags_sent;
+    uint32_t frags_reassembled;
+};
+
+/* ── session table helpers (client) ──────────────────────────────────────── */
+
+static mq_udp_cli_sess_t *
+cli_find_session(mq_udp_cli_t *u, uint32_t sid)
+{
+    for (size_t i = 0; i < MQ_UDP_CLI_MAX_SESSIONS; i++) {
+        if (u->sessions[i].used && u->sessions[i].session_id == sid) {
+            return &u->sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static mq_udp_cli_sess_t *
+cli_alloc_session(mq_udp_cli_t *u)
+{
+    for (size_t i = 0; i < MQ_UDP_CLI_MAX_SESSIONS; i++) {
+        if (!u->sessions[i].used) {
+            return &u->sessions[i];
+        }
+    }
+    return NULL;
+}
+
+/* Assign the next free session_id (u32 counter, skipping live ids on wrap —
+ * design §6.1; the live set is ≤ 1024 so a free id always exists). */
+static uint32_t
+cli_next_sid(mq_udp_cli_t *u)
+{
+    for (;;) {
+        uint32_t sid = u->next_sid++;
+        if (!cli_find_session(u, sid)) {
+            return sid;
+        }
+    }
+}
+
+/* ── pre-auth send queue ─────────────────────────────────────────────────── */
+
+static void
+cli_sendq_clear(mq_udp_cli_t *u, mq_udp_cli_sess_t *sess)
+{
+    for (size_t i = 0; i < MQ_UDP_CLI_SENDQ_MAX_MSGS; i++) {
+        free(sess->sendq[i].data);
+        sess->sendq[i].data = NULL;
+        sess->sendq[i].len = 0;
+    }
+    sess->sq_head = 0;
+    sess->sq_count = 0;
+    sess->sq_bytes = 0;
+    (void)u;
+}
+
+/* Drop the oldest queued message (FIFO eviction). */
+static void
+cli_sendq_drop_oldest(mq_udp_cli_t *u, mq_udp_cli_sess_t *sess)
+{
+    if (sess->sq_count == 0) {
+        return;
+    }
+    mq_cli_qmsg_t *m = &sess->sendq[sess->sq_head];
+    sess->sq_bytes -= m->len;
+    free(m->data);
+    m->data = NULL;
+    m->len = 0;
+    sess->sq_head = (sess->sq_head + 1) % MQ_UDP_CLI_SENDQ_MAX_MSGS;
+    sess->sq_count--;
+    u->sendq_evictions++;
+}
+
+/* Enqueue a payload copy, evicting oldest until both caps are satisfied. */
+static void
+cli_sendq_push(mq_udp_cli_t *u, mq_udp_cli_sess_t *sess, const uint8_t *payload,
+               size_t len)
+{
+    /* A single message larger than the byte cap can never fit: drop it. */
+    if (len > MQ_UDP_CLI_SENDQ_MAX_BYTES) {
+        u->sendq_evictions++;
+        return;
+    }
+    while (sess->sq_count > 0 && (sess->sq_count >= MQ_UDP_CLI_SENDQ_MAX_MSGS ||
+                                  sess->sq_bytes + len > MQ_UDP_CLI_SENDQ_MAX_BYTES)) {
+        cli_sendq_drop_oldest(u, sess);
+    }
+    uint8_t *copy = malloc(len ? len : 1);
+    if (!copy) {
+        u->sendq_evictions++;
+        return;
+    }
+    if (len) {
+        memcpy(copy, payload, len);
+    }
+    size_t slot = (sess->sq_head + sess->sq_count) % MQ_UDP_CLI_SENDQ_MAX_MSGS;
+    sess->sendq[slot].data = copy;
+    sess->sendq[slot].len = len;
+    sess->sq_bytes += len;
+    sess->sq_count++;
+}
+
+/* ── MSS cache (client; mirrors srv_get_mss_payload) ──────────────────────── */
+
+static size_t
+cli_get_mss_payload(mq_udp_cli_t *u)
+{
+    if (u->cached_mss == 0 || u->mss_emit_countdown == 0) {
+        u->cached_mss = mq_conn_datagram_mss(u->conn);
+        u->mss_emit_countdown = MQ_MSS_REFRESH_INTERVAL;
+    }
+    if (u->cached_mss <= MQ_UDP_MSG_HDR) {
+        return 0; /* not usable */
+    }
+    return u->cached_mss - MQ_UDP_MSG_HDR;
+}
+
+/* ── tunnel send (split → datagram) ──────────────────────────────────────────
+ *
+ * The server role's emit_ctx_t carries an mq_udp_srv_t*; to reuse
+ * mq_udp_msg_split for the client without coupling the two role structs, the
+ * client uses its own tiny ctx + emit callback. */
+typedef struct {
+    mq_udp_cli_t *u;
+    uint32_t frags_ok;
+} cli_emit_ctx_t;
+
+static void
+cli_emit_real(const mq_udp_msg_hdr_t *h, const uint8_t *p, size_t len, void *user)
+{
+    cli_emit_ctx_t *ctx = (cli_emit_ctx_t *)user;
+    mq_udp_cli_t *u = ctx->u;
+
+    if (mq_udp_msg_encode_hdr(u->emit_buf, h) != 0) {
+        u->drops_send_fail++;
+        return;
+    }
+    memcpy(u->emit_buf + MQ_UDP_MSG_HDR, p, len);
+
+    int rc = mq_conn_datagram_send(u->conn, u->emit_buf, MQ_UDP_MSG_HDR + len);
+    if (rc != 0) {
+        u->drops_send_fail++;
+        return; /* do NOT abort remaining frags (design §8) */
+    }
+    ctx->frags_ok++;
+    if (u->mss_emit_countdown > 0) {
+        u->mss_emit_countdown--;
+    }
+}
+
+/* Split + send one UDP payload on the tunnel for `sess`. */
+static void
+cli_send_now(mq_udp_cli_t *u, mq_udp_cli_sess_t *sess, const uint8_t *payload, size_t len)
+{
+    size_t mss_payload = cli_get_mss_payload(u);
+    if (mss_payload == 0) {
+        u->drops_send_fail++;
+        return;
+    }
+    cli_emit_ctx_t ctx = {.u = u, .frags_ok = 0};
+    int rc = mq_udp_msg_split(sess->session_id, sess->next_packet_id, payload, len,
+                              mss_payload, cli_emit_real, &ctx);
+    if (rc != 0) {
+        u->drops_oversize++;
+        return;
+    }
+    sess->next_packet_id++;
+    if (ctx.frags_ok > 1) {
+        u->frags_sent += ctx.frags_ok;
+    }
+}
+
+/* ── session reap (client; reap-once) ────────────────────────────────────────
+ *
+ * Frees the session's resources (stream + defrag + send queue) exactly once and
+ * clears the slot. Callbacks are detached BEFORE any stream close so a deferred
+ * close-notify cannot fire on the reaped slot. Does NOT itself fire on_err —
+ * callers decide whether/which on_err to dispatch first. */
+static void
+cli_reap_session(mq_udp_cli_sess_t *sess)
+{
+    if (!sess || !sess->used || sess->reaped) {
+        return;
+    }
+    sess->reaped = 1;
+    sess->closing = 1;
+
+    mq_udp_cli_t *u = sess->owner;
+
+    if (sess->stream) {
+        /* Detach our callbacks first (UAF: the eventual close-notify must not
+         * touch the reaped slot), then RESET the stream. Unlike the server's
+         * graceful FIN'd-RESP path, the client never owes a RESP on its 0x02
+         * stream, so a RESET is always correct here. */
+        mq_stream_set_cbs(sess->stream, NULL, NULL, NULL, NULL);
+        mq_stream_close(sess->stream);
+        sess->stream = NULL;
+    }
+    if (sess->defrag) {
+        mq_defrag_free(sess->defrag);
+        sess->defrag = NULL;
+    }
+    cli_sendq_clear(u, sess);
+
+    if (u && u->live_count > 0) {
+        u->live_count--;
+    }
+    memset(sess, 0, sizeof(*sess));
+}
+
+/* Dispatch on_err exactly once (suppressing on closing sessions) then reap.
+ * Sets `closing` BEFORE the callback so a re-entrant close() during the
+ * callback is swallowed (the callback-suppression contract). */
+static void
+cli_fail_session(mq_udp_cli_sess_t *sess, mq_udp_err_t err)
+{
+    if (!sess || !sess->used || sess->closing) {
+        return;
+    }
+    sess->closing = 1;
+    mq_udp_err_fn cb = sess->on_err;
+    void *user = sess->user;
+    if (cb) {
+        cb(sess, err, user);
+    }
+    cli_reap_session(sess);
+}
+
+/* ── 0x02 stream callbacks (RESP / close) ────────────────────────────────── */
+
+/* Flush the per-session pre-auth send queue (FIFO) now that the stream is up. */
+static void
+cli_sendq_flush(mq_udp_cli_t *u, mq_udp_cli_sess_t *sess)
+{
+    while (sess->sq_count > 0) {
+        mq_cli_qmsg_t *m = &sess->sendq[sess->sq_head];
+        cli_send_now(u, sess, m->data, m->len);
+        free(m->data);
+        m->data = NULL;
+        sess->sq_bytes -= m->len;
+        m->len = 0;
+        sess->sq_head = (sess->sq_head + 1) % MQ_UDP_CLI_SENDQ_MAX_MSGS;
+        sess->sq_count--;
+    }
+}
+
+static void
+cli_stream_readable_cb(mq_stream_t *s, void *user)
+{
+    mq_udp_cli_sess_t *sess = (mq_udp_cli_sess_t *)user;
+    if (sess->closing) {
+        return;
+    }
+    if (sess->resp_decoded) {
+        /* RESP already settled (OK): drain to keep the stream from stalling. */
+        uint8_t scratch[256];
+        int fin = 0;
+        while (mq_stream_recv(s, scratch, sizeof(scratch), &fin) > 0) {}
+        return;
+    }
+
+    int fin = 0;
+    if (mq_framebuf_fill(s, &sess->rx, &fin) < 0) {
+        /* Hard error / RESET before a RESP: normal stream close. */
+        cli_fail_session(sess, MQ_UDP_CLOSED);
+        return;
+    }
+
+    mq_udp_session_resp_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int consumed = mq_decode_udp_session_resp(sess->rx.buf, sess->rx.len, &resp);
+    if (consumed < 0) {
+        if (sess->rx.len >= sizeof(sess->rx.buf) || fin) {
+            /* Oversized, or FIN without a decodable RESP: treat as a normal
+             * (non-error-RESP) close → MQ_UDP_CLOSED. */
+            cli_fail_session(sess, MQ_UDP_CLOSED);
+        }
+        return; /* otherwise need more bytes */
+    }
+
+    if (resp.status != MQ_STATUS_OK) {
+        /* Decoded RESP error (wire code 1-4): report the wire code once, then
+         * reap. Do NOT RESET the stream from cli_reap here beyond the normal
+         * detach — the server already FIN'd it; reap's RESET on an already-FIN'd
+         * stream is harmless (no un-acked RESP to drop on the client side). */
+        cli_fail_session(sess, resp.error_code);
+        return;
+    }
+
+    /* RESP OK: nothing visible to the user (already optimistic). Mark settled. */
+    sess->resp_decoded = 1;
+}
+
+static void
+cli_stream_closed_cb(mq_stream_t *s, void *user)
+{
+    (void)s;
+    mq_udp_cli_sess_t *sess = (mq_udp_cli_sess_t *)user;
+    sess->stream = NULL; /* transport frees it after this returns */
+    if (sess->closing) {
+        return; /* late close-notify on an already-reaping session: swallow */
+    }
+    /* Stream closed WITHOUT a decoded RESP error (FIN / RESET from idle timeout,
+     * server stream close, etc.) → MQ_UDP_CLOSED. If a RESP error was already
+     * decoded, cli_fail_session already ran and set closing (handled above). */
+    cli_fail_session(sess, MQ_UDP_CLOSED);
+}
+
+/* ── stream issuance (issue 0x02 + send OPEN, then flush queued sends) ────── */
+
+/* Issue the 0x02 stream for a pending session: open a bidi stream, send
+ * [varint 0x02][encoded OPEN] in one send (mirrors mq_client's TCP path), then
+ * flush the pre-auth send queue. On failure fail the session (POLICY_DENIED is
+ * wrong here — a local stream-open failure is closer to a transport close, so
+ * MQ_UDP_CLOSED). Returns 0 on success, -1 on failure (session already reaped).*/
+static int
+cli_issue_stream(mq_udp_cli_t *u, mq_udp_cli_sess_t *sess)
+{
+    mq_stream_t *s = mq_conn_open_stream(u->conn);
+    if (!s) {
+        MQ_LOGE("mq_udp_cli: open 0x02 stream failed");
+        cli_fail_session(sess, MQ_UDP_CLOSED);
+        return -1;
+    }
+
+    mq_udp_session_open_t open;
+    memset(&open, 0, sizeof(open));
+    open.session_id = sess->session_id;
+    open.flags = 0;
+    open.address_type = sess->atype;
+    memcpy(open.host, sess->host, sess->host_len);
+    open.host_len = sess->host_len;
+    open.port = sess->port;
+    open.idle_timeout_ms = 0; /* server default */
+
+    uint8_t buf[512];
+    buf[0] = (uint8_t)MQ_STREAM_TYPE_UDP_SESSION;
+    int n = mq_encode_udp_session_open(buf + 1, sizeof(buf) - 1, &open);
+    if (n < 0) {
+        MQ_LOGE("mq_udp_cli: encode UDP_SESSION_OPEN failed");
+        mq_stream_set_cbs(s, NULL, NULL, NULL, NULL);
+        mq_stream_close(s);
+        cli_fail_session(sess, MQ_UDP_CLOSED);
+        return -1;
+    }
+
+    sess->stream = s;
+    sess->issued = 1;
+    mq_stream_set_cbs(s, cli_stream_readable_cb, NULL, cli_stream_closed_cb, sess);
+
+    /* No FIN: keep the stream open for the RESP + as the control handle. */
+    (void)mq_stream_send(s, buf, (size_t)(1 + n), /*fin=*/0);
+
+    /* Flush any payloads buffered while pending-auth (optimistic send). */
+    cli_sendq_flush(u, sess);
+    return 0;
+}
+
+/* ── boundary: open / send / close ───────────────────────────────────────── */
+
+void *
+mq_udp_cli_open(void *core, const uint8_t *host, size_t host_len, mq_addr_type_t atype,
+                uint16_t port, mq_udp_rx_fn on_rx, mq_udp_err_fn on_err, void *user)
+{
+    mq_udp_cli_t *u = (mq_udp_cli_t *)core;
+    if (!u || !host || host_len == 0 || host_len > MQ_MAX_HOST) {
+        return NULL;
+    }
+    /* Conn already gone (settled with no live conn): fail immediately. */
+    if (u->settled && !u->authed) {
+        return NULL;
+    }
+    if (u->live_count >= MQ_UDP_CLI_MAX_SESSIONS) {
+        return NULL; /* 1024-session cap */
+    }
+
+    mq_udp_cli_sess_t *sess = cli_alloc_session(u);
+    if (!sess) {
+        return NULL;
+    }
+    memset(sess, 0, sizeof(*sess));
+    sess->used = 1;
+    sess->owner = u;
+    sess->session_id = cli_next_sid(u);
+    sess->atype = atype;
+    memcpy(sess->host, host, host_len);
+    sess->host_len = host_len;
+    sess->port = port;
+    sess->on_rx = on_rx;
+    sess->on_err = on_err;
+    sess->user = user;
+    u->live_count++;
+
+    if (u->authed && u->available) {
+        /* Authed + capable: issue the stream + OPEN immediately (optimistic). */
+        if (cli_issue_stream(u, sess) != 0) {
+            return NULL; /* session already reaped (cli_fail_session) */
+        }
+        return sess;
+    }
+    if (u->settled && !u->available) {
+        /* Authed but capability denied: fail closed right away. */
+        cli_fail_session(sess, MQ_UDP_POLICY_DENIED);
+        return NULL;
+    }
+    /* Pre-auth: hold the session; stream issuance is deferred to mq_udp_cli_on_auth.
+     * Sends in the meantime are buffered in the per-session send queue. */
+    return sess;
+}
+
+void
+mq_udp_cli_send(void *session, const uint8_t *payload, size_t len)
+{
+    mq_udp_cli_sess_t *sess = (mq_udp_cli_sess_t *)session;
+    if (!sess || !sess->used || sess->closing) {
+        return;
+    }
+    mq_udp_cli_t *u = sess->owner;
+    if (sess->issued && sess->stream) {
+        cli_send_now(u, sess, payload, len);
+    } else {
+        /* Pre-auth: buffer for flush at stream issuance (oldest-drop on overflow). */
+        cli_sendq_push(u, sess, payload, len);
+    }
+}
+
+void
+mq_udp_cli_close(void *session)
+{
+    mq_udp_cli_sess_t *sess = (mq_udp_cli_sess_t *)session;
+    if (!sess || !sess->used) {
+        return;
+    }
+    /* Caller-initiated: no on_err. Detach + reap synchronously (the
+     * callback-suppression contract: no on_rx/on_err after close returns). */
+    sess->closing = 1;
+    cli_reap_session(sess);
+}
+
+/* ── server→tunnel datagram dispatch ─────────────────────────────────────── */
+
+void
+mq_udp_cli_on_datagram(mq_udp_cli_t *u, const uint8_t *data, size_t len)
+{
+    if (!u) {
+        return;
+    }
+    mq_udp_msg_hdr_t hdr;
+    if (mq_udp_msg_decode_hdr(data, len, &hdr) != 0) {
+        return; /* malformed framing: silent drop */
+    }
+
+    mq_udp_cli_sess_t *sess = cli_find_session(u, hdr.session_id);
+    if (!sess || sess->closing) {
+        /* Unknown sid (or a session being reaped): silent drop. The client has
+         * no pre-OPEN buffer — server→client datagrams only flow for sessions
+         * the client itself opened (design §6.2). */
+        MQ_LOGD("mq_udp_cli: datagram for unknown/closing sid %u dropped",
+                hdr.session_id);
+        return;
+    }
+
+    const uint8_t *payload = data + MQ_UDP_MSG_HDR;
+    size_t plen = len - MQ_UDP_MSG_HDR;
+
+    if (!sess->defrag) {
+        sess->defrag = mq_defrag_new();
+        if (!sess->defrag) {
+            u->defrag_drops++;
+            return;
+        }
+    }
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    int rc = mq_defrag_feed(sess->defrag, &hdr, payload, plen, &out, &out_len);
+    if (rc < 0) {
+        u->defrag_drops++;
+        return;
+    }
+    if (rc == 0) {
+        return; /* fragment accepted, packet not yet complete */
+    }
+    /* rc == 1: reassembly complete (out malloc'd, we free). */
+    if (hdr.frag_count > 1) {
+        u->frags_reassembled++;
+    }
+    if (sess->on_rx) {
+        sess->on_rx(out, out_len, sess->user);
+    }
+    free(out);
+}
+
+/* ── auth / conn-close glue ──────────────────────────────────────────────── */
+
+void
+mq_udp_cli_on_auth(mq_udp_cli_t *u, int ok, int available)
+{
+    if (!u || u->settled) {
+        return;
+    }
+    u->settled = 1;
+    u->authed = ok ? 1 : 0;
+    u->available = (ok && available) ? 1 : 0;
+
+    if (ok && available) {
+        /* Capability confirmed: issue streams + OPEN for every pending session,
+         * then each session's queued sends flush inside cli_issue_stream. Iterate
+         * defensively — cli_issue_stream may reap a session on local failure. */
+        for (size_t i = 0; i < MQ_UDP_CLI_MAX_SESSIONS; i++) {
+            mq_udp_cli_sess_t *sess = &u->sessions[i];
+            if (sess->used && !sess->issued && !sess->closing) {
+                cli_issue_stream(u, sess);
+            }
+        }
+        return;
+    }
+
+    /* Auth failure OR capability denied: fail-close every pending session.
+     * Auth failure is a remote-caused policy-level denial → MQ_UDP_POLICY_DENIED
+     * (NOT MQ_UDP_CLOSED, which the assoc reserves for non-OPEN-failure closes).
+     * Capability denied (authed, no feature bit / mss==0) → MQ_UDP_POLICY_DENIED
+     * (design §9.1: fail-closed, no negative cache). */
+    for (size_t i = 0; i < MQ_UDP_CLI_MAX_SESSIONS; i++) {
+        mq_udp_cli_sess_t *sess = &u->sessions[i];
+        if (sess->used && !sess->closing) {
+            cli_fail_session(sess, MQ_UDP_POLICY_DENIED);
+        }
+    }
+}
+
+void
+mq_udp_cli_on_conn_close(mq_udp_cli_t *u)
+{
+    if (!u) {
+        return;
+    }
+    u->settled = 1;
+    /* The conn is gone: every live/pending session terminates. Fail each with
+     * MQ_UDP_CLOSED (a non-OPEN-failure close — the assoc must not negative-cache
+     * on this). The stream pointers are stale once the transport tears the conn
+     * down; cli_reap detaches callbacks before any close, and on conn teardown
+     * the transport frees the streams — so do not touch sess->stream here beyond
+     * the detach inside cli_reap. */
+    u->conn = NULL;
+    for (size_t i = 0; i < MQ_UDP_CLI_MAX_SESSIONS; i++) {
+        mq_udp_cli_sess_t *sess = &u->sessions[i];
+        if (sess->used && !sess->closing) {
+            cli_fail_session(sess, MQ_UDP_CLOSED);
+        }
+    }
+}
+
+/* ── lifecycle ───────────────────────────────────────────────────────────── */
+
+mq_udp_cli_t *
+mq_udp_cli_new(mq_conn_t *c, struct event_base *base)
+{
+    mq_udp_cli_t *u = calloc(1, sizeof(*u));
+    if (!u) {
+        return NULL;
+    }
+    u->conn = c;
+    u->base = base;
+    u->next_sid = 1; /* 0 is a valid sid but start at 1 for log readability */
+    u->cached_mss = 0;
+    u->mss_emit_countdown = 0;
+    u->emit_buf = malloc(MQ_UDP_MSG_HDR + MQ_UDP_MAX_PAYLOAD);
+    if (!u->emit_buf) {
+        free(u);
+        return NULL;
+    }
+    return u;
+}
+
+void
+mq_udp_cli_free(mq_udp_cli_t *u)
+{
+    if (!u) {
+        return;
+    }
+    /* Teardown: reap every session WITHOUT firing on_err (the owner is going
+     * away — this is not a remote failure). */
+    for (size_t i = 0; i < MQ_UDP_CLI_MAX_SESSIONS; i++) {
+        mq_udp_cli_sess_t *sess = &u->sessions[i];
+        if (sess->used) {
+            sess->closing = 1;
+            cli_reap_session(sess);
+        }
+    }
+    free(u->emit_buf);
+    free(u);
 }

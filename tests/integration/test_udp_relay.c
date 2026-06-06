@@ -1,19 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 mp0rta
 
-/* test_udp_relay.c — Task 5.3: server-side UDP relay full-path integration.
+/* test_udp_relay.c — UDP relay full-path integration (Task 5.3 + 6.2).
  *
  * Stands up a REAL mq_client + REAL mq_server over loopback in-process on a
  * shared libevent base (same harness shape as test_client_server.c), plus a
- * local UDP echo socket bound inside the test. The client side has no UDP
- * ingress yet, so the test assembles the 0x02 (UDP_SESSION) stream + DATAGRAM
- * frames DIRECTLY on the client's mq_conn using the Task 1/4 codecs — it does
- * not depend on any client-role UDP implementation (Chunk 6).
+ * local UDP echo socket bound inside the test.
+ *
+ * Cases 1/2/a/b drive the CLIENT-ROLE boundary (mq_client_udp_open_fn /
+ * send / close — Task 6.2): the client owns the conn's datagram callback and
+ * reassembles server→client datagrams into on_rx. Cases 3/6/7/8/9 assemble the
+ * 0x02 (UDP_SESSION) stream + DATAGRAM frames DIRECTLY on the conn using the
+ * Task 1/4 codecs (raw-conn server-stimulus scaffolding), keeping precise
+ * control over send ordering / malformed inputs for server-behaviour coverage.
  *
  * Cases (design §2/§6/§9.2):
- *   1. OPEN → RESP OK → datagram round-trip byte-exact.
- *   2. OPEN + datagram in the SAME event-loop turn → delivered via the pre-OPEN
- *      buffer (xquic datagram-before-stream ordering regression — design §2).
+ *   1. client-role open → send → byte-exact echo (optimistic send, post-auth).
+ *   2. client-role open + send SAME turn → server pre-OPEN buffer delivers echo
+ *      (xquic datagram-before-stream ordering regression — design §2).
+ *   a. client-role open + send BEFORE auth → queued; flushed post-auth (startup
+ *      race regression).
+ *   b. client-role 3000B frag relay → byte-exact echo + frags_reassembled > 0.
  *   3. OPEN to a non-existent host (.invalid) → RESP MQ_UDP_DNS_FAILED + close.
  *   4. enabled=0 (--no-udp) → RESP MQ_UDP_POLICY_DENIED.
  *   5. idle_timeout_ms=100, left idle → server closes the 0x02 stream.
@@ -355,8 +362,12 @@ send_tunnel_datagram(mq_conn_t *conn, uint32_t sid, uint16_t pkt_id,
     return mq_conn_datagram_send(conn, out, MQ_UDP_MSG_HDR + plen);
 }
 
-/* ── datagram receive capture (server→tunnel echo lands here) ─────────────── */
-static uint8_t g_dgm_rx[2048];
+/* ── datagram receive capture (server→tunnel echo lands here) ──────────────
+ *
+ * Sized to 4096 so the 3000B frag-relay case (b) captures byte-exact. Used by
+ * the RAW-conn cases (6/7/8/9) that decode datagrams directly; the client-role
+ * cases use the cli_rx_t capture below (on_rx delivers reassembled payload). */
+static uint8_t g_dgm_rx[4096];
 static size_t g_dgm_rxlen;
 static int g_dgm_done;
 static uint32_t g_dgm_want_sid;
@@ -386,7 +397,12 @@ reset_dgm_capture(uint32_t sid)
     memset(g_dgm_rx, 0, sizeof(g_dgm_rx));
 }
 
-/* Authenticate the fixture's client + wire the client's datagram callback. */
+/* Authenticate the fixture's client + wire the client's datagram callback.
+ *
+ * NOTE: the RAW-conn cases (6/7/8/9) install on_client_datagram on the conn to
+ * decode datagrams directly. The client-role cases (1/2/a/b) must NOT do this:
+ * the mq_client already owns the conn's datagram callback (routing to its
+ * mq_udp_cli dispatch), so they leave it in place and capture via cli_rx_t. */
 static mq_conn_t *
 fixture_authed_conn(fixture_t *f)
 {
@@ -398,9 +414,56 @@ fixture_authed_conn(fixture_t *f)
     return conn;
 }
 
+/* ── client-role session capture (on_rx / on_err via the mq_udp_open_fn) ────
+ *
+ * The boundary delivers reassembled UDP payloads through on_rx and terminal
+ * failures through on_err. cli_rx_t captures the first payload (byte-exact, up
+ * to 4096B for the frag case) and any on_err code for assertion. */
+typedef struct {
+    uint8_t rx[4096];
+    size_t rxlen;
+    int rx_done;
+    int err_fired;
+    mq_udp_err_t err;
+} cli_rx_t;
+
+static void
+cli_on_rx(const uint8_t *payload, size_t len, void *user)
+{
+    cli_rx_t *c = (cli_rx_t *)user;
+    if (c->rx_done) return;
+    size_t n = len > sizeof(c->rx) ? sizeof(c->rx) : len;
+    memcpy(c->rx, payload, n);
+    c->rxlen = n;
+    c->rx_done = 1;
+}
+
+static void
+cli_on_err(void *session, mq_udp_err_t err, void *user)
+{
+    (void)session;
+    cli_rx_t *c = (cli_rx_t *)user;
+    c->err_fired = 1;
+    c->err = err;
+}
+
+/* Open a UDP relay session through the boundary (mq_client_udp_open_fn) to the
+ * loopback echo on `port`. Returns the opaque session handle (or NULL). */
+static void *
+cli_open_v4(mq_client_t *client, uint16_t port, cli_rx_t *cap)
+{
+    uint8_t host[4];
+    uint32_t v4 = htonl(INADDR_LOOPBACK);
+    memcpy(host, &v4, 4);
+    mq_udp_open_fn open_fn = mq_client_udp_open_fn();
+    void *core = mq_client_udp_open_core(client);
+    return open_fn(core, host, 4, MQ_ADDR_IPV4, port, cli_on_rx, cli_on_err, cap);
+}
+
 /* ── default-server scenarios (enabled=1, idle=60s): cases 1,2,3,6,7,8 ───── */
 
-/* Case 1: OPEN → RESP OK → datagram round-trip byte-exact. */
+/* Case 1: client-role open → send → byte-exact echo (via the mq_udp_open_fn
+ * boundary). Exercises optimistic send (open then send, post-auth) end-to-end. */
 static void
 test_case1_open_resp_echo(void)
 {
@@ -413,36 +476,36 @@ test_case1_open_resp_echo(void)
     uint16_t echo_port = 0;
     MQ_CHECK_EQ_INT(udp_echo_up(&echo, f.base, &echo_port), 0);
 
-    mq_conn_t *conn = fixture_authed_conn(&f);
+    /* Wait for auth (so the open issues the stream immediately); the mq_client
+     * owns the conn datagram callback (routing to its cli dispatch). */
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+    MQ_CHECK_EQ_INT(mq_client_udp_available(f.client), 1);
 
-    const uint32_t SID = 0x11111111u;
-    udpstream_t d;
-    memset(&d, 0, sizeof(d));
-    mq_stream_t *s = open_udp_v4(conn, SID, echo_port, 0, &d);
-    MQ_CHECK(s != NULL);
+    cli_rx_t cap;
+    memset(&cap, 0, sizeof(cap));
+    void *sess = cli_open_v4(f.client, echo_port, &cap);
+    MQ_CHECK(sess != NULL);
 
-    pump_until(f.base, &d.resp_seen, 4000);
-    MQ_CHECK(d.resp_seen);
-    MQ_CHECK_EQ_INT((int)d.resp.status, (int)MQ_STATUS_OK);
-    MQ_CHECK_EQ_INT((int)d.resp.error_code, (int)MQ_UDP_OK);
-
-    /* Round-trip a patterned payload tunnel→target→tunnel. */
+    /* Optimistic send: payload goes out without waiting for RESP. */
     uint8_t payload[512];
     for (int i = 0; i < 512; i++)
         payload[i] = (uint8_t)((i * 37 + 5) & 0xff);
-    reset_dgm_capture(SID);
-    MQ_CHECK_EQ_INT(send_tunnel_datagram(conn, SID, 0, payload, sizeof(payload)), 0);
+    mq_client_udp_send_fn()(sess, payload, sizeof(payload));
 
-    pump_until(f.base, &g_dgm_done, 4000);
-    MQ_CHECK(g_dgm_done);
-    MQ_CHECK_EQ_INT((int)g_dgm_rxlen, 512);
-    if (g_dgm_done) MQ_CHECK_MEM(g_dgm_rx, payload, 512);
+    pump_until(f.base, &cap.rx_done, 4000);
+    MQ_CHECK(cap.rx_done);
+    MQ_CHECK_EQ_INT((int)cap.rxlen, 512);
+    if (cap.rx_done) MQ_CHECK_MEM(cap.rx, payload, 512);
+    MQ_CHECK_EQ_INT(cap.err_fired, 0);
 
+    mq_client_udp_close_fn()(sess);
     udp_echo_down(&echo);
     fixture_down(&f);
 }
 
-/* Case 2: OPEN + datagram in the SAME event-loop turn → pre-OPEN buffer path. */
+/* Case 2: client-role open + send in the SAME turn (post-auth) → optimistic
+ * send + server pre-OPEN buffer deliver the echo byte-exact. */
 static void
 test_case2_preopen_sameflight(void)
 {
@@ -455,32 +518,120 @@ test_case2_preopen_sameflight(void)
     uint16_t echo_port = 0;
     MQ_CHECK_EQ_INT(udp_echo_up(&echo, f.base, &echo_port), 0);
 
-    mq_conn_t *conn = fixture_authed_conn(&f);
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
 
-    const uint32_t SID = 0x22222222u;
-    udpstream_t d;
-    memset(&d, 0, sizeof(d));
+    cli_rx_t cap;
+    memset(&cap, 0, sizeof(cap));
 
     uint8_t payload[300];
     for (int i = 0; i < 300; i++)
         payload[i] = (uint8_t)((i * 91 + 13) & 0xff);
-    reset_dgm_capture(SID);
 
-    /* SAME turn: open + OPEN-send AND the datagram, before any pump. The
-     * datagram beats the stream at the server (xquic ordering, design §2), so
-     * the relay must buffer it pre-OPEN and flush on session creation. */
-    mq_stream_t *s = open_udp_v4(conn, SID, echo_port, 0, &d);
-    MQ_CHECK(s != NULL);
-    MQ_CHECK_EQ_INT(send_tunnel_datagram(conn, SID, 0, payload, sizeof(payload)), 0);
+    /* SAME turn: open issues the 0x02 stream + OPEN AND we send the datagram,
+     * before any pump. The datagram beats the stream at the server (xquic
+     * ordering, design §2), so the server's pre-OPEN buffer must flush it. */
+    void *sess = cli_open_v4(f.client, echo_port, &cap);
+    MQ_CHECK(sess != NULL);
+    mq_client_udp_send_fn()(sess, payload, sizeof(payload));
 
-    /* The echo of the buffered datagram must come back byte-exact. */
-    pump_until(f.base, &g_dgm_done, 5000);
-    MQ_CHECK(d.resp_seen);
-    MQ_CHECK_EQ_INT((int)d.resp.error_code, (int)MQ_UDP_OK);
-    MQ_CHECK(g_dgm_done);
-    MQ_CHECK_EQ_INT((int)g_dgm_rxlen, 300);
-    if (g_dgm_done) MQ_CHECK_MEM(g_dgm_rx, payload, 300);
+    pump_until(f.base, &cap.rx_done, 5000);
+    MQ_CHECK(cap.rx_done);
+    MQ_CHECK_EQ_INT((int)cap.rxlen, 300);
+    if (cap.rx_done) MQ_CHECK_MEM(cap.rx, payload, 300);
 
+    mq_client_udp_close_fn()(sess);
+    udp_echo_down(&echo);
+    fixture_down(&f);
+}
+
+/* Case (a): client-role open + send BEFORE auth completes (startup race
+ * regression). The open is issued immediately after mq_client_start (auth not
+ * yet settled); the send is queued in the per-session pre-auth queue; after
+ * auth the stream issues, the queue flushes, and the echo returns. */
+static void
+test_caseA_preauth_open_send(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 60000, 1) != 0) {
+        fixture_down(&f);
+        return;
+    }
+    udp_echo_t echo;
+    uint16_t echo_port = 0;
+    MQ_CHECK_EQ_INT(udp_echo_up(&echo, f.base, &echo_port), 0);
+
+    /* No auth pump: open + send right after fixture_up (auth pending). */
+    MQ_CHECK_EQ_INT(mq_client_is_authed(f.client), 0);
+    MQ_CHECK_EQ_INT(mq_client_udp_available(f.client), -1); /* undetermined */
+
+    cli_rx_t cap;
+    memset(&cap, 0, sizeof(cap));
+    void *sess = cli_open_v4(f.client, echo_port, &cap);
+    MQ_CHECK(sess != NULL); /* held pending-auth, stream deferred */
+
+    uint8_t payload[200];
+    for (int i = 0; i < 200; i++)
+        payload[i] = (uint8_t)((i * 53 + 17) & 0xff);
+    mq_client_udp_send_fn()(sess, payload, sizeof(payload)); /* queued pre-auth */
+
+    /* Now pump: auth settles → stream issues → queued send flushes → echo. */
+    pump_until(f.base, &cap.rx_done, 5000);
+    MQ_CHECK(cap.rx_done);
+    MQ_CHECK_EQ_INT((int)cap.rxlen, 200);
+    if (cap.rx_done) MQ_CHECK_MEM(cap.rx, payload, 200);
+    MQ_CHECK_EQ_INT(cap.err_fired, 0);
+
+    mq_client_udp_close_fn()(sess);
+    udp_echo_down(&echo);
+    fixture_down(&f);
+}
+
+/* Case (b): in-process frag relay — a 3000B payload (> datagram mss) sent via
+ * the client role is split into frags, echoed by the origin, reassembled on the
+ * way back, and delivered byte-exact through on_rx. Asserts the server's
+ * frags_reassembled counter advanced (deterministic frag-path proof). */
+static void
+test_caseB_frag_relay(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 60000, 1) != 0) {
+        fixture_down(&f);
+        return;
+    }
+    udp_echo_t echo;
+    uint16_t echo_port = 0;
+    MQ_CHECK_EQ_INT(udp_echo_up(&echo, f.base, &echo_port), 0);
+
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+
+    cli_rx_t cap;
+    memset(&cap, 0, sizeof(cap));
+    void *sess = cli_open_v4(f.client, echo_port, &cap);
+    MQ_CHECK(sess != NULL);
+
+    /* 3000B forces a multi-frag split (datagram mss ~1200). */
+    uint8_t payload[3000];
+    for (int i = 0; i < 3000; i++)
+        payload[i] = (uint8_t)((i * 131 + 7) & 0xff);
+    mq_client_udp_send_fn()(sess, payload, sizeof(payload));
+
+    pump_until(f.base, &cap.rx_done, 6000);
+    MQ_CHECK(cap.rx_done);
+    MQ_CHECK_EQ_INT((int)cap.rxlen, 3000);
+    if (cap.rx_done) MQ_CHECK_MEM(cap.rx, payload, 3000);
+    MQ_CHECK_EQ_INT(cap.err_fired, 0);
+
+    /* The server reassembled the multi-frag tunnel→target packet. */
+    mq_udp_srv_t *u = mq_server_last_udp_srv(f.server);
+    MQ_CHECK(u != NULL);
+    if (u) {
+        mq_udp_srv_counters_t c = mq_udp_srv_counters(u);
+        MQ_CHECK(c.frags_reassembled > 0);
+    }
+
+    mq_client_udp_close_fn()(sess);
     udp_echo_down(&echo);
     fixture_down(&f);
 }
@@ -872,6 +1023,8 @@ test_udp_relay(void)
 {
     test_case1_open_resp_echo();
     test_case2_preopen_sameflight();
+    test_caseA_preauth_open_send();
+    test_caseB_frag_relay();
     test_case3_dns_failed();
     test_case6_preopen_evict();
     test_case7_preauth_drop_noflush();

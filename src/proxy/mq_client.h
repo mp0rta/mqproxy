@@ -111,6 +111,28 @@ void mq_client_tcp_open(void *core, const uint8_t *host, size_t host_len,
 mq_tcp_open_fn mq_client_tcp_open_fn(void);
 void *mq_client_tcp_open_core(mq_client_t *c);
 
+/* ── UDP relay (the ingress→core boundary, mq_ingress.h) ─────────────────────
+ *
+ * The client owns a per-connection UDP relay session table (mq_udp_cli_t). The
+ * function pointers + core pointer below let the UDP ingress (mq_udp_assoc,
+ * Task 6.3) open/send/close UDP relay sessions without knowing the concrete
+ * client type — mirroring the TCP getter style above. core is the mq_client_t*.
+ */
+mq_udp_open_fn mq_client_udp_open_fn(void);
+mq_udp_send_fn mq_client_udp_send_fn(void);
+mq_udp_close_fn mq_client_udp_close_fn(void);
+void *mq_client_udp_open_core(mq_client_t *c);
+
+/* UDP relay capability tri-state (the CLI's on_auth glue consults this — Task
+ * 6.3/6.4 — to decide whether to admit ASSOCIATE; the ingress never calls the
+ * core directly):
+ *    -1 = undetermined (pre-auth — optimistically admit)
+ *     0 = unavailable  (authed but no MQ_FEAT_UDP_RELAY, or datagram mss == 0)
+ *     1 = available    (authed + feature bit + mss > 0)
+ * The server advertises MQ_FEAT_UDP_RELAY in AUTH_RESPONSE.features; the client
+ * saves it at auth time and combines it with mq_conn_datagram_mss() > 0. */
+int mq_client_udp_available(const mq_client_t *c);
+
 /* Free the client. Does not close the connection on its own; callers tear down
  * the engine/paths which closes outstanding conns. Safe on NULL. */
 void mq_client_free(mq_client_t *c);
