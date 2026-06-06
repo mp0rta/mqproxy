@@ -82,7 +82,7 @@ parse_request(const uint8_t *buf, size_t len, size_t *consumed, mq_socks5_req_t 
     size_t total = addr_off + addr_len + 2; /* +2 for port */
     if (len < total) return MQ_SOCKS5_NEED_MORE;
 
-    /* addr_len <= 255 (IPv4=4, IPv6=16, domain LEN byte <=255) => fits host[]. */
+    /* exact fit (MQ_MAX_HOST == 255; no NUL terminator — host_len carries the length) */
     out->atype = mapped;
     out->host_len = addr_len;
     if (addr_len > 0) memcpy(out->host, buf + addr_off, addr_len);
@@ -199,6 +199,7 @@ mq_socks5_parse_udp_hdr(const uint8_t *buf, size_t len, mq_socks5_udp_hdr_t *out
     size_t total = addr_off + addr_len + 2; /* +2 for port */
     if (len < total) return -1;
 
+    /* exact fit (MQ_MAX_HOST == 255; no NUL terminator — host_len carries the length) */
     out->dst.atype = mapped;
     out->dst.host_len = addr_len;
     if (addr_len > 0) memcpy(out->dst.host, buf + addr_off, addr_len);

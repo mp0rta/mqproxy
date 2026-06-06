@@ -414,6 +414,29 @@ static const uint8_t UDP_HDR_DOMAIN[] = {
     0x01, 0xBB                                               /* PORT=443 */
 };
 
+/* Empty domain UDP header: ATYP=domain, LEN=0 (no domain bytes) */
+static const uint8_t UDP_HDR_EMPTY_DOMAIN[] = {
+    0x00, 0x00, /* RSV */
+    0x00,       /* FRAG */
+    0x03,       /* ATYP=domain */
+    0x00,       /* LEN=0 (empty domain) */
+    0x00, 0x50  /* PORT=80 */
+};
+
+static void
+test_parse_udp_hdr_empty_domain(void)
+{
+    mq_socks5_udp_hdr_t h;
+    memset(&h, 0, sizeof h);
+    int n =
+        mq_socks5_parse_udp_hdr(UDP_HDR_EMPTY_DOMAIN, sizeof UDP_HDR_EMPTY_DOMAIN, &h);
+    MQ_CHECK_EQ_INT(n, (int)sizeof UDP_HDR_EMPTY_DOMAIN);
+    MQ_CHECK_EQ_INT(h.hdr_len, sizeof UDP_HDR_EMPTY_DOMAIN);
+    MQ_CHECK_EQ_INT(h.dst.atype, MQ_ADDR_DOMAIN);
+    MQ_CHECK_EQ_INT(h.dst.host_len, 0);
+    MQ_CHECK_EQ_INT(h.dst.port, 80);
+}
+
 static void
 test_parse_udp_hdr_ipv4(void)
 {
@@ -668,6 +691,7 @@ MQ_TEST_MAIN({
     test_associate_reply_with_addr();
     test_connect_reply_unchanged();
     /* UDP encapsulation header parse */
+    test_parse_udp_hdr_empty_domain();
     test_parse_udp_hdr_ipv4();
     test_parse_udp_hdr_ipv6();
     test_parse_udp_hdr_domain();
