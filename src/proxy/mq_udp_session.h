@@ -14,10 +14,14 @@
  *     the conn closing all tear the session down (fd close + event free + defrag
  *     free), each path reaping exactly once.
  *
- * The datagram relay paths (tunnel→target send, target→tunnel split/send),
- * pre-OPEN buffering, auth gating, drop counters and stats dump are Task 5.2;
- * this module declares mq_udp_srv_on_datagram but stubs it, and registers the
- * UDP socket's EV_READ with a no-op callback that 5.2 replaces.
+ * The datagram relay paths are fully delivered: mq_udp_srv_on_datagram provides
+ * conn-level datagram dispatch with an auth gate (drops silently before
+ * mq_udp_srv_set_authed), tunnel→target defrag+send, and a pre-OPEN buffer
+ * (16 entries / 32 KiB per conn, 250 ms TTL) that buffers datagrams arriving
+ * before the OPEN completes and flushes them at session creation.  The UDP
+ * socket's EV_READ drives the target→tunnel path: split+send back to the
+ * tunnel.  §9.2 drop/activity counters are maintained throughout; stats are
+ * dumped to the log at conn close via mq_udp_srv_dump_stats.
  */
 #ifndef MQ_PROXY_MQ_UDP_SESSION_H
 #define MQ_PROXY_MQ_UDP_SESSION_H

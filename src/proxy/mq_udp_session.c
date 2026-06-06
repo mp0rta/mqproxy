@@ -26,8 +26,9 @@
  *     datagram or split is skipped and drops_send_fail is incremented.
  *
  * ── frag counter semantics ──────────────────────────────────────────────────
- * frags_sent:        incremented by the number of frags emitted ONLY when
- *                    split produced >1 frag (frag_count>1).  Single-frag
+ * frags_sent:        incremented by the number of frags successfully sent
+ *                    ONLY when ctx.frags_ok > 1 after a split (i.e. at least
+ *                    two frags were actually delivered).  Single-frag
  *                    passthrough does NOT count.  Proves the multi-frag emit
  *                    path ran.
  * frags_reassembled: incremented once per COMPLETED reassembly whose
@@ -44,9 +45,10 @@
  * arrival and at flush time.
  *
  * ── target→tunnel recv loop ─────────────────────────────────────────────────
- * recv into a 65535-byte heap buffer; loop until EAGAIN, bounded to 16 packets
- * per wakeup.  Persistent EV_READ re-fires for leftovers.  Per-emit assembly
- * uses one scratch buffer (9 + 65535 = 65544 bytes) allocated once on
+ * recv into a MQ_UDP_MAX_PAYLOAD-byte heap buffer; loop until EAGAIN, bounded
+ * to 16 packets per wakeup.  Persistent EV_READ re-fires for leftovers.
+ * Per-emit assembly uses one scratch buffer (MQ_UDP_MSG_HDR + MQ_UDP_MAX_PAYLOAD
+ * bytes) allocated once on
  * mq_udp_srv (NOT per packet, NOT on stack) to avoid per-frag heap churn.
  */
 #include "proxy/mq_udp_session.h"
@@ -83,6 +85,9 @@
 
 /* recv loop: max packets per EV_READ wakeup */
 #define MQ_UDP_RECV_LOOP_MAX 16
+
+/* maximum UDP payload length (IPv4/IPv6 max datagram payload) */
+#define MQ_UDP_MAX_PAYLOAD 65535
 
 /* MSS cache refresh interval in emit-count units (carries per direction count) */
 #define MQ_MSS_REFRESH_INTERVAL 64
@@ -167,11 +172,12 @@ struct mq_udp_srv {
     unsigned mss_emit_countdown;
 
     /* Per-conn scratch buffers (allocated once, reused per operation):
-     *   recv_buf:    65535-byte buffer for recvfrom()
-     *   emit_buf:    9+65535 bytes for assembling hdr+slice before datagram_send
+     *   recv_buf:    MQ_UDP_MAX_PAYLOAD bytes for recvfrom()
+     *   emit_buf:    MQ_UDP_MSG_HDR + MQ_UDP_MAX_PAYLOAD bytes for assembling
+     *                hdr+slice before datagram_send
      * Both allocated in mq_udp_srv_new; freed in mq_udp_srv_free. */
-    uint8_t *recv_buf; /* 65535 bytes */
-    uint8_t *emit_buf; /* MQ_UDP_MSG_HDR + 65535 bytes */
+    uint8_t *recv_buf; /* MQ_UDP_MAX_PAYLOAD bytes */
+    uint8_t *emit_buf; /* MQ_UDP_MSG_HDR + MQ_UDP_MAX_PAYLOAD bytes */
 
     /* Drop / activity counters (uint32_t, %u, design §9.2) */
     uint32_t drops_send_fail;   /* datagram_send returned -1, or split failed */
@@ -606,8 +612,7 @@ srv_idle_expired_cb(evutil_socket_t fd, short what, void *arg)
  * u->emit_buf and send as one datagram frame.  user is mq_udp_srv_t*. */
 typedef struct {
     mq_udp_srv_t *u;
-    uint32_t frag_count; /* frag_count of this split operation (from first emit) */
-    uint32_t frags_ok;   /* number of frags successfully sent in this split */
+    uint32_t frags_ok; /* number of frags successfully sent in this split */
 } emit_ctx_t;
 
 static void
@@ -648,7 +653,7 @@ srv_udp_readable_cb(evutil_socket_t evfd, short what, void *arg)
     /* Loop up to MQ_UDP_RECV_LOOP_MAX packets per wakeup; EV_PERSIST re-fires
      * for any left in the socket buffer. */
     for (int pkts = 0; pkts < MQ_UDP_RECV_LOOP_MAX; pkts++) {
-        ssize_t n = recv(evfd, u->recv_buf, 65535, 0);
+        ssize_t n = recv(evfd, u->recv_buf, MQ_UDP_MAX_PAYLOAD, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break; /* socket drained */
@@ -678,7 +683,6 @@ srv_udp_readable_cb(evutil_socket_t evfd, short what, void *arg)
          * count that as drops_oversize. */
         emit_ctx_t ctx;
         ctx.u = u;
-        ctx.frag_count = 0;
         ctx.frags_ok = 0;
 
         int split_rc =
@@ -993,12 +997,12 @@ mq_udp_srv_new(mq_conn_t *c, struct event_base *base, uint64_t idle_timeout_ms,
     u->mss_emit_countdown = 0;
 
     /* Allocate scratch buffers (once per conn; reused per packet). */
-    u->recv_buf = malloc(65535);
+    u->recv_buf = malloc(MQ_UDP_MAX_PAYLOAD);
     if (!u->recv_buf) {
         free(u);
         return NULL;
     }
-    u->emit_buf = malloc(MQ_UDP_MSG_HDR + 65535);
+    u->emit_buf = malloc(MQ_UDP_MSG_HDR + MQ_UDP_MAX_PAYLOAD);
     if (!u->emit_buf) {
         free(u->recv_buf);
         free(u);
