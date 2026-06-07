@@ -1271,6 +1271,103 @@ test_casec_client_on_err_dns_failed(void)
     fixture_down(&f);
 }
 
+/* Case (r): reconnect rebind regression (Phase 5b).
+ *
+ * Verifies that mq_udp_cli_reset + mq_udp_cli_set_conn correctly clear the
+ * one-shot latches and re-wire the conn, allowing a second auth/open cycle to
+ * run after an in-process simulated reconnect.
+ *
+ * Steps:
+ *   1. Establish a client-role UDP session + byte-exact echo (same as case 1).
+ *   2. Close the session caller-side so the table is empty.
+ *   3. Simulate a reconnect at the mq_udp_cli level:
+ *        mq_udp_cli_on_conn_close(u)  -- sets settled=1, conn=NULL
+ *        mq_udp_cli_reset(u)          -- clears settled/authed/available/mss
+ *        mq_udp_cli_set_conn(u, conn) -- re-wires the (still-live) conn
+ *        mq_udp_cli_on_auth(u, 1, 1)  -- fresh auth cycle runs (settled was 0)
+ *   4. Open a NEW session on the same `u` and assert a datagram round-trip is
+ *      byte-exact — proving the latches were cleared (on_auth fired again) and
+ *      the new conn is correctly wired. */
+static void
+test_caser_rebind_reconnect(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 60000, 1) != 0) {
+        fixture_down(&f);
+        return;
+    }
+    udp_echo_t echo;
+    uint16_t echo_port = 0;
+    MQ_CHECK_EQ_INT(udp_echo_up(&echo, f.base, &echo_port), 0);
+
+    /* Wait for auth (establishes the authed+available state). */
+    pump_until(f.base, &g_auth_fired, 4000);
+    MQ_CHECK(g_auth_ok);
+    MQ_CHECK_EQ_INT(mq_client_udp_available(f.client), 1);
+
+    /* Step 1: open a session + do a byte-exact echo round-trip. */
+    cli_rx_t cap1;
+    memset(&cap1, 0, sizeof(cap1));
+    void *sess1 = cli_open_v4(f.client, echo_port, &cap1);
+    MQ_CHECK(sess1 != NULL);
+
+    uint8_t payload1[128];
+    for (int i = 0; i < 128; i++)
+        payload1[i] = (uint8_t)((i * 43 + 11) & 0xff);
+    mq_client_udp_send_fn()(sess1, payload1, sizeof(payload1));
+
+    pump_until(f.base, &cap1.rx_done, 4000);
+    MQ_CHECK(cap1.rx_done);
+    MQ_CHECK_EQ_INT((int)cap1.rxlen, 128);
+    if (cap1.rx_done) MQ_CHECK_MEM(cap1.rx, payload1, 128);
+    MQ_CHECK_EQ_INT(cap1.err_fired, 0);
+
+    /* Step 2: caller-close the session so the table is empty before rebind. */
+    mq_client_udp_close_fn()(sess1);
+
+    /* Step 3: simulate reconnect at the mq_udp_cli level.
+     * Grab the cli + conn pointers before on_conn_close nulls the conn. */
+    mq_udp_cli_t *u = (mq_udp_cli_t *)mq_client_udp_open_core(f.client);
+    MQ_CHECK(u != NULL);
+    mq_conn_t *conn = mq_client_conn(f.client);
+    MQ_CHECK(conn != NULL);
+
+    mq_udp_cli_on_conn_close(u);  /* settled=1, conn=NULL, table already empty */
+    mq_udp_cli_reset(u);          /* settled=0, authed=0, available=0, mss=0 */
+    mq_udp_cli_set_conn(u, conn); /* re-wire the still-live conn */
+    mq_udp_cli_on_auth(u, 1, 1); /* fresh auth cycle: settled→1, authed→1, available→1 */
+
+    /* Step 4: open a NEW session on the rebind'd cli and assert byte-exact echo. */
+    cli_rx_t cap2;
+    memset(&cap2, 0, sizeof(cap2));
+    /* Use the boundary function pointer directly (same as cli_open_v4 does). */
+    {
+        uint8_t host[4];
+        uint32_t v4 = htonl(INADDR_LOOPBACK);
+        memcpy(host, &v4, 4);
+        mq_udp_open_fn open_fn = mq_client_udp_open_fn();
+        void *sess2 =
+            open_fn(u, host, 4, MQ_ADDR_IPV4, echo_port, cli_on_rx, cli_on_err, &cap2);
+        MQ_CHECK(sess2 != NULL);
+
+        uint8_t payload2[256];
+        for (int i = 0; i < 256; i++)
+            payload2[i] = (uint8_t)((i * 71 + 23) & 0xff);
+        mq_client_udp_send_fn()(sess2, payload2, sizeof(payload2));
+
+        pump_until(f.base, &cap2.rx_done, 4000);
+        MQ_CHECK(cap2.rx_done);
+        MQ_CHECK_EQ_INT((int)cap2.rxlen, 256);
+        if (cap2.rx_done) MQ_CHECK_MEM(cap2.rx, payload2, 256);
+        MQ_CHECK_EQ_INT(cap2.err_fired, 0);
+
+        mq_client_udp_close_fn()(sess2);
+    }
+
+    udp_echo_down(&echo);
+    fixture_down(&f);
+}
+
 static void
 test_udp_relay(void)
 {
@@ -1289,6 +1386,7 @@ test_udp_relay(void)
     test_case9_disabled_datagram_drop();
     test_casez_zero_len_datagram();
     test_casey_short_idle_across_activity();
+    test_caser_rebind_reconnect();
 }
 
 MQ_TEST_MAIN(test_udp_relay())

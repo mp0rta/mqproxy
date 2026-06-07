@@ -177,4 +177,12 @@ void mq_udp_cli_on_auth(mq_udp_cli_t *u, int ok, int available);
  * cli holds no sessions; the conn pointer must not be used again. */
 void mq_udp_cli_on_conn_close(mq_udp_cli_t *u);
 
+/* Reconnect support (Phase 5b). reset clears the one-shot latches (settled/
+ * authed/available) and the conn-derived MSS cache so the next auth cycle runs
+ * fresh; it leaves conn as-is (the caller nulls it via on_conn_close). set_conn
+ * wires the new conn after a reconnect (mirrors mq_client_start's create-then-wire
+ * ordering). The session table must already be empty (on_conn_close reaped it). */
+void mq_udp_cli_reset(mq_udp_cli_t *u);
+void mq_udp_cli_set_conn(mq_udp_cli_t *u, mq_conn_t *conn);
+
 #endif /* MQ_PROXY_MQ_UDP_SESSION_H */
