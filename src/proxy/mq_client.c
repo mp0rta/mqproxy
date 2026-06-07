@@ -1154,10 +1154,12 @@ mq_client_free(mq_client_t *c)
     }
     /* Disarm the mp-ready deferral timer (no-op if already stopped). */
     client_mp_timer_stop(c);
-    /* Free any still-queued opens (no cb: the owner is tearing down). The active
-     * data nodes are reaped via the conn CLOSED path before the engine frees the
-     * conn; by the time mq_client_free runs they should be gone. Fail defensively
-     * in case free is called without a prior CLOSED. */
+    /* Fail any still-queued opens (fires their cb with CONN_REFUSED). In
+     * practice the queue is already empty by free-time (drained/failed on the
+     * prior CLOSED); this is defensive. The active data nodes are reaped via
+     * the conn CLOSED path before the engine frees the conn; by the time
+     * mq_client_free runs they should be gone. Fail defensively in case free
+     * is called without a prior CLOSED. */
     client_fail_queue(c, MQ_TCP_CONN_REFUSED);
     while (c->data_head) {
         client_data_report(c->data_head, 0, MQ_TCP_CONN_REFUSED);

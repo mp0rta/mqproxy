@@ -35,6 +35,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -715,6 +717,13 @@ cmd_client(int argc, char **argv)
      * below via mq_client_add_paths). Otherwise bind the unspecified IPv4
      * address with an ephemeral port. */
     const char *primary_ip = (npaths > 0) ? paths[0] : "0.0.0.0";
+
+    /* Seed the process-global RNG once per client process so that reconnect
+     * backoff jitter is decorrelated across fleet processes that start or drop
+     * connectivity at the same time (e.g. a Starlink+LTE fleet dropping at
+     * once). Without seeding, all processes draw the identical jitter sequence
+     * and reconnect in lockstep, defeating the anti-thundering-herd purpose. */
+    srandom((unsigned)(getpid() ^ (unsigned)time(NULL)));
 
     int rc = 1;
     struct event_base *base = NULL;
