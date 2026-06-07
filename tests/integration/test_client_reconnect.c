@@ -128,7 +128,55 @@ typedef struct {
     mq_runtime_t *cli_rt;
     mq_server_t *server;
     mq_client_t *client;
+    uint16_t port; /* the loopback port the client dials; stable across server
+                      teardown/rebuild (used by the persistent-outage case). */
 } fixture_t;
+
+/* Stand up ONLY the server side (transport + runtime + server) bound to f->port.
+ * Split out of fixture_up so the persistent-outage case can tear the server down
+ * and rebuild it on the SAME port while the client keeps dialing. Returns 0/-1.
+ * On failure leaves the partially-built server fields for server_down to clean. */
+static int
+server_up(fixture_t *f)
+{
+    f->srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
+    MQ_CHECK(f->srv_t != NULL);
+    if (!f->srv_t) return -1;
+    f->srv_rt = mq_runtime_new(f->srv_t, f->base);
+    MQ_CHECK(f->srv_rt != NULL);
+    if (!f->srv_rt) return -1;
+    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2, 60000, 1);
+    MQ_CHECK(f->server != NULL);
+    if (!f->server) return -1;
+    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->srv_rt, "127.0.0.1", f->port), 0);
+    return 0;
+}
+
+/* Tear the server side down (transport, runtime, server) and NULL the fields so
+ * the client's re-dials cannot complete: "server gone". The client + its event
+ * base + the runtime/transport stay alive and keep retrying. SO_REUSEADDR (set
+ * by the runtime) lets server_up re-bind the same UDP port afterward.
+ *
+ * ORDER MIRRORS fixture_down: transport FIRST, then runtime, then server. The
+ * transport free runs xqc_engine_destroy → xqc_conn_destroy → mq_conn_close_notify
+ * → srv_conn_state, which dereferences the server struct — so the server MUST
+ * still be alive when the transport is freed (freeing the server first is a UAF). */
+static void
+server_down(fixture_t *f)
+{
+    if (f->srv_t) {
+        mq_transport_free(f->srv_t);
+        f->srv_t = NULL;
+    }
+    if (f->srv_rt) {
+        mq_runtime_free(f->srv_rt);
+        f->srv_rt = NULL;
+    }
+    if (f->server) {
+        mq_server_free(f->server);
+        f->server = NULL;
+    }
+}
 
 /* Stand the fixture up. keepalive_ms == 0 leaves the client default (30s); a
  * positive value is applied via mq_client_set_keepalive before start. Reconnect
@@ -147,18 +195,9 @@ fixture_up(fixture_t *f, uint64_t keepalive_ms)
     uint16_t port = reserve_udp_port();
     MQ_CHECK(port != 0);
     if (!port) return -1;
+    f->port = port;
 
-    f->srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
-    MQ_CHECK(f->srv_t != NULL);
-    if (!f->srv_t) return -1;
-    f->srv_rt = mq_runtime_new(f->srv_t, f->base);
-    MQ_CHECK(f->srv_rt != NULL);
-    if (!f->srv_rt) return -1;
-    f->server = mq_server_new(f->srv_t, f->srv_rt, "secret", MQ_CC_BBR2, 60000, 1);
-    MQ_CHECK(f->server != NULL);
-    if (!f->server) return -1;
-
-    MQ_CHECK_EQ_INT(mq_runtime_open_udp_path(f->srv_rt, "127.0.0.1", port), 0);
+    if (server_up(f) != 0) return -1;
 
     f->cli_t = mq_transport_new(0);
     MQ_CHECK(f->cli_t != NULL);
@@ -876,6 +915,146 @@ test_case6_keepalive_holds(void)
     fixture_down(&f);
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * Case 7: persistent outage — server GONE across MULTIPLE backoff cycles, then
+ *         brought BACK on the same port. Proves the always-on self-heal: the
+ *         client stays unauthed + keeps retrying (no spurious "recovery", no
+ *         crash/wedge) across ≥2 backoff intervals, then re-auths + a fresh TCP
+ *         echo flow completes byte-exact once the server returns.
+ *
+ * Mechanism: tear the server side DOWN entirely (server_down) so re-dials cannot
+ * complete, while the client + its event base stay alive and keep arming backoff.
+ * The reserved port is stable (f.port), so server_up rebinds the SAME UDP port
+ * (SO_REUSEADDR) and the client's ongoing re-dials then land on a live server.
+ * ════════════════════════════════════════════════════════════════════════ */
+static void
+test_case7_persistent_outage(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 0) != 0) {
+        fixture_down(&f);
+        return;
+    }
+    echo_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(echo_origin_up(&origin, f.base, &origin_port), 0);
+
+    /* Establish + first auth. */
+    pump_until_auth_count(f.base, 1, 4000);
+    MQ_CHECK_EQ_INT(g_auth_count, 1);
+    MQ_CHECK(g_auth_ok);
+    MQ_CHECK_EQ_INT(mq_client_is_authed(f.client), 1);
+    MQ_CHECK_EQ_INT(run_tcp_echo_flow(&f, origin_port), 0);
+
+    /* Bring the SERVER fully down, then drop the client's conn. Re-dials now
+     * cannot complete: server gone. The client keeps arming backoff + retrying. */
+    server_down(&f);
+    mq_conn_close(mq_client_conn(f.client));
+
+    /* mq_conn_close is async: pump until the CLOSED is processed (conn nulled,
+     * authed reset to 0, backoff armed) before asserting the outage invariant. */
+    pump_until_conn_null(&f, 4000);
+    MQ_CHECK(mq_client_conn(f.client) == NULL);
+    MQ_CHECK_EQ_INT(mq_client_is_authed(f.client), 0);
+
+    /* Pump across ≥2 backoff cycles (max-backoff 1000ms + full-jitter ⇒ a cap of
+     * ~1s per cycle; 3500ms spans at least two re-dial attempts). Throughout the
+     * outage the client must stay UNAUTHED, must NOT spuriously report recovery
+     * (auth_count stays 1), and must not crash/wedge. */
+    uint64_t outage_deadline = now_ms() + 3500;
+    while (now_ms() < outage_deadline) {
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+        /* Invariant checked continuously: no false "recovery" while server gone. */
+        MQ_CHECK_EQ_INT(g_auth_count, 1);
+        MQ_CHECK_EQ_INT(mq_client_is_authed(f.client), 0);
+    }
+    /* Outage assertions: still exactly one auth, still NOT authed. (conn may be
+     * NULL in the backoff window OR a non-NULL pending wrapper from an in-flight
+     * re-dial that is mid-handshake against the gone server — either is the
+     * "still trying, not recovered" state. is_authed==0 is the load-bearing
+     * proof of no spurious recovery.) */
+    MQ_CHECK_EQ_INT(g_auth_count, 1);
+    MQ_CHECK_EQ_INT(mq_client_is_authed(f.client), 0);
+
+    /* Bring the server BACK on the SAME port the client keeps dialing. */
+    MQ_CHECK_EQ_INT(server_up(&f), 0);
+
+    /* Pump until the client's next re-dial lands on the live server and re-auths
+     * (auth_count reaches 2). Budget generously: a backoff cycle + handshake +
+     * re-auth, and the re-dial may have to wait out the current backoff interval. */
+    pump_until_auth_count(f.base, 2, RECONNECT_BUDGET_MS * 2);
+    MQ_CHECK_EQ_INT(g_auth_count, 2);
+    MQ_CHECK(g_auth_ok);
+    MQ_CHECK_EQ_INT(mq_client_is_authed(f.client), 1);
+    MQ_CHECK(mq_client_conn(f.client) != NULL);
+
+    /* A NEW TCP echo flow completes byte-exact on the recovered conn. */
+    MQ_CHECK_EQ_INT(run_tcp_echo_flow(&f, origin_port), 0);
+
+    echo_origin_down(&origin);
+    fixture_down(&f);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Case 8: terminal close (reconnect DISABLED) → tcp_open fast-fails. Establish,
+ *         drop the conn so the client goes terminal (c->closed=1, no reconnect),
+ *         then a tcp_open must fail fast via the c->closed arm (no enqueue, no
+ *         hang). Exercises mq_client.c tcp_open's terminal fast-fail.
+ * ════════════════════════════════════════════════════════════════════════ */
+static void
+test_case8_open_after_terminal(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 0) != 0) {
+        fixture_down(&f);
+        return;
+    }
+    echo_origin_t origin;
+    uint16_t origin_port = 0;
+    MQ_CHECK_EQ_INT(echo_origin_up(&origin, f.base, &origin_port), 0);
+
+    pump_until_auth_count(f.base, 1, 4000);
+    MQ_CHECK_EQ_INT(g_auth_count, 1);
+    MQ_CHECK(g_auth_ok);
+
+    /* DISABLE reconnect: the next conn loss is terminal (c->closed=1). */
+    mq_client_set_reconnect(f.client, 0, 0);
+
+    /* Drop the conn; pump until the loss is registered and the client has gone
+     * terminal (conn NULL, no reconnect armed). NOTE: the terminal branch sets
+     * c->closed=1 and conn=NULL but does NOT reset c->authed (only the reconnect
+     * branch does), so is_authed may remain 1 — the c->closed latch is what gates
+     * tcp_open here, checked before the authed arm. */
+    mq_conn_close(mq_client_conn(f.client));
+    pump_until_conn_null(&f, 4000);
+    MQ_CHECK(mq_client_conn(f.client) == NULL);
+    /* No reconnect can recover it now: pump well past any backoff window; auth
+     * count must stay 1 (terminal, not reconnecting). */
+    pump_for(f.base, 1500);
+    MQ_CHECK_EQ_INT(g_auth_count, 1);
+    MQ_CHECK(mq_client_conn(f.client) == NULL);
+
+    /* tcp_open after terminal close must fail FAST (c->closed arm): the cb fires
+     * with ok=0 synchronously and the fd is closed — not enqueued, not hung. */
+    int sp[2];
+    MQ_CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+    set_nonblock(sp[0]);
+    set_nonblock(sp[1]);
+    open_result_t res;
+    memset(&res, 0, sizeof(res));
+    uint8_t host[4];
+    v4_loopback(host);
+    mq_client_tcp_open(mq_client_tcp_open_core(f.client), host, 4, MQ_ADDR_IPV4,
+                       origin_port, sp[1], NULL, 0, &res, on_tcp_open);
+    /* Fast-fail is synchronous: the cb has already fired (no pump needed). */
+    MQ_CHECK_EQ_INT(res.fired, 1);
+    MQ_CHECK_EQ_INT(res.ok, 0);
+    close(sp[0]); /* the client closed sp[1] on the fast-fail path */
+
+    echo_origin_down(&origin);
+    fixture_down(&f);
+}
+
 static void
 test_client_reconnect(void)
 {
@@ -888,6 +1067,8 @@ test_client_reconnect(void)
     test_case4_queue_carryover();
     test_case5_free_while_reconnecting();
     test_case6_keepalive_holds();
+    test_case7_persistent_outage();
+    test_case8_open_after_terminal();
 }
 
 MQ_TEST_MAIN(test_client_reconnect())

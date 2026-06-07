@@ -364,8 +364,13 @@ typedef struct {
     uint16_t lport;
 } gw_fixture_t;
 
+/* Full fixture constructor: parameterizes reconnect_enabled + keepalive_idle_ms
+ * so the terminal-path (reconnect off) and keepalive-setter (idle > 0) coverage
+ * cases can stand up the matching client. gw_fixture_up wraps this with the
+ * default (reconnect on, keepalive 0). */
 static int
-gw_fixture_up(gw_fixture_t *f, const char *token)
+gw_fixture_up_ex(gw_fixture_t *f, const char *token, int reconnect_enabled,
+                 uint64_t keepalive_idle_ms)
 {
     memset(f, 0, sizeof(*f));
     memset(&g_srv, 0, sizeof(g_srv));
@@ -407,8 +412,7 @@ gw_fixture_up(gw_fixture_t *f, const char *token)
      * point of this test; test_gw_client builds the same fixture with reconnect
      * DISABLED). */
     f->gw = mq_gw_client_new(f->cli_t, f->cli_rt, f->cli_h3, "127.0.0.1", srv_port, token,
-                             MQ_CC_BBR2, /*keepalive_idle_ms=*/0,
-                             /*reconnect_enabled=*/1,
+                             MQ_CC_BBR2, keepalive_idle_ms, reconnect_enabled,
                              /*reconnect_max_backoff_ms=*/RECONNECT_MAX_BACKOFF_MS);
     if (!f->gw) return -1;
 
@@ -421,6 +425,13 @@ gw_fixture_up(gw_fixture_t *f, const char *token)
     /* Settle: let the eager tunnel conn establish on loopback. */
     pump_a_bit(f->base, 300);
     return 0;
+}
+
+/* Default fixture: reconnect ENABLED, keepalive OFF (the original behavior). */
+static int
+gw_fixture_up(gw_fixture_t *f, const char *token)
+{
+    return gw_fixture_up_ex(f, token, /*reconnect_enabled=*/1, /*keepalive_idle_ms=*/0);
 }
 
 static void
@@ -618,6 +629,106 @@ test_case2_free_while_reconnecting(void)
     gw_fixture_down(&f); /* gw already freed; frees the rest cleanly */
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * Case 3: terminal path — reconnect DISABLED. Drop the tunnel from the server
+ *         side; the client must NOT reconnect (server on_new_conn stays at 1) and
+ *         a subsequent fetch must FAIL (tunnel is terminal-dead). Exercises
+ *         gw_conn_state's terminal else branch (reconnect off).
+ * ════════════════════════════════════════════════════════════════════════ */
+static void
+test_case3_terminal_no_reconnect(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up_ex(&f, "sekrit", /*reconnect_enabled=*/0,
+                         /*keepalive_idle_ms=*/0) != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+
+    /* Baseline fetch over the eager tunnel. */
+    static const uint8_t DL[] = "terminal-baseline-body";
+    MQ_CHECK_EQ_INT(run_fetch_ok(&f, "/file1", DL, sizeof(DL) - 1), 0);
+    MQ_CHECK_EQ_INT(g_srv_conn_count, 1);
+
+    /* Drop the tunnel from the server side. With reconnect DISABLED the client
+     * takes gw_conn_state's terminal else branch: conn NULLed, NO backoff armed. */
+    MQ_CHECK(g_srv_conn != NULL);
+    mq_h3_conn_close(g_srv_conn);
+    g_srv_conn = NULL;
+
+    /* Pump well past any backoff window: the client must NOT re-establish. The
+     * server must NOT accept a 2nd conn (terminal, not reconnecting). */
+    pump_a_bit(f.base, RECONNECT_BUDGET_MS);
+    MQ_CHECK_EQ_INT(g_srv_conn_count, 1); /* no reconnect — terminal */
+
+    /* A subsequent fetch must FAIL: the tunnel is terminal-dead, so it cannot
+     * complete with a 200. (Use a quiet round-trip, not run_fetch_ok, whose
+     * MQ_CHECKs would count a failed fetch as a test failure.) The gateway maps a
+     * dead tunnel to a non-2xx reply (e.g. 502/504) or a closed connection — in
+     * all cases NOT "HTTP/1.1 200". */
+    static const uint8_t DL2[] = "should-not-arrive";
+    g_dl_body = DL2;
+    g_dl_body_len = sizeof(DL2) - 1;
+    char req[256];
+    int rn = snprintf(req, sizeof(req),
+                      "POST /_mqproxy/fetch HTTP/1.1\r\n"
+                      "Host: x\r\n"
+                      "X-Mq-Auth: Bearer sekrit\r\n"
+                      "X-Mq-Target: https://example.test/file2\r\n"
+                      "Content-Length: 0\r\n\r\n");
+    MQ_CHECK(rn > 0 && (size_t)rn < sizeof(req));
+    uint8_t reply[4096] = {0};
+    size_t got =
+        fetch_roundtrip(f.base, f.lport, req, (size_t)rn, reply, sizeof(reply), 6000);
+    /* Must NOT be a 200 + download body. Either no reply, or a non-2xx status. */
+    int is_200 = (got >= 12 && memcmp(reply, "HTTP/1.1 200", 12) == 0);
+    MQ_CHECK_EQ_INT(is_200, 0);
+    MQ_CHECK_EQ_INT(g_srv.request_count, 1); /* server never saw a 2nd request */
+    /* Still no reconnect: the failed fetch must not have re-dialed the server. */
+    MQ_CHECK_EQ_INT(g_srv_conn_count, 1);
+
+    gw_fixture_down(&f);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Case 4: keepalive non-zero wire-up. A gw client built with keepalive_idle_ms
+ *         > 0 makes mq_h3_connect take the idle_time_out setter branch. Establish
+ *         + fetch, idle ~1500ms (< the 4000ms idle) while pumping, then a second
+ *         fetch still succeeds (conn held open across a sub-timeout idle). The
+ *         primary goal is exercising the L545 idle_time_out setter in
+ *         mq_h3_connect; the conn-survives assertion is the observable proof.
+ * ════════════════════════════════════════════════════════════════════════ */
+static void
+test_case4_keepalive_wireup(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up_ex(&f, "sekrit", /*reconnect_enabled=*/1,
+                         /*keepalive_idle_ms=*/4000) != 0) {
+        gw_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+
+    /* Baseline fetch over the eager tunnel (keepalive idle = 4000ms). */
+    static const uint8_t DL1[] = "keepalive-first-body-0123456789";
+    MQ_CHECK_EQ_INT(run_fetch_ok(&f, "/k1", DL1, sizeof(DL1) - 1), 0);
+    MQ_CHECK_EQ_INT(g_srv_conn_count, 1);
+
+    /* Idle ~1500ms (< 4000ms idle) with no fetch traffic, pumping the loop. The
+     * conn must stay up (not idle-closed) and not reconnect. */
+    pump_a_bit(f.base, 1500);
+    MQ_CHECK_EQ_INT(g_srv_conn_count, 1); /* no drop+reconnect during the idle */
+
+    /* A second fetch still succeeds on the same held-open conn. */
+    static const uint8_t DL2[] = "keepalive-second-body-abcdefghij";
+    MQ_CHECK_EQ_INT(run_fetch_ok(&f, "/k2", DL2, sizeof(DL2) - 1), 0);
+    MQ_CHECK_EQ_INT(g_srv_conn_count, 1); /* same conn, no reconnect */
+    MQ_CHECK_EQ_INT(g_srv.request_count, 2);
+
+    gw_fixture_down(&f);
+}
+
 static void
 run_all(void)
 {
@@ -625,6 +736,8 @@ run_all(void)
     signal(SIGPIPE, SIG_IGN);
     test_case1_gw_reconnect();
     test_case2_free_while_reconnecting();
+    test_case3_terminal_no_reconnect();
+    test_case4_keepalive_wireup();
 }
 
 MQ_TEST_MAIN(run_all())
