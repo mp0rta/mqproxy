@@ -163,6 +163,13 @@ usage_client(FILE *out)
             "| cubic.\n"
             "  --keepalive-idle <sec>     QUIC PING keepalive idle timeout in seconds\n"
             "                             (default: 30; 0 = disable).\n"
+            "  --reconnect                Re-establish the server connection on loss\n"
+            "                             (default: enabled).\n"
+            "  --no-reconnect             Disable automatic reconnect on connection\n"
+            "                             loss.\n"
+            "  --reconnect-max-backoff <sec>\n"
+            "                             Maximum reconnect back-off in seconds\n"
+            "                             (default: 30; must be > 0).\n"
             "  -h, --help                 Show this help and exit.\n");
 }
 
@@ -545,7 +552,9 @@ cmd_client(int argc, char **argv)
     mq_cc_t cc = MQ_CC_DEFAULT;
     const char *paths[MQ_MAX_EXTRA_PATHS];
     size_t npaths = 0;
-    long keepalive_idle_s = 30; /* --keepalive-idle <sec>; 0 = disable */
+    long keepalive_idle_s = 30;        /* --keepalive-idle <sec>; 0 = disable */
+    int reconnect_enabled = 1;         /* --reconnect / --no-reconnect */
+    long reconnect_max_backoff_s = 30; /* --reconnect-max-backoff <sec> */
 
     enum {
         OPT_SERVER = 256,
@@ -558,6 +567,9 @@ cmd_client(int argc, char **argv)
         OPT_QLOG,
         OPT_CC,
         OPT_KEEPALIVE_IDLE,
+        OPT_RECONNECT,
+        OPT_NO_RECONNECT,
+        OPT_RECONNECT_MAX_BACKOFF,
     };
     static const struct option longopts[] = {
         {"server", required_argument, NULL, OPT_SERVER},
@@ -570,6 +582,9 @@ cmd_client(int argc, char **argv)
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
         {"keepalive-idle", required_argument, NULL, OPT_KEEPALIVE_IDLE},
+        {"reconnect", no_argument, NULL, OPT_RECONNECT},
+        {"no-reconnect", no_argument, NULL, OPT_NO_RECONNECT},
+        {"reconnect-max-backoff", required_argument, NULL, OPT_RECONNECT_MAX_BACKOFF},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -607,6 +622,23 @@ cmd_client(int argc, char **argv)
                 return 2;
             }
             keepalive_idle_s = v;
+            break;
+        }
+        case OPT_RECONNECT: reconnect_enabled = 1; break;
+        case OPT_NO_RECONNECT: reconnect_enabled = 0; break;
+        case OPT_RECONNECT_MAX_BACKOFF: {
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(optarg, &endp, 10);
+            if (errno != 0 || endp == optarg || *endp != '\0' || v <= 0) {
+                fprintf(stderr,
+                        "mqproxy client: invalid --reconnect-max-backoff '%s' "
+                        "(must be > 0)\n\n",
+                        optarg);
+                usage_client(stderr);
+                return 2;
+            }
+            reconnect_max_backoff_s = v;
             break;
         }
         case 'h': usage_client(stdout); return 0;
@@ -738,6 +770,10 @@ cmd_client(int argc, char **argv)
             goto out;
         }
         mq_client_set_keepalive(client, (uint64_t)keepalive_idle_s * 1000u);
+        /* reconnect_enabled / reconnect_max_backoff_s are parsed but not yet wired
+         * to mq_client; they will be consumed by the reconnect task. */
+        (void)reconnect_enabled;
+        (void)reconnect_max_backoff_s;
         if (mq_client_start(client) != 0) {
             MQ_LOGE("failed to start client connection to %s:%u", server_ip, server_port);
             goto out;

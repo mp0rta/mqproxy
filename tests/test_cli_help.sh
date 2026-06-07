@@ -38,7 +38,7 @@ out=$("$BIN" client --help 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] || fail "'client --help' exited $rc (want 0)"
 for flag in "--server" "--token" "--socks5" "--http-connect" "--gateway" "--path" \
-            "--keepalive-idle"; do
+            "--keepalive-idle" "--reconnect" "--no-reconnect" "--reconnect-max-backoff"; do
     echo "$out" | grep -q -- "$flag" || fail "'client --help' output missing '$flag'"
 done
 echo "$out" | grep -q "UDP ASSOCIATE supported" || \
