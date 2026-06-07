@@ -220,6 +220,26 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_udp_relay COMMAND test_udp_relay)
 
+    # Client reconnect + keepalive integration (Phase 5b, Task 4.3): real
+    # client+server over loopback with RECONNECT ENABLED; drops the tunnel conn
+    # via mq_conn_close and proves reconnect/re-auth + queue carry-over + UDP
+    # rebind + free-while-reconnecting (ASan) + keepalive hold, end-to-end.
+    add_executable(test_client_reconnect tests/integration/test_client_reconnect.c)
+    target_link_libraries(test_client_reconnect
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_client_reconnect PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_client_reconnect PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_client_reconnect PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_client_reconnect COMMAND test_client_reconnect)
+
     add_executable(test_socks5_listener tests/integration/test_socks5_listener.c)
     target_link_libraries(test_socks5_listener
         mqproxy
