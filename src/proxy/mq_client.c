@@ -136,6 +136,9 @@ struct mq_client_s {
     /* Active in-flight / relaying data streams. */
     mq_client_data_t *data_head;
 
+    /* Keepalive: if > 0, enables xquic PING keepalive with this idle timeout. */
+    uint64_t keepalive_idle_ms;
+
     /* Deferred extra paths (Task 19, CLI --path). Stored at mq_client_add_paths;
      * added via mq_conn_add_path once the conn is multipath-ready. A recurring
      * libevent timer (pending_paths > 0) polls mp-ready and adds them. */
@@ -603,7 +606,17 @@ mq_client_new(mq_transport_t *t, mq_runtime_t *rt, const char *server_ip,
     /* auth_token is not NUL-guaranteed-meaningful but encoded as a string field;
      * use the NUL-terminated length. */
     snprintf(c->req.auth_token, sizeof(c->req.auth_token), "%s", auth_token);
+    c->keepalive_idle_ms = 30000; /* default 30 s; 0 = disable */
     return c;
+}
+
+void
+mq_client_set_keepalive(mq_client_t *c, uint64_t idle_ms)
+{
+    if (!c) {
+        return;
+    }
+    c->keepalive_idle_ms = idle_ms;
 }
 
 void
@@ -659,6 +672,12 @@ mq_client_start(mq_client_t *c)
      * conn. u16 field; max advertises the largest frame we accept (xquic caps
      * the effective payload to the path MTU regardless). */
     settings.max_datagram_frame_size = 65535;
+    /* PING keepalive: send periodic PINGs to keep the idle connection alive and
+     * detect peer loss.  Disabled when keepalive_idle_ms == 0. */
+    settings.ping_on = (c->keepalive_idle_ms > 0) ? 1 : 0;
+    if (c->keepalive_idle_ms > 0) {
+        settings.idle_time_out = c->keepalive_idle_ms;
+    }
     /* Multipath + aggregate-BDP flow-control windows (see mq_conn.h). */
     mq_conn_apply_mp_settings(&settings, /*is_server=*/0, c->cc);
 
