@@ -47,6 +47,14 @@ mq_client_t *mq_client_new(mq_transport_t *t, mq_runtime_t *rt, const char *serv
  * mq_client_start. NULL-safe. */
 void mq_client_set_keepalive(mq_client_t *c, uint64_t idle_ms);
 
+/* Configure in-process reconnect (Phase 5b): when enabled (default), a tunnel
+ * loss arms a jittered exponential-backoff timer that re-establishes the conn
+ * and re-auths, returning the client to SERVING without dropping its listeners.
+ * max_backoff_ms caps the backoff (default 30000). When disabled, MQ_CONN_CLOSED
+ * is terminal (today's behavior; for tests / supervised-restart deployments).
+ * Must be called before mq_client_start. NULL-safe. */
+void mq_client_set_reconnect(mq_client_t *c, int enabled, uint64_t max_backoff_ms);
+
 /* Register the auth-result callback (call before mq_client_start). */
 void mq_client_set_on_auth(mq_client_t *c, mq_client_on_auth_fn fn, void *user);
 

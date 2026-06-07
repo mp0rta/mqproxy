@@ -161,6 +161,11 @@ fixture_up(fixture_t *f, const char *client_token)
     MQ_CHECK(f->client != NULL);
     if (!f->client) return -1;
     mq_client_set_on_auth(f->client, on_auth, NULL);
+    /* These existing cases assert terminal behavior on conn close (esp. Case F,
+     * which closes the conn mid-pump); reconnect (default-ON in Phase 5b) would
+     * otherwise re-establish during the pump. Disable it here so the suite stays
+     * deterministic. Reconnect is exercised by the dedicated Task 4.3 test. */
+    mq_client_set_reconnect(f->client, 0, 30000);
 
     MQ_CHECK_EQ_INT(mq_client_start(f->client), 0);
     mq_client_set_on_state(f->client, on_client_state, NULL);

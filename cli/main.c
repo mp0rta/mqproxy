@@ -771,10 +771,8 @@ cmd_client(int argc, char **argv)
             goto out;
         }
         mq_client_set_keepalive(client, (uint64_t)keepalive_idle_s * 1000u);
-        /* reconnect_enabled / reconnect_max_backoff_s are parsed but not yet wired
-         * to mq_client; they will be consumed by the reconnect task. */
-        (void)reconnect_enabled;
-        (void)reconnect_max_backoff_s;
+        mq_client_set_reconnect(client, reconnect_enabled,
+                                (uint64_t)reconnect_max_backoff_s * 1000u);
         if (mq_client_start(client) != 0) {
             MQ_LOGE("failed to start client connection to %s:%u", server_ip, server_port);
             goto out;
