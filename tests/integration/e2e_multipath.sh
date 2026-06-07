@@ -346,15 +346,15 @@ count_token() {
 }
 
 # (2) per-path split: both paths moved real bytes (GATE). The client logs
-#   "mq_conn stats: path <id>: sent=<n> recv=<n>" on teardown (mq_conn_dump_stats).
-PATHS_WITH_BYTES="$(grep -Eo 'path [0-9]+: sent=[0-9]+ recv=[0-9]+' "${WORK}/client.log" 2>/dev/null \
-    | sed -E 's/path ([0-9]+): sent=([0-9]+) recv=([0-9]+)/\1 \2 \3/' \
+#   "mq.path id=<id> ... sent=<n> recv=<n> ..." on teardown (mq_conn_dump_stats).
+PATHS_WITH_BYTES="$(grep -E 'mq\.path id=' "${WORK}/client.log" 2>/dev/null \
+    | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
     | awk '($2+0 > 0 || $3+0 > 0) { print $1 }' \
     | sort -u | wc -l)"
 note "e2e_multipath: paths carrying bytes (from client stats) = ${PATHS_WITH_BYTES} (need >= 2)"
 if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
     note "e2e_multipath: FAIL: fewer than 2 paths carried bytes (no real aggregation)."
-    note "  Inspect ${WORK}/client.log for the per-path 'mq_conn stats:' lines."
+    note "  Inspect ${WORK}/client.log for the per-path 'mq.path id=' lines."
     fail=1
 fi
 

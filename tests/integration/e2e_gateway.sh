@@ -480,15 +480,15 @@ cmp -s "${BIGFILE}" "${DL8}" || fail 8 "2-path download body differs"
 
 # SIGTERM the client → it dumps the gateway conn per-path counters to client.log.
 stop_client
-PATHS_WITH_BYTES="$(grep -Eo 'path [0-9]+: sent=[0-9]+ recv=[0-9]+' "${WORK}/client.log" 2>/dev/null \
-    | sed -E 's/path ([0-9]+): sent=([0-9]+) recv=([0-9]+)/\1 \2 \3/' \
+PATHS_WITH_BYTES="$(grep -E 'mq\.path id=' "${WORK}/client.log" 2>/dev/null \
+    | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
     | awk '($2+0 > 0 || $3+0 > 0) { print $1 }' \
     | sort -u | wc -l)"
 note "case 8: gateway paths carrying bytes = ${PATHS_WITH_BYTES} (need >= 2)"
 if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
     note "case 8 FAIL: fewer than 2 gateway paths carried bytes."
     note "  per-path stats in ${WORK}/client.log:"
-    grep -E 'mq_conn stats: path' "${WORK}/client.log" >&2 2>/dev/null
+    grep -E 'mq\.path id=' "${WORK}/client.log" >&2 2>/dev/null
     exit 1
 fi
 ok 8 "2-path aggregation: both gateway paths carried bytes"
