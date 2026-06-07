@@ -14,6 +14,7 @@
  */
 #include "transport/mq_conn.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -508,6 +509,39 @@ mq_conn_path_bytes(const mq_conn_t *c, uint64_t path_id, uint64_t *sent, uint64_
     }
     free(st.paths_info);
     return rc;
+}
+
+int
+mq_conn_format_path_line(char *buf, size_t cap, const xqc_path_metrics_t *p)
+{
+    if (!buf || !p) {
+        return -1;
+    }
+    /* state raw int: 2 == XQC_PATH_STATE_ACTIVE (internal header; do not ref). */
+    int n = snprintf(buf, cap,
+                     "mq.path id=%llu state=%u srtt_ms=%llu bw_Bps=%llu "
+                     "sent=%llu recv=%llu lost=%llu",
+                     (unsigned long long)p->path_id, (unsigned)p->path_state,
+                     (unsigned long long)(p->path_srtt / 1000), /* usec -> ms */
+                     (unsigned long long)p->path_est_bw,        /* bytes/sec */
+                     (unsigned long long)p->path_send_bytes,
+                     (unsigned long long)p->path_recv_bytes,
+                     (unsigned long long)p->path_lost_count);
+    return (n < 0 || (size_t)n >= cap) ? -1 : n;
+}
+
+int
+mq_conn_format_conn_line(char *buf, size_t cap, const xqc_conn_stats_t *st)
+{
+    if (!buf || !st) {
+        return -1;
+    }
+    int n = snprintf(buf, cap,
+                     "mq.conn mp_state=%d paths=%u app_bytes=%llu standby_bytes=%llu",
+                     st->mp_state, (unsigned)st->paths_info_count,
+                     (unsigned long long)st->total_app_bytes,
+                     (unsigned long long)st->standby_path_app_bytes);
+    return (n < 0 || (size_t)n >= cap) ? -1 : n;
 }
 
 void

@@ -168,7 +168,15 @@ int mq_conn_path_state(const mq_conn_t *c, uint64_t path_id);
 
 /* ── Per-path observability (spec §23.1) ────────────────────────────────────
  *
- * mq_conn_dump_stats: snapshot per-path byte counters via xqc_conn_get_stats
+ * Per-path observability formatters (Phase 5c). Pure: no I/O, no allocation.
+ * Render one logfmt line into buf; return bytes written (>0) or -1 on snprintf
+ * truncation/error. MQ_METRICS_LINE_CAP is a safe caller-buffer size for either
+ * line (worst case 7 x 20-digit u64 + keys, well under 256). */
+#define MQ_METRICS_LINE_CAP 256
+int mq_conn_format_path_line(char *buf, size_t cap, const xqc_path_metrics_t *p);
+int mq_conn_format_conn_line(char *buf, size_t cap, const xqc_conn_stats_t *st);
+
+/* mq_conn_dump_stats: snapshot per-path byte counters via xqc_conn_get_stats
  * and log each path's id / send-bytes / recv-bytes at INFO. If xquic reports no
  * path metrics (paths_info == NULL or count == 0) it logs "no path metrics".
  * The heap-allocated paths_info buffer is freed with libc free() (the xquic
