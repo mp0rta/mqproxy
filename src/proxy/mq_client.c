@@ -639,21 +639,14 @@ mq_client_set_on_state(mq_client_t *c, mq_conn_on_state_fn fn, void *user)
     c->on_state_user = user;
 }
 
-int
-mq_client_start(mq_client_t *c)
+/* Build sockaddr + conn settings, call mq_conn_connect, wire on_state, and
+ * (if c->udp is already live from a previous start) re-wire the UDP table and
+ * datagram callback onto the new conn.  On the first start c->udp is NULL, so
+ * the re-wire block is skipped; mq_client_start creates the table afterwards.
+ * Returns 0 on success, -1 on failure. */
+static int
+client_issue_connect(mq_client_t *c)
 {
-    if (!c) {
-        return -1;
-    }
-
-    /* Register the client ALPN (no server-side hooks). Idempotency: registering
-     * twice on one engine is not supported, so this assumes one client per
-     * engine, which matches the proxy's usage. */
-    if (mq_conn_register_alpn(c->transport, MQ_CLIENT_ALPN, NULL, NULL, NULL) != 0) {
-        MQ_LOGE("mq_client: register_alpn failed");
-        return -1;
-    }
-
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
@@ -690,6 +683,36 @@ mq_client_start(mq_client_t *c)
         return -1;
     }
     mq_conn_set_on_state(c->conn, client_on_state, c);
+
+    /* On reconnect (c->udp already exists), re-wire the UDP session table and
+     * datagram callback onto the new conn.  On first start c->udp is NULL here
+     * (mq_client_start creates it after this call), so the block is a no-op. */
+    if (c->udp) {
+        mq_udp_cli_set_conn(c->udp, c->conn);
+        mq_conn_set_on_datagram(c->conn, client_on_datagram, c);
+    }
+
+    return 0;
+}
+
+int
+mq_client_start(mq_client_t *c)
+{
+    if (!c) {
+        return -1;
+    }
+
+    /* Register the client ALPN (no server-side hooks). Idempotency: registering
+     * twice on one engine is not supported, so this assumes one client per
+     * engine, which matches the proxy's usage. */
+    if (mq_conn_register_alpn(c->transport, MQ_CLIENT_ALPN, NULL, NULL, NULL) != 0) {
+        MQ_LOGE("mq_client: register_alpn failed");
+        return -1;
+    }
+
+    if (client_issue_connect(c) != 0) {
+        return -1;
+    }
 
     /* Per-connection UDP relay session table (client role) + datagram dispatch.
      * Created here so opens may be queued pre-auth; freed in mq_client_free.
