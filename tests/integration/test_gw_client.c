@@ -1026,7 +1026,8 @@ gw_fixture_up(gw_fixture_t *f, const char *token)
     if (!f->cli_h3) return -1;
 
     f->gw = mq_gw_client_new(f->cli_t, f->cli_rt, f->cli_h3, "127.0.0.1", srv_port, token,
-                             MQ_CC_BBR2);
+                             MQ_CC_BBR2, /*keepalive_idle_ms=*/0,
+                             /*reconnect_enabled=*/0, /*reconnect_max_backoff_ms=*/30000);
     if (!f->gw) return -1;
 
     /* Real fetch listener wired to the gw client's cbs. */
@@ -1066,7 +1067,8 @@ gw_fixture_up_dead(gw_fixture_t *f)
     f->cli_h3 = mq_h3_init(f->cli_t, NULL, NULL, NULL);
     if (!f->cli_h3) return -1;
     f->gw = mq_gw_client_new(f->cli_t, f->cli_rt, f->cli_h3, "127.0.0.1", dead, "tok",
-                             MQ_CC_BBR2);
+                             MQ_CC_BBR2, /*keepalive_idle_ms=*/0,
+                             /*reconnect_enabled=*/0, /*reconnect_max_backoff_ms=*/30000);
     if (!f->gw) return -1;
     f->listener = mq_fetch_listener_new(f->base, "127.0.0.1", 0, mq_gw_client_fetch_cbs(),
                                         mq_gw_client_fetch_user(f->gw));

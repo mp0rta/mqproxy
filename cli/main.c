@@ -840,7 +840,9 @@ cmd_client(int argc, char **argv)
             MQ_LOGE("failed to init H3 stack for gateway");
             goto out;
         }
-        gwc = mq_gw_client_new(transport, rt, h3, server_ip, server_port, token, cc);
+        gwc = mq_gw_client_new(transport, rt, h3, server_ip, server_port, token, cc,
+                               (uint64_t)keepalive_idle_s * 1000u, reconnect_enabled,
+                               (uint64_t)reconnect_max_backoff_s * 1000u);
         if (!gwc) {
             MQ_LOGE("failed to create gateway client (conn to %s:%u)", server_ip,
                     server_port);

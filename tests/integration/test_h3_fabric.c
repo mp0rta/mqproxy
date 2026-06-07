@@ -522,7 +522,7 @@ h3_connect_established(h3_fabric_t *f)
     g_client_conn_established = 0;
     mq_h3_conn_t *c =
         mq_h3_connect(f->ch3, (struct sockaddr *)&srv_addr, sizeof(srv_addr),
-                      MQ_CC_DEFAULT, on_client_conn_state, NULL);
+                      MQ_CC_DEFAULT, /*keepalive_idle_ms=*/0, on_client_conn_state, NULL);
     if (!c) {
         return NULL;
     }

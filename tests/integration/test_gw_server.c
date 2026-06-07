@@ -945,8 +945,9 @@ gws_fixture_up(gws_fixture_t *f, const char *token, size_t blob_len)
     peer.sin_family = AF_INET;
     peer.sin_port = htons(srv_port);
     inet_pton(AF_INET, "127.0.0.1", &peer.sin_addr);
-    f->cli_conn = mq_h3_connect(f->cli_h3, (struct sockaddr *)&peer, sizeof(peer),
-                                MQ_CC_BBR2, gws_cli_conn_state, f);
+    f->cli_conn =
+        mq_h3_connect(f->cli_h3, (struct sockaddr *)&peer, sizeof(peer), MQ_CC_BBR2,
+                      /*keepalive_idle_ms=*/0, gws_cli_conn_state, f);
     if (!f->cli_conn) return -1;
 
     /* Pump until the client conn is established. */
