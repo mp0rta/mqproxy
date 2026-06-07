@@ -111,6 +111,7 @@ struct mq_server_s {
      * Set in on_new_conn, cleared when that conn closes. Single-conn observation
      * hook (see mq_server_last_udp_srv). */
     mq_udp_srv_t *last_udp;
+    mq_conn_t *last_conn; /* most-recent accepted conn (Phase 5c observability) */
 };
 
 
@@ -616,7 +617,6 @@ srv_attach_data_stream(mq_srv_conn_t *sc, mq_stream_t *s)
 static void
 srv_conn_state(mq_conn_t *c, mq_conn_state_t st, void *user)
 {
-    (void)c;
     if (st == MQ_CONN_CLOSED) {
         mq_srv_conn_t *sc = (mq_srv_conn_t *)user;
         /* Reap every active relay (each closes its stream+fd once, frees
@@ -632,6 +632,9 @@ srv_conn_state(mq_conn_t *c, mq_conn_state_t st, void *user)
          * RESET that the closing conn drops). */
         if (sc->server->last_udp == sc->udp) {
             sc->server->last_udp = NULL;
+        }
+        if (sc->server->last_conn == c) {
+            sc->server->last_conn = NULL;
         }
         mq_udp_srv_free(sc->udp);
         sc->udp = NULL;
@@ -668,6 +671,7 @@ srv_on_new_conn(mq_conn_t *c, void *user)
     sc->udp = mq_udp_srv_new(c, mq_runtime_base(srv->rt), srv->udp_idle_timeout_ms,
                              srv->udp_enabled);
     srv->last_udp = sc->udp; /* observability: most-recent conn's UDP relay state */
+    srv->last_conn = c;      /* observability: most-recent accepted conn */
     mq_conn_set_user(c, sc);
     mq_conn_set_on_state(c, srv_conn_state, sc);
     /* Wire the connection-level DATAGRAM callback so tunnel→target datagrams
@@ -767,6 +771,12 @@ mq_udp_srv_t *
 mq_server_last_udp_srv(const mq_server_t *s)
 {
     return s ? s->last_udp : NULL;
+}
+
+mq_conn_t *
+mq_server_active_conn(const mq_server_t *s)
+{
+    return s ? s->last_conn : NULL;
 }
 
 void
