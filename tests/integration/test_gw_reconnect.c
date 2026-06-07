@@ -588,9 +588,13 @@ test_case2_free_while_reconnecting(void)
     MQ_CHECK_EQ_INT(g_srv_conn_count, 1);
 
     /* Drop the tunnel and pump JUST enough to register the close + arm the backoff
-     * timer, WITHOUT pumping long enough to reconnect (backoff floor 1000ms). We
-     * pump ~150ms: enough for the client's gw_conn_state(closed) to fire and arm
-     * backoff, well under the 1000ms floor. */
+     * timer, WITHOUT pumping long enough to reconnect. The "1000ms" knob is the
+     * MAX-backoff cap, not the first delay: the actual first-attempt delay is
+     * mq_backoff_ms(250, cap, attempt=1)=500ms jittered to [250,500]ms, so the
+     * real minimum before the timer can fire is ~250ms. We pump ~150ms — under
+     * that ~250ms minimum — so gw_conn_state(closed) has fired and armed backoff
+     * but the re-dial has NOT yet happened (margin ~100ms, robust on loopback;
+     * ASan leak/UAF-freeness, not this timing, is the case's primary assertion). */
     MQ_CHECK(g_srv_conn != NULL);
     mq_h3_conn_close(g_srv_conn);
     g_srv_conn = NULL;
