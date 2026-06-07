@@ -554,12 +554,16 @@ test_case1_tcp_reconnect(void)
      * must keep recovering (reconnect, not terminal) and re-auth once more. */
     int auth_before = g_auth_count; /* == 2 */
     mq_conn_close(mq_client_conn(f.client));
-    /* Pump a touch so the backoff timer re-dials; then immediately re-drop the
-     * fresh conn around its AUTH cycle (best-effort kill-point during auth). */
+    /* Pump a touch, then attempt a SECOND drop of the fresh conn. NOTE: this is a
+     * best-effort second drop that MAY OR MAY NOT land during the auth cycle — if
+     * c2 is NULL we're mid-backoff and skip it. So this exercises double-loss
+     * recovery deterministically; it does NOT deterministically hit a
+     * kill-DURING-auth point (that would require closing from inside on_auth).
+     * The recovery assertion below is sound regardless. */
     pump_for(f.base, 50);
     mq_conn_t *c2 = mq_client_conn(f.client);
     if (c2) mq_conn_close(c2); /* may be NULL mid-backoff — that's fine */
-    /* Despite the double/auth-window kill, the client must recover + re-auth. */
+    /* Despite the double drop, the client must recover + re-auth. */
     pump_until_auth_count(f.base, auth_before + 1, RECONNECT_BUDGET_MS * 2);
     MQ_CHECK(g_auth_count >= auth_before + 1);
     MQ_CHECK(g_auth_ok);
