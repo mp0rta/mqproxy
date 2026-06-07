@@ -673,7 +673,9 @@ mq_client_start(mq_client_t *c)
      * the effective payload to the path MTU regardless). */
     settings.max_datagram_frame_size = 65535;
     /* PING keepalive: send periodic PINGs to keep the idle connection alive and
-     * detect peer loss.  Disabled when keepalive_idle_ms == 0. */
+     * detect peer loss.  Disabled when keepalive_idle_ms == 0. Only the post-
+     * handshake idle timeout is set here; init_idle_time_out is left at the
+     * xquic default (pre-handshake idle, intentional). */
     settings.ping_on = (c->keepalive_idle_ms > 0) ? 1 : 0;
     if (c->keepalive_idle_ms > 0) {
         settings.idle_time_out = c->keepalive_idle_ms;

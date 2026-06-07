@@ -39,9 +39,12 @@ mq_client_t *mq_client_new(mq_transport_t *t, mq_runtime_t *rt, const char *serv
                            uint16_t server_port, const char *client_id,
                            const char *auth_token, mq_cc_t cc);
 
-/* Configure PING keepalive: xquic sends PINGs every idle_ms milliseconds.
- * idle_ms == 0 disables keepalive.  Default is 30000 (30 s).
- * Must be called before mq_client_start. NULL-safe. */
+/* Configure QUIC idle timeout for keepalive: idle_ms sets the connection
+ * idle timeout (0 = disable keepalive / use xquic default). When enabled,
+ * xquic sends keepalive PINGs at a fixed ~15s cadence to hold the connection
+ * open. Values below ~15000 ms are counterproductive (the PING cannot refresh
+ * a shorter idle timeout). Default is 30000 (30 s). Must be called before
+ * mq_client_start. NULL-safe. */
 void mq_client_set_keepalive(mq_client_t *c, uint64_t idle_ms);
 
 /* Register the auth-result callback (call before mq_client_start). */
