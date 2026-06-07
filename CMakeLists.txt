@@ -274,6 +274,27 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_gw_client COMMAND test_gw_client)
 
+    # Gateway client reconnect (Task 5.2, Phase 5b): in-process proof that the
+    # gw_client reconnect path re-establishes the H3 tunnel on loss and a fresh
+    # fetch completes end-to-end. Same real client+server H3-over-loopback fixture
+    # as the gateway-client cases in test_gw_client, so it needs the cert/key
+    # defines too.
+    add_executable(test_gw_reconnect tests/integration/test_gw_reconnect.c)
+    target_link_libraries(test_gw_reconnect
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_gw_reconnect PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_gw_reconnect PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_gw_reconnect PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_gw_reconnect COMMAND test_gw_reconnect)
+
     # mq_origin_curl (Task 4.2): the libcurl-multi origin client on libevent.
     # Drives the mq_origin_* API against an in-process evhttp origin over plain
     # loopback HTTP/1.1. evhttp lives in libevent_extra (EVENT_EXTRA_LIB); curl
