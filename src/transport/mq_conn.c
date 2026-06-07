@@ -566,12 +566,14 @@ mq_conn_dump_stats_cid(mq_transport_t *t, const xqc_cid_t *cid)
         free(st.paths_info); /* free(NULL) is safe; count 0 may carry a buffer */
         return;
     }
-    /* spec §23.1 per-path schema: bytes_sent / bytes_received per path. */
+    char line[MQ_METRICS_LINE_CAP];
+    if (mq_conn_format_conn_line(line, sizeof(line), &st) > 0) {
+        MQ_LOGI("%s", line);
+    }
     for (uint32_t i = 0; i < st.paths_info_count; i++) {
-        MQ_LOGI("mq_conn stats: path %llu: sent=%llu recv=%llu",
-                (unsigned long long)st.paths_info[i].path_id,
-                (unsigned long long)st.paths_info[i].path_send_bytes,
-                (unsigned long long)st.paths_info[i].path_recv_bytes);
+        if (mq_conn_format_path_line(line, sizeof(line), &st.paths_info[i]) > 0) {
+            MQ_LOGI("%s", line);
+        }
     }
     free(st.paths_info);
 }
