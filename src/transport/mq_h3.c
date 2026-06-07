@@ -499,7 +499,7 @@ mq_h3_free(mq_h3_t *h)
 
 mq_h3_conn_t *
 mq_h3_connect(mq_h3_t *h, const struct sockaddr *peer, socklen_t peerlen, mq_cc_t cc,
-              mq_h3_conn_state_fn st, void *user)
+              uint64_t keepalive_idle_ms, mq_h3_conn_state_fn st, void *user)
 {
     if (!h || !peer) {
         return NULL;
@@ -537,6 +537,13 @@ mq_h3_connect(mq_h3_t *h, const struct sockaddr *peer, socklen_t peerlen, mq_cc_
     memset(&s, 0, sizeof(s));
     s.proto_version = XQC_VERSION_V1;
     mq_conn_apply_mp_settings(&s, /*is_server=*/0, cc);
+    /* PING keepalive (mirror mq_client): keep the idle tunnel alive + detect peer
+     * loss. Only the post-handshake idle_time_out is set here; init_idle_time_out
+     * is left at the xquic default (pre-handshake idle, intentional). */
+    s.ping_on = (keepalive_idle_ms > 0) ? 1 : 0;
+    if (keepalive_idle_ms > 0) {
+        s.idle_time_out = keepalive_idle_ms;
+    }
 
     xqc_conn_ssl_config_t conn_ssl;
     memset(&conn_ssl, 0, sizeof(conn_ssl));

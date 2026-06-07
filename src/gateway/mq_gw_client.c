@@ -62,6 +62,7 @@
 
 #include "gateway/mq_gw_headers.h"
 #include "gateway/mq_http1.h"
+#include "util/mq_backoff.h"
 #include "util/mq_log.h"
 
 /* Bound on the internal upload spill buffer (junction #1): bytes the local peer
@@ -89,6 +90,9 @@
 #define MQ_GW_MP_POLL_MS 50
 #define MQ_GW_MAX_PATHS  8
 #define MQ_GW_IP_MAX     64
+
+/* Base delay (ms) for the reconnect exponential backoff (mirrors mq_client). */
+#define MQ_GW_RECONNECT_BASE_MS 250
 
 /* ── per-request state ──────────────────────────────────────────────────────*/
 
@@ -143,6 +147,23 @@ struct mq_gw_client_s {
     size_t n_extra_paths;
     size_t added_paths;
     struct event *mp_timer;
+
+    /* Keepalive: > 0 enables xquic PING keepalive with this idle timeout. Passed
+     * to every mq_h3_connect (initial + reconnect). */
+    uint64_t keepalive_idle_ms;
+
+    /* Reconnect controller (Phase 5b, mirrors mq_client). reconnect_ev is created
+     * ONCE in mq_gw_client_new (when enabled) and freed ONLY in mq_gw_client_free;
+     * it is a one-shot timer re-armed across reconnect cycles, so a stop must NOT
+     * free it. shutting_down is set FIRST by mq_gw_client_free so a late conn close
+     * takes the terminal path (no reconnect-after-free). The gateway has NO
+     * connection-level auth latch (auth is per-request via x-mq-auth), so the
+     * reconnect-success hook is `established` (conn_up=1), not an auth-OK event. */
+    int shutting_down;
+    int reconnect_enabled;
+    uint64_t reconnect_max_backoff_ms;
+    struct event *reconnect_ev;
+    unsigned reconnect_attempts;
 };
 
 /* ── forward decls ──────────────────────────────────────────────────────────*/
@@ -157,6 +178,12 @@ static void upload_pump(mq_gw_req_t *r);
 static void download_pump(mq_gw_req_t *r);
 static void gw_local_error_req(mq_gw_req_t *r, int code, const char *reason,
                                const char *xmq);
+/* Reconnect controller + the re-issuable connect body (defined below). */
+static int gw_issue_connect(mq_gw_client_t *c);
+static void gw_reconnect_arm(mq_gw_client_t *c);
+static void gw_reconnect_stop(mq_gw_client_t *c);
+static void gw_mp_timer_arm(mq_gw_client_t *c);
+static void gw_mp_timer_stop(mq_gw_client_t *c);
 
 /* ── small helpers ──────────────────────────────────────────────────────────*/
 
@@ -1064,12 +1091,41 @@ gw_conn_state(mq_h3_conn_t *c, int established, void *user)
     if (established) {
         cli->conn_up = 1;
         MQ_LOGI("mq_gw_client: tunnel conn established");
+        /* Back to SERVING: reset the backoff counter + disarm the reconnect timer
+         * so the next loss starts from base again. The gateway has no auth latch,
+         * so `established` IS the reconnect-success hook. */
+        cli->reconnect_attempts = 0;
+        gw_reconnect_stop(cli);
+        /* Re-arm multipath for this (possibly reconnected) conn: reset added_paths
+         * so the mp-timer re-adds every registered extra path on the new conn.
+         * Harmless on the first establish (added_paths is 0; arm is a no-op when
+         * n_extra_paths == 0). */
+        cli->added_paths = 0;
+        gw_mp_timer_arm(cli);
     } else {
-        cli->conn_up = 0;
-        cli->conn = NULL; /* the conn wrapper is freed after this returns */
         MQ_LOGI("mq_gw_client: tunnel conn closed");
         /* In-flight requests get their own per-request on_close from mq_h3, which
          * handles their local teardown. Nothing to do here for them. */
+
+        /* Decide reconnect vs terminal from shutting_down + reconnect_enabled ONLY.
+         * reconnect_ev != NULL also guards the timer existing. */
+        int reconnect_now =
+            (!cli->shutting_down && cli->reconnect_enabled && cli->reconnect_ev != NULL);
+
+        if (reconnect_now) {
+            /* Do NOT go terminal: tear down the dead conn's per-conn state and arm
+             * the backoff timer to re-establish. conn stays NULL through the backoff
+             * window; gw_issue_connect re-wires a fresh conn. */
+            cli->conn_up = 0;
+            cli->conn = NULL; /* the conn wrapper is freed after this returns */
+            cli->added_paths = 0;
+            gw_mp_timer_stop(cli);
+            gw_reconnect_arm(cli);
+        } else {
+            /* Terminal (shutting_down or reconnect disabled): legacy behavior. */
+            cli->conn_up = 0;
+            cli->conn = NULL; /* the conn wrapper is freed after this returns */
+        }
     }
 }
 
@@ -1140,9 +1196,73 @@ mq_gw_client_fetch_user(mq_gw_client_t *c)
     return c;
 }
 
+/* Issue the (re-)connect: open a fresh H3 tunnel conn with keepalive and wire the
+ * state callback. Re-invoked by the reconnect timer. Returns 0 on success, -1 on
+ * failure (the caller re-arms backoff). */
+static int
+gw_issue_connect(mq_gw_client_t *c)
+{
+    c->conn = mq_h3_connect(c->h3, (struct sockaddr *)&c->peer, c->peerlen, c->cc,
+                            c->keepalive_idle_ms, gw_conn_state, c);
+    if (!c->conn) {
+        MQ_LOGE("mq_gw_client: tunnel connect failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* ── Reconnect controller (Phase 5b, mirrors mq_client) ──────────────────────
+ *
+ * reconnect_ev is created ONCE in mq_gw_client_new and freed ONLY in
+ * mq_gw_client_free; it is a one-shot timer re-armed across reconnect cycles, so
+ * stop() must NOT free it (unlike the mp-timer). */
+
+/* Disarm the backoff timer (idempotent). Does NOT free reconnect_ev. */
+static void
+gw_reconnect_stop(mq_gw_client_t *c)
+{
+    if (c->reconnect_ev) {
+        evtimer_del(c->reconnect_ev);
+    }
+}
+
+/* Arm the one-shot backoff timer for the next reconnect attempt. Exponential
+ * (base 250 ms, cap reconnect_max_backoff_ms) with half-jitter into [d/2, d] so
+ * the re-arm cannot land near zero and spin. */
+static void
+gw_reconnect_arm(mq_gw_client_t *c)
+{
+    if (!c->reconnect_ev) {
+        return;
+    }
+    c->reconnect_attempts++;
+    uint64_t d = mq_backoff_ms(MQ_GW_RECONNECT_BASE_MS, c->reconnect_max_backoff_ms,
+                               c->reconnect_attempts);
+    uint64_t j = d / 2 + (uint64_t)(random() % (long)(d / 2 + 1));
+    struct timeval tv = {.tv_sec = (time_t)(j / 1000),
+                         .tv_usec = (suseconds_t)((j % 1000) * 1000)};
+    evtimer_add(c->reconnect_ev, &tv);
+}
+
+/* Backoff timer fired: re-issue the connect. On a synchronous connect failure
+ * re-arm with the next backoff rather than going terminal — an always-on device
+ * must self-heal across long outages. */
+static void
+gw_reconnect_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void)fd;
+    (void)what;
+    mq_gw_client_t *c = (mq_gw_client_t *)arg;
+    if (gw_issue_connect(c) != 0) {
+        gw_reconnect_arm(c);
+    }
+}
+
 mq_gw_client_t *
 mq_gw_client_new(mq_transport_t *t, mq_runtime_t *rt, mq_h3_t *h3, const char *server_ip,
-                 uint16_t server_port, const char *token, mq_cc_t cc)
+                 uint16_t server_port, const char *token, mq_cc_t cc,
+                 uint64_t keepalive_idle_ms, int reconnect_enabled,
+                 uint64_t reconnect_max_backoff_ms)
 {
     if (!t || !rt || !h3 || !server_ip || !token) return NULL;
 
@@ -1154,6 +1274,13 @@ mq_gw_client_new(mq_transport_t *t, mq_runtime_t *rt, mq_h3_t *h3, const char *s
     c->cc = cc;
     snprintf(c->token, sizeof(c->token), "%s", token);
 
+    c->keepalive_idle_ms = keepalive_idle_ms;
+    c->reconnect_enabled = reconnect_enabled ? 1 : 0;
+    if (reconnect_max_backoff_ms < 1000) {
+        reconnect_max_backoff_ms = 1000;
+    }
+    c->reconnect_max_backoff_ms = reconnect_max_backoff_ms;
+
     memset(&c->peer, 0, sizeof(c->peer));
     c->peer.sin_family = AF_INET;
     c->peer.sin_port = htons(server_port);
@@ -1163,10 +1290,23 @@ mq_gw_client_new(mq_transport_t *t, mq_runtime_t *rt, mq_h3_t *h3, const char *s
     }
     c->peerlen = sizeof(c->peer);
 
-    /* Eager connect (mirror mq_client). */
-    c->conn =
-        mq_h3_connect(h3, (struct sockaddr *)&c->peer, c->peerlen, cc, gw_conn_state, c);
-    if (!c->conn) {
+    /* Create the reconnect backoff timer ONCE (when enabled), BEFORE the eager
+     * connect so the timer exists if the first connect's conn later closes. It is
+     * one-shot, armed only from the close handler, disarmed on establish + on
+     * shutdown, and freed only in mq_gw_client_free. */
+    if (c->reconnect_enabled) {
+        c->reconnect_ev = evtimer_new(mq_runtime_base(c->rt), gw_reconnect_cb, c);
+        if (!c->reconnect_ev) {
+            MQ_LOGW("mq_gw_client: reconnect timer alloc failed (reconnect disabled)");
+        }
+    }
+
+    /* Eager connect (mirror mq_client), using keepalive. */
+    if (gw_issue_connect(c) != 0) {
+        if (c->reconnect_ev) {
+            event_free(c->reconnect_ev);
+            c->reconnect_ev = NULL;
+        }
         free(c);
         return NULL;
     }
@@ -1204,6 +1344,14 @@ void
 mq_gw_client_free(mq_gw_client_t *c)
 {
     if (!c) return;
+    /* Mark teardown FIRST so a late conn close takes the terminal path (no
+     * reconnect-after-free). Then disarm + free the backoff timer. */
+    c->shutting_down = 1;
+    gw_reconnect_stop(c);
+    if (c->reconnect_ev) {
+        event_free(c->reconnect_ev);
+        c->reconnect_ev = NULL;
+    }
     gw_mp_timer_stop(c);
 
     /* DETACH the conn-state callback first. gw_client_free runs while the H3

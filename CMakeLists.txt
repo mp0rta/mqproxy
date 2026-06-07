@@ -8,6 +8,7 @@ find_package(CURL REQUIRED)
 add_library(mqproxy STATIC
     src/util/mq_log.c
     src/util/mq_buf.c
+    src/util/mq_backoff.c
     src/wire/mq_varint.c
     src/wire/mq_wire.c
     src/wire/mq_udp_msg.c
@@ -90,6 +91,11 @@ add_executable(test_defrag tests/test_defrag.c)
 target_link_libraries(test_defrag mqproxy)
 target_include_directories(test_defrag PRIVATE tests)
 add_test(NAME test_defrag COMMAND test_defrag)
+
+add_executable(test_backoff tests/test_backoff.c)
+target_link_libraries(test_backoff mqproxy)
+target_include_directories(test_backoff PRIVATE tests)
+add_test(NAME test_backoff COMMAND test_backoff)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
@@ -214,6 +220,26 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_udp_relay COMMAND test_udp_relay)
 
+    # Client reconnect + keepalive integration (Phase 5b, Task 4.3): real
+    # client+server over loopback with RECONNECT ENABLED; drops the tunnel conn
+    # via mq_conn_close and proves reconnect/re-auth + queue carry-over + UDP
+    # rebind + free-while-reconnecting (ASan) + keepalive hold, end-to-end.
+    add_executable(test_client_reconnect tests/integration/test_client_reconnect.c)
+    target_link_libraries(test_client_reconnect
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_client_reconnect PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_client_reconnect PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_client_reconnect PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_client_reconnect COMMAND test_client_reconnect)
+
     add_executable(test_socks5_listener tests/integration/test_socks5_listener.c)
     target_link_libraries(test_socks5_listener
         mqproxy
@@ -247,6 +273,27 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_gw_client PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_gw_client COMMAND test_gw_client)
+
+    # Gateway client reconnect (Task 5.2, Phase 5b): in-process proof that the
+    # gw_client reconnect path re-establishes the H3 tunnel on loss and a fresh
+    # fetch completes end-to-end. Same real client+server H3-over-loopback fixture
+    # as the gateway-client cases in test_gw_client, so it needs the cert/key
+    # defines too.
+    add_executable(test_gw_reconnect tests/integration/test_gw_reconnect.c)
+    target_link_libraries(test_gw_reconnect
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_gw_reconnect PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_gw_reconnect PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_gw_reconnect PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_gw_reconnect COMMAND test_gw_reconnect)
 
     # mq_origin_curl (Task 4.2): the libcurl-multi origin client on libevent.
     # Drives the mq_origin_* API against an in-process evhttp origin over plain

@@ -65,12 +65,25 @@ typedef struct mq_gw_client_s mq_gw_client_t;
  *            client-side; the server performs the authoritative verification.
  *            The string is copied.
  *   cc     : congestion control for the tunnel conn.
+ *   keepalive_idle_ms : QUIC PING keepalive idle timeout for the tunnel conn
+ *            (> 0 enables keepalive + sets the post-handshake idle timeout;
+ *            0 disables). Mirrors mq_client_set_keepalive.
+ *   reconnect_enabled : 1 re-establishes the tunnel conn on loss with an
+ *            exponential backoff (mirrors mq_client); 0 keeps the legacy
+ *            terminal-on-close behavior.
+ *   reconnect_max_backoff_ms : backoff cap (floored to 1000 ms). Ignored when
+ *            reconnect is disabled.
+ *
+ * Because the connection is established EAGERLY in the constructor (there is no
+ * separate start), keepalive + reconnect are constructor args (not setters).
  *
  * Establishes the gateway H3 connection EAGERLY (mirrors mq_client's eager
  * connect). Returns NULL on bad args / OOM / connect failure. */
 mq_gw_client_t *mq_gw_client_new(mq_transport_t *t, mq_runtime_t *rt, mq_h3_t *h3,
                                  const char *server_ip, uint16_t server_port,
-                                 const char *token, mq_cc_t cc);
+                                 const char *token, mq_cc_t cc,
+                                 uint64_t keepalive_idle_ms, int reconnect_enabled,
+                                 uint64_t reconnect_max_backoff_ms);
 
 /* The mq_fetch_cbs_t implementation to wire into mq_fetch_listener_new. The
  * returned pointer is to a static, immutable vtable (valid for the program

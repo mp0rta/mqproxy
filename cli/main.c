@@ -35,6 +35,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -124,44 +126,54 @@ usage_server(FILE *out)
 static void
 usage_client(FILE *out)
 {
-    fprintf(out,
-            "Usage: mqproxy client --server <ip:port> --token <token>\n"
-            "                      [--socks5 <ip:port>] [--http-connect <ip:port>]\n"
-            "                      [--gateway <ip:port>] [--path <local ip>]...\n"
-            "                      [--client-id <id>]\n"
-            "\n"
-            "At least one ingress is required: --socks5, --http-connect, or "
-            "--gateway.\n"
-            "\n"
-            "Options:\n"
-            "  --server       <ip:port>   UDP address of the mqproxy server "
-            "(required).\n"
-            "  --token        <token>     Shared auth token (required).\n"
-            "  --socks5       <ip:port>   Local TCP address for the SOCKS5 ingress\n"
-            "                             (UDP ASSOCIATE supported).\n"
-            "  --http-connect <ip:port>   Local TCP address for the HTTP CONNECT "
-            "ingress.\n"
-            "  --gateway      <ip:port>   Local TCP address for the HTTP gateway "
-            "fetch\n"
-            "                             ingress (POST /_mqproxy/fetch over its own "
-            "H3\n"
-            "                             tunnel; independent of the SOCKS5/CONNECT "
-            "core).\n"
-            "  --path         <local ip>  Local IP to bind a path to (repeatable). "
-            "The\n"
-            "                             first is the primary bind; each extra "
-            "becomes a\n"
-            "                             second/third MPQUIC path once the "
-            "connection is\n"
-            "                             multipath-ready.\n"
-            "  --client-id    <id>        Client identifier sent at auth "
-            "(default: mqproxy).\n"
-            "  --qlog         <dir>       Write xquic qlog (EXTRA importance) to "
-            "<dir>/client.qlog\n"
-            "                             (the 1-B blocked-frame instrument).\n"
-            "  --cc           <algo>      Congestion control: bbr (default) | bbr2 "
-            "| cubic.\n"
-            "  -h, --help                 Show this help and exit.\n");
+    fprintf(
+        out,
+        "Usage: mqproxy client --server <ip:port> --token <token>\n"
+        "                      [--socks5 <ip:port>] [--http-connect <ip:port>]\n"
+        "                      [--gateway <ip:port>] [--path <local ip>]...\n"
+        "                      [--client-id <id>]\n"
+        "\n"
+        "At least one ingress is required: --socks5, --http-connect, or "
+        "--gateway.\n"
+        "\n"
+        "Options:\n"
+        "  --server       <ip:port>   UDP address of the mqproxy server "
+        "(required).\n"
+        "  --token        <token>     Shared auth token (required).\n"
+        "  --socks5       <ip:port>   Local TCP address for the SOCKS5 ingress\n"
+        "                             (UDP ASSOCIATE supported).\n"
+        "  --http-connect <ip:port>   Local TCP address for the HTTP CONNECT "
+        "ingress.\n"
+        "  --gateway      <ip:port>   Local TCP address for the HTTP gateway "
+        "fetch\n"
+        "                             ingress (POST /_mqproxy/fetch over its own "
+        "H3\n"
+        "                             tunnel; independent of the SOCKS5/CONNECT "
+        "core).\n"
+        "  --path         <local ip>  Local IP to bind a path to (repeatable). "
+        "The\n"
+        "                             first is the primary bind; each extra "
+        "becomes a\n"
+        "                             second/third MPQUIC path once the "
+        "connection is\n"
+        "                             multipath-ready.\n"
+        "  --client-id    <id>        Client identifier sent at auth "
+        "(default: mqproxy).\n"
+        "  --qlog         <dir>       Write xquic qlog (EXTRA importance) to "
+        "<dir>/client.qlog\n"
+        "                             (the 1-B blocked-frame instrument).\n"
+        "  --cc           <algo>      Congestion control: bbr (default) | bbr2 "
+        "| cubic.\n"
+        "  --keepalive-idle <sec>     QUIC idle timeout in seconds, kept alive by\n"
+        "                             PINGs (default: 30; 0 = disable; <15 not useful).\n"
+        "  --reconnect                Re-establish the server connection on loss\n"
+        "                             (default: enabled).\n"
+        "  --no-reconnect             Disable automatic reconnect on connection\n"
+        "                             loss.\n"
+        "  --reconnect-max-backoff <sec>\n"
+        "                             Maximum reconnect back-off in seconds\n"
+        "                             (default: 30; must be > 0).\n"
+        "  -h, --help                 Show this help and exit.\n");
 }
 
 /* ── ip:port parsing ────────────────────────────────────────────────────────*/
@@ -543,6 +555,9 @@ cmd_client(int argc, char **argv)
     mq_cc_t cc = MQ_CC_DEFAULT;
     const char *paths[MQ_MAX_EXTRA_PATHS];
     size_t npaths = 0;
+    long keepalive_idle_s = 30;        /* --keepalive-idle <sec>; 0 = disable */
+    int reconnect_enabled = 1;         /* --reconnect / --no-reconnect */
+    long reconnect_max_backoff_s = 30; /* --reconnect-max-backoff <sec> */
 
     enum {
         OPT_SERVER = 256,
@@ -554,6 +569,10 @@ cmd_client(int argc, char **argv)
         OPT_CLIENT_ID,
         OPT_QLOG,
         OPT_CC,
+        OPT_KEEPALIVE_IDLE,
+        OPT_RECONNECT,
+        OPT_NO_RECONNECT,
+        OPT_RECONNECT_MAX_BACKOFF,
     };
     static const struct option longopts[] = {
         {"server", required_argument, NULL, OPT_SERVER},
@@ -565,6 +584,10 @@ cmd_client(int argc, char **argv)
         {"client-id", required_argument, NULL, OPT_CLIENT_ID},
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
+        {"keepalive-idle", required_argument, NULL, OPT_KEEPALIVE_IDLE},
+        {"reconnect", no_argument, NULL, OPT_RECONNECT},
+        {"no-reconnect", no_argument, NULL, OPT_NO_RECONNECT},
+        {"reconnect-max-backoff", required_argument, NULL, OPT_RECONNECT_MAX_BACKOFF},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -589,6 +612,38 @@ cmd_client(int argc, char **argv)
         case OPT_CLIENT_ID: client_id = optarg; break;
         case OPT_QLOG: qlog_dir = optarg; break;
         case OPT_CC: cc_name = optarg; break;
+        case OPT_KEEPALIVE_IDLE: {
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(optarg, &endp, 10);
+            if (errno != 0 || endp == optarg || *endp != '\0' || v < 0) {
+                fprintf(
+                    stderr,
+                    "mqproxy client: invalid --keepalive-idle '%s' (must be >= 0)\n\n",
+                    optarg);
+                usage_client(stderr);
+                return 2;
+            }
+            keepalive_idle_s = v;
+            break;
+        }
+        case OPT_RECONNECT: reconnect_enabled = 1; break;
+        case OPT_NO_RECONNECT: reconnect_enabled = 0; break;
+        case OPT_RECONNECT_MAX_BACKOFF: {
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(optarg, &endp, 10);
+            if (errno != 0 || endp == optarg || *endp != '\0' || v <= 0) {
+                fprintf(stderr,
+                        "mqproxy client: invalid --reconnect-max-backoff '%s' "
+                        "(must be > 0)\n\n",
+                        optarg);
+                usage_client(stderr);
+                return 2;
+            }
+            reconnect_max_backoff_s = v;
+            break;
+        }
         case 'h': usage_client(stdout); return 0;
         default: usage_client(stderr); return 2;
         }
@@ -663,6 +718,13 @@ cmd_client(int argc, char **argv)
      * address with an ephemeral port. */
     const char *primary_ip = (npaths > 0) ? paths[0] : "0.0.0.0";
 
+    /* Seed the process-global RNG once per client process so that reconnect
+     * backoff jitter is decorrelated across fleet processes that start or drop
+     * connectivity at the same time (e.g. a Starlink+LTE fleet dropping at
+     * once). Without seeding, all processes draw the identical jitter sequence
+     * and reconnect in lockstep, defeating the anti-thundering-herd purpose. */
+    srandom((unsigned)(getpid() ^ (unsigned)time(NULL)));
+
     int rc = 1;
     struct event_base *base = NULL;
     mq_transport_t *transport = NULL;
@@ -717,6 +779,9 @@ cmd_client(int argc, char **argv)
             MQ_LOGE("failed to create client");
             goto out;
         }
+        mq_client_set_keepalive(client, (uint64_t)keepalive_idle_s * 1000u);
+        mq_client_set_reconnect(client, reconnect_enabled,
+                                (uint64_t)reconnect_max_backoff_s * 1000u);
         if (mq_client_start(client) != 0) {
             MQ_LOGE("failed to start client connection to %s:%u", server_ip, server_port);
             goto out;
@@ -784,7 +849,9 @@ cmd_client(int argc, char **argv)
             MQ_LOGE("failed to init H3 stack for gateway");
             goto out;
         }
-        gwc = mq_gw_client_new(transport, rt, h3, server_ip, server_port, token, cc);
+        gwc = mq_gw_client_new(transport, rt, h3, server_ip, server_port, token, cc,
+                               (uint64_t)keepalive_idle_s * 1000u, reconnect_enabled,
+                               (uint64_t)reconnect_max_backoff_s * 1000u);
         if (!gwc) {
             MQ_LOGE("failed to create gateway client (conn to %s:%u)", server_ip,
                     server_port);

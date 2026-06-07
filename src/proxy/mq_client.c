@@ -27,6 +27,7 @@
 #include "proxy/mq_framebuf.h"
 #include "proxy/mq_udp_session.h"
 #include "transport/mq_stream.h"
+#include "util/mq_backoff.h"
 #include "util/mq_log.h"
 #include "wire/mq_wire.h"
 
@@ -48,6 +49,8 @@
 #define MQ_CLIENT_IP_MAX 64
 /* Poll interval (ms) for the mp-ready deferral timer. */
 #define MQ_CLIENT_MP_POLL_MS 50
+/* Base delay (ms) for the reconnect exponential backoff. */
+#define MQ_CLIENT_RECONNECT_BASE_MS 250
 
 typedef struct mq_client_open_s mq_client_open_t;
 
@@ -136,6 +139,9 @@ struct mq_client_s {
     /* Active in-flight / relaying data streams. */
     mq_client_data_t *data_head;
 
+    /* Keepalive: if > 0, enables xquic PING keepalive with this idle timeout. */
+    uint64_t keepalive_idle_ms;
+
     /* Deferred extra paths (Task 19, CLI --path). Stored at mq_client_add_paths;
      * added via mq_conn_add_path once the conn is multipath-ready. A recurring
      * libevent timer (pending_paths > 0) polls mp-ready and adds them. */
@@ -143,11 +149,30 @@ struct mq_client_s {
     size_t n_extra_paths;   /* total registered */
     size_t added_paths;     /* how many have been brought up so far */
     struct event *mp_timer; /* armed while paths remain to add */
+
+    /* Reconnect controller (Phase 5b). reconnect_ev is created ONCE in
+     * mq_client_start (when enabled) and freed ONLY in mq_client_free; it is a
+     * one-shot timer re-armed across reconnect cycles, so it must survive a stop.
+     * shutting_down is set FIRST by mq_client_free so a late MQ_CONN_CLOSED takes
+     * the terminal path (no reconnect-after-free). */
+    int shutting_down;
+    int reconnect_enabled;
+    uint64_t reconnect_max_backoff_ms;
+    struct event *reconnect_ev;
+    unsigned reconnect_attempts;
 };
 
 /* Forward decl: the mp-ready deferral timer teardown is referenced from
  * client_on_state (CLOSED) but defined below near the other path-add helpers. */
 static void client_mp_timer_stop(mq_client_t *c);
+static void client_mp_timer_arm(mq_client_t *c);
+
+/* Forward decls: the reconnect controller is referenced from client_on_state /
+ * client_report_auth but its arm path needs client_issue_connect (defined below).
+ * client_issue_connect itself is declared here so client_reconnect_cb can call it. */
+static int client_issue_connect(mq_client_t *c);
+static void client_reconnect_arm(mq_client_t *c);
+static void client_reconnect_stop(mq_client_t *c);
 
 /* Bridge mq_conn's datagram callback (mq_conn_t* + user) to the UDP relay
  * client role's dispatch (mq_udp_cli_t* first arg). user is the mq_client_t*. */
@@ -461,6 +486,10 @@ client_report_auth(mq_client_t *c, int ok, mq_auth_err_t err)
     /* Drain queued opens now that the auth outcome is known. On success they are
      * issued; on failure they are failed (cb + close local_fd). */
     if (ok) {
+        /* Back to SERVING: reset the backoff counter + disarm the reconnect timer
+         * so the next loss starts from base again. */
+        c->reconnect_attempts = 0;
+        client_reconnect_stop(c);
         client_drain_queue(c);
     } else {
         client_fail_queue(c, MQ_TCP_CONN_REFUSED);
@@ -541,35 +570,83 @@ client_on_state(mq_conn_t *conn, mq_conn_state_t st, void *user)
             client_report_auth(c, 0, MQ_AUTH_FAILED);
             goto forward;
         }
-    } else if (st == MQ_CONN_CLOSED) {
-        c->conn = NULL;
-        c->ctrl = NULL;
-        c->closed = 1;
-        /* The conn is gone: no more paths can be added. Disarm the deferral
-         * timer so it does not dereference the freed conn. */
-        client_mp_timer_stop(c);
-        /* If the connection died before auth settled, report failure (this also
-         * fails any pre-auth queued opens). If auth already succeeded, the queue
-         * is empty, but fail it defensively in case opens were queued in a race. */
-        client_report_auth(c, 0, MQ_AUTH_FAILED);
-        client_fail_queue(c, MQ_TCP_CONN_REFUSED);
 
+        /* Re-arm multipath for this (possibly reconnected) conn: reset added_paths
+         * so the mp-timer re-adds every registered extra path on the new conn.
+         * Harmless on the first start (added_paths is already 0 and arm is a no-op
+         * when n_extra_paths == 0). */
+        c->added_paths = 0;
+        client_mp_timer_arm(c);
+    } else if (st == MQ_CONN_CLOSED) {
         /* Reap every active data node: fail any in-flight open whose response
          * never arrived (cb with an error), then close stream + local_fd once.
-         * Iterate defensively against the self-unlink. */
+         * In-flight flows do NOT survive a tunnel loss (irreducible — design
+         * §Non-goal); only NEW opens resume after reconnect. Iterate defensively
+         * against the self-unlink. This runs identically on both branches. */
         while (c->data_head) {
             mq_client_data_t *d = c->data_head;
             client_data_report(d, 0, MQ_TCP_CONN_REFUSED);
             client_data_reap(d);
         }
 
-        /* Fail every live/pending UDP relay session with MQ_UDP_CLOSED (a
-         * non-OPEN-failure close — the assoc must not negative-cache on it). If
-         * the conn died before auth, client_report_auth above already failed the
-         * pending UDP sessions with POLICY_DENIED (auth failure); on_conn_close is
-         * then a no-op (cli already settled). */
-        if (c->udp) {
-            mq_udp_cli_on_conn_close(c->udp);
+        /* Decide reconnect vs terminal from shutting_down + reconnect_enabled
+         * ONLY (NOT auth_reported/authed — those are reset below on the reconnect
+         * path). reconnect_ev != NULL also guards the timer existing. */
+        int reconnect_now =
+            (!c->shutting_down && c->reconnect_enabled && c->reconnect_ev != NULL);
+
+        if (reconnect_now) {
+            /* Carry the pre-auth/serving open queue across to the next attempt:
+             * do NOT report auth failure and do NOT fail the queue. Instead reset
+             * the per-conn one-shot latches + conn-bound buffers so the next auth
+             * cycle runs fresh (design §Per-conn state reset). */
+            c->auth_reported = 0;
+            c->authed = 0;
+            c->auth_features = 0;
+            c->closed = 0;
+            c->ctrl = NULL;
+            c->rx.len = 0;
+
+            /* UDP: fail live/pending sessions w/ MQ_UDP_CLOSED + null the conn,
+             * then clear the latch/mss cache so the table is ready for a fresh
+             * auth cycle. conn stays NULL through the backoff window;
+             * client_issue_connect re-wires it (mq_udp_cli_set_conn) at the
+             * re-issued connect. */
+            if (c->udp) {
+                mq_udp_cli_on_conn_close(c->udp);
+                mq_udp_cli_reset(c->udp);
+            }
+
+            c->conn = NULL;
+            /* No more paths can be added on the dead conn; the new ESTABLISHED
+             * re-arms after resetting added_paths. */
+            client_mp_timer_stop(c);
+
+            /* Arm the backoff timer to re-establish the conn. */
+            client_reconnect_arm(c);
+        } else {
+            /* Terminal (shutting_down or reconnect disabled): today's behavior. */
+            c->conn = NULL;
+            c->ctrl = NULL;
+            c->closed = 1;
+            /* The conn is gone: no more paths can be added. Disarm the deferral
+             * timer so it does not dereference the freed conn. */
+            client_mp_timer_stop(c);
+            /* If the connection died before auth settled, report failure (this
+             * also fails any pre-auth queued opens). If auth already succeeded,
+             * the queue is empty, but fail it defensively in case opens were
+             * queued in a race. */
+            client_report_auth(c, 0, MQ_AUTH_FAILED);
+            client_fail_queue(c, MQ_TCP_CONN_REFUSED);
+
+            /* Fail every live/pending UDP relay session with MQ_UDP_CLOSED (a
+             * non-OPEN-failure close — the assoc must not negative-cache on it).
+             * If the conn died before auth, client_report_auth above already
+             * failed the pending UDP sessions with POLICY_DENIED (auth failure);
+             * on_conn_close is then a no-op (cli already settled). */
+            if (c->udp) {
+                mq_udp_cli_on_conn_close(c->udp);
+            }
         }
     }
 
@@ -603,7 +680,33 @@ mq_client_new(mq_transport_t *t, mq_runtime_t *rt, const char *server_ip,
     /* auth_token is not NUL-guaranteed-meaningful but encoded as a string field;
      * use the NUL-terminated length. */
     snprintf(c->req.auth_token, sizeof(c->req.auth_token), "%s", auth_token);
+    c->keepalive_idle_ms = 30000; /* default 30 s; 0 = disable */
+    /* Reconnect on by default (design §Config); 30 s backoff cap. */
+    c->reconnect_enabled = 1;
+    c->reconnect_max_backoff_ms = 30000;
     return c;
+}
+
+void
+mq_client_set_reconnect(mq_client_t *c, int enabled, uint64_t max_backoff_ms)
+{
+    if (!c) {
+        return;
+    }
+    c->reconnect_enabled = enabled ? 1 : 0;
+    if (max_backoff_ms < 1000) {
+        max_backoff_ms = 1000;
+    }
+    c->reconnect_max_backoff_ms = max_backoff_ms;
+}
+
+void
+mq_client_set_keepalive(mq_client_t *c, uint64_t idle_ms)
+{
+    if (!c) {
+        return;
+    }
+    c->keepalive_idle_ms = idle_ms;
 }
 
 void
@@ -626,21 +729,14 @@ mq_client_set_on_state(mq_client_t *c, mq_conn_on_state_fn fn, void *user)
     c->on_state_user = user;
 }
 
-int
-mq_client_start(mq_client_t *c)
+/* Build sockaddr + conn settings, call mq_conn_connect, wire on_state, and
+ * (if c->udp is already live from a previous start) re-wire the UDP table and
+ * datagram callback onto the new conn.  On the first start c->udp is NULL, so
+ * the re-wire block is skipped; mq_client_start creates the table afterwards.
+ * Returns 0 on success, -1 on failure. */
+static int
+client_issue_connect(mq_client_t *c)
 {
-    if (!c) {
-        return -1;
-    }
-
-    /* Register the client ALPN (no server-side hooks). Idempotency: registering
-     * twice on one engine is not supported, so this assumes one client per
-     * engine, which matches the proxy's usage. */
-    if (mq_conn_register_alpn(c->transport, MQ_CLIENT_ALPN, NULL, NULL, NULL) != 0) {
-        MQ_LOGE("mq_client: register_alpn failed");
-        return -1;
-    }
-
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
@@ -659,6 +755,14 @@ mq_client_start(mq_client_t *c)
      * conn. u16 field; max advertises the largest frame we accept (xquic caps
      * the effective payload to the path MTU regardless). */
     settings.max_datagram_frame_size = 65535;
+    /* PING keepalive: send periodic PINGs to keep the idle connection alive and
+     * detect peer loss.  Disabled when keepalive_idle_ms == 0. Only the post-
+     * handshake idle timeout is set here; init_idle_time_out is left at the
+     * xquic default (pre-handshake idle, intentional). */
+    settings.ping_on = (c->keepalive_idle_ms > 0) ? 1 : 0;
+    if (c->keepalive_idle_ms > 0) {
+        settings.idle_time_out = c->keepalive_idle_ms;
+    }
     /* Multipath + aggregate-BDP flow-control windows (see mq_conn.h). */
     mq_conn_apply_mp_settings(&settings, /*is_server=*/0, c->cc);
 
@@ -669,6 +773,96 @@ mq_client_start(mq_client_t *c)
         return -1;
     }
     mq_conn_set_on_state(c->conn, client_on_state, c);
+
+    /* On reconnect (c->udp already exists), re-wire the UDP session table and
+     * datagram callback onto the new conn.  On first start c->udp is NULL here
+     * (mq_client_start creates it after this call), so the block is a no-op. */
+    if (c->udp) {
+        mq_udp_cli_set_conn(c->udp, c->conn);
+        mq_conn_set_on_datagram(c->conn, client_on_datagram, c);
+    }
+
+    return 0;
+}
+
+/* ── Reconnect controller (Phase 5b) ─────────────────────────────────────────
+ *
+ * reconnect_ev is created ONCE in mq_client_start and freed ONLY in
+ * mq_client_free; it is a one-shot timer re-armed across reconnect cycles, so
+ * stop() must NOT free it (unlike the mp-timer). */
+
+/* Disarm the backoff timer (idempotent). Does NOT free reconnect_ev — it must
+ * survive for the next reconnect cycle (freed only in mq_client_free). */
+static void
+client_reconnect_stop(mq_client_t *c)
+{
+    if (c->reconnect_ev) {
+        evtimer_del(c->reconnect_ev);
+    }
+}
+
+/* Arm the one-shot backoff timer for the next reconnect attempt. Exponential
+ * (base 250 ms, cap reconnect_max_backoff_ms) with full jitter + a floor:
+ * the delay is randomised into [d/2, d] so the re-arm cannot land near zero and
+ * spin. */
+static void
+client_reconnect_arm(mq_client_t *c)
+{
+    if (!c->reconnect_ev) {
+        return;
+    }
+    c->reconnect_attempts++;
+    uint64_t d = mq_backoff_ms(MQ_CLIENT_RECONNECT_BASE_MS, c->reconnect_max_backoff_ms,
+                               c->reconnect_attempts);
+    /* jitter into [d/2, d] (half-jitter with a d/2 floor to avoid near-zero re-spin). */
+    uint64_t j = d / 2 + (uint64_t)(random() % (long)(d / 2 + 1));
+    struct timeval tv = {.tv_sec = (time_t)(j / 1000),
+                         .tv_usec = (suseconds_t)((j % 1000) * 1000)};
+    evtimer_add(c->reconnect_ev, &tv);
+}
+
+/* Backoff timer fired: re-issue the connect. If the connect itself fails
+ * (mq_conn_connect returned NULL), re-arm with the next backoff rather than
+ * going terminal — an always-on device must self-heal across long outages. */
+static void
+client_reconnect_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void)fd;
+    (void)what;
+    mq_client_t *c = (mq_client_t *)arg;
+    if (client_issue_connect(c) != 0) {
+        client_reconnect_arm(c);
+    }
+}
+
+int
+mq_client_start(mq_client_t *c)
+{
+    if (!c) {
+        return -1;
+    }
+
+    /* Register the client ALPN (no server-side hooks). Idempotency: registering
+     * twice on one engine is not supported, so this assumes one client per
+     * engine, which matches the proxy's usage. */
+    if (mq_conn_register_alpn(c->transport, MQ_CLIENT_ALPN, NULL, NULL, NULL) != 0) {
+        MQ_LOGE("mq_client: register_alpn failed");
+        return -1;
+    }
+
+    /* Create the reconnect backoff timer ONCE (when enabled). It is one-shot,
+     * armed only from the CLOSED handler, disarmed on reaching SERVING + on
+     * shutdown, and freed only in mq_client_free. */
+    if (c->reconnect_enabled) {
+        c->reconnect_ev = evtimer_new(mq_runtime_base(c->rt), client_reconnect_cb, c);
+        if (!c->reconnect_ev) {
+            MQ_LOGW("mq_client: reconnect timer alloc failed (reconnect disabled)");
+        }
+    }
+
+    if (client_issue_connect(c) != 0) {
+        return -1;
+    }
 
     /* Per-connection UDP relay session table (client role) + datagram dispatch.
      * Created here so opens may be queued pre-auth; freed in mq_client_free.
@@ -842,25 +1036,33 @@ mq_client_tcp_open(void *core, const uint8_t *host, size_t host_len, mq_addr_typ
         if (local_fd >= 0) close(local_fd);
         return;
     }
-    /* Connection already gone: fail fast. */
-    if (c->closed || !c->conn) {
+    /* Admission (Phase 5b reconnect-aware ordering):
+     *   closed (terminal)         → fail fast.
+     *   not authed                → enqueue (pre-auth OR reconnect window: conn
+     *                               may be NULL; client_enqueue_open does not
+     *                               dereference c->conn — it only queues). The
+     *                               queue drains on the next auth OK (carried
+     *                               across a reconnect loss).
+     *   authed but no conn (race) → fail fast (narrow authed-mid-teardown guard;
+     *                               do not simplify away).
+     *   authed + conn             → issue immediately. */
+    if (c->closed) {
         if (cb) cb(0, MQ_TCP_CONN_REFUSED, user);
         if (local_fd >= 0) close(local_fd);
-        return;
-    }
-    /* Not yet authed: queue for replay on auth success. */
-    if (!c->authed) {
+    } else if (!c->authed) {
         if (client_enqueue_open(c, host, host_len, atype, port, local_fd, prebuf,
                                 prebuf_len, user, cb) != 0) {
             MQ_LOGW("mq_client: tcp_open queue full, rejecting");
             if (cb) cb(0, MQ_TCP_CONN_REFUSED, user);
             if (local_fd >= 0) close(local_fd);
         }
-        return;
+    } else if (!c->conn) {
+        if (cb) cb(0, MQ_TCP_CONN_REFUSED, user);
+        if (local_fd >= 0) close(local_fd);
+    } else {
+        client_issue_open(c, host, host_len, atype, port, local_fd, prebuf, prebuf_len,
+                          user, cb);
     }
-    /* Authed: issue immediately. */
-    client_issue_open(c, host, host_len, atype, port, local_fd, prebuf, prebuf_len, user,
-                      cb);
 }
 
 mq_tcp_open_fn
@@ -936,12 +1138,28 @@ mq_client_free(mq_client_t *c)
     if (!c) {
         return;
     }
+    /* (1) Mark teardown FIRST so a late MQ_CONN_CLOSED takes the terminal path
+     * (no reconnect-after-free). (2) Disarm the backoff timer, then (3) free it.
+     * (4) Detach the conn state callback so a late CLOSED (the engine frees the
+     * conn after us, in some teardown orders) cannot re-enter client_on_state and
+     * dereference the freed c. Only then run the existing teardown. */
+    c->shutting_down = 1;
+    client_reconnect_stop(c);
+    if (c->reconnect_ev) {
+        event_free(c->reconnect_ev);
+        c->reconnect_ev = NULL;
+    }
+    if (c->conn) {
+        mq_conn_set_on_state(c->conn, NULL, NULL);
+    }
     /* Disarm the mp-ready deferral timer (no-op if already stopped). */
     client_mp_timer_stop(c);
-    /* Free any still-queued opens (no cb: the owner is tearing down). The active
-     * data nodes are reaped via the conn CLOSED path before the engine frees the
-     * conn; by the time mq_client_free runs they should be gone. Fail defensively
-     * in case free is called without a prior CLOSED. */
+    /* Fail any still-queued opens (fires their cb with CONN_REFUSED). In
+     * practice the queue is already empty by free-time (drained/failed on the
+     * prior CLOSED); this is defensive. The active data nodes are reaped via
+     * the conn CLOSED path before the engine frees the conn; by the time
+     * mq_client_free runs they should be gone. Fail defensively in case free
+     * is called without a prior CLOSED. */
     client_fail_queue(c, MQ_TCP_CONN_REFUSED);
     while (c->data_head) {
         client_data_report(c->data_head, 0, MQ_TCP_CONN_REFUSED);

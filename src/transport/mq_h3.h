@@ -89,10 +89,13 @@ void mq_h3_free(mq_h3_t *h);
 typedef void (*mq_h3_conn_state_fn)(mq_h3_conn_t *c, int established, void *user);
 
 /* Client: initiate an H3 connection to `peer` with congestion control `cc`.
- * `st` / `user` receive lifecycle transitions (may be NULL). Returns a new
- * mq_h3_conn (callbacks fire later) or NULL on failure. */
+ * `st` / `user` receive lifecycle transitions (may be NULL). `keepalive_idle_ms`
+ * enables xquic PING keepalive when > 0 (and sets the post-handshake idle
+ * timeout to that value); 0 disables keepalive. Returns a new mq_h3_conn
+ * (callbacks fire later) or NULL on failure. */
 mq_h3_conn_t *mq_h3_connect(mq_h3_t *h, const struct sockaddr *peer, socklen_t peerlen,
-                            mq_cc_t cc, mq_h3_conn_state_fn st, void *user);
+                            mq_cc_t cc, uint64_t keepalive_idle_ms,
+                            mq_h3_conn_state_fn st, void *user);
 
 /* 1 once xquic fired ready_to_create_path_notify for this conn (cids exchanged)
  * — i.e. mq_h3_conn_add_path can now succeed. 0 before that (or on NULL).

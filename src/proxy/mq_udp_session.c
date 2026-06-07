@@ -1855,6 +1855,32 @@ mq_udp_cli_on_conn_close(mq_udp_cli_t *u)
     }
 }
 
+void
+mq_udp_cli_reset(mq_udp_cli_t *u)
+{
+    if (!u) {
+        return;
+    }
+    /* Precondition: session table must be empty (on_conn_close reaped it). */
+    if (u->live_count != 0) {
+        MQ_LOGW("mq_udp_cli_reset: called with live_count=%zu (expected 0)",
+                u->live_count);
+    }
+    u->settled = 0;
+    u->authed = 0;
+    u->available = 0;
+    u->cached_mss = 0;
+    u->mss_emit_countdown = 0;
+}
+
+void
+mq_udp_cli_set_conn(mq_udp_cli_t *u, mq_conn_t *conn)
+{
+    if (u) {
+        u->conn = conn;
+    }
+}
+
 /* ── lifecycle ───────────────────────────────────────────────────────────── */
 
 mq_udp_cli_t *
