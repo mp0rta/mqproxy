@@ -438,7 +438,18 @@ static void
 gw_fixture_down(gw_fixture_t *f)
 {
     /* SANCTIONED TEARDOWN ORDER (mq_gw_client.h): gw_client_free FIRST while the
-     * client H3 engine is still live, THEN mq_h3_free, THEN transport_free. */
+     * client H3 engine is still live, THEN mq_h3_free, THEN transport_free.
+     *
+     * NB: this order is exactly what revert-proves the late-callback UAF guard in
+     * mq_gw_client_free (the mq_h3_conn_set_state_cb(NULL) detach). Whenever a case
+     * ends with a LIVE tunnel conn (e.g. case 1), freeing the gw_client here while
+     * the conn is still alive orphans it; the subsequent mq_h3_free engine teardown
+     * delivers a late conn-close into gw_conn_state. The detach makes that a no-op;
+     * removing it makes this teardown ASan-abort (heap-use-after-free at the
+     * gw_conn_state CLOSED branch reading the freed cli). So the gateway detach is
+     * load-bearing and exercised by the existing cases — no dedicated case needed
+     * (cf. test_client_reconnect case 9, which must INVERT its fixture order because
+     * mq_client's fixture_down frees the transport before the client). */
     if (f->gw) mq_gw_client_free(f->gw);
     if (f->cli_h3) mq_h3_free(f->cli_h3);
     if (f->srv_h3) mq_h3_free(f->srv_h3);

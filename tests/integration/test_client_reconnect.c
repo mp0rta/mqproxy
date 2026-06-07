@@ -1055,6 +1055,57 @@ test_case8_open_after_terminal(void)
     fixture_down(&f);
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * Case 9: late-callback UAF guard — free the client while its conn is STILL
+ *         ALIVE (SERVING, never dropped), THEN tear the engine down. The engine
+ *         teardown (mq_transport_free → xqc_engine_destroy → mq_conn_close_notify)
+ *         delivers a LATE MQ_CONN_CLOSED for the now-orphaned conn whose on_state
+ *         still points at the just-freed client. mq_client_free's state-cb detach
+ *         (mq_conn_set_on_state(c->conn, NULL, NULL)) is what makes that late
+ *         CLOSED a no-op.
+ *
+ * This is the ONLY case that exercises that detach: every other case (and the
+ * shared fixture_down) frees the transport BEFORE the client, so their late
+ * CLOSED fires while the client is still alive (no UAF). Here we INVERT the
+ * order — free the client first — so the detach is load-bearing.
+ *
+ * REVERT-PROOF: deleting the detach in mq_client_free makes this case fail under
+ * ASan (heap-use-after-free reading c->data_head in client_on_state's CLOSED
+ * branch). Verified by disabling the detach: this case then ASan-aborts.
+ *
+ * The conn is NEVER dropped before the free, so this is distinct from case 5
+ * (free DURING the backoff window, conn already NULL): there the late callback
+ * cannot fire (conn already freed); here the conn is live at free time.
+ * ════════════════════════════════════════════════════════════════════════ */
+static void
+test_case9_free_before_engine_destroy(void)
+{
+    fixture_t f;
+    if (fixture_up(&f, 0) != 0) {
+        fixture_down(&f);
+        return;
+    }
+    /* Reach SERVING; the conn is alive and was NEVER dropped. */
+    pump_until_auth_count(f.base, 1, 4000);
+    MQ_CHECK_EQ_INT(g_auth_count, 1);
+    MQ_CHECK(g_auth_ok);
+    MQ_CHECK(mq_client_conn(f.client) != NULL); /* live conn, not dropped */
+
+    /* Free the client FIRST, while its conn is still live in the engine. The conn
+     * is now orphaned (its on_state still references the freed client struct);
+     * mq_client_free's mq_conn_set_on_state(NULL) detach must have severed it so
+     * the imminent engine-teardown CLOSED cannot re-enter client_on_state. */
+    mq_client_free(f.client);
+    f.client = NULL; /* prevent double-free in fixture_down */
+
+    /* Tear the engine down. fixture_down frees cli_t FIRST: mq_transport_free →
+     * xqc_engine_destroy → mq_conn_close_notify for the orphaned conn → on_state
+     * is NULL (detached), so NO re-entry into client_on_state. Without the detach
+     * this is a heap-use-after-free (caught by ASan). No positive assertion: the
+     * proof is "ASan stays silent here, and fails when the detach is reverted". */
+    fixture_down(&f);
+}
+
 static void
 test_client_reconnect(void)
 {
@@ -1069,6 +1120,7 @@ test_client_reconnect(void)
     test_case6_keepalive_holds();
     test_case7_persistent_outage();
     test_case8_open_after_terminal();
+    test_case9_free_before_engine_destroy();
 }
 
 MQ_TEST_MAIN(test_client_reconnect())
