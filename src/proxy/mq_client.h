@@ -50,8 +50,9 @@ void mq_client_set_keepalive(mq_client_t *c, uint64_t idle_ms);
 /* Configure in-process reconnect (Phase 5b): when enabled (default), a tunnel
  * loss arms a jittered exponential-backoff timer that re-establishes the conn
  * and re-auths, returning the client to SERVING without dropping its listeners.
- * max_backoff_ms caps the backoff (default 30000). When disabled, MQ_CONN_CLOSED
- * is terminal (today's behavior; for tests / supervised-restart deployments).
+ * max_backoff_ms caps the backoff (default 30000); it is floored to 1000ms to
+ * prevent a zero-backoff busy-spin. When disabled, MQ_CONN_CLOSED is terminal
+ * (today's behavior; for tests / supervised-restart deployments).
  * Must be called before mq_client_start. NULL-safe. */
 void mq_client_set_reconnect(mq_client_t *c, int enabled, uint64_t max_backoff_ms);
 

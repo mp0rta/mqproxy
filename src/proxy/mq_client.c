@@ -49,6 +49,8 @@
 #define MQ_CLIENT_IP_MAX 64
 /* Poll interval (ms) for the mp-ready deferral timer. */
 #define MQ_CLIENT_MP_POLL_MS 50
+/* Base delay (ms) for the reconnect exponential backoff. */
+#define MQ_CLIENT_RECONNECT_BASE_MS 250
 
 typedef struct mq_client_open_s mq_client_open_t;
 
@@ -692,6 +694,9 @@ mq_client_set_reconnect(mq_client_t *c, int enabled, uint64_t max_backoff_ms)
         return;
     }
     c->reconnect_enabled = enabled ? 1 : 0;
+    if (max_backoff_ms < 1000) {
+        max_backoff_ms = 1000;
+    }
     c->reconnect_max_backoff_ms = max_backoff_ms;
 }
 
@@ -807,8 +812,9 @@ client_reconnect_arm(mq_client_t *c)
         return;
     }
     c->reconnect_attempts++;
-    uint64_t d = mq_backoff_ms(250, c->reconnect_max_backoff_ms, c->reconnect_attempts);
-    /* Full jitter with a d/2 floor: random in [d/2, d]. */
+    uint64_t d = mq_backoff_ms(MQ_CLIENT_RECONNECT_BASE_MS, c->reconnect_max_backoff_ms,
+                               c->reconnect_attempts);
+    /* jitter into [d/2, d] (half-jitter with a d/2 floor to avoid near-zero re-spin). */
     uint64_t j = d / 2 + (uint64_t)(random() % (long)(d / 2 + 1));
     struct timeval tv = {.tv_sec = (time_t)(j / 1000),
                          .tv_usec = (suseconds_t)((j % 1000) * 1000)};
