@@ -8,6 +8,7 @@ find_package(CURL REQUIRED)
 add_library(mqproxy STATIC
     src/util/mq_log.c
     src/util/mq_buf.c
+    src/util/mq_backoff.c
     src/wire/mq_varint.c
     src/wire/mq_wire.c
     src/wire/mq_udp_msg.c
@@ -90,6 +91,11 @@ add_executable(test_defrag tests/test_defrag.c)
 target_link_libraries(test_defrag mqproxy)
 target_include_directories(test_defrag PRIVATE tests)
 add_test(NAME test_defrag COMMAND test_defrag)
+
+add_executable(test_backoff tests/test_backoff.c)
+target_link_libraries(test_backoff mqproxy)
+target_include_directories(test_backoff PRIVATE tests)
+add_test(NAME test_backoff COMMAND test_backoff)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
