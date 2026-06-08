@@ -920,10 +920,12 @@ gw_dispatch(mq_gw_req_t *r)
      * ctx.scheme is validated by scheme_ok() above and NUL-terminated by copy_z. */
     snprintf(r->method, sizeof(r->method), "%s", ctx.method);
     snprintf(r->authority, sizeof(r->authority), "%s", ctx.authority);
-    snprintf(r->path, sizeof(r->path), "%s",
-             ctx.path); /* r->path is 512 B, ctx.path is 1024 B: a 513–1023 B path is the
-                           full value at the origin URL (built above) but is silently
-                           truncated in this metrics-only copy */
+    snprintf(
+        r->path, sizeof(r->path), "%.*s", (int)sizeof(r->path) - 1,
+        ctx.path); /* r->path is 512 B, ctx.path is 1024 B: a 513–1023 B path is the
+                      full value at the origin URL (built above) but is silently
+                      truncated in this metrics-only copy. The %.*s precision bound
+                      caps output to fit so -Werror=format-truncation can prove it. */
     r->origin_is_tls = (strcmp(ctx.scheme, "https") == 0); /* gates origin_tls (NEW-3) */
 
     /* Upload framing: body present → known CL (>=0) or chunked sentinel. */
