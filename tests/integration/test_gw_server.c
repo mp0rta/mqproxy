@@ -881,6 +881,7 @@ typedef struct {
     mq_transport_t *srv_t;
     mq_runtime_t *srv_rt;
     mq_gw_server_t *gw;
+    uint16_t srv_port; /* the gw_server's loopback UDP port (for a 2nd client) */
 
     mq_transport_t *cli_t;
     mq_runtime_t *cli_rt;
@@ -913,6 +914,7 @@ gws_fixture_up(gws_fixture_t *f, const char *token, size_t blob_len)
 
     uint16_t srv_port = reserve_udp_port();
     if (!srv_port) return -1;
+    f->srv_port = srv_port;
 
     /* Server transport + runtime + gw_server (mq_h3_init done inside gw_server). */
     f->srv_t = mq_transport_new_server(TEST_CERT_FILE, TEST_KEY_FILE);
@@ -1990,6 +1992,131 @@ test_gws_active_conn(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 13: multi-conn teardown — older live conn must not UAF ────
+ *
+ * Regression for the gw_srv_conn_state detach-on-overwrite (gw_on_new_conn in
+ * src/gateway/mq_gw_server.c). The gw_server installs gw_srv_conn_state (user =
+ * the mq_gw_server_t *) on every accepted H3 tunnel conn and tracks the most-
+ * recent one in s->last_conn. When a SECOND conn is accepted while the FIRST is
+ * still live, gw_on_new_conn must DETACH the cb from the first before overwriting
+ * last_conn, so AT MOST ONE live conn ever carries the cb.
+ *
+ * Without that detach, the older still-live conn keeps gw_srv_conn_state(s).
+ * At teardown gw_server_free(s) frees `s` BEFORE mq_h3_free() (engine teardown,
+ * which fires c->on_state(c, 0, user) for every remaining conn) — so the older
+ * conn would fire gw_srv_conn_state into the freed `s`: a heap-use-after-free.
+ *
+ * This test accepts TWO server-side conns to the SAME gw_server (via two SEPARATE
+ * client H3 stacks → two mq_h3_connect), leaves the OLDER one LIVE (never closed),
+ * then runs the sanctioned fixture teardown (mq_gw_server_free → mq_h3_free →
+ * transport_free). Under ASan it must be clean WITH the fix and a heap-use-after-
+ * free WITHOUT it. */
+
+/* A minimal second client-side H3 stack (its own transport + runtime + h3 + conn)
+ * connecting to the gw_server, used only to force a 2nd server-side accept. */
+typedef struct {
+    mq_transport_t *t;
+    mq_runtime_t *rt;
+    mq_h3_t *h3;
+    mq_h3_conn_t *conn;
+    int up;
+} gws_cli2_t;
+
+static void
+gws_cli2_conn_state(mq_h3_conn_t *cn, int established, void *user)
+{
+    (void)cn;
+    gws_cli2_t *c2 = (gws_cli2_t *)user;
+    c2->up = established ? 1 : 0;
+}
+
+/* Stand up an independent client H3 conn to f->srv_port; pump until established.
+ * Returns 0 on success. Caller frees with gws_cli2_down. */
+static int
+gws_cli2_up(gws_fixture_t *f, gws_cli2_t *c2)
+{
+    memset(c2, 0, sizeof(*c2));
+    c2->t = mq_transport_new(0);
+    if (!c2->t) return -1;
+    c2->rt = mq_runtime_new(c2->t, f->base);
+    if (!c2->rt) return -1;
+    if (mq_runtime_open_udp_path(c2->rt, "127.0.0.1", 0) != 0) return -1;
+    c2->h3 = mq_h3_init(c2->t, NULL, NULL, NULL);
+    if (!c2->h3) return -1;
+
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(f->srv_port);
+    inet_pton(AF_INET, "127.0.0.1", &peer.sin_addr);
+    c2->conn = mq_h3_connect(c2->h3, (struct sockaddr *)&peer, sizeof(peer), MQ_CC_BBR2,
+                             /*keepalive_idle_ms=*/0, gws_cli2_conn_state, c2);
+    if (!c2->conn) return -1;
+
+    uint64_t deadline = now_ms() + 5000;
+    while (!c2->up && now_ms() < deadline)
+        event_base_loop(f->base, EVLOOP_NONBLOCK);
+    return c2->up ? 0 : -1;
+}
+
+static void
+gws_cli2_down(gws_cli2_t *c2)
+{
+    if (c2->h3) mq_h3_free(c2->h3);
+    if (c2->t) mq_transport_free(c2->t);
+    if (c2->rt) mq_runtime_free(c2->rt);
+}
+
+static void
+test_gws_multi_conn_teardown(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 4096) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+
+    /* (1) First server-side accept: the fixture's own client conn. Drive ONE full
+     * fetch so the gw_server has surely accepted + tracked it (gw_on_new_conn). */
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(4096);
+    c.body_cap = 4096;
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/blob",
+                              "Bearer sekrit", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    uint64_t deadline = now_ms() + 10000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+    MQ_CHECK_EQ_INT(c.status, 200);
+
+    mq_h3_conn_t *first = mq_gw_server_active_conn(f.gw);
+    MQ_CHECK(first != NULL); /* positive assertion: first conn accepted + tracked */
+    free(c.body);
+
+    /* (2) Second server-side accept: a SEPARATE client H3 stack → a 2nd
+     * mq_h3_connect to the SAME gw_server. After it establishes, gw_on_new_conn
+     * fires again and active_conn must move to the new (second) conn — proving two
+     * DISTINCT conns were accepted. The FIRST conn is never closed → still live. */
+    gws_cli2_t c2;
+    int rc2 = gws_cli2_up(&f, &c2);
+    MQ_CHECK_EQ_INT(rc2, 0);
+
+    mq_h3_conn_t *second = mq_gw_server_active_conn(f.gw);
+    MQ_CHECK(second != NULL);  /* positive assertion: a conn is still tracked */
+    MQ_CHECK(second != first); /* positive assertion: it MOVED to a 2nd conn */
+
+    /* (3) Tear down WITHOUT closing either conn. The first is still live and, pre-
+     * fix, still carries gw_srv_conn_state(s). gws_fixture_down frees the gw_server
+     * (frees `s`) BEFORE mq_h3_free fires the close transition on every remaining
+     * server conn — pre-fix that fires gw_srv_conn_state(freed s) → ASan UAF.
+     * Free the 2nd client stack first (so its conn is gone before the server-side
+     * teardown), then the sanctioned fixture teardown for the rest. */
+    gws_cli2_down(&c2);
+    gws_fixture_down(&f);
+}
+
 int
 main(void)
 {
@@ -2027,6 +2154,7 @@ main(void)
     test_gws_xmq_origin_protocol_drop_before_count();
     test_gws_teardown_inflight();
     test_gws_active_conn();
+    test_gws_multi_conn_teardown();
 
     if (mq_test_failures) {
         fprintf(stderr, "%d failure(s)\n", mq_test_failures);
