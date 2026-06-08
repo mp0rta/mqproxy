@@ -120,6 +120,12 @@ usage_server(FILE *out)
                  "<dir>/server.qlog.\n"
                  "  --cc     <algo>     Congestion control: bbr (default) | bbr2 | "
                  "cubic.\n"
+                 "  --metrics-interval <sec>\n"
+                 "                      Periodically log per-path stats "
+                 "(mq.conn/mq.path)\n"
+                 "                      every <sec> seconds (default off; min 1s; "
+                 "server logs\n"
+                 "                      the most-recently-accepted conn only).\n"
                  "  -h, --help          Show this help and exit.\n");
 }
 
@@ -173,6 +179,11 @@ usage_client(FILE *out)
         "  --reconnect-max-backoff <sec>\n"
         "                             Maximum reconnect back-off in seconds\n"
         "                             (default: 30; must be > 0).\n"
+        "  --metrics-interval <sec>   Periodically log per-path stats "
+        "(mq.conn/mq.path)\n"
+        "                             every <sec> seconds (default off; min 1s; "
+        "server logs\n"
+        "                             the most-recently-accepted conn only).\n"
         "  -h, --help                 Show this help and exit.\n");
 }
 
@@ -255,6 +266,42 @@ install_signal_handlers(struct event_base *base, mq_runtime_t *rt, struct event 
     return 0;
 }
 
+/* ── periodic metrics dump (opt-in via --metrics-interval) ───────────────────*/
+
+/* Context for the client-side periodic metrics tick: carries the TCP-proxy core
+ * (mq_client) and the gateway client (mq_gw_client). Either may be NULL; the
+ * dump helpers guard NULL / closed conns. */
+struct cli_metrics_ctx {
+    mq_client_t *client;
+    mq_gw_client_t *gwc;
+};
+
+static void
+cli_metrics_tick(evutil_socket_t fd, short what, void *arg)
+{
+    (void)fd;
+    (void)what;
+    struct cli_metrics_ctx *m = (struct cli_metrics_ctx *)arg;
+    mq_conn_t *conn = mq_client_conn(m->client);
+    if (conn) {
+        mq_conn_dump_stats(conn);
+    }
+    if (m->gwc) {
+        mq_gw_client_dump_stats(m->gwc);
+    }
+}
+
+static void
+srv_metrics_tick(evutil_socket_t fd, short what, void *arg)
+{
+    (void)fd;
+    (void)what;
+    mq_conn_t *conn = mq_server_active_conn((mq_server_t *)arg);
+    if (conn) {
+        mq_conn_dump_stats(conn);
+    }
+}
+
 /* ── server subcommand ──────────────────────────────────────────────────────*/
 
 /* Default origin connect timeout (seconds) for the gateway bridge. */
@@ -293,9 +340,10 @@ cmd_server(int argc, char **argv)
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
     mq_cc_t cc = MQ_CC_DEFAULT;
-    int gateway_enabled = 1;      /* gateway on by default; --no-gateway opts out */
-    long udp_idle_timeout_s = 60; /* --udp-idle-timeout <sec>, default 60 */
-    int udp_enabled = 1;          /* --no-udp clears this */
+    int gateway_enabled = 1;          /* gateway on by default; --no-gateway opts out */
+    long udp_idle_timeout_s = 60;     /* --udp-idle-timeout <sec>, default 60 */
+    int udp_enabled = 1;              /* --no-udp clears this */
+    uint64_t metrics_interval_ms = 0; /* --metrics-interval <sec>; 0 = off */
 
     enum {
         OPT_LISTEN = 256,
@@ -308,6 +356,7 @@ cmd_server(int argc, char **argv)
         OPT_NO_UDP,
         OPT_QLOG,
         OPT_CC,
+        OPT_METRICS_INTERVAL,
     };
     static const struct option longopts[] = {
         {"listen", required_argument, NULL, OPT_LISTEN},
@@ -320,6 +369,7 @@ cmd_server(int argc, char **argv)
         {"no-udp", no_argument, NULL, OPT_NO_UDP},
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
+        {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -352,6 +402,17 @@ cmd_server(int argc, char **argv)
         case OPT_NO_UDP: udp_enabled = 0; break;
         case OPT_QLOG: qlog_dir = optarg; break;
         case OPT_CC: cc_name = optarg; break;
+        case OPT_METRICS_INTERVAL: {
+            char *end = NULL;
+            errno = 0;
+            long v = strtol(optarg, &end, 10); /* seconds */
+            if (errno != 0 || end == optarg || *end != '\0' || v <= 0) {
+                metrics_interval_ms = 0; /* invalid / <=0 => off */
+            } else {
+                metrics_interval_ms = (uint64_t)v * 1000;
+            }
+            break;
+        }
         case 'h': usage_server(stdout); return 0;
         default: usage_server(stderr); return 2;
         }
@@ -401,6 +462,7 @@ cmd_server(int argc, char **argv)
     mq_server_t *server = NULL;
     mq_gw_server_t *gws = NULL;
     struct event *sint = NULL, *sterm = NULL;
+    struct event *metrics_ev = NULL;
 
     base = event_base_new();
     if (!base) {
@@ -462,6 +524,19 @@ cmd_server(int argc, char **argv)
         "mqproxy server listening on %s:%u (cc=%s, gateway=%s, udp=%s, udp-idle=%lds)",
         listen_ip, listen_port, mq_cc_name(cc), gateway_enabled ? "on" : "off",
         udp_enabled ? "on" : "off", udp_idle_timeout_s);
+
+    /* Phase 5c periodic metrics (opt-in via --metrics-interval). Dumps the
+     * most-recently-accepted conn's per-path stats every interval. */
+    if (metrics_interval_ms > 0) {
+        metrics_ev = event_new(base, -1, EV_PERSIST, srv_metrics_tick, server);
+        if (metrics_ev) {
+            struct timeval tv = {.tv_sec = (time_t)(metrics_interval_ms / 1000),
+                                 .tv_usec =
+                                     (suseconds_t)((metrics_interval_ms % 1000) * 1000)};
+            event_add(metrics_ev, &tv);
+        }
+    }
+
     mq_runtime_run(rt);
     rc = 0;
 
@@ -502,6 +577,10 @@ out:
      *   -> runtime free
      *   -> mq_server_free
      *   -> base free (CLI owns base). */
+    if (metrics_ev) {
+        event_del(metrics_ev);
+        event_free(metrics_ev);
+    }
     if (sint) event_free(sint);
     if (sterm) event_free(sterm);
     {
@@ -558,6 +637,7 @@ cmd_client(int argc, char **argv)
     long keepalive_idle_s = 30;        /* --keepalive-idle <sec>; 0 = disable */
     int reconnect_enabled = 1;         /* --reconnect / --no-reconnect */
     long reconnect_max_backoff_s = 30; /* --reconnect-max-backoff <sec> */
+    uint64_t metrics_interval_ms = 0;  /* --metrics-interval <sec>; 0 = off */
 
     enum {
         OPT_SERVER = 256,
@@ -573,6 +653,7 @@ cmd_client(int argc, char **argv)
         OPT_RECONNECT,
         OPT_NO_RECONNECT,
         OPT_RECONNECT_MAX_BACKOFF,
+        OPT_METRICS_INTERVAL,
     };
     static const struct option longopts[] = {
         {"server", required_argument, NULL, OPT_SERVER},
@@ -588,6 +669,7 @@ cmd_client(int argc, char **argv)
         {"reconnect", no_argument, NULL, OPT_RECONNECT},
         {"no-reconnect", no_argument, NULL, OPT_NO_RECONNECT},
         {"reconnect-max-backoff", required_argument, NULL, OPT_RECONNECT_MAX_BACKOFF},
+        {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -642,6 +724,17 @@ cmd_client(int argc, char **argv)
                 return 2;
             }
             reconnect_max_backoff_s = v;
+            break;
+        }
+        case OPT_METRICS_INTERVAL: {
+            char *end = NULL;
+            errno = 0;
+            long v = strtol(optarg, &end, 10); /* seconds */
+            if (errno != 0 || end == optarg || *end != '\0' || v <= 0) {
+                metrics_interval_ms = 0; /* invalid / <=0 => off */
+            } else {
+                metrics_interval_ms = (uint64_t)v * 1000;
+            }
             break;
         }
         case 'h': usage_client(stdout); return 0;
@@ -736,6 +829,7 @@ cmd_client(int argc, char **argv)
     mq_gw_client_t *gwc = NULL;
     mq_fetch_listener_t *fetch_l = NULL;
     struct event *sint = NULL, *sterm = NULL;
+    struct event *metrics_ev = NULL;
     struct client_auth_ctx auth_ctx = {NULL, NULL};
 
     base = event_base_new();
@@ -898,6 +992,20 @@ cmd_client(int argc, char **argv)
         MQ_LOGI("mqproxy client: server=%s:%u%s (bind %s, cc=%s)", server_ip, server_port,
                 ingress, primary_ip, mq_cc_name(cc));
     }
+
+    /* Phase 5c periodic metrics (opt-in via --metrics-interval). mctx outlives
+     * mq_runtime_run (same function), so a local is fine. */
+    struct cli_metrics_ctx mctx = {.client = client, .gwc = gwc};
+    if (metrics_interval_ms > 0) {
+        metrics_ev = event_new(base, -1, EV_PERSIST, cli_metrics_tick, &mctx);
+        if (metrics_ev) {
+            struct timeval tv = {.tv_sec = (time_t)(metrics_interval_ms / 1000),
+                                 .tv_usec =
+                                     (suseconds_t)((metrics_interval_ms % 1000) * 1000)};
+            event_add(metrics_ev, &tv);
+        }
+    }
+
     mq_runtime_run(rt);
     rc = 0;
 
@@ -974,6 +1082,10 @@ out:
      *   -> mq_client_free
      *   -> socks5 / http listener free
      *   -> base free (CLI owns base). */
+    if (metrics_ev) {
+        event_del(metrics_ev);
+        event_free(metrics_ev);
+    }
     if (sint) event_free(sint);
     if (sterm) event_free(sterm);
     if (gwc) mq_gw_client_free(gwc);

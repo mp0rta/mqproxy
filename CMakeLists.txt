@@ -114,6 +114,14 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_engine_boot COMMAND test_engine_boot)
 
+    add_executable(test_metrics_format tests/test_metrics_format.c)
+    target_link_libraries(test_metrics_format
+        mqproxy xquic ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB} pthread dl m stdc++)
+    target_include_directories(test_metrics_format PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_metrics_format PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_metrics_format COMMAND test_metrics_format)
+
     add_executable(test_path_bind tests/integration/test_path_bind.c)
     target_link_libraries(test_path_bind
         mqproxy
@@ -200,6 +208,20 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_client_server PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_client_server COMMAND test_client_server)
+
+    # Phase 5c Task 3: mq_server_active_conn lifecycle (set on accept, cleared on
+    # close). Real client+server on a shared base, so it needs the test cert.
+    add_executable(test_metrics_active_conn tests/integration/test_metrics_active_conn.c)
+    target_link_libraries(test_metrics_active_conn
+        mqproxy xquic ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB} pthread dl m stdc++)
+    target_include_directories(test_metrics_active_conn PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_metrics_active_conn PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_metrics_active_conn PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_metrics_active_conn COMMAND test_metrics_active_conn)
 
     # UDP relay server-side full-path integration (Task 5.3): real client+server
     # over loopback UDP + a local UDP echo socket; the test drives 0x02 streams

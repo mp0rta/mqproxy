@@ -51,6 +51,12 @@ unsigned mq_server_auth_attempts(const mq_server_t *s);
  * it across a conn teardown. */
 mq_udp_srv_t *mq_server_last_udp_srv(const mq_server_t *s);
 
+/* The most-recently-accepted tunnel conn, or NULL if none is live. Observability
+ * hook (mirrors last_udp / mq_server_last_udp_srv). Per-instance deployments have
+ * one client conn; multi-conn servers see only the newest here. The returned
+ * pointer is cleared to NULL when that conn closes, so it is never dangling. */
+mq_conn_t *mq_server_active_conn(const mq_server_t *s);
+
 /* Free the server. Safe on NULL. (Per-conn state is freed as conns close.) */
 void mq_server_free(mq_server_t *s);
 

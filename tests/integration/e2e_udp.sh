@@ -503,19 +503,19 @@ fi
 # SIGTERM the client → it dumps mq_conn_dump_stats per-path counters to client_c.log.
 stop_process "${CLIENT_C_PID}"; CLIENT_C_PID=""
 
-# Assert both paths carried bytes: "path <id>: sent=<n> recv=<n>" lines where
-# (sent > 0 OR recv > 0). The client logs these at INFO on SIGTERM via
+# Assert both paths carried bytes: "mq.path id=<id> ... sent=<n> recv=<n> ..." lines
+# where (sent > 0 OR recv > 0). The client logs these at INFO on SIGTERM via
 # mq_conn_dump_stats (same pattern as e2e_multipath and e2e_gateway case 8).
-PATHS_WITH_BYTES="$(grep -Eo 'path [0-9]+: sent=[0-9]+ recv=[0-9]+' \
+PATHS_WITH_BYTES="$(grep -E 'mq\.path id=' \
         "${WORK}/client_c.log" 2>/dev/null \
-    | sed -E 's/path ([0-9]+): sent=([0-9]+) recv=([0-9]+)/\1 \2 \3/' \
+    | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
     | awk '($2+0 > 0 || $3+0 > 0) { print $1 }' \
     | sort -u | wc -l)"
 note "case 6: gateway paths carrying bytes = ${PATHS_WITH_BYTES} (need >= 2)"
 if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
     note "case 6 FAIL: fewer than 2 paths carried bytes."
     note "  per-path stats in ${WORK}/client_c.log:"
-    grep -E 'path [0-9]+: sent=' "${WORK}/client_c.log" >&2 2>/dev/null
+    grep -E 'mq\.path id=' "${WORK}/client_c.log" >&2 2>/dev/null
     exit 1
 fi
 ok 6 "2-path: both paths carried bytes (${PATHS_WITH_BYTES} paths)"
