@@ -5,11 +5,15 @@
 #include <stdint.h>
 
 /* mq.req line buffer cap. Holds the fixed keys plus the capped authority/path
- * (see *_CAP below). 1024 is comfortable; the formatter caps the two unbounded
- * fields so a -1 truncation return is pathological, not normal. */
+ * (see *_CAP below). 1024 is comfortable. Note: each *_CAP bounds INPUT
+ * characters; a quoted field can emit up to ~2x its cap in bytes when every
+ * character needs escaping (e.g. all-quotes value). A -1 (caller drops the
+ * line) is therefore reachable on adversarial input; expected-rare for normal
+ * URL authority/path. */
 #define MQ_GW_REQ_LINE_CAP      1024
 #define MQ_GW_REQ_AUTHORITY_CAP 128
 #define MQ_GW_REQ_PATH_CAP      256
+#define MQ_GW_REQ_RESET_CAP     64 /* max input chars for reset_reason field */
 
 /* All values are already gathered by the caller; no xquic/libcurl/libevent
  * dependency, so this is a pure-unit test target. String fields must be

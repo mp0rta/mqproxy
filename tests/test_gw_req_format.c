@@ -74,6 +74,12 @@ test_quote_escape(void)
     int n = mq_gw_format_req_line(buf, sizeof(buf), "0", 1, &m);
     MQ_CHECK(n > 0);
     MQ_CHECK(strstr(buf, "path=\"/a\\\"b\""));
+
+    /* backslash must also be escaped: /a\b → path="/a\\b" */
+    m.path = "/a\\b";
+    n = mq_gw_format_req_line(buf, sizeof(buf), "0", 1, &m);
+    MQ_CHECK(n > 0);
+    MQ_CHECK(strstr(buf, "path=\"/a\\\\b\""));
 }
 
 static void
@@ -96,8 +102,8 @@ test_path_cap(void)
     mq_gw_req_metrics_t m = base();
     m.path = longpath;
     int n = mq_gw_format_req_line(buf, sizeof(buf), "0", 1, &m);
-    MQ_CHECK(n > 0); /* capped, NOT truncated to -1 */
-    MQ_CHECK(strstr(buf, "\xE2\x80\xA6") || strstr(buf, "...")); /* truncation marker */
+    MQ_CHECK(n > 0);                       /* capped, NOT truncated to -1 */
+    MQ_CHECK(strstr(buf, "\xE2\x80\xA6")); /* truncation marker (U+2026) */
 }
 
 MQ_TEST_MAIN({

@@ -72,7 +72,8 @@ mq_gw_format_req_line(char *buf, size_t cap, const char *cid_hex, uint64_t sid,
     if (n < 0 || off + n >= (int)cap) return -1;
     off += n;
 
-    off = append_quoted(buf, cap, off, "reset", m->reset_reason, 64);
+    off = append_quoted(buf, cap, off, "reset", m->reset_reason, MQ_GW_REQ_RESET_CAP);
     if (off < 0) return -1;
+    if (off < (int)cap) buf[off] = '\0';
     return off;
 }
