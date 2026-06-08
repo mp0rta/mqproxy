@@ -987,7 +987,17 @@ gw_on_new_conn(mq_h3_conn_t *c, void *user)
     mq_gw_server_t *s = (mq_gw_server_t *)user;
     /* Track the most-recent accepted conn for the periodic metrics dump, and
      * install a state cb to clear it on close (UAF guard). Per-request state is
-     * still allocated lazily in on_new_req. */
+     * still allocated lazily in on_new_req.
+     *
+     * DETACH the cb from the previously-tracked conn before overwriting, so AT
+     * MOST ONE live conn ever carries gw_srv_conn_state(s). Otherwise an older
+     * conn that is still live when a newer one is accepted would keep the cb, and
+     * mq_h3_free's engine teardown (which runs AFTER mq_gw_server_free frees `s`)
+     * would fire gw_srv_conn_state into the freed `s` — a use-after-free. With
+     * this, mq_gw_server_free's single detach of last_conn fully covers it. */
+    if (s->last_conn && s->last_conn != c) {
+        mq_h3_conn_set_state_cb(s->last_conn, NULL, NULL);
+    }
     s->last_conn = c;
     mq_h3_conn_set_state_cb(c, gw_srv_conn_state, s);
 }
