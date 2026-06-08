@@ -1930,6 +1930,66 @@ test_gws_teardown_inflight(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server Case 9: mq_gw_server_active_conn lifecycle + clear-on-close ────
+ *
+ * Phase 5c review fix (P2): the gw_server tracks its most-recently-accepted H3
+ * tunnel conn for periodic metrics. This mirrors test_metrics_active_conn.c
+ * (which covers the TCP server's mq_server_active_conn) for the gateway path:
+ *   1. After one full gateway fetch the gw has accepted an H3 conn, so
+ *      mq_gw_server_active_conn(f.gw) is non-NULL (set in gw_on_new_conn).
+ *   2. mq_h3_conn_dump_stats() on that pointer must not crash/leak (ASan smoke).
+ *   3. Closing that conn fires gw_srv_conn_state's clear-if-self guard, so the
+ *      accessor returns NULL — the observability pointer is never left dangling
+ *      (UAF guard, load-bearing: see the revert-proof in the commit message). */
+static void
+test_gws_active_conn(void)
+{
+    const size_t N = 4096;
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", N) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(N);
+    c.body_cap = N;
+
+    /* (Setup) Drive ONE full fetch through the real gw client→server path, so the
+     * gw_server accepts an H3 conn and sets last_conn. */
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/blob",
+                              "Bearer sekrit", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+
+    uint64_t deadline = now_ms() + 10000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+    MQ_CHECK_EQ_INT(c.status, 200);
+    MQ_CHECK_EQ_INT((long long)c.body_len, (long long)N);
+
+    /* (1) A conn was accepted + tracked. */
+    mq_h3_conn_t *active = mq_gw_server_active_conn(f.gw);
+    MQ_CHECK(active != NULL);
+
+    /* (2) ASan smoke: dumping stats on the live conn must not crash/leak — this is
+     * exactly what the periodic metrics path will call on the server side. */
+    mq_h3_conn_dump_stats(mq_gw_server_active_conn(f.gw));
+
+    /* (3) Close that conn; pump (bounded) until gw_srv_conn_state's clear-if-self
+     * guard NULLs last_conn. There is no client reconnect, so nothing re-sets it. */
+    mq_h3_conn_close(mq_gw_server_active_conn(f.gw));
+    uint64_t clear_deadline = now_ms() + 3000;
+    while (mq_gw_server_active_conn(f.gw) != NULL && now_ms() < clear_deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK(mq_gw_server_active_conn(f.gw) == NULL);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
 int
 main(void)
 {
@@ -1966,6 +2026,7 @@ main(void)
     test_gws_resp_header_count_overflow();
     test_gws_xmq_origin_protocol_drop_before_count();
     test_gws_teardown_inflight();
+    test_gws_active_conn();
 
     if (mq_test_failures) {
         fprintf(stderr, "%d failure(s)\n", mq_test_failures);
