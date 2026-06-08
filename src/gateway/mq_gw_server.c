@@ -274,7 +274,11 @@ gw_send_error(mq_gw_req_t *r, const char *status, const char *xmq_error)
     };
     /* Record the synthetic status so error rows report a non-zero status in mq.req
      * (B2: gw_send_error was the only send path that never stored resp_status). */
-    r->resp_status = (int)strtol(status, NULL, 10);
+    r->resp_status = (int)strtol(
+        status, NULL,
+        10); /* intentional: mq.req `status` = status sent to client; synthetic error
+                replaces any earlier origin status (e.g. a 502 over an oversized-header
+                200) — that is correct, not a clobber bug */
     long sh = mq_h3_req_send_headers(r->req, hs, 3, /*fin=*/1);
     if (sh < 0) {
         /* Hard send failure: reset; on_close finishes teardown. */
@@ -915,7 +919,10 @@ gw_dispatch(mq_gw_req_t *r)
      * ctx.scheme is validated by scheme_ok() above and NUL-terminated by copy_z. */
     snprintf(r->method, sizeof(r->method), "%s", ctx.method);
     snprintf(r->authority, sizeof(r->authority), "%s", ctx.authority);
-    snprintf(r->path, sizeof(r->path), "%s", ctx.path);
+    snprintf(r->path, sizeof(r->path), "%s",
+             ctx.path); /* r->path is 512 B, ctx.path is 1024 B: a 513–1023 B path is the
+                           full value at the origin URL (built above) but is silently
+                           truncated in this metrics-only copy */
     r->origin_is_tls = (strcmp(ctx.scheme, "https") == 0); /* gates origin_tls (NEW-3) */
 
     /* Upload framing: body present → known CL (>=0) or chunked sentinel. */
