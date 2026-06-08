@@ -329,9 +329,17 @@ cmp -s "${BIGFILE}" "${DL}" || fail 1 "downloaded body differs from origin big.b
 ok 1 "8MB download byte-exact (200)"
 
 # ── mq.req assertion: server must have emitted one request-metrics line ────────
+# h3_on_close (which emits mq.req) fires slightly AFTER the client download
+# returns, so poll briefly rather than grepping once to avoid a timing race.
 # The formatter emits "method=GET status=200" adjacent (single space); match exactly.
-grep -E 'mq\.req cid=.* sid=[0-9]+ method=GET status=200' "${WORK}/server.log" \
-    || { echo "FAIL: no mq.req line in ${WORK}/server.log"; exit 1; }
+mqreq_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req cid=.* sid=[0-9]+ method=GET status=200' "${WORK}/server.log"; then
+        mqreq_found=1; break
+    fi
+    sleep 0.2
+done
+[ "${mqreq_found}" -eq 1 ] || { echo "FAIL: no mq.req line in ${WORK}/server.log after retry"; exit 1; }
 note "mq.req line found in server.log"
 
 # ── case 7: x-mq-origin-protocol present on case-1 response (http/1.1) ────────
