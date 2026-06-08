@@ -458,6 +458,15 @@ cmd_server(int argc, char **argv)
         }
     }
 
+    /* --request-metrics only takes effect inside the gateway block below; with
+     * --no-gateway it is silently ignored. Warn (not error: the flag is opt-in)
+     * so the operator knows it has no effect. Emitted here, after option parsing,
+     * so it surfaces regardless of which required arg may be missing. */
+    if (request_metrics && !gateway_enabled) {
+        fprintf(stderr, "mqproxy server: --request-metrics has no effect with "
+                        "--no-gateway (request metrics are gateway-only); ignoring\n");
+    }
+
     if (!listen) {
         fprintf(stderr, "mqproxy server: missing required --listen\n\n");
         usage_server(stderr);
