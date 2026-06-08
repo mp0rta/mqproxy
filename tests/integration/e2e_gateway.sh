@@ -253,6 +253,7 @@ start_server() {
         --token "${TOKEN}" \
         --cert "${MQPROXY_CERT}" --key "${MQPROXY_KEY}" \
         --origin-ca "${ORIGIN_CERT}" \
+        --request-metrics \
         >"${WORK}/server.log" 2>&1 &
     SERVER_PID=$!
 }
@@ -326,6 +327,12 @@ code1="$(curl -s -o "${DL}" -D "${H1}" -w '%{http_code}' --max-time 30 \
 [ "${code1}" = "200" ] || fail 1 "download HTTP code = ${code1} (want 200); headers: $(tr -d '\r' <"${H1}" | head -3 | tr '\n' '|')"
 cmp -s "${BIGFILE}" "${DL}" || fail 1 "downloaded body differs from origin big.bin"
 ok 1 "8MB download byte-exact (200)"
+
+# ── mq.req assertion: server must have emitted one request-metrics line ────────
+# The formatter emits "method=GET status=200" adjacent (single space); match exactly.
+grep -E 'mq\.req cid=.* sid=[0-9]+ method=GET status=200' "${WORK}/server.log" \
+    || { echo "FAIL: no mq.req line in ${WORK}/server.log"; exit 1; }
+note "mq.req line found in server.log"
 
 # ── case 7: x-mq-origin-protocol present on case-1 response (http/1.1) ────────
 if grep -qi '^x-mq-origin-protocol:[[:space:]]*http/1.1' "${H1}"; then
