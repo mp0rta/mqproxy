@@ -28,6 +28,7 @@ add_library(mqproxy STATIC
     src/gateway/mq_fetch_listener.c
     src/gateway/mq_gw_client.c
     src/gateway/mq_gw_server.c
+    src/gateway/mq_gw_metrics.c
     src/gateway/mq_origin_curl.c
     src/transport/mq_conn.c
     src/transport/mq_h3.c
@@ -96,6 +97,10 @@ add_executable(test_backoff tests/test_backoff.c)
 target_link_libraries(test_backoff mqproxy)
 target_include_directories(test_backoff PRIVATE tests)
 add_test(NAME test_backoff COMMAND test_backoff)
+
+add_executable(test_gw_req_format tests/test_gw_req_format.c src/gateway/mq_gw_metrics.c)
+target_include_directories(test_gw_req_format PRIVATE tests src)  # tests → mqtest.h, src → gateway/mq_gw_metrics.h
+add_test(NAME test_gw_req_format COMMAND test_gw_req_format)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
