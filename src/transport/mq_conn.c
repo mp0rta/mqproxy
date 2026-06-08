@@ -518,15 +518,18 @@ mq_conn_format_path_line(char *buf, size_t cap, const xqc_path_metrics_t *p)
         return -1;
     }
     /* state raw int: 2 == XQC_PATH_STATE_ACTIVE (internal header; do not ref). */
-    int n = snprintf(buf, cap,
-                     "mq.path id=%llu state=%u srtt_ms=%llu bw_Bps=%llu "
-                     "sent=%llu recv=%llu lost=%llu",
-                     (unsigned long long)p->path_id, (unsigned)p->path_state,
-                     (unsigned long long)(p->path_srtt / 1000), /* usec -> ms */
-                     (unsigned long long)p->path_est_bw,        /* bytes/sec */
-                     (unsigned long long)p->path_send_bytes,
-                     (unsigned long long)p->path_recv_bytes,
-                     (unsigned long long)p->path_lost_count);
+    int n = snprintf(
+        buf, cap,
+        "mq.path id=%llu state=%u srtt_ms=%llu bw_Bps=%llu "
+        "sent=%llu recv=%llu lost=%llu"
+        " min_rtt_ms=%llu cwnd=%llu inflight=%llu",
+        (unsigned long long)p->path_id, (unsigned)p->path_state,
+        (unsigned long long)(p->path_srtt / 1000), /* usec -> ms */
+        (unsigned long long)p->path_est_bw,        /* bytes/sec */
+        (unsigned long long)p->path_send_bytes, (unsigned long long)p->path_recv_bytes,
+        (unsigned long long)p->path_lost_count,
+        (unsigned long long)(p->path_min_rtt / 1000), /* usec -> ms */
+        (unsigned long long)p->path_cwnd, (unsigned long long)p->path_bytes_in_flight);
     return (n < 0 || (size_t)n >= cap) ? -1 : n;
 }
 
