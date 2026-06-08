@@ -105,10 +105,13 @@ typedef struct {
 
     /* Terminal callback. curl_result is the CURLE_* code (0 == CURLE_OK).
      * http_ver is the negotiated CURLINFO_HTTP_VERSION value (e.g.
-     * CURL_HTTP_VERSION_1_1). This is the LAST touch of the request: the
+     * CURL_HTTP_VERSION_1_1). ssl_verify is CURLINFO_SSL_VERIFYRESULT (0 =
+     * verified ok; nonzero = verify failure). On a connect/handshake failure
+     * curl_result is nonzero and ssl_verify may be unset (0) — classify by
+     * curl_result first. This is the LAST touch of the request: the
      * mq_origin_req_t is freed right after this returns. Fires for completion
      * and error, but NOT for mq_origin_abort. */
-    void (*on_done)(int curl_result, long http_ver, void *u);
+    void (*on_done)(int curl_result, long http_ver, long ssl_verify, void *u);
 } mq_origin_cbs_t;
 
 /* Create an origin client bound to `base`. ca_file (nullable) sets CURLOPT_CAINFO

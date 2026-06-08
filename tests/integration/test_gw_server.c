@@ -417,8 +417,9 @@ cap_pull_body(uint8_t *buf, size_t cap, void *u)
 }
 
 static void
-cap_on_done(int result, long http_ver, void *u)
+cap_on_done(int result, long http_ver, long ssl_verify, void *u)
 {
+    (void)ssl_verify;
     cap_t *c = (cap_t *)u;
     c->done = 1;
     c->done_result = result;

@@ -143,6 +143,8 @@ check_multi_info(mq_origin_t *o)
 
         long http_ver = 0;
         curl_easy_getinfo(easy, CURLINFO_HTTP_VERSION, &http_ver);
+        long ssl_verify = 0;
+        curl_easy_getinfo(easy, CURLINFO_SSL_VERIFYRESULT, &ssl_verify);
 
         if (r) {
             mq_origin_cbs_t cbs = r->cbs;
@@ -152,7 +154,7 @@ check_multi_info(mq_origin_t *o)
              * handle is removed from the multi inside req_destroy, which is safe
              * here (we are between info_read calls, not mid-action). */
             req_destroy(r);
-            if (cbs.on_done) cbs.on_done((int)result, http_ver, u);
+            if (cbs.on_done) cbs.on_done((int)result, http_ver, ssl_verify, u);
         }
     }
 }

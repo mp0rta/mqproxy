@@ -62,6 +62,27 @@
  * xqc delivers a bounded header set; 64 is comfortable for the MVP. */
 #define MQ_GWS_MAX_HDRS 64
 
+/* ── TLS outcome (origin_tls field) ─────────────────────────────────────────*/
+
+typedef enum {
+    MQ_TLS_NA = 0,       /* non-TLS origin (http://) or origin not reached */
+    MQ_TLS_OK,           /* https + curl OK + cert verified */
+    MQ_TLS_VERIFY_FAIL,  /* cert rejected by curl */
+    MQ_TLS_CONNECT_FAIL, /* any other transport/handshake failure on https */
+} mq_tls_result_t;
+
+static const char *tls_token(mq_tls_result_t t) __attribute__((unused));
+static const char *
+tls_token(mq_tls_result_t t)
+{
+    switch (t) {
+    case MQ_TLS_OK: return "ok";
+    case MQ_TLS_VERIFY_FAIL: return "verify_fail";
+    case MQ_TLS_CONNECT_FAIL: return "connect_fail";
+    default: return "na";
+    }
+}
+
 /* ── per-request state ──────────────────────────────────────────────────────*/
 
 typedef struct mq_gw_req_s {
@@ -86,9 +107,11 @@ typedef struct mq_gw_req_s {
     int pull_paused;  /* pull_body returned 0 (PAUSE); resume when spill refills */
 
     /* ── download (junction #4): origin response → H3 response ── */
-    int resp_headers_sent; /* we sent the H3 response header section */
-    int resp_status;       /* origin http_status (from on_status) */
-    long resp_http_ver;    /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
+    int resp_headers_sent;      /* we sent the H3 response header section */
+    int resp_status;            /* origin http_status (from on_status) */
+    long resp_http_ver;         /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
+    int origin_is_tls;          /* origin scheme == https (set in gw_dispatch, Task 5) */
+    mq_tls_result_t origin_tls; /* TLS verify outcome, set in origin_on_done */
     int recv_paused;    /* on_body returned 0 (curl download paused); resume on drain */
     int origin_done_ok; /* on_done(OK) fired; send the response fin once pend drains */
     int finished;       /* we sent the response fin (clean completion) */
@@ -542,12 +565,25 @@ origin_on_body(const uint8_t *p, size_t len, void *u)
  * (if headers not yet sent) or RESET (if already sent). The origin side is freed
  * right after this returns — null r->oreq + set origin_dead FIRST. */
 static void
-origin_on_done(int curl_result, long http_ver, void *u)
+origin_on_done(int curl_result, long http_ver, long ssl_verify, void *u)
 {
     mq_gw_req_t *r = (mq_gw_req_t *)u;
     r->oreq = NULL; /* freed right after on_done returns */
     r->origin_dead = 1;
     r->resp_http_ver = http_ver;
+    /* TLS outcome — only meaningful for an https origin. A plain http:// origin
+     * (scheme_ok accepts both, mq_gw_server.c:751) has NO TLS result → MQ_TLS_NA,
+     * even on success. ok = https + curl OK + verify passed; verify_fail = cert
+     * rejected; connect_fail = any other transport failure on an https origin.
+     * origin_is_tls is set in gw_dispatch (Task 5); defaults 0 until then. */
+    if (!r->origin_is_tls)
+        r->origin_tls = MQ_TLS_NA;
+    else if (curl_result == 0 && ssl_verify == 0)
+        r->origin_tls = MQ_TLS_OK;
+    else if (ssl_verify != 0 || curl_result == CURLE_PEER_FAILED_VERIFICATION)
+        r->origin_tls = MQ_TLS_VERIFY_FAIL;
+    else
+        r->origin_tls = MQ_TLS_CONNECT_FAIL;
 
     if (r->h3_dead || !r->req) {
         gw_req_maybe_free(r);
