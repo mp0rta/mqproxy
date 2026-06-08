@@ -197,6 +197,7 @@ The client automatically re-establishes its MPQUIC tunnel after a transient loss
 | `--no-udp` | Disable UDP relay (do not advertise the capability; refuse all sessions) |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/server.qlog` |
 | `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s (must be > 0; omit to disable). Logs the most-recently-accepted TCP and gateway conn. |
+| `--request-metrics` | Emit one `mq.req` logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of `--metrics-interval`. |
 
 ### Client options
 

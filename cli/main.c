@@ -126,6 +126,12 @@ usage_server(FILE *out)
                  "                      every <sec>s (must be > 0; omit to disable).\n"
                  "                      Logs the most-recently-accepted TCP and "
                  "gateway conn.\n"
+                 "  --request-metrics   Emit one mq.req logfmt line per gateway "
+                 "request\n"
+                 "                      (method/status/target/ttfb/origin_protocol/"
+                 "cache/…).\n"
+                 "                      Opt-in; off by default. Independent of "
+                 "--metrics-interval.\n"
                  "  -h, --help          Show this help and exit.\n");
 }
 
@@ -359,6 +365,7 @@ cmd_server(int argc, char **argv)
     long udp_idle_timeout_s = 60;     /* --udp-idle-timeout <sec>, default 60 */
     int udp_enabled = 1;              /* --no-udp clears this */
     uint64_t metrics_interval_ms = 0; /* --metrics-interval <sec>; 0 = off */
+    int request_metrics = 0;          /* --request-metrics; off by default */
 
     enum {
         OPT_LISTEN = 256,
@@ -372,6 +379,7 @@ cmd_server(int argc, char **argv)
         OPT_QLOG,
         OPT_CC,
         OPT_METRICS_INTERVAL,
+        OPT_REQUEST_METRICS,
     };
     static const struct option longopts[] = {
         {"listen", required_argument, NULL, OPT_LISTEN},
@@ -385,6 +393,7 @@ cmd_server(int argc, char **argv)
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
         {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
+        {"request-metrics", no_argument, NULL, OPT_REQUEST_METRICS},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -432,6 +441,7 @@ cmd_server(int argc, char **argv)
             metrics_interval_ms = (uint64_t)v * 1000;
             break;
         }
+        case OPT_REQUEST_METRICS: request_metrics = 1; break;
         case 'h': usage_server(stdout); return 0;
         default: usage_server(stderr); return 2;
         }
@@ -534,6 +544,7 @@ cmd_server(int argc, char **argv)
                     origin_ca ? origin_ca : "(system)", connect_timeout_s);
             goto out;
         }
+        if (request_metrics) mq_gw_server_set_request_metrics(gws, 1);
     }
     if (install_signal_handlers(base, rt, &sint, &sterm) != 0) {
         MQ_LOGE("failed to install signal handlers");
