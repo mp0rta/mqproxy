@@ -123,9 +123,9 @@ usage_server(FILE *out)
                  "  --metrics-interval <sec>\n"
                  "                      Periodically log per-path stats "
                  "(mq.conn/mq.path)\n"
-                 "                      every <sec> seconds (default off; min 1s; "
-                 "server logs\n"
-                 "                      the most-recently-accepted conn only).\n"
+                 "                      every <sec>s (must be > 0; omit to disable).\n"
+                 "                      Logs the most-recently-accepted TCP and "
+                 "gateway conn.\n"
                  "  -h, --help          Show this help and exit.\n");
 }
 
@@ -181,9 +181,10 @@ usage_client(FILE *out)
         "                             (default: 30; must be > 0).\n"
         "  --metrics-interval <sec>   Periodically log per-path stats "
         "(mq.conn/mq.path)\n"
-        "                             every <sec> seconds (default off; min 1s; "
-        "server logs\n"
-        "                             the most-recently-accepted conn only).\n"
+        "                             every <sec>s (must be > 0; omit to "
+        "disable). Logs the\n"
+        "                             proxy conn (and the gateway conn with "
+        "--gateway).\n"
         "  -h, --help                 Show this help and exit.\n");
 }
 
@@ -291,14 +292,28 @@ cli_metrics_tick(evutil_socket_t fd, short what, void *arg)
     }
 }
 
+struct srv_metrics_ctx {
+    mq_server_t *server; /* TCP-proxy server (always present) */
+    mq_gw_server_t *gws; /* gateway server (NULL when --no-gateway) */
+};
+
 static void
 srv_metrics_tick(evutil_socket_t fd, short what, void *arg)
 {
     (void)fd;
     (void)what;
-    mq_conn_t *conn = mq_server_active_conn((mq_server_t *)arg);
+    struct srv_metrics_ctx *m = (struct srv_metrics_ctx *)arg;
+    mq_conn_t *conn = mq_server_active_conn(m->server);
     if (conn) {
         mq_conn_dump_stats(conn);
+    }
+    /* Gateway accepts its own H3 conns (separate from the TCP conns) — dump the
+     * most-recent one too, else a gateway-only server emits no metrics. */
+    if (m->gws) {
+        mq_h3_conn_t *gc = mq_gw_server_active_conn(m->gws);
+        if (gc) {
+            mq_h3_conn_dump_stats(gc);
+        }
     }
 }
 
@@ -407,10 +422,14 @@ cmd_server(int argc, char **argv)
             errno = 0;
             long v = strtol(optarg, &end, 10); /* seconds */
             if (errno != 0 || end == optarg || *end != '\0' || v <= 0) {
-                metrics_interval_ms = 0; /* invalid / <=0 => off */
-            } else {
-                metrics_interval_ms = (uint64_t)v * 1000;
+                fprintf(stderr,
+                        "mqproxy server: invalid --metrics-interval '%s' (must be > 0; "
+                        "omit to disable)\n\n",
+                        optarg);
+                usage_server(stderr);
+                return 2;
             }
+            metrics_interval_ms = (uint64_t)v * 1000;
             break;
         }
         case 'h': usage_server(stdout); return 0;
@@ -461,6 +480,7 @@ cmd_server(int argc, char **argv)
     mq_runtime_t *rt = NULL;
     mq_server_t *server = NULL;
     mq_gw_server_t *gws = NULL;
+    struct srv_metrics_ctx smctx = {0}; /* metrics tick ctx; filled before arming */
     struct event *sint = NULL, *sterm = NULL;
     struct event *metrics_ev = NULL;
 
@@ -528,7 +548,9 @@ cmd_server(int argc, char **argv)
     /* Phase 5c periodic metrics (opt-in via --metrics-interval). Dumps the
      * most-recently-accepted conn's per-path stats every interval. */
     if (metrics_interval_ms > 0) {
-        metrics_ev = event_new(base, -1, EV_PERSIST, srv_metrics_tick, server);
+        smctx.server = server;
+        smctx.gws = gws;
+        metrics_ev = event_new(base, -1, EV_PERSIST, srv_metrics_tick, &smctx);
         if (metrics_ev) {
             struct timeval tv = {.tv_sec = (time_t)(metrics_interval_ms / 1000),
                                  .tv_usec =
@@ -731,10 +753,14 @@ cmd_client(int argc, char **argv)
             errno = 0;
             long v = strtol(optarg, &end, 10); /* seconds */
             if (errno != 0 || end == optarg || *end != '\0' || v <= 0) {
-                metrics_interval_ms = 0; /* invalid / <=0 => off */
-            } else {
-                metrics_interval_ms = (uint64_t)v * 1000;
+                fprintf(stderr,
+                        "mqproxy client: invalid --metrics-interval '%s' (must be > 0; "
+                        "omit to disable)\n\n",
+                        optarg);
+                usage_client(stderr);
+                return 2;
             }
+            metrics_interval_ms = (uint64_t)v * 1000;
             break;
         }
         case 'h': usage_client(stdout); return 0;

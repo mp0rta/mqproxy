@@ -136,6 +136,12 @@ struct mq_gw_server_s {
 
     unsigned requests; /* accepted H3 requests (observability) */
 
+    /* Most-recently-accepted H3 tunnel conn (Phase 5c observability). Set
+     * unconditionally in gw_on_new_conn, cleared (if still itself) in
+     * gw_srv_conn_state on close, and detached in mq_gw_server_free. Mirrors the
+     * TCP server's last_conn (mq_server.c). Per-instance: one client conn. */
+    mq_h3_conn_t *last_conn;
+
     mq_gw_req_t *reqs; /* intrusive list of live per-request states */
 };
 
@@ -958,12 +964,42 @@ h3_on_close(mq_h3_req_t *hr, void *user)
 
 /* ── mq_h3 server hooks ─────────────────────────────────────────────────────*/
 
+/* Conn-state hook for accepted H3 tunnel conns: clear the observability slot on
+ * close if it still points at this conn (a later accept may have replaced it),
+ * so the metrics tick never dereferences a freed h3 conn. Mirrors the TCP
+ * server's clear-if-self guard (mq_server.c). `established` is unused (we only
+ * act on close). */
+static void
+gw_srv_conn_state(mq_h3_conn_t *c, int established, void *user)
+{
+    if (established) {
+        return;
+    }
+    mq_gw_server_t *s = (mq_gw_server_t *)user;
+    if (s->last_conn == c) {
+        s->last_conn = NULL;
+    }
+}
+
 static void
 gw_on_new_conn(mq_h3_conn_t *c, void *user)
 {
-    (void)c;
-    (void)user;
-    /* Nothing to do per-conn: per-request state is allocated in on_new_req. */
+    mq_gw_server_t *s = (mq_gw_server_t *)user;
+    /* Track the most-recent accepted conn for the periodic metrics dump, and
+     * install a state cb to clear it on close (UAF guard). Per-request state is
+     * still allocated lazily in on_new_req.
+     *
+     * DETACH the cb from the previously-tracked conn before overwriting, so AT
+     * MOST ONE live conn ever carries gw_srv_conn_state(s). Otherwise an older
+     * conn that is still live when a newer one is accepted would keep the cb, and
+     * mq_h3_free's engine teardown (which runs AFTER mq_gw_server_free frees `s`)
+     * would fire gw_srv_conn_state into the freed `s` — a use-after-free. With
+     * this, mq_gw_server_free's single detach of last_conn fully covers it. */
+    if (s->last_conn && s->last_conn != c) {
+        mq_h3_conn_set_state_cb(s->last_conn, NULL, NULL);
+    }
+    s->last_conn = c;
+    mq_h3_conn_set_state_cb(c, gw_srv_conn_state, s);
 }
 
 static void
@@ -1035,6 +1071,12 @@ mq_gw_server_h3(const mq_gw_server_t *s)
     return s ? s->h3 : NULL;
 }
 
+mq_h3_conn_t *
+mq_gw_server_active_conn(const mq_gw_server_t *s)
+{
+    return s ? s->last_conn : NULL;
+}
+
 unsigned
 mq_gw_server_requests(const mq_gw_server_t *s)
 {
@@ -1055,6 +1097,16 @@ void
 mq_gw_server_free(mq_gw_server_t *s)
 {
     if (!s) return;
+
+    /* DETACH the conn-state cb on the tracked conn FIRST. gw_server_free runs
+     * while the H3 engine is still live (sanctioned order); the subsequent
+     * mq_h3_free destroys remaining conns and fires their close-notify — by then
+     * `s` is freed, so a live gw_srv_conn_state(s) would be a use-after-free.
+     * Mirrors the mq_gw_client_free detach. (Per-instance: one live conn.) */
+    if (s->last_conn) {
+        mq_h3_conn_set_state_cb(s->last_conn, NULL, NULL);
+        s->last_conn = NULL;
+    }
 
     /* Tear down in-flight requests. SANCTIONED ORDER (see header): gw_server_free
      * runs FIRST, while the H3 engine is STILL LIVE, so touching r->req is valid.
