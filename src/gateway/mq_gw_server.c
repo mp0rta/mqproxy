@@ -112,6 +112,12 @@ typedef struct mq_gw_req_s {
     long resp_http_ver;         /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
     int origin_is_tls;          /* origin scheme == https (set in gw_dispatch, Task 5) */
     mq_tls_result_t origin_tls; /* TLS verify outcome, set in origin_on_done */
+
+    /* observability (mq.req); captured in gw_dispatch */
+    char method[16];
+    char authority[256];
+    char path[512];
+
     int recv_paused;    /* on_body returned 0 (curl download paused); resume on drain */
     int origin_done_ok; /* on_done(OK) fired; send the response fin once pend drains */
     int finished;       /* we sent the response fin (clean completion) */
@@ -166,6 +172,8 @@ struct mq_gw_server_s {
     mq_h3_conn_t *last_conn;
 
     mq_gw_req_t *reqs; /* intrusive list of live per-request states */
+
+    int request_metrics; /* emit mq.req per-request line (opt-in; default 0) */
 };
 
 /* ── forward decls ──────────────────────────────────────────────────────────*/
@@ -264,6 +272,9 @@ gw_send_error(mq_gw_req_t *r, const char *status, const char *xmq_error)
         {"x-mq-error", xmq_error},
         {"content-length", "0"},
     };
+    /* Record the synthetic status so error rows report a non-zero status in mq.req
+     * (B2: gw_send_error was the only send path that never stored resp_status). */
+    r->resp_status = (int)strtol(status, NULL, 10);
     long sh = mq_h3_req_send_headers(r->req, hs, 3, /*fin=*/1);
     if (sh < 0) {
         /* Hard send failure: reset; on_close finishes teardown. */
@@ -900,6 +911,13 @@ gw_dispatch(mq_gw_req_t *r)
         return;
     }
 
+    /* Observability capture (best-effort; safe even if the request later aborts).
+     * ctx.scheme is validated by scheme_ok() above and NUL-terminated by copy_z. */
+    snprintf(r->method, sizeof(r->method), "%s", ctx.method);
+    snprintf(r->authority, sizeof(r->authority), "%s", ctx.authority);
+    snprintf(r->path, sizeof(r->path), "%s", ctx.path);
+    r->origin_is_tls = (strcmp(ctx.scheme, "https") == 0); /* gates origin_tls (NEW-3) */
+
     /* Upload framing: body present → known CL (>=0) or chunked sentinel. */
     int64_t upload_len = -1; /* no body */
     if (r->has_body) {
@@ -1052,7 +1070,8 @@ gw_on_new_req(mq_h3_req_t *hr, void *user)
     }
     r->srv = s;
     r->req = hr;
-    r->resp_http_ver = CURL_HTTP_VERSION_1_1; /* sane default until on_done */
+    r->resp_http_ver =
+        CURL_HTTP_VERSION_NONE; /* "none" until on_done sets the real version */
 
     /* Link before wiring callbacks so teardown can find it. */
     r->next = s->reqs;
@@ -1127,6 +1146,12 @@ mq_gw_server_live_reqs(const mq_gw_server_t *s)
     for (const mq_gw_req_t *r = s->reqs; r; r = r->next)
         n++;
     return n;
+}
+
+void
+mq_gw_server_set_request_metrics(mq_gw_server_t *s, int on)
+{
+    if (s) s->request_metrics = on ? 1 : 0;
 }
 
 void
