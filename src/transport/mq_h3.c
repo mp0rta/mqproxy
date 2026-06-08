@@ -856,3 +856,13 @@ mq_h3_req_reset(mq_h3_req_t *r)
     }
     xqc_h3_request_close(r->r);
 }
+
+int
+mq_h3_req_get_stats(mq_h3_req_t *r, xqc_request_stats_t *out)
+{
+    if (!r || !r->r || !out) {
+        return -1;
+    }
+    *out = xqc_h3_request_get_stats(r->r);
+    return 0;
+}

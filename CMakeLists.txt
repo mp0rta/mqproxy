@@ -127,6 +127,16 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_metrics_format PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_metrics_format COMMAND test_metrics_format)
 
+    # mq_h3_req_get_stats + mq_h3_req_stream_id NULL-guard unit tests.
+    # Links mq_h3.o -> xqc_* so it lives in the xquic-gated block.
+    add_executable(test_h3_req_stats tests/test_h3_req_stats.c)
+    target_link_libraries(test_h3_req_stats
+        mqproxy xquic ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB} pthread dl m stdc++)
+    target_include_directories(test_h3_req_stats PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_h3_req_stats PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_h3_req_stats COMMAND test_h3_req_stats)
+
     add_executable(test_path_bind tests/integration/test_path_bind.c)
     target_link_libraries(test_path_bind
         mqproxy
