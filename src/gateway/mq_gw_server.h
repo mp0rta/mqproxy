@@ -92,6 +92,13 @@ mq_gw_server_t *mq_gw_server_new(mq_transport_t *t, mq_runtime_t *rt, const char
  * do NOT free it before mq_gw_server_free. Returns NULL on a NULL arg. */
 mq_h3_t *mq_gw_server_h3(const mq_gw_server_t *s);
 
+/* The most-recently-accepted H3 tunnel conn, or NULL if none is live (Phase 5c
+ * observability hook; mirrors mq_server_active_conn). Cleared to NULL when that
+ * conn closes, so it is never dangling. Per-instance deployments have one client
+ * conn; with multiple simultaneous gateway clients only the newest is tracked.
+ * Pass the result to mq_h3_conn_dump_stats for periodic per-path metrics. */
+mq_h3_conn_t *mq_gw_server_active_conn(const mq_gw_server_t *s);
+
 /* Free the gateway server: abort every in-flight origin request, detach the H3
  * request callbacks, free the origin client and the gw_server. Does NOT free the
  * mq_h3 it created (see the SANCTIONED TEARDOWN ORDER above), nor t / rt. Safe on

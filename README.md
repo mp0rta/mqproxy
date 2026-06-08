@@ -196,7 +196,7 @@ The client automatically re-establishes its MPQUIC tunnel after a transient loss
 | `--udp-idle-timeout <sec>` | UDP session idle timeout (default 60); the effective value is `min(client request, this)` |
 | `--no-udp` | Disable UDP relay (do not advertise the capability; refuse all sessions) |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/server.qlog` |
-| `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s. Default off; min 1s. Server logs the most-recently-accepted conn only. |
+| `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s (must be > 0; omit to disable). Logs the most-recently-accepted TCP and gateway conn. |
 
 ### Client options
 
@@ -213,7 +213,7 @@ The client automatically re-establishes its MPQUIC tunnel after a transient loss
 | `--reconnect` / `--no-reconnect` | Auto-reconnect on tunnel loss (default: enabled) |
 | `--reconnect-max-backoff <sec>` | Cap on exponential reconnect backoff in seconds (default 30; floored to 1) |
 | `--keepalive-idle <sec>` | Send QUIC PINGs when idle for this many seconds (default 30; 0 = disable; values <15 have no additional effect since xquic's PING cadence is ~15 s) |
-| `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s. Default off; min 1s. Server logs the most-recently-accepted conn only. |
+| `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s (must be > 0; omit to disable). Logs the proxy conn (and the gateway conn when `--gateway` is set). |
 
 > The bundled test certificate is for local testing only. For real deployments, pass your own `--cert`/`--key` and a strong `--token`.
 
