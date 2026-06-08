@@ -36,8 +36,8 @@ test_path_line(void)
     char buf2[MQ_METRICS_LINE_CAP];
     int n2 = mq_conn_format_path_line(buf2, sizeof(buf2), &p2);
     MQ_CHECK(n2 > 0);
-    MQ_CHECK(strstr(buf2, "min_rtt_ms=12") != NULL);
-    MQ_CHECK(strstr(buf2, "cwnd=65535") != NULL);
+    MQ_CHECK(strstr(buf2, "min_rtt_ms=12 ") != NULL);
+    MQ_CHECK(strstr(buf2, "cwnd=65535 ") != NULL);
     MQ_CHECK(strstr(buf2, "inflight=4096") != NULL);
 }
 
