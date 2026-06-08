@@ -866,3 +866,12 @@ mq_h3_req_get_stats(mq_h3_req_t *r, xqc_request_stats_t *out)
     *out = xqc_h3_request_get_stats(r->r);
     return 0;
 }
+
+uint64_t
+mq_h3_req_stream_id(mq_h3_req_t *r)
+{
+    if (!r || !r->r) {
+        return 0;
+    }
+    return (uint64_t)xqc_h3_stream_id(r->r);
+}

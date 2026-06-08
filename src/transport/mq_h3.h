@@ -197,6 +197,9 @@ long mq_h3_req_recv_body(mq_h3_req_t *r, uint8_t *buf, size_t cap, int *fin);
  * is gone. */
 int mq_h3_req_get_stats(mq_h3_req_t *r, xqc_request_stats_t *out);
 
+/* The request's MPQUIC stream id (for log correlation). 0 if r is NULL/dead. */
+uint64_t mq_h3_req_stream_id(mq_h3_req_t *r);
+
 /* Close the request. xqc_h3_request_close sends RESET_STREAM only if the
  * request has not already completed; on a finished request it is a graceful
  * close. The mq_h3_req is freed later via h3_request_close_notify. */

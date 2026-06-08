@@ -9,4 +9,5 @@ MQ_TEST_MAIN({
     MQ_CHECK(mq_h3_req_get_stats(NULL, &st) == -1);
     /* a non-NULL req with NULL inner handle is exercised in the gateway
      * integration (test_gw_server); here we only pin the NULL contract. */
+    MQ_CHECK(mq_h3_req_stream_id(NULL) == 0);
 })
