@@ -1055,9 +1055,12 @@ gw_emit_req_metrics(mq_gw_req_t *r, mq_h3_req_t *hr)
     /* origin_tls: origin_on_done set it for a COMPLETED origin (MQ_TLS_NA for a plain
      * http:// origin). If the origin is still live at close (oreq != NULL and not yet
      * dead), this request is closing with the origin in-flight (H3-first abort, which
-     * fires no on_done) → no completed/verified origin → connect_fail. */
-    const char *otls =
-        (r->oreq && !r->origin_dead) ? "connect_fail" : tls_token(r->origin_tls);
+     * fires no on_done) → no completed/verified origin. For a TLS origin that means
+     * connect_fail; for a plain http:// origin there is no TLS handshake to fail, so
+     * report "na" (same value origin_on_done would have set). */
+    const char *otls = (r->oreq && !r->origin_dead)
+                           ? (r->origin_is_tls ? "connect_fail" : "na")
+                           : tls_token(r->origin_tls);
 
     mq_gw_req_metrics_t m = {
         .method = r->method[0] ? r->method : "-",
