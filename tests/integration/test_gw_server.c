@@ -77,6 +77,33 @@ now_ms(void)
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+/* Capture stderr (where MQ_LOGI writes) into a buffer across a code region.
+ * The transport emits verbose xquic [report] lines to stderr too, so callers
+ * use a generous buffer and strstr() for the field they care about. */
+typedef struct {
+    int saved_fd;
+    FILE *tmp;
+} stderr_cap_t;
+static void
+stderr_cap_begin(stderr_cap_t *c)
+{
+    fflush(stderr);
+    c->saved_fd = dup(STDERR_FILENO);
+    c->tmp = tmpfile();
+    dup2(fileno(c->tmp), STDERR_FILENO);
+}
+static void
+stderr_cap_end(stderr_cap_t *c, char *buf, size_t cap)
+{
+    fflush(stderr);
+    dup2(c->saved_fd, STDERR_FILENO);
+    close(c->saved_fd);
+    rewind(c->tmp);
+    size_t n = fread(buf, 1, cap - 1, c->tmp);
+    buf[n] = '\0';
+    fclose(c->tmp);
+}
+
 /* Pump the base non-blocking until *flag != 0 or the budget elapses. Returns the
  * final flag value. */
 static int
@@ -1085,6 +1112,96 @@ test_gws_get(void)
     MQ_CHECK_EQ_INT(f.origin.saw_custom, 1);
     MQ_CHECK(strcmp(f.origin.custom_val, "keepme") == 0);
     MQ_CHECK_EQ_INT(mq_gw_server_requests(f.gw), 1);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
+/* ── gw_server Case 1b: mq.req emitted when request-metrics is ON ────────────*/
+static void
+test_gws_req_metrics_on(void)
+{
+    const size_t N = 64 * 1024;
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", N) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    mq_gw_server_set_request_metrics(f.gw, 1);
+
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(N);
+    c.body_cap = N;
+
+    /* Capture stderr (MQ_LOGI sink) across a GET driven to clean close. The buffer
+     * is generous because the transport also logs verbose [report] lines here. */
+    static char log[1 << 18]; /* 256 KiB; static to keep it off the stack */
+    stderr_cap_t cap;
+    stderr_cap_begin(&cap);
+
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/blob",
+                              "Bearer sekrit", NULL, 0, 0, NULL);
+    if (rc == 0) {
+        uint64_t deadline = now_ms() + 10000;
+        while (!c.closed && now_ms() < deadline)
+            event_base_loop(f.base, EVLOOP_NONBLOCK);
+    }
+
+    stderr_cap_end(&cap, log, sizeof(log));
+
+    MQ_CHECK_EQ_INT(rc, 0);
+    MQ_CHECK_EQ_INT(c.status, 200);
+    MQ_CHECK_EQ_INT((long long)c.body_len, (long long)N);
+
+    /* The mq.req line carries the expected app fields. */
+    MQ_CHECK(strstr(log, "mq.req cid=-") != NULL);
+    MQ_CHECK(strstr(log, "method=GET status=200") != NULL);
+    MQ_CHECK(strstr(log, "origin_protocol=") != NULL);
+    MQ_CHECK(strstr(log, "cache=bypass origin_reuse=0") != NULL);
+
+    free(c.body);
+    gws_fixture_down(&f);
+}
+
+/* ── gw_server Case 1c: NO mq.req when request-metrics is OFF (opt-in gate) ──*/
+static void
+test_gws_req_metrics_off(void)
+{
+    const size_t N = 64 * 1024;
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", N) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    /* Default is OFF; do not enable request-metrics. */
+
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    c.body = malloc(N);
+    c.body_cap = N;
+
+    static char log[1 << 18];
+    stderr_cap_t cap;
+    stderr_cap_begin(&cap);
+
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/blob",
+                              "Bearer sekrit", NULL, 0, 0, NULL);
+    if (rc == 0) {
+        uint64_t deadline = now_ms() + 10000;
+        while (!c.closed && now_ms() < deadline)
+            event_base_loop(f.base, EVLOOP_NONBLOCK);
+    }
+
+    stderr_cap_end(&cap, log, sizeof(log));
+
+    MQ_CHECK_EQ_INT(rc, 0);
+    MQ_CHECK_EQ_INT(c.status, 200);
+    MQ_CHECK((long long)c.body_len == (long long)N);
+    /* Opt-in gate: no mq.req line emitted with the flag off. */
+    MQ_CHECK(strstr(log, "mq.req") == NULL);
 
     free(c.body);
     gws_fixture_down(&f);
@@ -2137,6 +2254,8 @@ main(void)
 
     /* Gateway-server (Task 4.3) cases — each owns its own base + transports. */
     test_gws_get();
+    test_gws_req_metrics_on();
+    test_gws_req_metrics_off();
     test_gws_class();
     test_gws_403();
     test_gws_400();
