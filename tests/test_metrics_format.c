@@ -22,8 +22,23 @@ test_path_line(void)
     char buf[MQ_METRICS_LINE_CAP];
     int n = mq_conn_format_path_line(buf, sizeof(buf), &p);
     MQ_CHECK(n > 0);
-    MQ_CHECK(strcmp(buf, "mq.path id=1 state=2 srtt_ms=12 bw_Bps=6029312 "
-                         "sent=1287654 recv=83120 lost=14") == 0);
+    MQ_CHECK(strcmp(buf,
+                    "mq.path id=1 state=2 srtt_ms=12 bw_Bps=6029312 "
+                    "sent=1287654 recv=83120 lost=14 min_rtt_ms=0 cwnd=0 inflight=0") ==
+             0);
+
+    /* Populated-value sub-case: verify min_rtt/cwnd/inflight render correctly. */
+    xqc_path_metrics_t p2;
+    memset(&p2, 0, sizeof(p2));
+    p2.path_min_rtt = 12000; /* usec -> 12 ms */
+    p2.path_cwnd = 65535;
+    p2.path_bytes_in_flight = 4096;
+    char buf2[MQ_METRICS_LINE_CAP];
+    int n2 = mq_conn_format_path_line(buf2, sizeof(buf2), &p2);
+    MQ_CHECK(n2 > 0);
+    MQ_CHECK(strstr(buf2, "min_rtt_ms=12 ") != NULL);
+    MQ_CHECK(strstr(buf2, "cwnd=65535 ") != NULL);
+    MQ_CHECK(strstr(buf2, "inflight=4096") != NULL);
 }
 
 static void

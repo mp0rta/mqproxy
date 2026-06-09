@@ -28,6 +28,7 @@ add_library(mqproxy STATIC
     src/gateway/mq_fetch_listener.c
     src/gateway/mq_gw_client.c
     src/gateway/mq_gw_server.c
+    src/gateway/mq_gw_metrics.c
     src/gateway/mq_origin_curl.c
     src/transport/mq_conn.c
     src/transport/mq_h3.c
@@ -97,6 +98,10 @@ target_link_libraries(test_backoff mqproxy)
 target_include_directories(test_backoff PRIVATE tests)
 add_test(NAME test_backoff COMMAND test_backoff)
 
+add_executable(test_gw_req_format tests/test_gw_req_format.c src/gateway/mq_gw_metrics.c)
+target_include_directories(test_gw_req_format PRIVATE tests src)  # tests → mqtest.h, src → gateway/mq_gw_metrics.h
+add_test(NAME test_gw_req_format COMMAND test_gw_req_format)
+
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     add_executable(test_engine_boot tests/integration/test_engine_boot.c)
@@ -121,6 +126,16 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     set_target_properties(test_metrics_format PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_metrics_format COMMAND test_metrics_format)
+
+    # mq_h3_req_get_stats + mq_h3_req_stream_id NULL-guard unit tests.
+    # Links mq_h3.o -> xqc_* so it lives in the xquic-gated block.
+    add_executable(test_h3_req_stats tests/test_h3_req_stats.c)
+    target_link_libraries(test_h3_req_stats
+        mqproxy xquic ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB} pthread dl m stdc++)
+    target_include_directories(test_h3_req_stats PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_h3_req_stats PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_h3_req_stats COMMAND test_h3_req_stats)
 
     add_executable(test_path_bind tests/integration/test_path_bind.c)
     target_link_libraries(test_path_bind

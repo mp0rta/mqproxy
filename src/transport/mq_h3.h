@@ -190,6 +190,16 @@ int mq_h3_req_recv_headers(mq_h3_req_t *r,
  * *fin==0 means no body available right now (was -XQC_EAGAIN). */
 long mq_h3_req_recv_body(mq_h3_req_t *r, uint8_t *buf, size_t cap, int *fin);
 
+/* Read the request's transport stats (timings, mp_state, body sizes, stream_err,
+ * stream_close_msg). Valid only while the request is live — e.g. from inside the
+ * on_close callback, where the wrapper is freed only AFTER the callback returns.
+ * Returns 0 and fills *out on success; -1 if r/out is NULL or the inner handle
+ * is gone. */
+int mq_h3_req_get_stats(mq_h3_req_t *r, xqc_request_stats_t *out);
+
+/* The request's MPQUIC stream id (for log correlation). 0 if r is NULL/dead. */
+uint64_t mq_h3_req_stream_id(mq_h3_req_t *r);
+
 /* Close the request. xqc_h3_request_close sends RESET_STREAM only if the
  * request has not already completed; on a finished request it is a graceful
  * close. The mq_h3_req is freed later via h3_request_close_notify. */

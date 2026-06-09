@@ -47,6 +47,7 @@
 #include <event2/event.h>
 
 #include "gateway/mq_gw_headers.h"
+#include "gateway/mq_gw_metrics.h"
 #include "gateway/mq_origin_curl.h"
 #include "util/mq_ct.h"
 #include "util/mq_log.h"
@@ -61,6 +62,27 @@
 /* Max forwarded origin request headers (the request's non-stripped headers).
  * xqc delivers a bounded header set; 64 is comfortable for the MVP. */
 #define MQ_GWS_MAX_HDRS 64
+
+/* ── TLS outcome (origin_tls field) ─────────────────────────────────────────*/
+
+typedef enum {
+    MQ_TLS_NA = 0,       /* non-TLS origin (http://) or origin not reached */
+    MQ_TLS_OK,           /* https + curl OK + cert verified */
+    MQ_TLS_VERIFY_FAIL,  /* cert rejected by curl */
+    MQ_TLS_CONNECT_FAIL, /* any other transport/handshake failure on https */
+} mq_tls_result_t;
+
+static const char *tls_token(mq_tls_result_t t) __attribute__((unused));
+static const char *
+tls_token(mq_tls_result_t t)
+{
+    switch (t) {
+    case MQ_TLS_OK: return "ok";
+    case MQ_TLS_VERIFY_FAIL: return "verify_fail";
+    case MQ_TLS_CONNECT_FAIL: return "connect_fail";
+    default: return "na";
+    }
+}
 
 /* ── per-request state ──────────────────────────────────────────────────────*/
 
@@ -86,9 +108,17 @@ typedef struct mq_gw_req_s {
     int pull_paused;  /* pull_body returned 0 (PAUSE); resume when spill refills */
 
     /* ── download (junction #4): origin response → H3 response ── */
-    int resp_headers_sent; /* we sent the H3 response header section */
-    int resp_status;       /* origin http_status (from on_status) */
-    long resp_http_ver;    /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
+    int resp_headers_sent;      /* we sent the H3 response header section */
+    int resp_status;            /* origin http_status (from on_status) */
+    long resp_http_ver;         /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
+    int origin_is_tls;          /* origin scheme == https (set in gw_dispatch, Task 5) */
+    mq_tls_result_t origin_tls; /* TLS verify outcome, set in origin_on_done */
+
+    /* observability (mq.req); captured in gw_dispatch */
+    char method[16];
+    char authority[256];
+    char path[512];
+
     int recv_paused;    /* on_body returned 0 (curl download paused); resume on drain */
     int origin_done_ok; /* on_done(OK) fired; send the response fin once pend drains */
     int finished;       /* we sent the response fin (clean completion) */
@@ -143,6 +173,8 @@ struct mq_gw_server_s {
     mq_h3_conn_t *last_conn;
 
     mq_gw_req_t *reqs; /* intrusive list of live per-request states */
+
+    int request_metrics; /* emit mq.req per-request line (opt-in; default 0) */
 };
 
 /* ── forward decls ──────────────────────────────────────────────────────────*/
@@ -241,6 +273,13 @@ gw_send_error(mq_gw_req_t *r, const char *status, const char *xmq_error)
         {"x-mq-error", xmq_error},
         {"content-length", "0"},
     };
+    /* Record the synthetic status so error rows report a non-zero status in mq.req
+     * (B2: gw_send_error was the only send path that never stored resp_status). */
+    r->resp_status = (int)strtol(
+        status, NULL,
+        10); /* intentional: mq.req `status` = status sent to client; synthetic error
+                replaces any earlier origin status (e.g. a 502 over an oversized-header
+                200) — that is correct, not a clobber bug */
     long sh = mq_h3_req_send_headers(r->req, hs, 3, /*fin=*/1);
     if (sh < 0) {
         /* Hard send failure: reset; on_close finishes teardown. */
@@ -542,12 +581,25 @@ origin_on_body(const uint8_t *p, size_t len, void *u)
  * (if headers not yet sent) or RESET (if already sent). The origin side is freed
  * right after this returns — null r->oreq + set origin_dead FIRST. */
 static void
-origin_on_done(int curl_result, long http_ver, void *u)
+origin_on_done(int curl_result, long http_ver, long ssl_verify, void *u)
 {
     mq_gw_req_t *r = (mq_gw_req_t *)u;
     r->oreq = NULL; /* freed right after on_done returns */
     r->origin_dead = 1;
     r->resp_http_ver = http_ver;
+    /* TLS outcome — only meaningful for an https origin. A plain http:// origin
+     * (scheme_ok accepts both, mq_gw_server.c:751) has NO TLS result → MQ_TLS_NA,
+     * even on success. ok = https + curl OK + verify passed; verify_fail = cert
+     * rejected; connect_fail = any other transport failure on an https origin.
+     * origin_is_tls is set in gw_dispatch (Task 5); defaults 0 until then. */
+    if (!r->origin_is_tls)
+        r->origin_tls = MQ_TLS_NA;
+    else if (curl_result == 0 && ssl_verify == 0)
+        r->origin_tls = MQ_TLS_OK;
+    else if (ssl_verify != 0 || curl_result == CURLE_PEER_FAILED_VERIFICATION)
+        r->origin_tls = MQ_TLS_VERIFY_FAIL;
+    else
+        r->origin_tls = MQ_TLS_CONNECT_FAIL;
 
     if (r->h3_dead || !r->req) {
         gw_req_maybe_free(r);
@@ -864,6 +916,18 @@ gw_dispatch(mq_gw_req_t *r)
         return;
     }
 
+    /* Observability capture (best-effort; safe even if the request later aborts).
+     * ctx.scheme is validated by scheme_ok() above and NUL-terminated by copy_z. */
+    snprintf(r->method, sizeof(r->method), "%s", ctx.method);
+    snprintf(r->authority, sizeof(r->authority), "%s", ctx.authority);
+    snprintf(
+        r->path, sizeof(r->path), "%.*s", (int)sizeof(r->path) - 1,
+        ctx.path); /* r->path is 512 B, ctx.path is 1024 B: a 513–1023 B path is the
+                      full value at the origin URL (built above) but is silently
+                      truncated in this metrics-only copy. The %.*s precision bound
+                      caps output to fit so -Werror=format-truncation can prove it. */
+    r->origin_is_tls = (strcmp(ctx.scheme, "https") == 0); /* gates origin_tls (NEW-3) */
+
     /* Upload framing: body present → known CL (>=0) or chunked sentinel. */
     int64_t upload_len = -1; /* no body */
     if (r->has_body) {
@@ -933,11 +997,113 @@ h3_on_write(mq_h3_req_t *hr, void *user)
     if (r->pend_off < r->pend_len || r->recv_paused) download_flush(r);
 }
 
+/* ── mq.req metrics emission ─────────────────────────────────────────────────
+ * Stage-0 (Task 3b) finding, verified live against test_gw_server downloads:
+ * the SEND-side stamps are the server's response timings and are reliably
+ * populated > h3r_begin_time on a clean close:
+ *   - h3r_header_send_time  → ttfb_ms     (e.g. +0.8ms..+1.9ms after begin)
+ *   - stream_fin_send_time  → duration_ms (e.g. +2.0ms)
+ *   - stream_fin_ack_time   → completion_ms (e.g. +2.1ms)
+ * recv_body_size/send_body_size carry the request/response body sizes.
+ * On an error/reset close, fin_send/fin_ack come back 0 (ms_since → -1, guarded)
+ * and stream_err is nonzero. The receive-side stream_fin_time/h3r_end_time
+ * measure the REQUEST upload finishing, NOT the response — not used here.
+ * h3r_header_send_time is reliable, so the Step-3b TTFB fallback is NOT needed. */
+static int
+ms_since(xqc_usec_t begin, xqc_usec_t later)
+{
+    if (begin == 0 || later == 0 || later < begin) return -1;
+    return (int)((later - begin) / 1000);
+}
+
+/* Copy `in` up to the first '?' (drop query) into out[0..cap). */
+static void
+emit_path_strip_query(const char *in, char *out, size_t cap)
+{
+    size_t n = 0;
+    for (const char *p = in; *p && *p != '?' && n + 1 < cap; p++)
+        out[n++] = *p;
+    out[n] = '\0';
+}
+
+/* metrics-only origin protocol token: h3/h2/h1/none. Do NOT reuse http_ver_token
+ * (it returns "http/1.1"/"http/1.0" for H1, which violates the mq.req schema).
+ * NONE/unknown → "none" so an origin that never negotiated a version (start-failure
+ * or H3-first abort, where resp_http_ver stays at the NONE default) is not mislabeled. */
+static const char *
+origin_proto_token(long ver)
+{
+    switch (ver) {
+    case CURL_HTTP_VERSION_3: return "h3";
+    case CURL_HTTP_VERSION_2: return "h2";
+    case CURL_HTTP_VERSION_1_1:
+    case CURL_HTTP_VERSION_1_0: return "h1";
+    default: return "none"; /* incl. CURL_HTTP_VERSION_NONE */
+    }
+}
+
+static void
+gw_emit_req_metrics(mq_gw_req_t *r, mq_h3_req_t *hr)
+{
+    if (!r->srv->request_metrics) return;
+    xqc_request_stats_t st;
+    int have = (mq_h3_req_get_stats(hr, &st) == 0);
+
+    char pathbuf[MQ_GW_REQ_PATH_CAP + 1];
+    emit_path_strip_query(r->path[0] ? r->path : "-", pathbuf, sizeof(pathbuf));
+
+    /* origin_tls: origin_on_done set it for a COMPLETED origin (MQ_TLS_NA for a plain
+     * http:// origin). If the origin is still live at close (oreq != NULL and not yet
+     * dead), this request is closing with the origin in-flight (H3-first abort, which
+     * fires no on_done) → no completed/verified origin. For a TLS origin that means
+     * connect_fail; for a plain http:// origin there is no TLS handshake to fail, so
+     * report "na" (same value origin_on_done would have set). */
+    const char *otls = (r->oreq && !r->origin_dead)
+                           ? (r->origin_is_tls ? "connect_fail" : "na")
+                           : tls_token(r->origin_tls);
+
+    mq_gw_req_metrics_t m = {
+        .method = r->method[0] ? r->method : "-",
+        .status = r->resp_status, /* client-visible status; set on BOTH the
+                                     origin path (on_status) and gw_send_error
+                                     (Task 5) so error rows are not status=0 */
+        .authority = r->authority[0] ? r->authority : "-",
+        .path = pathbuf,
+        .req_bytes = have ? st.recv_body_size : 0,  /* server RECEIVES request body */
+        .resp_bytes = have ? st.send_body_size : 0, /* server SENDS response body */
+        /* SERVER-side response timings use SEND-side stamps (verified in Stage-0):
+         * h3r_*send_time / stream_fin_send_time / stream_fin_ack_time. The receive-side
+         * stream_fin_time ("receiving transport fin") / h3r_end_time measure the
+         * REQUEST upload finishing, NOT the response — do not use them here. */
+        .ttfb_ms = have ? ms_since(st.h3r_begin_time, st.h3r_header_send_time) : -1,
+        .duration_ms = have ? ms_since(st.h3r_begin_time, st.stream_fin_send_time) : -1,
+        .completion_ms = have ? ms_since(st.h3r_begin_time, st.stream_fin_ack_time) : -1,
+        .origin_protocol =
+            origin_proto_token(r->resp_http_ver), /* NONE-default → "none" */
+        .origin_tls = otls,
+        .cache = "bypass", /* honest Phase-2 constant; Phase 6 flips */
+        .origin_reuse = 0, /* honest Phase-2 constant; Phase 6 flips */
+        .mp_state = have ? st.mp_state : 0,
+        .reset_reason = (have && st.stream_err)
+                            ? (st.stream_close_msg ? st.stream_close_msg : "stream-err")
+                            : "",
+    };
+
+    /* cid=- : 5c log lines carry no cid, so there is nothing to correlate a hex
+     * cid against today. sid (the MPQUIC stream id) correlates within a conn. */
+    char line[MQ_GW_REQ_LINE_CAP];
+    uint64_t sid = mq_h3_req_stream_id(hr); /* Task 3.5 accessor */
+    if (mq_gw_format_req_line(line, sizeof(line), "-", sid, &m) > 0)
+        MQ_LOGI("%s", line);
+    else
+        MQ_LOGW("mq.req line truncated (dropped)"); /* MQ_LOGW exists, mq_log.h:28 */
+}
+
 static void
 h3_on_close(mq_h3_req_t *hr, void *user)
 {
-    (void)hr;
     mq_gw_req_t *r = (mq_gw_req_t *)user;
+    gw_emit_req_metrics(r, hr);
     r->h3_dead = 1;
     r->req = NULL; /* freed right after this returns */
 
@@ -1016,7 +1182,8 @@ gw_on_new_req(mq_h3_req_t *hr, void *user)
     }
     r->srv = s;
     r->req = hr;
-    r->resp_http_ver = CURL_HTTP_VERSION_1_1; /* sane default until on_done */
+    r->resp_http_ver =
+        CURL_HTTP_VERSION_NONE; /* "none" until on_done sets the real version */
 
     /* Link before wiring callbacks so teardown can find it. */
     r->next = s->reqs;
@@ -1091,6 +1258,12 @@ mq_gw_server_live_reqs(const mq_gw_server_t *s)
     for (const mq_gw_req_t *r = s->reqs; r; r = r->next)
         n++;
     return n;
+}
+
+void
+mq_gw_server_set_request_metrics(mq_gw_server_t *s, int on)
+{
+    if (s) s->request_metrics = on ? 1 : 0;
 }
 
 void

@@ -118,4 +118,8 @@ unsigned mq_gw_server_requests(const mq_gw_server_t *s);
  * traffic is a per-request state leak. 0 on a NULL arg. */
 unsigned mq_gw_server_live_reqs(const mq_gw_server_t *s);
 
+/* Enable per-request mq.req metrics emission (opt-in; default off). Idempotent.
+ * Pass on=1 to enable, on=0 to disable. Safe on NULL (no-op). */
+void mq_gw_server_set_request_metrics(mq_gw_server_t *s, int on);
+
 #endif /* MQ_GATEWAY_MQ_GW_SERVER_H */

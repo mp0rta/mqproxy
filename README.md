@@ -2,7 +2,7 @@
 
 A **multipath application proxy/accelerator** built on [Multipath QUIC](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/), using a [fork of XQUIC](https://github.com/mp0rta/xquic). mqproxy maps application flows directly onto MPQUIC primitives — one TCP flow becomes one MPQUIC stream, one HTTP request becomes one H3 stream over MPQUIC, one UDP session becomes MPQUIC DATAGRAMs — so that applications get path diversity, seamless failover, and **bandwidth aggregation** without implementing MPQUIC themselves.
 
-> **Status: Phase 5 (Production Hardening) in progress.** Phase 1's TCP proxy (SOCKS5 / HTTP CONNECT → MPQUIC → origin, ~2× aggregation over two shaped paths), Phase 2's HTTP Request Execution Gateway (delegated `POST /_mqproxy/fetch` requests carried as H3 streams over MPQUIC, run against origins via libcurl with TLS verification always on), and Phase 3's UDP relay (SOCKS5 UDP ASSOCIATE → session-tagged MPQUIC DATAGRAMs → connected UDP socket, with fragmentation/reassembly and idle-timeout teardown) are all implemented and validated end-to-end including 2-path aggregation. Phase 5 is now underway: 5b (reconnect/keepalive) and 5c (per-path metrics) are done. Phases 4, 6, and 7 are on the [roadmap](#roadmap).
+> **Status: Phase 5 (Production Hardening) in progress.** Phase 1's TCP proxy (SOCKS5 / HTTP CONNECT → MPQUIC → origin, ~2× aggregation over two shaped paths), Phase 2's HTTP Request Execution Gateway (delegated `POST /_mqproxy/fetch` requests carried as H3 streams over MPQUIC, run against origins via libcurl with TLS verification always on), and Phase 3's UDP relay (SOCKS5 UDP ASSOCIATE → session-tagged MPQUIC DATAGRAMs → connected UDP socket, with fragmentation/reassembly and idle-timeout teardown) are all implemented and validated end-to-end including 2-path aggregation. Phase 5 is now underway: 5b (reconnect/keepalive), 5c (per-path `mq.path` metrics), and per-request `mq.req` metrics (`--request-metrics`) are done. Phases 4, 6, and 7 are on the [roadmap](#roadmap).
 
 mqproxy is the L4/L7 sibling of [mqvpn](https://github.com/mp0rta/mqvpn): where mqvpn is a standards-based L3 VPN that carries IP packets in QUIC DATAGRAMs (MASQUE CONNECT-IP), mqproxy works at the application-flow layer and is **MPQUIC-native**.
 
@@ -197,6 +197,7 @@ The client automatically re-establishes its MPQUIC tunnel after a transient loss
 | `--no-udp` | Disable UDP relay (do not advertise the capability; refuse all sessions) |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/server.qlog` |
 | `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s (must be > 0; omit to disable). Logs the most-recently-accepted TCP and gateway conn. |
+| `--request-metrics` | Emit one `mq.req` logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of `--metrics-interval`. |
 
 ### Client options
 
@@ -241,7 +242,7 @@ Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts conf
 | **2. HTTP Request Execution Gateway** | ✅ `POST /_mqproxy/fetch` (header + raw body), H3-over-MPQUIC tunnel (ALPN `h3`), libcurl origin client (h2→h1, h3-ready), per-request auth, header policy, error mapping, up/download |
 | **3. UDP Relay** | ✅ SOCKS5 UDP ASSOCIATE ingress, per-session bidi signalling, MPQUIC DATAGRAM send/recv, fragmentation + LRU reassembly, idle timeout, DNS / non-QUIC UDP |
 | 4. Controlled Web App Integration | mqcurl / SDK, browser upload/download UI, progress, request policy, CORS |
-| 5. Production Hardening | TCP half-close, reconnect/keepalive ✅ (5b done), metrics ✅ (5c done), masquerade mode, qlog, flow-control tuning, scheduler hints |
+| 5. Production Hardening | TCP half-close, reconnect/keepalive ✅ (5b done), per-path metrics `mq.path` ✅ (5c done), per-request metrics `mq.req` ✅ (`--request-metrics`), masquerade mode, qlog, flow-control tuning, scheduler hints |
 | 6. Advanced HTTP Gateway | origin protocol selection, connection pooling, header filtering, cache integration |
 | 7. TLS MITM Ingress (optional) | managed-device CA, dynamic certs, H3 termination, Do-Not-Inspect policy |
 

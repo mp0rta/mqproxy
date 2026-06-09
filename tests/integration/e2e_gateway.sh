@@ -253,6 +253,7 @@ start_server() {
         --token "${TOKEN}" \
         --cert "${MQPROXY_CERT}" --key "${MQPROXY_KEY}" \
         --origin-ca "${ORIGIN_CERT}" \
+        --request-metrics \
         >"${WORK}/server.log" 2>&1 &
     SERVER_PID=$!
 }
@@ -326,6 +327,20 @@ code1="$(curl -s -o "${DL}" -D "${H1}" -w '%{http_code}' --max-time 30 \
 [ "${code1}" = "200" ] || fail 1 "download HTTP code = ${code1} (want 200); headers: $(tr -d '\r' <"${H1}" | head -3 | tr '\n' '|')"
 cmp -s "${BIGFILE}" "${DL}" || fail 1 "downloaded body differs from origin big.bin"
 ok 1 "8MB download byte-exact (200)"
+
+# ── mq.req assertion: server must have emitted one request-metrics line ────────
+# h3_on_close (which emits mq.req) fires slightly AFTER the client download
+# returns, so poll briefly rather than grepping once to avoid a timing race.
+# The formatter emits "method=GET status=200" adjacent (single space); match exactly.
+mqreq_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req cid=.* sid=[0-9]+ method=GET status=200' "${WORK}/server.log"; then
+        mqreq_found=1; break
+    fi
+    sleep 0.2
+done
+[ "${mqreq_found}" -eq 1 ] || { echo "FAIL: no mq.req line in ${WORK}/server.log after retry"; exit 1; }
+note "mq.req line found in server.log"
 
 # ── case 7: x-mq-origin-protocol present on case-1 response (http/1.1) ────────
 if grep -qi '^x-mq-origin-protocol:[[:space:]]*http/1.1' "${H1}"; then
@@ -477,6 +492,46 @@ code8="$(curl -s -o "${DL8}" -w '%{http_code}' --max-time 40 \
     -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/big.bin")"
 [ "${code8}" = "200" ] || fail 8 "2-path download HTTP code = ${code8} (want 200)"
 cmp -s "${BIGFILE}" "${DL8}" || fail 8 "2-path download body differs"
+
+# The case-8 request runs on a 2-path connection, so its mq.req must report a
+# multipath mp_state; 0 would mean the 2nd path never came up.
+#
+# We assert [1-3], NOT =1. mp_state is computed by xquic (xqc_multipath.c, from
+# the per-stream-per-path cumulative byte counters) and classifies by path
+# APP-STATUS, not path count: 1=stream used both an Available- AND a Standby-class
+# path, 2=Standby-class only, 3=Available-class only. mqproxy creates ALL paths as
+# Available-class (path_status 0; it never marks a path STANDBY — see
+# mq_conn.c:412), so a multipath request here ALWAYS reads mp_state=3, never 1/2.
+# Note mp_state=3 does NOT prove 2-path aggregation: it's 3 whether 1 or 2
+# Available paths carried the stream (this download does aggregate — 8MiB in
+# ~750ms ≈ 90Mbit > a single 50mbit path — but mp_state alone can't show that).
+# Proving the within-stream byte split needs the per-path-per-stream bytes (spec
+# §23.2 "必須"); xquic tracks them internally but does not surface them in
+# request_stats — see
+# docs/impl-notes/memos/2026-06-09-per-path-per-stream-bytes-not-emitted.md.
+# We ANCHOR the match to THIS download's mq.req line via its exact
+# resp_bytes=8388608 (the 8 MiB body — the only request of this size in case-8's
+# truncated server.log), and on that same line also require a multipath mp_state.
+# Anchoring on resp_bytes does double duty: it pins the assertion to the download
+# (not some stray request) AND verifies the response-byte accounting is correct
+# end-to-end under real 2-path conditions (more valuable than mp_state alone,
+# which only confirms the 2nd path came up — it does NOT prove the byte split).
+# server.log was truncated by this restart's start_server (case-8 traffic only);
+# mq.req fires slightly AFTER curl returns, so poll briefly.
+mpmulti_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=8388608 .* mp_state=[1-3]' "${WORK}/server.log"; then
+        mpmulti_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${mpmulti_found}" -ne 1 ]; then
+    note "case 8 FAIL: no mq.req for the 8MiB download (resp_bytes=8388608) with a multipath mp_state (1-3)"
+    note "  mq.req lines in ${WORK}/server.log:"
+    grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null
+    exit 1
+fi
+note "case 8: download mq.req confirmed (resp_bytes=8388608, $(grep -Eo 'mq\.req .* resp_bytes=8388608 .* mp_state=[0-9]+' "${WORK}/server.log" | grep -Eo 'mp_state=[0-9]+' | tail -1))"
 
 # SIGTERM the client → it dumps the gateway conn per-path counters to client.log.
 stop_client

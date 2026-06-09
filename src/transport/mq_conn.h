@@ -171,8 +171,9 @@ int mq_conn_path_state(const mq_conn_t *c, uint64_t path_id);
  * Per-path observability formatters (Phase 5c). Pure: no I/O, no allocation.
  * Render one logfmt line into buf; return bytes written (>0) or -1 on snprintf
  * truncation/error. MQ_METRICS_LINE_CAP is a safe caller-buffer size for either
- * line (worst case 7 x 20-digit u64 + keys, well under 256). */
-#define MQ_METRICS_LINE_CAP 256
+ * line (mq.path worst case ≈265 B with 10 numeric fields including min_rtt_ms,
+ * cwnd, and inflight; 320 cap gives ~55 B headroom for future fields). */
+#define MQ_METRICS_LINE_CAP 320
 int mq_conn_format_path_line(char *buf, size_t cap, const xqc_path_metrics_t *p);
 int mq_conn_format_conn_line(char *buf, size_t cap, const xqc_conn_stats_t *st);
 
