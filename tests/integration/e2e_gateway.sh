@@ -509,22 +509,29 @@ cmp -s "${BIGFILE}" "${DL8}" || fail 8 "2-path download body differs"
 # §23.2 "必須"); xquic tracks them internally but does not surface them in
 # request_stats — see
 # docs/impl-notes/memos/2026-06-09-per-path-per-stream-bytes-not-emitted.md.
+# We ANCHOR the match to THIS download's mq.req line via its exact
+# resp_bytes=8388608 (the 8 MiB body — the only request of this size in case-8's
+# truncated server.log), and on that same line also require a multipath mp_state.
+# Anchoring on resp_bytes does double duty: it pins the assertion to the download
+# (not some stray request) AND verifies the response-byte accounting is correct
+# end-to-end under real 2-path conditions (more valuable than mp_state alone,
+# which only confirms the 2nd path came up — it does NOT prove the byte split).
 # server.log was truncated by this restart's start_server (case-8 traffic only);
 # mq.req fires slightly AFTER curl returns, so poll briefly.
 mpmulti_found=0
 for _ in $(seq 1 25); do
-    if grep -Eq 'mq\.req .* mp_state=[1-3]' "${WORK}/server.log"; then
+    if grep -Eq 'mq\.req .* resp_bytes=8388608 .* mp_state=[1-3]' "${WORK}/server.log"; then
         mpmulti_found=1; break
     fi
     sleep 0.2
 done
 if [ "${mpmulti_found}" -ne 1 ]; then
-    note "case 8 FAIL: no mq.req with a multipath mp_state (1-3); request did not see the 2nd path"
+    note "case 8 FAIL: no mq.req for the 8MiB download (resp_bytes=8388608) with a multipath mp_state (1-3)"
     note "  mq.req lines in ${WORK}/server.log:"
     grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null
     exit 1
 fi
-note "case 8: mq.req multipath mp_state confirmed ($(grep -Eo 'mq\.req .* mp_state=[0-9]+' "${WORK}/server.log" | grep -Eo 'mp_state=[0-9]+' | tail -1))"
+note "case 8: download mq.req confirmed (resp_bytes=8388608, $(grep -Eo 'mq\.req .* resp_bytes=8388608 .* mp_state=[0-9]+' "${WORK}/server.log" | grep -Eo 'mp_state=[0-9]+' | tail -1))"
 
 # SIGTERM the client → it dumps the gateway conn per-path counters to client.log.
 stop_client
