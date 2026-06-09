@@ -494,13 +494,20 @@ code8="$(curl -s -o "${DL8}" -w '%{http_code}' --max-time 40 \
 cmp -s "${BIGFILE}" "${DL8}" || fail 8 "2-path download body differs"
 
 # The case-8 request runs on a 2-path connection, so its mq.req must report a
-# multipath mp_state (1=both / 2=standby-only / 3=available-only); 0 would mean
-# the 2nd path never came up. NOTE: we deliberately do NOT assert mp_state=1.
-# mp_state is the request's *instantaneous* MP state read at h3_on_close, NOT a
-# whole-transfer aggregation proof — empirically this download aggregates (8MiB
-# in ~750ms ≈ 90Mbit > a single 50mbit path) yet often reads mp_state=3 at close.
-# Verifying the actual within-stream byte split would need per-path-per-stream
-# bytes (spec §23.2 "必須"), which xquic's request_stats does not expose — see
+# multipath mp_state; 0 would mean the 2nd path never came up.
+#
+# We assert [1-3], NOT =1. mp_state is computed by xquic (xqc_multipath.c, from
+# the per-stream-per-path cumulative byte counters) and classifies by path
+# APP-STATUS, not path count: 1=stream used both an Available- AND a Standby-class
+# path, 2=Standby-class only, 3=Available-class only. mqproxy creates ALL paths as
+# Available-class (path_status 0; it never marks a path STANDBY — see
+# mq_conn.c:412), so a multipath request here ALWAYS reads mp_state=3, never 1/2.
+# Note mp_state=3 does NOT prove 2-path aggregation: it's 3 whether 1 or 2
+# Available paths carried the stream (this download does aggregate — 8MiB in
+# ~750ms ≈ 90Mbit > a single 50mbit path — but mp_state alone can't show that).
+# Proving the within-stream byte split needs the per-path-per-stream bytes (spec
+# §23.2 "必須"); xquic tracks them internally but does not surface them in
+# request_stats — see
 # docs/impl-notes/memos/2026-06-09-per-path-per-stream-bytes-not-emitted.md.
 # server.log was truncated by this restart's start_server (case-8 traffic only);
 # mq.req fires slightly AFTER curl returns, so poll briefly.
