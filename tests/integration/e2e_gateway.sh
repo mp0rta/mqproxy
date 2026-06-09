@@ -493,6 +493,26 @@ code8="$(curl -s -o "${DL8}" -w '%{http_code}' --max-time 40 \
 [ "${code8}" = "200" ] || fail 8 "2-path download HTTP code = ${code8} (want 200)"
 cmp -s "${BIGFILE}" "${DL8}" || fail 8 "2-path download body differs"
 
+# The case-8 download aggregated across both paths, so its per-request metrics
+# line must report mp_state=1 (request transmitted on BOTH Available and Standby
+# — see xqc_request_stats_t.mp_state). This restart's start_server truncated
+# server.log, so it holds only case-8 traffic. mq.req fires at the server's
+# h3_on_close, slightly AFTER curl returns, so poll briefly.
+mp1_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* mp_state=1' "${WORK}/server.log"; then
+        mp1_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${mp1_found}" -ne 1 ]; then
+    note "case 8 FAIL: no mq.req with mp_state=1 (within-stream multipath not reflected in request metrics)"
+    note "  mq.req lines in ${WORK}/server.log:"
+    grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null
+    exit 1
+fi
+note "case 8: mq.req mp_state=1 confirmed (request used both paths)"
+
 # SIGTERM the client → it dumps the gateway conn per-path counters to client.log.
 stop_client
 PATHS_WITH_BYTES="$(grep -E 'mq\.path id=' "${WORK}/client.log" 2>/dev/null \
