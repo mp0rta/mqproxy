@@ -150,20 +150,28 @@ check_multi_info(mq_origin_t *o)
         CURLcode nc = curl_easy_getinfo(easy, CURLINFO_NUM_CONNECTS, &num_connects);
         curl_off_t appconnect_us = 0;
         CURLcode ac = curl_easy_getinfo(easy, CURLINFO_APPCONNECT_TIME_T, &appconnect_us);
+        curl_off_t connect_us = 0;
+        CURLcode cc = curl_easy_getinfo(easy, CURLINFO_CONNECT_TIME_T, &connect_us);
 
         /* origin_reuse: NUM_CONNECTS==0 means no NEW connection was opened => reused.
-         * Gate on CURLE_OK for BOTH the transfer (result) AND the getinfo (nc): a request
-         * that failed before connecting ALSO reports 0 connects, and a getinfo failure
-         * would leave num_connects at its 0 init (which would FALSELY read as reuse).
-         * origin_connect_ms = APPCONNECT (TCP+TLS) in ms, 0 when reused, -1 when unknown.
-         * NOTE: APPCONNECT is 0 for a plain http:// origin (no TLS leg); the e2e origin
-         * is https so the timing proof is valid. */
+         * Gate on CURLE_OK for BOTH the transfer (result) AND the NUM_CONNECTS getinfo
+         * (nc): a request that failed before connecting ALSO reports 0 connects, and a
+         * getinfo failure would leave num_connects at its 0 init (FALSELY reading as
+         * reuse). origin_connect_ms = origin connection SETUP time in ms: TCP+TLS for an
+         * https origin (APPCONNECT, measured from start through the TLS handshake), and
+         * TCP-only for a plain http:// origin (APPCONNECT is 0 there — no TLS leg — so
+         * fall back to CONNECT_TIME so a fresh http connection is NOT reported as
+         * 0/reuse). 0 on reuse (no new connection); -1 when unknown / getinfo failed. */
         int origin_reuse = 0;
         int origin_connect_ms = -1;
         if (result == CURLE_OK && nc == CURLE_OK) {
             origin_reuse = (num_connects == 0) ? 1 : 0;
-            if (ac == CURLE_OK)
-                origin_connect_ms = origin_reuse ? 0 : (int)(appconnect_us / 1000);
+            if (origin_reuse)
+                origin_connect_ms = 0;
+            else if (ac == CURLE_OK && appconnect_us > 0)
+                origin_connect_ms = (int)(appconnect_us / 1000); /* TCP+TLS (https) */
+            else if (cc == CURLE_OK)
+                origin_connect_ms = (int)(connect_us / 1000); /* TCP only (plain http) */
         }
 
         if (r) {

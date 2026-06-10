@@ -643,7 +643,11 @@ ok 8 "2-path aggregation: both gateway paths carried bytes"
 # on the origin TCP port. Defensively probe tc add; skip L2 if it fails.
 tc qdisc del dev lo root 2>/dev/null || true
 if ! tc qdisc add dev lo root handle 1: htb default 1 2>/dev/null; then
-    note "case 10 SKIP: tc qdisc add failed after case-8 teardown (unexpected)."
+    # We are past the case-8 gate, so root+tc were ALREADY proven (can_tc=1) and case 8
+    # just used HTB+netem successfully. A failure here is a real problem, NOT a skip —
+    # failing silently would let the final "case 10 ran under NET_ADMIN" RESULT lie.
+    note "case 10 FAIL: tc qdisc add failed after case-8 teardown (root+tc already proven)."
+    exit 1
 else
     tc class add dev lo parent 1: classid 1:1  htb rate 10gbit ceil 10gbit
     tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}" quantum 1514
