@@ -81,13 +81,14 @@ int mq_gw_parse_method(const char *s, size_t len, char out[16]);
  *     Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, TE,
  *     Trailer, Transfer-Encoding, Upgrade
  *   client → tunnel  (mq_gw_strip_client): hop-by-hop + X-Mq-* (any) + Host +
- *     Content-Length + Cookie
+ *     Content-Length + Cookie (UNLESS forward_cookie != 0 — the X-Mq-Forward-Cookie
+ *     opt-in; see mq_gw_forward_cookie_requested)
  *   server → origin  (mq_gw_strip_server): hop-by-hop + X-Mq-* (any)
  *
  * NOTE: Authorization is intentionally NOT in any set — it is default-forwarded
- * to the origin so the caller can authenticate to the target. Cookie is
- * stripped client-side only (not server-side); Content-Length is stripped
- * client-side but is NOT hop-by-hop.
+ * to the origin so the caller can authenticate to the target. Cookie is stripped
+ * client-side only (not server-side) and only when forward_cookie == 0;
+ * Content-Length is stripped client-side but is NOT hop-by-hop.
  * ------------------------------------------------------------------------- */
 int mq_gw_strip_client(const char *n, size_t nl, int forward_cookie);
 int mq_gw_strip_server(const char *n, size_t nl);

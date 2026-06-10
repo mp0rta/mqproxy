@@ -312,16 +312,11 @@ mq_gw_forward_cookie_requested(const mq_http1_req_t *req)
 {
     for (size_t i = 0; i < req->nh; i++) {
         if (!name_eq(req->h[i].n, req->h[i].nl, "X-Mq-Forward-Cookie")) continue;
-        const char *v = req->h[i].v;
-        size_t vl = req->h[i].vl;
-        while (vl > 0 && (v[0] == ' ' || v[0] == '\t')) {
-            v++;
-            vl--;
-        }
-        while (vl > 0 && (v[vl - 1] == ' ' || v[vl - 1] == '\t'))
-            vl--;
-        return name_eq(v, vl,
-                       "true"); /* name_eq = generic case-insensitive slice==cstr */
+        /* Values reach us already OWS-trimmed: mq_http1_parse_req (the only producer of
+         * mq_http1_req_t) strips leading/trailing SP/HTAB before storing v/vl, so no trim
+         * is needed here. name_eq is a generic length-checked case-insensitive
+         * slice==cstr. */
+        return name_eq(req->h[i].v, req->h[i].vl, "true");
     }
     return 0; /* header absent */
 }
