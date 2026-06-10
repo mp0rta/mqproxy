@@ -151,6 +151,13 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/echo-cookie":
+            body = (self.headers.get("Cookie") or "(none)").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         path = os.path.join(ROOT, os.path.basename(self.path))
         if not os.path.isfile(path):
             self.send_response(404)
@@ -515,6 +522,19 @@ fi
 
 ok 9 "origin_reuse flips 0->1 on repeat same-origin request (L1 reuse proof)"
 
+# ── case 11: X-Mq-Forward-Cookie forwarding proof (no root required) ─────────
+# Positive: X-Mq-Forward-Cookie: true → origin receives the Cookie header.
+# Negative: no opt-in header → Cookie is stripped before the origin request.
+bodyp="$(curl -s --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/echo-cookie" \
+    -H "X-Mq-Forward-Cookie: true" -H "Cookie: k=v")"
+[ "${bodyp}" = "k=v" ] || fail 11 "forward-cookie ON: origin saw Cookie='${bodyp}' (want k=v)"
+# negative: no opt-in → Cookie stripped client-side
+bodyn="$(curl -s --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/echo-cookie" -H "Cookie: k=v")"
+[ "${bodyn}" = "(none)" ] || fail 11 "forward-cookie OFF: origin saw Cookie='${bodyn}' (want (none))"
+ok 11 "X-Mq-Forward-Cookie: true forwards Cookie to origin; absent strips it"
+
 # ── case 8: 2-path aggregation smoke (NET_ADMIN-gated) ───────────────────────
 # Requires tc/netem on lo (NET_ADMIN). Without it: a note + continue (cases 1-7
 # already passed → exit 0). With it: shape two equal-rate loopback paths, run a
@@ -531,7 +551,7 @@ fi
 
 if [ "${can_tc}" -ne 1 ]; then
     note "case 8 skipped (no NET_ADMIN): 2-path aggregation smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-7 + case 9; case 8 skipped)."
+    note "RESULT = PASS (cases 1-7 + cases 9 + 11; case 8 skipped)."
     exit 0
 fi
 
@@ -757,5 +777,5 @@ else
     TC_ON=0
 fi
 
-note "RESULT = PASS (cases 1-9 + L2 case 10 ran under NET_ADMIN)."
+note "RESULT = PASS (cases 1-9 + 11 + L2 case 10 ran under NET_ADMIN)."
 exit 0
