@@ -732,9 +732,13 @@ else
     note "case 10: reused origin_reuse=1 origin_connect_ms=0 confirmed"
 
     # ── assert 3: reused ttfb_ms < fresh ttfb_ms ──────────────────────────────
-    fresh_ttfb="$(grep -Eo "mq\\.req .* resp_bytes=${C_SIZE} .* ttfb_ms=[0-9-]+" "${WORK}/server.log" \
+    # Anchor the whole mq.req LINE on resp_bytes (grep without -o), then extract the
+    # ttfb_ms token from it — ttfb_ms sits IMMEDIATELY after resp_bytes in the line, so
+    # a "resp_bytes=N .* ttfb_ms=N" -o pattern can't match (the ".* " needs a second
+    # separator that the adjacency doesn't provide). Order-independent extraction:
+    fresh_ttfb="$(grep -E "mq\\.req .* resp_bytes=${C_SIZE} " "${WORK}/server.log" \
         | grep -Eo 'ttfb_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
-    reuse_ttfb="$(grep -Eo "mq\\.req .* resp_bytes=${D_SIZE} .* ttfb_ms=[0-9-]+" "${WORK}/server.log" \
+    reuse_ttfb="$(grep -E "mq\\.req .* resp_bytes=${D_SIZE} " "${WORK}/server.log" \
         | grep -Eo 'ttfb_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
     [ -n "${fresh_ttfb}" ] && [ -n "${reuse_ttfb}" ] || \
         { note "case 10 FAIL: could not extract ttfb_ms (fresh=${fresh_ttfb} reuse=${reuse_ttfb})"; exit 1; }
