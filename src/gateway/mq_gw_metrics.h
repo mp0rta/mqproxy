@@ -30,7 +30,7 @@ typedef struct {
     const char *origin_protocol; /* "h3"/"h2"/"h1"/"none" */
     const char *origin_tls;      /* "ok"/"verify_fail"/"connect_fail"/"na" */
     const char *cache;           /* "bypass" now; "hit"/"miss" in Phase 6 */
-    int origin_reuse;            /* 0 now; 1 when pooled (Phase 6) */
+    int origin_reuse;            /* 1 when the origin connection was reused, else 0 */
     int origin_connect_ms;       /* origin TCP+TLS setup ms; 0 on reuse; -1 unknown */
     int mp_state;                /* xqc_request_stats_t.mp_state 0..3 */
     int completion_ms;           /* -1 if unknown */

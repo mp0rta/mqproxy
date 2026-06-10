@@ -26,7 +26,8 @@
  *   - mq_origin_start returns a borrowed pointer. The owner (the gateway server)
  *     stashes its per-request state in `u`. `u` MUST outlive the request.
  *   - Exactly ONE of two terminal events ends a request:
- *       (a) on_done(result, http_ver, u) fires — the request completed (success
+ *       (a) on_done(result, http_ver, ssl_verify, origin_reuse, origin_connect_ms, u)
+ *           fires — the request completed (success
  *           or error). This is the LAST callback and the LAST time mqproxy
  *           touches the mq_origin_req_t: it is freed immediately after on_done
  *           returns. The owner frees its own `u` state from inside on_done.
