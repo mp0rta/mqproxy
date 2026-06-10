@@ -89,7 +89,7 @@ int mq_gw_parse_method(const char *s, size_t len, char out[16]);
  * stripped client-side only (not server-side); Content-Length is stripped
  * client-side but is NOT hop-by-hop.
  * ------------------------------------------------------------------------- */
-int mq_gw_strip_client(const char *n, size_t nl);
+int mq_gw_strip_client(const char *n, size_t nl, int forward_cookie);
 int mq_gw_strip_server(const char *n, size_t nl);
 int mq_gw_strip_hop(const char *n, size_t nl);
 

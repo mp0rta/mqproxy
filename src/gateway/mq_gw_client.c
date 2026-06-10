@@ -391,6 +391,7 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
      * is a corruption / smuggling surface; fail closed with 400 header-too-long.
      * (The download-side pseudo + diagnostic headers are validated where they are
      * emitted.) */
+    int forward_cookie = mq_gw_forward_cookie_requested(req);
     {
         if (auth_vl >= MQ_GW_HDR_VAL_CAP) {
             gw_reject_write(handle, 400, "Bad Request", "header-too-long");
@@ -405,7 +406,7 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         for (size_t i = 0; i < req->nh; i++) {
             const char *n = req->h[i].n;
             size_t nl = req->h[i].nl;
-            if (mq_gw_strip_client(n, nl)) continue;
+            if (mq_gw_strip_client(n, nl, forward_cookie)) continue;
             if (nl >= MQ_GW_HDR_NAME_CAP || req->h[i].vl >= MQ_GW_HDR_VAL_CAP) {
                 gw_reject_write(handle, 400, "Bad Request", "header-too-long");
                 return -1;
@@ -536,7 +537,7 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     for (size_t i = 0; i < req->nh && nh < MQ_GW_MAX_SEND_HDRS; i++) {
         const char *n = req->h[i].n;
         size_t nl = req->h[i].nl;
-        if (mq_gw_strip_client(n, nl)) continue;
+        if (mq_gw_strip_client(n, nl, forward_cookie)) continue;
         char *nb = namebuf + nh * NS;
         char *vb = valbuf + nh * VS;
         size_t cnl = nl < NS - 1 ? nl : NS - 1;

@@ -349,7 +349,12 @@ test_method_empty(void)
 static int
 sc(const char *n)
 {
-    return mq_gw_strip_client(n, strlen(n));
+    return mq_gw_strip_client(n, strlen(n), 0);
+}
+static int
+scf(const char *n)
+{
+    return mq_gw_strip_client(n, strlen(n), 1);
 }
 static int
 ss(const char *n)
@@ -555,6 +560,20 @@ test_forward_cookie_requested(void)
     MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 0);
 }
 
+static void
+test_cookie_forward_optin(void)
+{
+    /* forward_cookie=1 (scf): ONLY Cookie's strip decision flips; every other strip is
+     * unaffected by the flag, and the opt-in header itself is still stripped.
+     * (sc("Cookie")==1 for forward_cookie=0 is already covered by test_cookie_asymmetry /
+     * test_strip_client_names.) */
+    MQ_CHECK_EQ_INT(scf("Cookie"), 0); /* opted in: NOT stripped */
+    MQ_CHECK_EQ_INT(scf("cookie"), 0); /* case-insensitive */
+    MQ_CHECK_EQ_INT(scf("Host"), 1);   /* a non-Cookie strip is flag-independent */
+    MQ_CHECK_EQ_INT(scf("X-Mq-Forward-Cookie"),
+                    1); /* the opt-in header is still stripped */
+}
+
 /* ===================================================================
  * mq_gw_status_from_curl
  * =================================================================== */
@@ -633,6 +652,7 @@ MQ_TEST_MAIN({
     test_dup_empty();
     /* forward cookie */
     test_forward_cookie_requested();
+    test_cookie_forward_optin();
     /* curl map */
     test_curl_map();
 })

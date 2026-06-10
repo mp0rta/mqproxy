@@ -267,13 +267,13 @@ mq_gw_strip_hop(const char *n, size_t nl)
 }
 
 int
-mq_gw_strip_client(const char *n, size_t nl)
+mq_gw_strip_client(const char *n, size_t nl, int forward_cookie)
 {
     if (mq_gw_strip_hop(n, nl)) return 1;
     if (name_has_prefix(n, nl, "X-Mq-")) return 1;
     if (name_eq(n, nl, "Host")) return 1;
     if (name_eq(n, nl, "Content-Length")) return 1;
-    if (name_eq(n, nl, "Cookie")) return 1;
+    if (!forward_cookie && name_eq(n, nl, "Cookie")) return 1;
     return 0;
 }
 
