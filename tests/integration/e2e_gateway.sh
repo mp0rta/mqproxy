@@ -441,6 +441,76 @@ ok 6 "504 on origin connect timeout (blackhole)"
 
 note "cases 1-7 PASS (${PASS_COUNT}/7 checks)."
 
+# ── case 9: L1 origin-connection reuse proof (no root required) ──────────────
+# Proves that two sequential same-origin requests flip origin_reuse 0→1, which
+# validates both the Task-2 capture wiring and libcurl's implicit keep-alive.
+#
+# COLD conncache: case 6 restarted the server with a short connect timeout;
+# there may be residual connections in the server's libcurl conncache from
+# earlier cases. Restart server+client clean so the conncache starts fresh and
+# server.log is truncated to only case-9 traffic.
+stop_client
+kill "${SERVER_PID}" 2>/dev/null; wait "${SERVER_PID}" 2>/dev/null; SERVER_PID=""
+start_server "" || exit 1
+start_client || exit 1
+wait_gateway_ready || exit 1
+
+# Two test files of DISTINCT sizes — neither 8388608 (8 MiB) nor each other.
+# Reuse is keyed by origin HOST:PORT, not path, so the two files must live at
+# the same origin authority (https://127.0.0.1:${ORIGIN_PORT}).
+A_SIZE=3145728   # 3 MiB
+B_SIZE=1048576   # 1 MiB
+head -c "${A_SIZE}" /dev/zero >"${WORK}/a.bin"
+head -c "${B_SIZE}" /dev/zero >"${WORK}/b.bin"
+
+# First request — fresh connection, expect origin_reuse=0.
+RESP9A="${WORK}/c9a_resp.bin"
+code9a="$(curl -s -o "${RESP9A}" -w '%{http_code}' --max-time 30 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/a.bin")"
+[ "${code9a}" = "200" ] || fail 9 "(a) first fetch HTTP code = ${code9a} (want 200)"
+
+# Second request — same origin authority, expect reuse (origin_reuse=1).
+RESP9B="${WORK}/c9b_resp.bin"
+code9b="$(curl -s -o "${RESP9B}" -w '%{http_code}' --max-time 30 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/b.bin")"
+[ "${code9b}" = "200" ] || fail 9 "(b) second fetch HTTP code = ${code9b} (want 200)"
+
+# Poll for the first mq.req (anchored to resp_bytes=3145728, origin_reuse=0).
+reuse_a_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=3145728 .* origin_reuse=0' "${WORK}/server.log"; then
+        reuse_a_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${reuse_a_found}" -ne 1 ]; then
+    note "case 9 FAIL: no mq.req with resp_bytes=3145728 origin_reuse=0 in server.log"
+    note "  mq.req lines in ${WORK}/server.log:"
+    grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+
+# Poll for the second mq.req (anchored to resp_bytes=1048576, origin_reuse=1).
+reuse_b_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=1048576 .* origin_reuse=1' "${WORK}/server.log"; then
+        reuse_b_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${reuse_b_found}" -ne 1 ]; then
+    note "case 9 FAIL: no mq.req with resp_bytes=1048576 origin_reuse=1 in server.log"
+    note "  mq.req lines in ${WORK}/server.log:"
+    grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+
+ok 9 "origin_reuse flips 0->1 on repeat same-origin request (L1 reuse proof)"
+
 # ── case 8: 2-path aggregation smoke (NET_ADMIN-gated) ───────────────────────
 # Requires tc/netem on lo (NET_ADMIN). Without it: a note + continue (cases 1-7
 # already passed → exit 0). With it: shape two equal-rate loopback paths, run a
@@ -457,11 +527,12 @@ fi
 
 if [ "${can_tc}" -ne 1 ]; then
     note "case 8 skipped (no NET_ADMIN): 2-path aggregation smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-7; case 8 skipped)."
+    note "RESULT = PASS (cases 1-7 + case 9; case 8 skipped)."
     exit 0
 fi
 
-# Restart server+client clean (case 6 left a short-timeout server up).
+# Restart server+client clean (case 9 left a clean server up; restart anyway
+# to isolate case-8 tc shaping from any residual state).
 stop_client
 kill "${SERVER_PID}" 2>/dev/null; wait "${SERVER_PID}" 2>/dev/null; SERVER_PID=""
 
@@ -548,5 +619,5 @@ if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
 fi
 ok 8 "2-path aggregation: both gateway paths carried bytes"
 
-note "RESULT = PASS (cases 1-8)."
+note "RESULT = PASS (cases 1-9)."
 exit 0
