@@ -100,11 +100,11 @@ int mq_gw_strip_hop(const char *n, size_t nl);
  * are legal and ignored here. Name comparison is case-insensitive. */
 int mq_gw_has_dup_xmq(const mq_http1_req_t *req);
 
-/* Returns 1 iff the request carries X-Mq-Forward-Cookie whose value, after trimming
- * leading/trailing OWS (SP/HTAB), case-insensitively equals "true" — the spec §14.2
- * opt-in to forward the Cookie header upstream. Absent / "false" / "1" / "" / anything
- * else → 0. (A duplicate X-Mq-Forward-Cookie is rejected upstream by mq_gw_has_dup_xmq;
- * this reads the first match.) */
+/* Returns 1 iff the request carries X-Mq-Forward-Cookie whose value (already OWS-trimmed
+ * by mq_http1_parse_req) case-insensitively equals "true" — the spec §14.2 opt-in to
+ * forward the Cookie header upstream. Absent / "false" / "1" / "" / anything else → 0.
+ * (A duplicate X-Mq-Forward-Cookie is rejected upstream by mq_gw_has_dup_xmq; this reads
+ * the first match.) */
 int mq_gw_forward_cookie_requested(const mq_http1_req_t *req);
 
 /* ---------------------------------------------------------------------------
