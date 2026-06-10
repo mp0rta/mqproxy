@@ -525,6 +525,37 @@ test_dup_empty(void)
 }
 
 /* ===================================================================
+ * mq_gw_forward_cookie_requested
+ * =================================================================== */
+
+static void
+test_forward_cookie_requested(void)
+{
+    mq_http1_req_t r;
+    set_h(&r, 0, "X-Mq-Forward-Cookie", "true");
+    r.nh = 1;
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 1);
+    set_h(&r, 0, "x-mq-forward-cookie", "TRUE");
+    r.nh = 1; /* name + value case-insensitive */
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 1);
+    set_h(&r, 0, "X-Mq-Forward-Cookie", "  true ");
+    r.nh = 1; /* OWS trimmed */
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 1);
+    set_h(&r, 0, "X-Mq-Forward-Cookie", "false");
+    r.nh = 1;
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 0);
+    set_h(&r, 0, "X-Mq-Forward-Cookie", "1");
+    r.nh = 1;
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 0);
+    set_h(&r, 0, "X-Mq-Forward-Cookie", "");
+    r.nh = 1;
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 0);
+    set_h(&r, 0, "Accept", "*/*");
+    r.nh = 1; /* header absent */
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 0);
+}
+
+/* ===================================================================
  * mq_gw_status_from_curl
  * =================================================================== */
 
@@ -600,6 +631,8 @@ MQ_TEST_MAIN({
     test_dup_non_xmq();
     test_dup_case_insensitive();
     test_dup_empty();
+    /* forward cookie */
+    test_forward_cookie_requested();
     /* curl map */
     test_curl_map();
 })
