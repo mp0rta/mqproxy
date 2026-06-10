@@ -108,10 +108,15 @@ typedef struct {
      * CURL_HTTP_VERSION_1_1). ssl_verify is CURLINFO_SSL_VERIFYRESULT (0 =
      * verified ok; nonzero = verify failure). On a connect/handshake failure
      * curl_result is nonzero and ssl_verify may be unset (0) — classify by
-     * curl_result first. This is the LAST touch of the request: the
-     * mq_origin_req_t is freed right after this returns. Fires for completion
-     * and error, but NOT for mq_origin_abort. */
-    void (*on_done)(int curl_result, long http_ver, long ssl_verify, void *u);
+     * curl_result first. origin_reuse is 1 iff the connection was reused
+     * (CURLINFO_NUM_CONNECTS==0 on CURLE_OK), 0 otherwise. origin_connect_ms
+     * is the TCP+TLS setup time in ms (APPCONNECT_TIME_T/1000); 0 on reuse,
+     * -1 when unknown (failed before connect, or getinfo error). This is the
+     * LAST touch of the request: the mq_origin_req_t is freed right after
+     * this returns. Fires for completion and error, but NOT for
+     * mq_origin_abort. */
+    void (*on_done)(int curl_result, long http_ver, long ssl_verify, int origin_reuse,
+                    int origin_connect_ms, void *u);
 } mq_origin_cbs_t;
 
 /* Create an origin client bound to `base`. ca_file (nullable) sets CURLOPT_CAINFO

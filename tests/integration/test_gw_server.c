@@ -386,6 +386,8 @@ typedef struct {
     int done;
     int done_result;
     long done_http_ver;
+    int done_origin_reuse;
+    int done_origin_connect_ms;
 } cap_t;
 
 static void
@@ -444,13 +446,16 @@ cap_pull_body(uint8_t *buf, size_t cap, void *u)
 }
 
 static void
-cap_on_done(int result, long http_ver, long ssl_verify, void *u)
+cap_on_done(int result, long http_ver, long ssl_verify, int origin_reuse,
+            int origin_connect_ms, void *u)
 {
     (void)ssl_verify;
     cap_t *c = (cap_t *)u;
     c->done = 1;
     c->done_result = result;
     c->done_http_ver = http_ver;
+    c->done_origin_reuse = origin_reuse;
+    c->done_origin_connect_ms = origin_connect_ms;
 }
 
 static mq_origin_cbs_t
@@ -517,6 +522,8 @@ test_get_blob(struct event_base *base)
     MQ_CHECK_EQ_INT(c.saw_tag, 1);
     MQ_CHECK_EQ_INT((long long)c.body_len, (long long)N);
     MQ_CHECK_EQ_INT(c.done_http_ver, CURL_HTTP_VERSION_1_1);
+    MQ_CHECK(c.done_origin_reuse == 0 || c.done_origin_reuse == 1);
+    MQ_CHECK(c.done_origin_connect_ms >= -1);
 
     /* Byte-exact pattern check. */
     int ok = 1;

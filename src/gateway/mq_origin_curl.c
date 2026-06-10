@@ -146,6 +146,26 @@ check_multi_info(mq_origin_t *o)
         long ssl_verify = 0;
         curl_easy_getinfo(easy, CURLINFO_SSL_VERIFYRESULT, &ssl_verify);
 
+        long num_connects = 0;
+        CURLcode nc = curl_easy_getinfo(easy, CURLINFO_NUM_CONNECTS, &num_connects);
+        curl_off_t appconnect_us = 0;
+        CURLcode ac = curl_easy_getinfo(easy, CURLINFO_APPCONNECT_TIME_T, &appconnect_us);
+
+        /* origin_reuse: NUM_CONNECTS==0 means no NEW connection was opened => reused.
+         * Gate on CURLE_OK for BOTH the transfer (result) AND the getinfo (nc): a request
+         * that failed before connecting ALSO reports 0 connects, and a getinfo failure
+         * would leave num_connects at its 0 init (which would FALSELY read as reuse).
+         * origin_connect_ms = APPCONNECT (TCP+TLS) in ms, 0 when reused, -1 when unknown.
+         * NOTE: APPCONNECT is 0 for a plain http:// origin (no TLS leg); the e2e origin
+         * is https so the timing proof is valid. */
+        int origin_reuse = 0;
+        int origin_connect_ms = -1;
+        if (result == CURLE_OK && nc == CURLE_OK) {
+            origin_reuse = (num_connects == 0) ? 1 : 0;
+            if (ac == CURLE_OK)
+                origin_connect_ms = origin_reuse ? 0 : (int)(appconnect_us / 1000);
+        }
+
         if (r) {
             mq_origin_cbs_t cbs = r->cbs;
             void *u = r->u;
@@ -154,7 +174,9 @@ check_multi_info(mq_origin_t *o)
              * handle is removed from the multi inside req_destroy, which is safe
              * here (we are between info_read calls, not mid-action). */
             req_destroy(r);
-            if (cbs.on_done) cbs.on_done((int)result, http_ver, ssl_verify, u);
+            if (cbs.on_done)
+                cbs.on_done((int)result, http_ver, ssl_verify, origin_reuse,
+                            origin_connect_ms, u);
         }
     }
 }

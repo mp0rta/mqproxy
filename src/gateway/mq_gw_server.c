@@ -113,6 +113,8 @@ typedef struct mq_gw_req_s {
     long resp_http_ver;         /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
     int origin_is_tls;          /* origin scheme == https (set in gw_dispatch, Task 5) */
     mq_tls_result_t origin_tls; /* TLS verify outcome, set in origin_on_done */
+    int origin_reuse;      /* 0 fresh / not-yet-done; 1 when the origin conn was reused */
+    int origin_connect_ms; /* origin TCP+TLS setup ms; 0 on reuse; -1 unknown */
 
     /* observability (mq.req); captured in gw_dispatch */
     char method[16];
@@ -581,12 +583,15 @@ origin_on_body(const uint8_t *p, size_t len, void *u)
  * (if headers not yet sent) or RESET (if already sent). The origin side is freed
  * right after this returns — null r->oreq + set origin_dead FIRST. */
 static void
-origin_on_done(int curl_result, long http_ver, long ssl_verify, void *u)
+origin_on_done(int curl_result, long http_ver, long ssl_verify, int origin_reuse,
+               int origin_connect_ms, void *u)
 {
     mq_gw_req_t *r = (mq_gw_req_t *)u;
     r->oreq = NULL; /* freed right after on_done returns */
     r->origin_dead = 1;
     r->resp_http_ver = http_ver;
+    r->origin_reuse = origin_reuse;
+    r->origin_connect_ms = origin_connect_ms;
     /* TLS outcome — only meaningful for an https origin. A plain http:// origin
      * (scheme_ok accepts both, mq_gw_server.c:751) has NO TLS result → MQ_TLS_NA,
      * even on success. ok = https + curl OK + verify passed; verify_fail = cert
@@ -1081,8 +1086,9 @@ gw_emit_req_metrics(mq_gw_req_t *r, mq_h3_req_t *hr)
         .origin_protocol =
             origin_proto_token(r->resp_http_ver), /* NONE-default → "none" */
         .origin_tls = otls,
-        .cache = "bypass", /* honest Phase-2 constant; Phase 6 flips */
-        .origin_reuse = 0, /* honest Phase-2 constant; Phase 6 flips */
+        .cache = "bypass",               /* honest Phase-2 constant; Phase 6 flips */
+        .origin_reuse = r->origin_reuse, /* Phase 6: real (was honest 0) */
+        .origin_connect_ms = r->origin_connect_ms, /* Phase 6: 0 reuse / -1 unknown */
         .mp_state = have ? st.mp_state : 0,
         .reset_reason = (have && st.stream_err)
                             ? (st.stream_close_msg ? st.stream_close_msg : "stream-err")
@@ -1184,6 +1190,8 @@ gw_on_new_req(mq_h3_req_t *hr, void *user)
     r->req = hr;
     r->resp_http_ver =
         CURL_HTTP_VERSION_NONE; /* "none" until on_done sets the real version */
+    r->origin_reuse = 0;
+    r->origin_connect_ms = -1;
 
     /* Link before wiring callbacks so teardown can find it. */
     r->next = s->reqs;
