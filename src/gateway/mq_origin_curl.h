@@ -111,8 +111,10 @@ typedef struct {
      * curl_result is nonzero and ssl_verify may be unset (0) — classify by
      * curl_result first. origin_reuse is 1 iff the connection was reused
      * (CURLINFO_NUM_CONNECTS==0 on CURLE_OK), 0 otherwise. origin_connect_ms
-     * is the TCP+TLS setup time in ms (APPCONNECT_TIME_T/1000); 0 on reuse,
-     * -1 when unknown (failed before connect, or getinfo error). This is the
+     * is the origin connection setup time in ms: APPCONNECT_TIME_T/1000 (TCP+TLS)
+     * for an https origin, or CONNECT_TIME_T/1000 (TCP only) for a plain http
+     * origin where APPCONNECT is 0; 0 on reuse, -1 when unknown (failed before
+     * connect, or getinfo error). Sub-millisecond setups round to 0. This is the
      * LAST touch of the request: the mq_origin_req_t is freed right after
      * this returns. Fires for completion and error, but NOT for
      * mq_origin_abort. */
