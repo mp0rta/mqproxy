@@ -619,5 +619,131 @@ if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
 fi
 ok 8 "2-path aggregation: both gateway paths carried bytes"
 
-note "RESULT = PASS (cases 1-9)."
+# ── case 10 (L2): netem-shaped origin leg — quantitative timing proof ─────────
+# Proves that a fresh request pays the TCP-handshake penalty (origin_connect_ms
+# reflects the netem delay on the origin TCP leg) while a reused connection
+# skips it entirely (origin_connect_ms=0, origin_reuse=1), and that reused
+# ttfb_ms < fresh ttfb_ms.
+#
+# We shape ONLY the origin TCP leg (dst/src port ${ORIGIN_PORT}, protocol=tcp)
+# so that the QUIC tunnel (UDP, different port) is unaffected. Without an
+# explicit ip protocol match, a filter on the port number alone would also hit
+# the QUIC port if it happened to collide numerically (free_port tcp vs
+# free_port udp are allocated independently).
+#
+# COLD conncache: case 8 may have left a live origin connection in libcurl's
+# pool. Restart server+client AFTER applying the shaping so the first shaped
+# request opens a NEW, delayed connection.
+
+# Clear any tc state case 8 left, then install a fresh single-class HTB+netem
+# on the origin TCP port. Defensively probe tc add; skip L2 if it fails.
+tc qdisc del dev lo root 2>/dev/null || true
+if ! tc qdisc add dev lo root handle 1: htb default 1 2>/dev/null; then
+    note "case 10 SKIP: tc qdisc add failed after case-8 teardown (unexpected)."
+else
+    tc class add dev lo parent 1: classid 1:1  htb rate 10gbit ceil 10gbit
+    tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}" quantum 1514
+    tc qdisc add dev lo parent 1:10 handle 10: netem delay "${DELAY}" limit 20000
+    # Match TCP traffic to/from the origin port; explicitly require ip protocol=6
+    # so the filter does NOT accidentally match UDP QUIC traffic on the same port number.
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+        match ip protocol 6 0xff match ip dport "${ORIGIN_PORT}" 0xffff flowid 1:10
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+        match ip protocol 6 0xff match ip sport "${ORIGIN_PORT}" 0xffff flowid 1:10
+    TC_ON=1
+    note "case 10: tc shaping applied (TCP port ${ORIGIN_PORT}, RATE=${RATE} DELAY=${DELAY})."
+
+    # Cold restart after shaping is in place.
+    stop_client
+    kill "${SERVER_PID}" 2>/dev/null; wait "${SERVER_PID}" 2>/dev/null; SERVER_PID=""
+    start_server "" || { note "case 10 FAIL: server restart"; exit 1; }
+    start_client || { note "case 10 FAIL: client restart"; exit 1; }
+    wait_gateway_ready || { note "case 10 FAIL: tunnel not ready"; exit 1; }
+
+    # Two fresh distinct-size files (not used by any prior case):
+    #   c.bin = 2 MiB (2097152)
+    #   d.bin = 512 KiB (524288)
+    C_SIZE=2097152
+    D_SIZE=524288
+    head -c "${C_SIZE}" /dev/zero >"${WORK}/c.bin"
+    head -c "${D_SIZE}" /dev/zero >"${WORK}/d.bin"
+
+    # ── fresh request (c.bin) — must open a new TCP connection to the origin ───
+    RESP10C="${WORK}/c10c_resp.bin"
+    code10c="$(curl -s -o "${RESP10C}" -w '%{http_code}' --max-time 30 \
+        -X POST "http://${GW}/_mqproxy/fetch" \
+        -H "${AUTH}" \
+        -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/c.bin")"
+    [ "${code10c}" = "200" ] || { note "case 10 FAIL: fresh fetch HTTP code = ${code10c} (want 200)"; exit 1; }
+
+    # ── reused request (d.bin) — must reuse the existing origin connection ─────
+    RESP10D="${WORK}/c10d_resp.bin"
+    code10d="$(curl -s -o "${RESP10D}" -w '%{http_code}' --max-time 30 \
+        -X POST "http://${GW}/_mqproxy/fetch" \
+        -H "${AUTH}" \
+        -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/d.bin")"
+    [ "${code10d}" = "200" ] || { note "case 10 FAIL: reused fetch HTTP code = ${code10d} (want 200)"; exit 1; }
+
+    # Poll for both mq.req lines (mq.req fires slightly after curl returns).
+    mq10_fresh_found=0
+    for _ in $(seq 1 25); do
+        if grep -Eq "mq\\.req .* resp_bytes=${C_SIZE} .* origin_connect_ms=[0-9-]+" "${WORK}/server.log"; then
+            mq10_fresh_found=1; break
+        fi
+        sleep 0.2
+    done
+    if [ "${mq10_fresh_found}" -ne 1 ]; then
+        note "case 10 FAIL: no mq.req with resp_bytes=${C_SIZE} in server.log"
+        grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+        exit 1
+    fi
+
+    mq10_reuse_found=0
+    for _ in $(seq 1 25); do
+        if grep -Eq "mq\\.req .* resp_bytes=${D_SIZE} .* origin_reuse=[0-9]+" "${WORK}/server.log"; then
+            mq10_reuse_found=1; break
+        fi
+        sleep 0.2
+    done
+    if [ "${mq10_reuse_found}" -ne 1 ]; then
+        note "case 10 FAIL: no mq.req with resp_bytes=${D_SIZE} in server.log"
+        grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+        exit 1
+    fi
+
+    # ── assert 1: fresh origin_connect_ms > 10 (netem adds ~${DELAY} per RTT) ──
+    fresh_cm="$(grep -Eo "mq\\.req .* resp_bytes=${C_SIZE} .* origin_connect_ms=[0-9-]+" "${WORK}/server.log" \
+        | grep -Eo 'origin_connect_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
+    [ -n "${fresh_cm}" ] || { note "case 10 FAIL: could not extract fresh origin_connect_ms"; exit 1; }
+    [ "${fresh_cm}" -gt 10 ] || { note "case 10 FAIL: fresh origin_connect_ms=${fresh_cm} not > 10 under netem (DELAY=${DELAY})"; exit 1; }
+    note "case 10: fresh origin_connect_ms=${fresh_cm} (> 10, netem confirmed)"
+
+    # ── assert 2: reused origin_reuse=1 and origin_connect_ms=0 ───────────────
+    reuse_flag="$(grep -Eo "mq\\.req .* resp_bytes=${D_SIZE} .* origin_reuse=[0-9]+" "${WORK}/server.log" \
+        | grep -Eo 'origin_reuse=[0-9]+' | tail -1 | cut -d= -f2)"
+    reuse_cm="$(grep -Eo "mq\\.req .* resp_bytes=${D_SIZE} .* origin_connect_ms=[0-9-]+" "${WORK}/server.log" \
+        | grep -Eo 'origin_connect_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
+    [ "${reuse_flag}" = "1" ] || { note "case 10 FAIL: reused request origin_reuse=${reuse_flag} (want 1)"; exit 1; }
+    [ "${reuse_cm}" = "0" ] || { note "case 10 FAIL: reused request origin_connect_ms=${reuse_cm} (want 0)"; exit 1; }
+    note "case 10: reused origin_reuse=1 origin_connect_ms=0 confirmed"
+
+    # ── assert 3: reused ttfb_ms < fresh ttfb_ms ──────────────────────────────
+    fresh_ttfb="$(grep -Eo "mq\\.req .* resp_bytes=${C_SIZE} .* ttfb_ms=[0-9-]+" "${WORK}/server.log" \
+        | grep -Eo 'ttfb_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
+    reuse_ttfb="$(grep -Eo "mq\\.req .* resp_bytes=${D_SIZE} .* ttfb_ms=[0-9-]+" "${WORK}/server.log" \
+        | grep -Eo 'ttfb_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
+    [ -n "${fresh_ttfb}" ] && [ -n "${reuse_ttfb}" ] || \
+        { note "case 10 FAIL: could not extract ttfb_ms (fresh=${fresh_ttfb} reuse=${reuse_ttfb})"; exit 1; }
+    [ "${reuse_ttfb}" -lt "${fresh_ttfb}" ] || \
+        { note "case 10 FAIL: reused ttfb_ms=${reuse_ttfb} not < fresh ttfb_ms=${fresh_ttfb}"; exit 1; }
+    note "case 10: ttfb_ms fresh=${fresh_ttfb} reuse=${reuse_ttfb} (reuse < fresh confirmed)"
+
+    ok 10 "netem-shaped origin: fresh origin_connect_ms=${fresh_cm} > 10, reuse=0ms, ttfb drop confirmed"
+
+    # Tear down the L2 shaping (cleanup trap also handles TC_ON=1).
+    tc qdisc del dev lo root 2>/dev/null || true
+    TC_ON=0
+fi
+
+note "RESULT = PASS (cases 1-9 + L2 case 10 ran under NET_ADMIN)."
 exit 0
