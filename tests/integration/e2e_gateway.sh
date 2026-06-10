@@ -458,6 +458,10 @@ wait_gateway_ready || exit 1
 # Two test files of DISTINCT sizes — neither 8388608 (8 MiB) nor each other.
 # Reuse is keyed by origin HOST:PORT, not path, so the two files must live at
 # the same origin authority (https://127.0.0.1:${ORIGIN_PORT}).
+# RESERVED sizes — the mq.req anchors below grep server.log by resp_bytes, so each
+# reuse-case body size MUST be unique across the whole script: 3MiB/1MiB (case 9),
+# 2MiB/512KiB (case 10), 8MiB (big.bin, cases 1/2/8). A new case reusing one of
+# these sizes in the same server.log epoch could mis-anchor (grep|tail -1).
 A_SIZE=3145728   # 3 MiB
 B_SIZE=1048576   # 1 MiB
 head -c "${A_SIZE}" /dev/zero >"${WORK}/a.bin"
