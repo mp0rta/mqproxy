@@ -135,7 +135,7 @@ trap cleanup EXIT INT TERM
 # interpolated into the python source.
 write_origin_py() {
     cat >"${WORK}/origin.py" <<'PY'
-import http.server, os, ssl
+import gzip, http.server, os, ssl
 
 ROOT = os.environ["MQ_ORIGIN_ROOT"]
 SAVE = os.environ["MQ_ORIGIN_SAVE"]
@@ -157,6 +157,22 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if self.path == "/compressible":
+            raw = b"compressible-text-" * 4096  # 73728 bytes, highly compressible
+            ae = self.headers.get("Accept-Encoding") or ""
+            if "gzip" in ae:
+                body = gzip.compress(raw)
+                self.send_response(200)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
             return
         path = os.path.join(ROOT, os.path.basename(self.path))
         if not os.path.isfile(path):
@@ -535,6 +551,34 @@ bodyn="$(curl -s --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}
 [ "${bodyn}" = "(none)" ] || fail 11 "forward-cookie OFF: origin saw Cookie='${bodyn}' (want (none))"
 ok 11 "X-Mq-Forward-Cookie: true forwards Cookie to origin; absent strips it"
 
+# ── case 12: X-Mq-Accept-Encoding gzip compression proof (no root required) ──
+# Positive: opt in → origin compresses → mq.req content_encoding=gzip, resp_bytes < raw 73728.
+# Negative: no opt-in → identity → mq.req content_encoding=none, resp_bytes=73728.
+curl -s -o /dev/null --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/compressible" \
+    -H "X-Mq-Accept-Encoding: gzip"
+cz=""
+for _ in $(seq 1 25); do
+    line="$(grep -E 'mq\.req .* content_encoding=gzip' "${WORK}/server.log" | tail -1)"
+    [ -n "${line}" ] && { cz="$(printf '%s' "${line}" | grep -Eo 'resp_bytes=[0-9]+' | cut -d= -f2)"; break; }
+    sleep 0.2
+done
+[ -n "${cz}" ] || fail 12 "compression ON: no mq.req with content_encoding=gzip"
+[ "${cz}" -lt 73728 ] || fail 12 "compression ON: resp_bytes=${cz} not < raw 73728 (not compressed?)"
+# negative: no opt-in → identity → content_encoding=none. Anchor by TARGET path (robust;
+# not by raw size), then assert the size separately.
+curl -s -o /dev/null --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/compressible"
+nb=""
+for _ in $(seq 1 25); do
+    line="$(grep -E 'mq\.req .* path="/compressible" .* content_encoding=none' "${WORK}/server.log" | tail -1)"
+    [ -n "${line}" ] && { nb="$(printf '%s' "${line}" | grep -Eo 'resp_bytes=[0-9]+' | cut -d= -f2)"; break; }
+    sleep 0.2
+done
+[ -n "${nb}" ] || fail 12 "compression OFF: no mq.req for /compressible with content_encoding=none"
+[ "${nb}" = "73728" ] || fail 12 "compression OFF: resp_bytes=${nb} (want 73728, uncompressed)"
+ok 12 "X-Mq-Accept-Encoding: gzip compresses the download (content_encoding=gzip, resp_bytes ${cz} < 73728)"
+
 # ── case 8: 2-path aggregation smoke (NET_ADMIN-gated) ───────────────────────
 # Requires tc/netem on lo (NET_ADMIN). Without it: a note + continue (cases 1-7
 # already passed → exit 0). With it: shape two equal-rate loopback paths, run a
@@ -551,7 +595,7 @@ fi
 
 if [ "${can_tc}" -ne 1 ]; then
     note "case 8 skipped (no NET_ADMIN): 2-path aggregation smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-7 + cases 9 + 11; case 8 skipped)."
+    note "RESULT = PASS (cases 1-7 + cases 9 + 11 + 12; case 8 skipped)."
     exit 0
 fi
 
@@ -777,5 +821,5 @@ else
     TC_ON=0
 fi
 
-note "RESULT = PASS (cases 1-9 + 11 + L2 case 10 ran under NET_ADMIN)."
+note "RESULT = PASS (cases 1-9 + 11 + 12 + L2 case 10 ran under NET_ADMIN)."
 exit 0
