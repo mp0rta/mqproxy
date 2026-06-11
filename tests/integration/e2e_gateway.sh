@@ -559,7 +559,7 @@ curl -s -o /dev/null --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${A
     -H "X-Mq-Accept-Encoding: gzip"
 cz=""
 for _ in $(seq 1 25); do
-    line="$(grep -E 'mq\.req .* content_encoding=gzip' "${WORK}/server.log" | tail -1)"
+    line="$(grep -E 'mq\.req .* path="/compressible" .* content_encoding=gzip' "${WORK}/server.log" | tail -1)"
     [ -n "${line}" ] && { cz="$(printf '%s' "${line}" | grep -Eo 'resp_bytes=[0-9]+' | cut -d= -f2)"; break; }
     sleep 0.2
 done
