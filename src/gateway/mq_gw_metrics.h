@@ -29,12 +29,14 @@ typedef struct {
     int duration_ms;             /* -1 if unknown */
     const char *origin_protocol; /* "h3"/"h2"/"h1"/"none" */
     const char *origin_tls;      /* "ok"/"verify_fail"/"connect_fail"/"na" */
-    const char *cache;           /* "bypass" now; "hit"/"miss" in Phase 6 */
-    int origin_reuse;            /* 1 when the origin connection was reused, else 0 */
-    int origin_connect_ms;       /* origin conn setup ms; 0 reuse; -1 unknown */
-    int mp_state;                /* xqc_request_stats_t.mp_state 0..3 */
-    int completion_ms;           /* -1 if unknown */
-    const char *reset_reason;    /* "" if clean close */
+    const char
+        *content_encoding; /* origin response Content-Encoding: gzip/br/identity/none */
+    const char *cache;     /* "bypass" now; "hit"/"miss" in Phase 6 */
+    int origin_reuse;      /* 1 when the origin connection was reused, else 0 */
+    int origin_connect_ms; /* origin conn setup ms; 0 reuse; -1 unknown */
+    int mp_state;          /* xqc_request_stats_t.mp_state 0..3 */
+    int completion_ms;     /* -1 if unknown */
+    const char *reset_reason; /* "" if clean close */
 } mq_gw_req_metrics_t;
 
 /* Render a logfmt "mq.req ..." line into buf. cid_hex is the connection cid as

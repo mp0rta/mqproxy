@@ -62,14 +62,14 @@ mq_gw_format_req_line(char *buf, size_t cap, const char *cid_hex, uint64_t sid,
     off = append_quoted(buf, cap, off, "path", m->path, MQ_GW_REQ_PATH_CAP);
     if (off < 0) return -1;
 
-    int n =
-        snprintf(buf + off, cap - off,
-                 " req_bytes=%llu resp_bytes=%llu ttfb_ms=%d duration_ms=%d"
-                 " origin_protocol=%s origin_tls=%s cache=%s origin_reuse=%d"
-                 " origin_connect_ms=%d mp_state=%d completion_ms=%d",
-                 (unsigned long long)m->req_bytes, (unsigned long long)m->resp_bytes,
-                 m->ttfb_ms, m->duration_ms, m->origin_protocol, m->origin_tls, m->cache,
-                 m->origin_reuse, m->origin_connect_ms, m->mp_state, m->completion_ms);
+    int n = snprintf(buf + off, cap - off,
+                     " req_bytes=%llu resp_bytes=%llu ttfb_ms=%d duration_ms=%d"
+                     " origin_protocol=%s origin_tls=%s content_encoding=%s cache=%s"
+                     " origin_reuse=%d origin_connect_ms=%d mp_state=%d completion_ms=%d",
+                     (unsigned long long)m->req_bytes, (unsigned long long)m->resp_bytes,
+                     m->ttfb_ms, m->duration_ms, m->origin_protocol, m->origin_tls,
+                     m->content_encoding, m->cache, m->origin_reuse, m->origin_connect_ms,
+                     m->mp_state, m->completion_ms);
     if (n < 0 || off + n >= (int)cap) return -1;
     off += n;
 
