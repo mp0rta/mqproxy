@@ -679,6 +679,8 @@ typedef struct {
     char cls[128];
     int has_class;
 
+    mq_http_ver_t origin_http_version; /* from x-mq-origin-protocol; DEFAULT if absent */
+
     /* forwarded origin headers (minus x-mq-* / hop-by-hop / pseudo). */
     mq_h3_header_t fwd[MQ_GWS_MAX_HDRS];
     char fwd_name[MQ_GWS_MAX_HDRS][128];
@@ -742,6 +744,12 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
         copy_z(ctx->cls, sizeof(ctx->cls), v, vl);
         ctx->has_class = 1;
         return;
+    }
+    if (slice_ieq(n, nl, "x-mq-origin-protocol")) {
+        /* Reuse the shared parser. Client already validated; DEFAULT here = defensive
+         * no-op. */
+        ctx->origin_http_version = mq_gw_parse_http_ver(v, vl);
+        return; /* control header — do NOT forward to origin */
     }
     /* Remember content-length for the upload framing, but do NOT forward it to
      * the origin: CURLOPT_INFILESIZE_LARGE is the sole framing source, so
@@ -956,7 +964,7 @@ gw_dispatch(mq_gw_req_t *r)
     cbs.on_done = origin_on_done;
 
     r->oreq = mq_origin_start(s->origin, url, ctx.method, ctx.fwd, ctx.n_fwd, upload_len,
-                              MQ_HTTP_VER_DEFAULT, &cbs, r);
+                              ctx.origin_http_version, &cbs, r);
     if (!r->oreq) {
         /* Could not start the origin request → 502. Origin side never existed. */
         r->origin_dead = 1;

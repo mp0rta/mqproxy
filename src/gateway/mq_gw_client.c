@@ -536,9 +536,8 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     /* x-mq-origin-protocol: re-emit the RAW validated token onto the tunnel only when a
      * recognized choice was parsed (DEFAULT = no preference, not conveyed). The original
      * X-Mq-* request header is stripped by mq_gw_strip_client; this re-emit carries the
-     * validated selection to the server. (Server-side consumption — re-parse via
-     * mq_gw_parse_http_ver and pass to mq_origin_start in place of the hard-coded
-     * MQ_HTTP_VER_DEFAULT — lands in the next commit.) */
+     * validated selection to the server. (The server reads it in req_each_header, maps it
+     * via mq_gw_parse_http_ver, and passes it to mq_origin_start.) */
     if (xop_ver != MQ_HTTP_VER_DEFAULT && nh < MQ_GW_MAX_SEND_HDRS) {
         char *nb = namebuf + nh * NS;
         char *vb = valbuf + nh * VS;
