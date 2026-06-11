@@ -392,6 +392,9 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
      * (The download-side pseudo + diagnostic headers are validated where they are
      * emitted.) */
     int forward_cookie = mq_gw_forward_cookie_requested(req);
+    size_t xae_vl = 0;
+    const char *xae = find_hdr(req, "x-mq-accept-encoding", &xae_vl);
+    int inject_ae = (xae && xae_vl > 0); /* present AND non-empty (empty => no-op) */
     {
         if (auth_vl >= MQ_GW_HDR_VAL_CAP) {
             gw_reject_write(handle, 400, "Bad Request", "header-too-long");
@@ -400,6 +403,10 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         size_t xcl_vl = 0;
         const char *xcl = find_hdr(req, "x-mq-class", &xcl_vl);
         if (xcl && xcl_vl >= MQ_GW_HDR_VAL_CAP) {
+            gw_reject_write(handle, 400, "Bad Request", "header-too-long");
+            return -1;
+        }
+        if (inject_ae && xae_vl >= MQ_GW_HDR_VAL_CAP) {
             gw_reject_write(handle, 400, "Bad Request", "header-too-long");
             return -1;
         }
@@ -510,6 +517,19 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         }
     }
 
+    /* accept-encoding: emit when X-Mq-Accept-Encoding opt-in is present. */
+    if (inject_ae && nh < MQ_GW_MAX_SEND_HDRS) {
+        char *nb = namebuf + nh * NS;
+        char *vb = valbuf + nh * VS;
+        size_t vl = xae_vl < VS - 1 ? xae_vl : VS - 1;
+        memcpy(nb, "accept-encoding", 16);
+        memcpy(vb, xae, vl);
+        vb[vl] = '\0';
+        hs[nh].name = nb;
+        hs[nh].value = vb;
+        nh++;
+    }
+
     /* content-length: re-emit the recomputed value over the tunnel when the
      * request has a known body length (CL > 0). Design §7.1 ("recompute"): the
      * ORIGINAL Content-Length header is stripped (mq_gw_strip_client) and we
@@ -538,6 +558,7 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         const char *n = req->h[i].n;
         size_t nl = req->h[i].nl;
         if (mq_gw_strip_client(n, nl, forward_cookie)) continue;
+        if (inject_ae && slice_ieq(n, nl, "accept-encoding")) continue;
         char *nb = namebuf + nh * NS;
         char *vb = valbuf + nh * VS;
         size_t cnl = nl < NS - 1 ? nl : NS - 1;
