@@ -114,6 +114,7 @@ UPLOAD_SAVE="${WORK}/upload_saved.bin"   # origin writes PUT bodies here
 ORIGIN_PID=""
 SERVER_PID=""
 CLIENT_PID=""
+DEMO_SERVER_PID=""   # xquic demo_server for the gated case-13 h3 sub-case
 TC_ON=0
 
 cleanup() {
@@ -121,6 +122,7 @@ cleanup() {
     [ -n "${CLIENT_PID}" ] && kill "${CLIENT_PID}" 2>/dev/null
     [ -n "${SERVER_PID}" ] && kill "${SERVER_PID}" 2>/dev/null
     [ -n "${ORIGIN_PID}" ] && kill "${ORIGIN_PID}" 2>/dev/null
+    [ -n "${DEMO_SERVER_PID}" ] && kill "${DEMO_SERVER_PID}" 2>/dev/null
     [ "${TC_ON}" -eq 1 ] && tc qdisc del dev lo root 2>/dev/null
     wait 2>/dev/null
     rm -rf "${WORK}"
@@ -483,8 +485,8 @@ wait_gateway_ready || exit 1
 # the same origin authority (https://127.0.0.1:${ORIGIN_PORT}).
 # RESERVED sizes — the mq.req anchors below grep server.log by resp_bytes, so each
 # reuse-case body size MUST be unique across the whole script: 3MiB/1MiB (case 9),
-# 2MiB/512KiB (case 10), 8MiB (big.bin, cases 1/2/8). A new case reusing one of
-# these sizes in the same server.log epoch could mis-anchor (grep|tail -1).
+# 2MiB/512KiB (case 10), 8MiB (big.bin, cases 1/2/8), 4MiB (case 13). A new case
+# reusing one of these sizes in the same server.log epoch could mis-anchor (grep|tail -1).
 A_SIZE=3145728   # 3 MiB
 B_SIZE=1048576   # 1 MiB
 head -c "${A_SIZE}" /dev/zero >"${WORK}/a.bin"
@@ -579,6 +581,119 @@ done
 [ "${nb}" = "73728" ] || fail 12 "compression OFF: resp_bytes=${nb} (want 73728, uncompressed)"
 ok 12 "X-Mq-Accept-Encoding: gzip compresses the download (content_encoding=gzip, resp_bytes ${cz} < 73728)"
 
+# ── case 13: X-Mq-Origin-Protocol request-preference (no root) ───────────────
+# Phase 6: the caller picks the origin HTTP version via X-Mq-Origin-Protocol.
+# Two things are testable on the system (no-h3) libcurl build:
+#   (a) an invalid value is rejected at the client with 400 + x-mq-error.
+#   (b) a valid h1 selection is read/relayed/mapped end-to-end (WIRING smoke).
+# A real protocol SWITCH (h2/h3) cannot be proven here — the test origin (python
+# http.server) is HTTP/1.1-only, and the no-header default is ALSO h1 — so (b) is
+# honestly a wiring smoke, NOT a switch-proof. The switch-proof is the GATED h3
+# sub-case below (needs an h3-libcurl build + an h3 origin), which SKIPs on this
+# build. (NB: this is the REQUEST-preference role of x-mq-origin-protocol; case 7
+# asserts the orthogonal RESPONSE-diagnostic role — both must hold.)
+
+# ── (a) invalid value → 400 + x-mq-error: bad-origin-protocol ────────────────
+# Mirror case 3's -D + grep pattern: a code-only check would pass on ANY 400, so
+# assert BOTH the 400 code AND the specific x-mq-error reason from the client.
+HV="${WORK}/c13_headers.txt"
+codev="$(curl -s -o /dev/null -D "${HV}" -w '%{http_code}' --max-time 20 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/big.bin" \
+    -H "X-Mq-Origin-Protocol: bogus")"
+[ "${codev}" = "400" ] || fail 13 "invalid X-Mq-Origin-Protocol: code=${codev} (want 400)"
+grep -qi '^x-mq-error:[[:space:]]*bad-origin-protocol' "${HV}" || \
+    fail 13 "invalid X-Mq-Origin-Protocol: x-mq-error missing; got: $(grep -i x-mq-error "${HV}" || echo '<none>')"
+
+# ── (b) h1 wiring smoke — FALSIFIABLE + UNIQUELY ANCHORED ────────────────────
+# Stage a NEW unique-sized file (4 MiB — see the reserved-sizes block above; NOT
+# 8MiB/3MiB/2MiB/1MiB/512KiB/73728) so polling for origin_protocol=h1 cannot
+# mis-anchor onto case 1's default h1 download (which is 8 MiB). Then a REAL
+# 25×0.2s retry loop with fail-on-miss (mirror case 9) — an unconditional ok
+# would prove nothing. Field order is resp_bytes=… … origin_protocol=… so anchor
+# left-to-right (mq_gw_metrics.c).
+C13_SIZE=4194304   # 4 MiB — NEW reserved size (not in {8MiB,3MiB,1MiB,2MiB,512KiB,73728})
+head -c "${C13_SIZE}" /dev/zero >"${WORK}/c13.bin"
+code13="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+    -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/c13.bin" \
+    -H "X-Mq-Origin-Protocol: h1")"
+[ "${code13}" = "200" ] || fail 13 "h1 smoke: fetch HTTP code = ${code13} (want 200)"
+c13_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=4194304 .* origin_protocol=h1' "${WORK}/server.log"; then
+        c13_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${c13_found}" -ne 1 ]; then
+    note "case 13 FAIL: no mq.req with resp_bytes=4194304 origin_protocol=h1 in server.log"
+    note "  mq.req lines in ${WORK}/server.log:"
+    grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+ok 13 "X-Mq-Origin-Protocol: invalid→400 (+x-mq-error); h1→honored (origin_protocol=h1, wiring smoke not switch-proof)"
+
+# ── case 13 (h3): protocol SWITCH proof — GATED on an h3-libcurl build ────────
+# This is the only honest switch-proof: select h3 to an h3-capable origin and
+# assert the server actually negotiated h3 (mq.req origin_protocol=h3). It needs
+#   (1) the gateway built with MQPROXY_H3_CURL (server.log logs "HTTP3=yes" at
+#       startup — mq_origin_curl.c:49), and
+#   (2) an h3 origin: xquic's demo_server (NOT built by default).
+# On the system (no-h3) curl build this SKIPs with a note — it NEVER flips RESULT.
+if grep -q 'HTTP3=yes' "${WORK}/server.log" 2>/dev/null; then
+    XQUIC_BUILD="${REPO_ROOT}/third_party/xquic/build"
+    DEMO_SERVER="${XQUIC_BUILD}/demo_server"
+    if [ ! -x "${DEMO_SERVER}" ]; then
+        note "case 13 (h3): building demo_server (XQC_ENABLE_TESTING)..."
+        ( cmake -S "${REPO_ROOT}/third_party/xquic" -B "${XQUIC_BUILD}" -DXQC_ENABLE_TESTING=ON >/dev/null 2>&1 \
+          && cmake --build "${XQUIC_BUILD}" --target demo_server >/dev/null 2>&1 ) || \
+            note "case 13 (h3): demo_server build failed; see above."
+    fi
+    if [ -x "${DEMO_SERVER}" ]; then
+        H3_DIR="${WORK}/h3origin"
+        mkdir -p "${H3_DIR}"
+        cp "${ORIGIN_CERT}" "${H3_DIR}/server.crt"
+        cp "${ORIGIN_KEY}" "${H3_DIR}/server.key"
+        H3_SIZE=262144   # 256 KiB (gated h3 origin). The h3 grep below needs NO resp_bytes
+                         # anchor: server.log is shared (not re-truncated here), but
+                         # origin_protocol=h3 is emitted ONLY on a real HTTP/3 negotiation,
+                         # which no other case exercises (all hit the h1 python origin).
+        head -c "${H3_SIZE}" /dev/zero >"${H3_DIR}/h3.bin"
+        H3_PORT="$(free_port udp)"
+        # `exec` so $! is the demo_server binary, NOT the subshell wrapper — otherwise
+        # the cleanup-trap kill would hit the wrapper and leak a stray QUIC server.
+        # (cert paths server.crt/server.key are CWD-relative, hence the cd.)
+        ( cd "${H3_DIR}" && exec "${DEMO_SERVER}" -p "${H3_PORT}" -D "${H3_DIR}" >"${WORK}/demo_server.log" 2>&1 ) &
+        DEMO_SERVER_PID=$!
+        # Poll-based readiness (the script's idiom — no fixed sleep): retry the fetch
+        # until demo_server's QUIC listener is up (a not-yet-ready origin → non-200).
+        code13h3=000
+        for _ in $(seq 1 25); do
+            code13h3="$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 \
+                -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+                -H "X-Mq-Target: https://127.0.0.1:${H3_PORT}/h3.bin" \
+                -H "X-Mq-Origin-Protocol: h3")"
+            [ "${code13h3}" = "200" ] && break
+            sleep 0.2
+        done
+        [ "${code13h3}" = "200" ] || fail 13 "h3 switch: fetch HTTP code = ${code13h3} (want 200); demo_server.log: $(tail -3 "${WORK}/demo_server.log" 2>/dev/null | tr '\n' '|')"
+        c13h3_found=0
+        for _ in $(seq 1 25); do
+            if grep -Eq 'mq\.req .* origin_protocol=h3' "${WORK}/server.log"; then
+                c13h3_found=1; break
+            fi
+            sleep 0.2
+        done
+        [ "${c13h3_found}" -eq 1 ] || fail 13 "h3 switch: no mq.req origin_protocol=h3 in server.log"
+        ok 13 "X-Mq-Origin-Protocol: h3 → server negotiated h3 to origin (origin_protocol=h3, SWITCH proof)"
+    else
+        note "case 13 (h3): demo_server unavailable — h3 SWITCH sub-case skipped (does not affect RESULT)."
+    fi
+else
+    note "case 13 (h3): gateway built without h3-libcurl (HTTP3=no) — h3 SWITCH sub-case skipped (does not affect RESULT)."
+fi
+
 # ── case 8: 2-path aggregation smoke (NET_ADMIN-gated) ───────────────────────
 # Requires tc/netem on lo (NET_ADMIN). Without it: a note + continue (cases 1-7
 # already passed → exit 0). With it: shape two equal-rate loopback paths, run a
@@ -595,7 +710,7 @@ fi
 
 if [ "${can_tc}" -ne 1 ]; then
     note "case 8 skipped (no NET_ADMIN): 2-path aggregation smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-7 + cases 9 + 11 + 12; case 8 skipped)."
+    note "RESULT = PASS (cases 1-7 + cases 9 + 11 + 12 + 13; case 8 skipped)."
     exit 0
 fi
 
@@ -821,5 +936,5 @@ else
     TC_ON=0
 fi
 
-note "RESULT = PASS (cases 1-9 + 11 + 12 + L2 case 10 ran under NET_ADMIN)."
+note "RESULT = PASS (cases 1-9 + 11 + 12 + 13 + L2 case 10 ran under NET_ADMIN)."
 exit 0
