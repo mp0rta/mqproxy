@@ -532,10 +532,15 @@ origin_on_body(const uint8_t *p, size_t len, void *u)
     mq_gw_req_t *r = (mq_gw_req_t *)u;
     if (r->h3_dead || !r->req) return 0; /* H3 gone: pause (teardown handles it) */
 
-    /* Capture the negotiated protocol lazily (http_ver is reliable by first body).
-     * It is also re-read on on_done; either is fine. */
-
     if (!r->resp_headers_sent) {
+        /* Capture the negotiated origin HTTP version NOW: CURLINFO_HTTP_VERSION is
+         * valid once headers are parsed, and the synthesized x-mq-origin-protocol
+         * response header (download_send_headers) must report the REAL version.
+         * on_done re-reads it later for the mq.req metrics line; both agree. Without
+         * this, resp_http_ver stays NONE here → http_ver_token defaults to "http/1.1",
+         * mislabeling every h2/h3 origin response (on_done fires too late — the
+         * response headers are already on the wire by the first body chunk). */
+        if (r->oreq) r->resp_http_ver = mq_origin_http_ver(r->oreq);
         if (download_send_headers(r) != 0) {
             /* download_send_headers may have already synthesized a clean error
              * response (oversized origin header → 502 + fin); only reset if it

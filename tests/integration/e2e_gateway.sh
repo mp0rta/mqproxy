@@ -671,13 +671,14 @@ if grep -q 'HTTP3=yes' "${WORK}/server.log" 2>/dev/null; then
         # Poll-based readiness (the script's idiom — no fixed sleep): retry the fetch
         # until demo_server's QUIC listener is up (a not-yet-ready origin → non-200).
         code13h3=000
+        H3_HDR="${WORK}/c13h3_headers.txt"
         # Target https://localhost (NOT 127.0.0.1): the gateway's libcurl sends SNI
         # only for a hostname, never for an IP literal, and xquic's demo_server REQUIRES
         # SNI (its cert callback errors "hostname is NULL" → CERT_CB_ERROR → 504). localhost
         # resolves to 127.0.0.1 where demo_server listens, and the dual-SAN origin cert
         # (IP:127.0.0.1,DNS:localhost) satisfies the gateway's hostname verification for it.
         for _ in $(seq 1 25); do
-            code13h3="$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 \
+            code13h3="$(curl -s -o /dev/null -D "${H3_HDR}" -w '%{http_code}' --max-time 25 \
                 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
                 -H "X-Mq-Target: https://localhost:${H3_PORT}/h3.bin" \
                 -H "X-Mq-Origin-Protocol: h3")"
@@ -685,6 +686,14 @@ if grep -q 'HTTP3=yes' "${WORK}/server.log" 2>/dev/null; then
             sleep 0.2
         done
         [ "${code13h3}" = "200" ] || fail 13 "h3 switch: fetch HTTP code = ${code13h3} (want 200); demo_server.log: $(tail -3 "${WORK}/demo_server.log" 2>/dev/null | tr '\n' '|')"
+        # Response-diagnostic header must ALSO report h3. Regression guard: this header
+        # is synthesized from resp_http_ver, which used to stay NONE until on_done —
+        # AFTER the response headers were already sent on the first body chunk — so
+        # http_ver_token defaulted to "http/1.1", mislabeling every body-bearing h2/h3
+        # response. (The mq.req metrics origin_protocol below is set at close/on_done and
+        # was always correct; only the RESPONSE header was wrong.)
+        grep -qi '^x-mq-origin-protocol:[[:space:]]*h3' "${H3_HDR}" || \
+            fail 13 "h3 switch: response x-mq-origin-protocol not h3; got: $(grep -i x-mq-origin-protocol "${H3_HDR}" || echo '<none>')"
         c13h3_found=0
         for _ in $(seq 1 25); do
             if grep -Eq 'mq\.req .* origin_protocol=h3' "${WORK}/server.log"; then
@@ -693,7 +702,7 @@ if grep -q 'HTTP3=yes' "${WORK}/server.log" 2>/dev/null; then
             sleep 0.2
         done
         [ "${c13h3_found}" -eq 1 ] || fail 13 "h3 switch: no mq.req origin_protocol=h3 in server.log"
-        ok 13 "X-Mq-Origin-Protocol: h3 → server negotiated h3 to origin (origin_protocol=h3, SWITCH proof)"
+        ok 13 "X-Mq-Origin-Protocol: h3 → h3 negotiated (response header=h3 + mq.req origin_protocol=h3, SWITCH proof)"
     else
         note "case 13 (h3): demo_server unavailable — h3 SWITCH sub-case skipped (does not affect RESULT)."
     fi
