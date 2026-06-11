@@ -3,7 +3,20 @@ project(mqproxy VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 include(cmake/BuildSetup.cmake)
-find_package(CURL REQUIRED)
+if(MQPROXY_H3_CURL)
+    add_library(CURL::libcurl SHARED IMPORTED)
+    set_target_properties(CURL::libcurl PROPERTIES
+        IMPORTED_LOCATION "${MQPROXY_H3_CURL}/lib/libcurl.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${MQPROXY_H3_CURL}/include")
+    # RPATH: do NOT use a global set(CMAKE_BUILD_RPATH ...) here — this tree sets a
+    # bare per-target BUILD_RPATH "${XQUIC_BUILD_DIR}" on all 20 executables
+    # (e.g. :355 test_gw_server, :473 mqproxy_cli), and set_target_properties REPLACES
+    # (not appends), so a global value would be dropped. USE_LINK_PATH instead ADDS the
+    # imported .so's directory to each target's RPATH, combining with the per-target value.
+    set(CMAKE_BUILD_RPATH_USE_LINK_PATH ON)
+else()
+    find_package(CURL REQUIRED)
+endif()
 
 add_library(mqproxy STATIC
     src/util/mq_log.c
