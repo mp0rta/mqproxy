@@ -114,6 +114,7 @@ UPLOAD_SAVE="${WORK}/upload_saved.bin"   # origin writes PUT bodies here
 ORIGIN_PID=""
 SERVER_PID=""
 CLIENT_PID=""
+DEMO_SERVER_PID=""   # xquic demo_server for the gated case-13 h3 sub-case
 TC_ON=0
 
 cleanup() {
@@ -121,6 +122,7 @@ cleanup() {
     [ -n "${CLIENT_PID}" ] && kill "${CLIENT_PID}" 2>/dev/null
     [ -n "${SERVER_PID}" ] && kill "${SERVER_PID}" 2>/dev/null
     [ -n "${ORIGIN_PID}" ] && kill "${ORIGIN_PID}" 2>/dev/null
+    [ -n "${DEMO_SERVER_PID}" ] && kill "${DEMO_SERVER_PID}" 2>/dev/null
     [ "${TC_ON}" -eq 1 ] && tc qdisc del dev lo root 2>/dev/null
     wait 2>/dev/null
     rm -rf "${WORK}"
@@ -135,7 +137,7 @@ trap cleanup EXIT INT TERM
 # interpolated into the python source.
 write_origin_py() {
     cat >"${WORK}/origin.py" <<'PY'
-import http.server, os, ssl
+import gzip, http.server, os, ssl
 
 ROOT = os.environ["MQ_ORIGIN_ROOT"]
 SAVE = os.environ["MQ_ORIGIN_SAVE"]
@@ -151,6 +153,29 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/echo-cookie":
+            body = (self.headers.get("Cookie") or "(none)").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/compressible":
+            raw = b"compressible-text-" * 4096  # 73728 bytes, highly compressible
+            ae = self.headers.get("Accept-Encoding") or ""
+            if "gzip" in ae:
+                body = gzip.compress(raw)
+                self.send_response(200)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            return
         path = os.path.join(ROOT, os.path.basename(self.path))
         if not os.path.isfile(path):
             self.send_response(404)
@@ -441,6 +466,241 @@ ok 6 "504 on origin connect timeout (blackhole)"
 
 note "cases 1-7 PASS (${PASS_COUNT}/7 checks)."
 
+# ── case 9: L1 origin-connection reuse proof (no root required) ──────────────
+# Proves that two sequential same-origin requests flip origin_reuse 0→1, which
+# validates both the Task-2 capture wiring and libcurl's implicit keep-alive.
+#
+# COLD conncache: case 6 restarted the server with a short connect timeout;
+# there may be residual connections in the server's libcurl conncache from
+# earlier cases. Restart server+client clean so the conncache starts fresh and
+# server.log is truncated to only case-9 traffic.
+stop_client
+kill "${SERVER_PID}" 2>/dev/null; wait "${SERVER_PID}" 2>/dev/null; SERVER_PID=""
+start_server "" || exit 1
+start_client || exit 1
+wait_gateway_ready || exit 1
+
+# Two test files of DISTINCT sizes — neither 8388608 (8 MiB) nor each other.
+# Reuse is keyed by origin HOST:PORT, not path, so the two files must live at
+# the same origin authority (https://127.0.0.1:${ORIGIN_PORT}).
+# RESERVED sizes — the mq.req anchors below grep server.log by resp_bytes, so each
+# reuse-case body size MUST be unique across the whole script: 3MiB/1MiB (case 9),
+# 2MiB/512KiB (case 10), 8MiB (big.bin, cases 1/2/8), 4MiB (case 13). A new case
+# reusing one of these sizes in the same server.log epoch could mis-anchor (grep|tail -1).
+A_SIZE=3145728   # 3 MiB
+B_SIZE=1048576   # 1 MiB
+head -c "${A_SIZE}" /dev/zero >"${WORK}/a.bin"
+head -c "${B_SIZE}" /dev/zero >"${WORK}/b.bin"
+
+# First request — fresh connection, expect origin_reuse=0.
+RESP9A="${WORK}/c9a_resp.bin"
+code9a="$(curl -s -o "${RESP9A}" -w '%{http_code}' --max-time 30 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/a.bin")"
+[ "${code9a}" = "200" ] || fail 9 "(a) first fetch HTTP code = ${code9a} (want 200)"
+
+# Second request — same origin authority, expect reuse (origin_reuse=1).
+RESP9B="${WORK}/c9b_resp.bin"
+code9b="$(curl -s -o "${RESP9B}" -w '%{http_code}' --max-time 30 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/b.bin")"
+[ "${code9b}" = "200" ] || fail 9 "(b) second fetch HTTP code = ${code9b} (want 200)"
+
+# Poll for the first mq.req (anchored to resp_bytes=3145728, origin_reuse=0).
+reuse_a_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=3145728 .* origin_reuse=0' "${WORK}/server.log"; then
+        reuse_a_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${reuse_a_found}" -ne 1 ]; then
+    note "case 9 FAIL: no mq.req with resp_bytes=3145728 origin_reuse=0 in server.log"
+    note "  mq.req lines in ${WORK}/server.log:"
+    grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+
+# Poll for the second mq.req (anchored to resp_bytes=1048576, origin_reuse=1).
+reuse_b_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=1048576 .* origin_reuse=1' "${WORK}/server.log"; then
+        reuse_b_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${reuse_b_found}" -ne 1 ]; then
+    note "case 9 FAIL: no mq.req with resp_bytes=1048576 origin_reuse=1 in server.log"
+    note "  mq.req lines in ${WORK}/server.log:"
+    grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+
+ok 9 "origin_reuse flips 0->1 on repeat same-origin request (L1 reuse proof)"
+
+# ── case 11: X-Mq-Forward-Cookie forwarding proof (no root required) ─────────
+# Positive: X-Mq-Forward-Cookie: true → origin receives the Cookie header.
+# Negative: no opt-in header → Cookie is stripped before the origin request.
+bodyp="$(curl -s --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/echo-cookie" \
+    -H "X-Mq-Forward-Cookie: true" -H "Cookie: k=v")"
+[ "${bodyp}" = "k=v" ] || fail 11 "forward-cookie ON: origin saw Cookie='${bodyp}' (want k=v)"
+# negative: no opt-in → Cookie stripped client-side
+bodyn="$(curl -s --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/echo-cookie" -H "Cookie: k=v")"
+[ "${bodyn}" = "(none)" ] || fail 11 "forward-cookie OFF: origin saw Cookie='${bodyn}' (want (none))"
+ok 11 "X-Mq-Forward-Cookie: true forwards Cookie to origin; absent strips it"
+
+# ── case 12: X-Mq-Accept-Encoding gzip compression proof (no root required) ──
+# Positive: opt in → origin compresses → mq.req content_encoding=gzip, resp_bytes < raw 73728.
+# Negative: no opt-in → identity → mq.req content_encoding=none, resp_bytes=73728.
+curl -s -o /dev/null --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/compressible" \
+    -H "X-Mq-Accept-Encoding: gzip"
+cz=""
+for _ in $(seq 1 25); do
+    line="$(grep -E 'mq\.req .* path="/compressible" .* content_encoding=gzip' "${WORK}/server.log" | tail -1)"
+    [ -n "${line}" ] && { cz="$(printf '%s' "${line}" | grep -Eo 'resp_bytes=[0-9]+' | cut -d= -f2)"; break; }
+    sleep 0.2
+done
+[ -n "${cz}" ] || fail 12 "compression ON: no mq.req with content_encoding=gzip"
+[ "${cz}" -lt 73728 ] || fail 12 "compression ON: resp_bytes=${cz} not < raw 73728 (not compressed?)"
+# negative: no opt-in → identity → content_encoding=none. Anchor by TARGET path (robust;
+# not by raw size), then assert the size separately.
+curl -s -o /dev/null --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/compressible"
+nb=""
+for _ in $(seq 1 25); do
+    line="$(grep -E 'mq\.req .* path="/compressible" .* content_encoding=none' "${WORK}/server.log" | tail -1)"
+    [ -n "${line}" ] && { nb="$(printf '%s' "${line}" | grep -Eo 'resp_bytes=[0-9]+' | cut -d= -f2)"; break; }
+    sleep 0.2
+done
+[ -n "${nb}" ] || fail 12 "compression OFF: no mq.req for /compressible with content_encoding=none"
+[ "${nb}" = "73728" ] || fail 12 "compression OFF: resp_bytes=${nb} (want 73728, uncompressed)"
+ok 12 "X-Mq-Accept-Encoding: gzip compresses the download (content_encoding=gzip, resp_bytes ${cz} < 73728)"
+
+# ── case 13: X-Mq-Origin-Protocol request-preference (no root) ───────────────
+# Phase 6: the caller picks the origin HTTP version via X-Mq-Origin-Protocol.
+# Two things are testable on the system (no-h3) libcurl build:
+#   (a) an invalid value is rejected at the client with 400 + x-mq-error.
+#   (b) a valid h1 selection is read/relayed/mapped end-to-end (WIRING smoke).
+# A real protocol SWITCH (h2/h3) cannot be proven here — the test origin (python
+# http.server) is HTTP/1.1-only, and the no-header default is ALSO h1 — so (b) is
+# honestly a wiring smoke, NOT a switch-proof. The switch-proof is the GATED h3
+# sub-case below (needs an h3-libcurl build + an h3 origin), which SKIPs on this
+# build. (NB: this is the REQUEST-preference role of x-mq-origin-protocol; case 7
+# asserts the orthogonal RESPONSE-diagnostic role — both must hold.)
+
+# ── (a) invalid value → 400 + x-mq-error: bad-origin-protocol ────────────────
+# Mirror case 3's -D + grep pattern: a code-only check would pass on ANY 400, so
+# assert BOTH the 400 code AND the specific x-mq-error reason from the client.
+HV="${WORK}/c13_headers.txt"
+codev="$(curl -s -o /dev/null -D "${HV}" -w '%{http_code}' --max-time 20 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/big.bin" \
+    -H "X-Mq-Origin-Protocol: bogus")"
+[ "${codev}" = "400" ] || fail 13 "invalid X-Mq-Origin-Protocol: code=${codev} (want 400)"
+grep -qi '^x-mq-error:[[:space:]]*bad-origin-protocol' "${HV}" || \
+    fail 13 "invalid X-Mq-Origin-Protocol: x-mq-error missing; got: $(grep -i x-mq-error "${HV}" || echo '<none>')"
+
+# ── (b) h1 wiring smoke — FALSIFIABLE + UNIQUELY ANCHORED ────────────────────
+# Stage a NEW unique-sized file (4 MiB — see the reserved-sizes block above; NOT
+# 8MiB/3MiB/2MiB/1MiB/512KiB/73728) so polling for origin_protocol=h1 cannot
+# mis-anchor onto case 1's default h1 download (which is 8 MiB). Then a REAL
+# 25×0.2s retry loop with fail-on-miss (mirror case 9) — an unconditional ok
+# would prove nothing. Field order is resp_bytes=… … origin_protocol=… so anchor
+# left-to-right (mq_gw_metrics.c).
+C13_SIZE=4194304   # 4 MiB — NEW reserved size (not in {8MiB,3MiB,1MiB,2MiB,512KiB,73728})
+head -c "${C13_SIZE}" /dev/zero >"${WORK}/c13.bin"
+code13="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+    -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/c13.bin" \
+    -H "X-Mq-Origin-Protocol: h1")"
+[ "${code13}" = "200" ] || fail 13 "h1 smoke: fetch HTTP code = ${code13} (want 200)"
+c13_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=4194304 .* origin_protocol=h1' "${WORK}/server.log"; then
+        c13_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${c13_found}" -ne 1 ]; then
+    note "case 13 FAIL: no mq.req with resp_bytes=4194304 origin_protocol=h1 in server.log"
+    note "  mq.req lines in ${WORK}/server.log:"
+    grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+ok 13 "X-Mq-Origin-Protocol: invalid→400 (+x-mq-error); h1→honored (origin_protocol=h1, wiring smoke not switch-proof)"
+
+# ── case 13 (h3): protocol SWITCH proof — GATED on an h3-libcurl build ────────
+# This is the only honest switch-proof: select h3 to an h3-capable origin and
+# assert the server actually negotiated h3 (mq.req origin_protocol=h3). It needs
+#   (1) the gateway built with MQPROXY_H3_CURL (server.log logs "HTTP3=yes" at
+#       startup — mq_origin_curl.c:49), and
+#   (2) an h3 origin: xquic's demo_server (NOT built by default).
+# On the system (no-h3) curl build this SKIPs with a note — it NEVER flips RESULT.
+if grep -q 'HTTP3=yes' "${WORK}/server.log" 2>/dev/null; then
+    XQUIC_BUILD="${REPO_ROOT}/third_party/xquic/build"
+    # xquic builds demo_server under build/demo/ (the --target demo_server invocation
+    # below emits it there), NOT directly under build/.
+    DEMO_SERVER="${XQUIC_BUILD}/demo/demo_server"
+    if [ ! -x "${DEMO_SERVER}" ]; then
+        note "case 13 (h3): building demo_server (XQC_ENABLE_TESTING)..."
+        ( cmake -S "${REPO_ROOT}/third_party/xquic" -B "${XQUIC_BUILD}" -DXQC_ENABLE_TESTING=ON >/dev/null 2>&1 \
+          && cmake --build "${XQUIC_BUILD}" --target demo_server >/dev/null 2>&1 ) || \
+            note "case 13 (h3): demo_server build failed; see above."
+    fi
+    if [ -x "${DEMO_SERVER}" ]; then
+        H3_DIR="${WORK}/h3origin"
+        mkdir -p "${H3_DIR}"
+        cp "${ORIGIN_CERT}" "${H3_DIR}/server.crt"
+        cp "${ORIGIN_KEY}" "${H3_DIR}/server.key"
+        H3_SIZE=262144   # 256 KiB (gated h3 origin). The h3 grep below needs NO resp_bytes
+                         # anchor: server.log is shared (not re-truncated here), but
+                         # origin_protocol=h3 is emitted ONLY on a real HTTP/3 negotiation,
+                         # which no other case exercises (all hit the h1 python origin).
+        head -c "${H3_SIZE}" /dev/zero >"${H3_DIR}/h3.bin"
+        H3_PORT="$(free_port udp)"
+        # `exec` so $! is the demo_server binary, NOT the subshell wrapper — otherwise
+        # the cleanup-trap kill would hit the wrapper and leak a stray QUIC server.
+        # (cert paths server.crt/server.key are CWD-relative, hence the cd.)
+        ( cd "${H3_DIR}" && exec "${DEMO_SERVER}" -p "${H3_PORT}" -D "${H3_DIR}" >"${WORK}/demo_server.log" 2>&1 ) &
+        DEMO_SERVER_PID=$!
+        # Poll-based readiness (the script's idiom — no fixed sleep): retry the fetch
+        # until demo_server's QUIC listener is up (a not-yet-ready origin → non-200).
+        code13h3=000
+        # Target https://localhost (NOT 127.0.0.1): the gateway's libcurl sends SNI
+        # only for a hostname, never for an IP literal, and xquic's demo_server REQUIRES
+        # SNI (its cert callback errors "hostname is NULL" → CERT_CB_ERROR → 504). localhost
+        # resolves to 127.0.0.1 where demo_server listens, and the dual-SAN origin cert
+        # (IP:127.0.0.1,DNS:localhost) satisfies the gateway's hostname verification for it.
+        for _ in $(seq 1 25); do
+            code13h3="$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 \
+                -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+                -H "X-Mq-Target: https://localhost:${H3_PORT}/h3.bin" \
+                -H "X-Mq-Origin-Protocol: h3")"
+            [ "${code13h3}" = "200" ] && break
+            sleep 0.2
+        done
+        [ "${code13h3}" = "200" ] || fail 13 "h3 switch: fetch HTTP code = ${code13h3} (want 200); demo_server.log: $(tail -3 "${WORK}/demo_server.log" 2>/dev/null | tr '\n' '|')"
+        c13h3_found=0
+        for _ in $(seq 1 25); do
+            if grep -Eq 'mq\.req .* origin_protocol=h3' "${WORK}/server.log"; then
+                c13h3_found=1; break
+            fi
+            sleep 0.2
+        done
+        [ "${c13h3_found}" -eq 1 ] || fail 13 "h3 switch: no mq.req origin_protocol=h3 in server.log"
+        ok 13 "X-Mq-Origin-Protocol: h3 → server negotiated h3 to origin (origin_protocol=h3, SWITCH proof)"
+    else
+        note "case 13 (h3): demo_server unavailable — h3 SWITCH sub-case skipped (does not affect RESULT)."
+    fi
+else
+    note "case 13 (h3): gateway built without h3-libcurl (HTTP3=no) — h3 SWITCH sub-case skipped (does not affect RESULT)."
+fi
+
 # ── case 8: 2-path aggregation smoke (NET_ADMIN-gated) ───────────────────────
 # Requires tc/netem on lo (NET_ADMIN). Without it: a note + continue (cases 1-7
 # already passed → exit 0). With it: shape two equal-rate loopback paths, run a
@@ -457,11 +717,12 @@ fi
 
 if [ "${can_tc}" -ne 1 ]; then
     note "case 8 skipped (no NET_ADMIN): 2-path aggregation smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-7; case 8 skipped)."
+    note "RESULT = PASS (cases 1-7 + cases 9 + 11 + 12 + 13; case 8 skipped)."
     exit 0
 fi
 
-# Restart server+client clean (case 6 left a short-timeout server up).
+# Restart server+client clean (case 9 left a clean server up; restart anyway
+# to isolate case-8 tc shaping from any residual state).
 stop_client
 kill "${SERVER_PID}" 2>/dev/null; wait "${SERVER_PID}" 2>/dev/null; SERVER_PID=""
 
@@ -548,5 +809,139 @@ if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
 fi
 ok 8 "2-path aggregation: both gateway paths carried bytes"
 
-note "RESULT = PASS (cases 1-8)."
+# ── case 10 (L2): netem-shaped origin leg — quantitative timing proof ─────────
+# Proves that a fresh request pays the TCP-handshake penalty (origin_connect_ms
+# reflects the netem delay on the origin TCP leg) while a reused connection
+# skips it entirely (origin_connect_ms=0, origin_reuse=1), and that reused
+# ttfb_ms < fresh ttfb_ms.
+#
+# We shape ONLY the origin TCP leg (dst/src port ${ORIGIN_PORT}, protocol=tcp)
+# so that the QUIC tunnel (UDP, different port) is unaffected. Without an
+# explicit ip protocol match, a filter on the port number alone would also hit
+# the QUIC port if it happened to collide numerically (free_port tcp vs
+# free_port udp are allocated independently).
+#
+# COLD conncache: case 8 may have left a live origin connection in libcurl's
+# pool. Restart server+client AFTER applying the shaping so the first shaped
+# request opens a NEW, delayed connection.
+
+# Clear any tc state case 8 left, then install a fresh single-class HTB+netem
+# on the origin TCP port. Defensively probe tc add; skip L2 if it fails.
+tc qdisc del dev lo root 2>/dev/null || true
+if ! tc qdisc add dev lo root handle 1: htb default 1 2>/dev/null; then
+    # We are past the case-8 gate, so root+tc were ALREADY proven (can_tc=1) and case 8
+    # just used HTB+netem successfully. A failure here is a real problem, NOT a skip —
+    # failing silently would let the final "case 10 ran under NET_ADMIN" RESULT lie.
+    note "case 10 FAIL: tc qdisc add failed after case-8 teardown (root+tc already proven)."
+    exit 1
+else
+    tc class add dev lo parent 1: classid 1:1  htb rate 10gbit ceil 10gbit
+    tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}" quantum 1514
+    tc qdisc add dev lo parent 1:10 handle 10: netem delay "${DELAY}" limit 20000
+    # Match TCP traffic to/from the origin port; explicitly require ip protocol=6
+    # so the filter does NOT accidentally match UDP QUIC traffic on the same port number.
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+        match ip protocol 6 0xff match ip dport "${ORIGIN_PORT}" 0xffff flowid 1:10
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+        match ip protocol 6 0xff match ip sport "${ORIGIN_PORT}" 0xffff flowid 1:10
+    TC_ON=1
+    note "case 10: tc shaping applied (TCP port ${ORIGIN_PORT}, RATE=${RATE} DELAY=${DELAY})."
+
+    # Cold restart after shaping is in place.
+    stop_client
+    kill "${SERVER_PID}" 2>/dev/null; wait "${SERVER_PID}" 2>/dev/null; SERVER_PID=""
+    start_server "" || { note "case 10 FAIL: server restart"; exit 1; }
+    start_client || { note "case 10 FAIL: client restart"; exit 1; }
+    wait_gateway_ready || { note "case 10 FAIL: tunnel not ready"; exit 1; }
+
+    # Two fresh distinct-size files (not used by any prior case):
+    #   c.bin = 2 MiB (2097152)
+    #   d.bin = 512 KiB (524288)
+    C_SIZE=2097152
+    D_SIZE=524288
+    head -c "${C_SIZE}" /dev/zero >"${WORK}/c.bin"
+    head -c "${D_SIZE}" /dev/zero >"${WORK}/d.bin"
+
+    # ── fresh request (c.bin) — must open a new TCP connection to the origin ───
+    RESP10C="${WORK}/c10c_resp.bin"
+    code10c="$(curl -s -o "${RESP10C}" -w '%{http_code}' --max-time 30 \
+        -X POST "http://${GW}/_mqproxy/fetch" \
+        -H "${AUTH}" \
+        -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/c.bin")"
+    [ "${code10c}" = "200" ] || { note "case 10 FAIL: fresh fetch HTTP code = ${code10c} (want 200)"; exit 1; }
+
+    # ── reused request (d.bin) — must reuse the existing origin connection ─────
+    RESP10D="${WORK}/c10d_resp.bin"
+    code10d="$(curl -s -o "${RESP10D}" -w '%{http_code}' --max-time 30 \
+        -X POST "http://${GW}/_mqproxy/fetch" \
+        -H "${AUTH}" \
+        -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/d.bin")"
+    [ "${code10d}" = "200" ] || { note "case 10 FAIL: reused fetch HTTP code = ${code10d} (want 200)"; exit 1; }
+
+    # Poll for both mq.req lines (mq.req fires slightly after curl returns).
+    mq10_fresh_found=0
+    for _ in $(seq 1 25); do
+        if grep -Eq "mq\\.req .* resp_bytes=${C_SIZE} .* origin_connect_ms=[0-9-]+" "${WORK}/server.log"; then
+            mq10_fresh_found=1; break
+        fi
+        sleep 0.2
+    done
+    if [ "${mq10_fresh_found}" -ne 1 ]; then
+        note "case 10 FAIL: no mq.req with resp_bytes=${C_SIZE} in server.log"
+        grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+        exit 1
+    fi
+
+    mq10_reuse_found=0
+    for _ in $(seq 1 25); do
+        if grep -Eq "mq\\.req .* resp_bytes=${D_SIZE} .* origin_reuse=[0-9]+" "${WORK}/server.log"; then
+            mq10_reuse_found=1; break
+        fi
+        sleep 0.2
+    done
+    if [ "${mq10_reuse_found}" -ne 1 ]; then
+        note "case 10 FAIL: no mq.req with resp_bytes=${D_SIZE} in server.log"
+        grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+        exit 1
+    fi
+
+    # ── assert 1: fresh origin_connect_ms > 10 (netem adds ~${DELAY} per RTT) ──
+    fresh_cm="$(grep -Eo "mq\\.req .* resp_bytes=${C_SIZE} .* origin_connect_ms=[0-9-]+" "${WORK}/server.log" \
+        | grep -Eo 'origin_connect_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
+    [ -n "${fresh_cm}" ] || { note "case 10 FAIL: could not extract fresh origin_connect_ms"; exit 1; }
+    [ "${fresh_cm}" -gt 10 ] || { note "case 10 FAIL: fresh origin_connect_ms=${fresh_cm} not > 10 under netem (DELAY=${DELAY})"; exit 1; }
+    note "case 10: fresh origin_connect_ms=${fresh_cm} (> 10, netem confirmed)"
+
+    # ── assert 2: reused origin_reuse=1 and origin_connect_ms=0 ───────────────
+    reuse_flag="$(grep -Eo "mq\\.req .* resp_bytes=${D_SIZE} .* origin_reuse=[0-9]+" "${WORK}/server.log" \
+        | grep -Eo 'origin_reuse=[0-9]+' | tail -1 | cut -d= -f2)"
+    reuse_cm="$(grep -Eo "mq\\.req .* resp_bytes=${D_SIZE} .* origin_connect_ms=[0-9-]+" "${WORK}/server.log" \
+        | grep -Eo 'origin_connect_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
+    [ "${reuse_flag}" = "1" ] || { note "case 10 FAIL: reused request origin_reuse=${reuse_flag} (want 1)"; exit 1; }
+    [ "${reuse_cm}" = "0" ] || { note "case 10 FAIL: reused request origin_connect_ms=${reuse_cm} (want 0)"; exit 1; }
+    note "case 10: reused origin_reuse=1 origin_connect_ms=0 confirmed"
+
+    # ── assert 3: reused ttfb_ms < fresh ttfb_ms ──────────────────────────────
+    # Anchor the whole mq.req LINE on resp_bytes (grep without -o), then extract the
+    # ttfb_ms token from it — ttfb_ms sits IMMEDIATELY after resp_bytes in the line, so
+    # a "resp_bytes=N .* ttfb_ms=N" -o pattern can't match (the ".* " needs a second
+    # separator that the adjacency doesn't provide). Order-independent extraction:
+    fresh_ttfb="$(grep -E "mq\\.req .* resp_bytes=${C_SIZE} " "${WORK}/server.log" \
+        | grep -Eo 'ttfb_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
+    reuse_ttfb="$(grep -E "mq\\.req .* resp_bytes=${D_SIZE} " "${WORK}/server.log" \
+        | grep -Eo 'ttfb_ms=[0-9-]+' | tail -1 | cut -d= -f2)"
+    [ -n "${fresh_ttfb}" ] && [ -n "${reuse_ttfb}" ] || \
+        { note "case 10 FAIL: could not extract ttfb_ms (fresh=${fresh_ttfb} reuse=${reuse_ttfb})"; exit 1; }
+    [ "${reuse_ttfb}" -lt "${fresh_ttfb}" ] || \
+        { note "case 10 FAIL: reused ttfb_ms=${reuse_ttfb} not < fresh ttfb_ms=${fresh_ttfb}"; exit 1; }
+    note "case 10: ttfb_ms fresh=${fresh_ttfb} reuse=${reuse_ttfb} (reuse < fresh confirmed)"
+
+    ok 10 "netem-shaped origin: fresh origin_connect_ms=${fresh_cm} > 10, reuse=0ms, ttfb drop confirmed"
+
+    # Tear down the L2 shaping (cleanup trap also handles TC_ON=1).
+    tc qdisc del dev lo root 2>/dev/null || true
+    TC_ON=0
+fi
+
+note "RESULT = PASS (cases 1-9 + 11 + 12 + 13 + L2 case 10 ran under NET_ADMIN)."
 exit 0

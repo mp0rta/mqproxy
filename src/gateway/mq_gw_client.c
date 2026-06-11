@@ -383,6 +383,22 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         memcpy(method, "GET", 4);
     }
 
+    /* 4a. X-Mq-Origin-Protocol if present: validate via the shared parser. A present,
+     * non-empty, UNRECOGNIZED token is a caller bug → 400 (mirrors the other
+     * control-header validations). Absent / empty → DEFAULT (no preference; not
+     * re-emitted below). */
+    size_t xop_vl = 0;
+    const char *xop = find_hdr(req, "x-mq-origin-protocol", &xop_vl);
+    mq_http_ver_t xop_ver = MQ_HTTP_VER_DEFAULT;
+    if (xop && xop_vl > 0) {
+        xop_ver = mq_gw_parse_http_ver(xop, xop_vl);
+        if (xop_ver ==
+            MQ_HTTP_VER_DEFAULT) { /* present + non-empty + unrecognized = caller bug */
+            gw_reject_write(handle, 400, "Bad Request", "bad-origin-protocol");
+            return -1;
+        }
+    }
+
     /* 4b. Reject (locally, BEFORE opening the H3 request) any header that would
      * not fit the forwarding arena, instead of silently clamping it. The arena
      * slots are MQ_GW_HDR_NAME_CAP name / MQ_GW_HDR_VAL_CAP value, holding cap-1
@@ -391,6 +407,10 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
      * is a corruption / smuggling surface; fail closed with 400 header-too-long.
      * (The download-side pseudo + diagnostic headers are validated where they are
      * emitted.) */
+    int forward_cookie = mq_gw_forward_cookie_requested(req);
+    size_t xae_vl = 0;
+    const char *xae = find_hdr(req, "x-mq-accept-encoding", &xae_vl);
+    int inject_ae = (xae && xae_vl > 0); /* present AND non-empty (empty => no-op) */
     {
         if (auth_vl >= MQ_GW_HDR_VAL_CAP) {
             gw_reject_write(handle, 400, "Bad Request", "header-too-long");
@@ -402,10 +422,14 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
             gw_reject_write(handle, 400, "Bad Request", "header-too-long");
             return -1;
         }
+        if (inject_ae && xae_vl >= MQ_GW_HDR_VAL_CAP) {
+            gw_reject_write(handle, 400, "Bad Request", "header-too-long");
+            return -1;
+        }
         for (size_t i = 0; i < req->nh; i++) {
             const char *n = req->h[i].n;
             size_t nl = req->h[i].nl;
-            if (mq_gw_strip_client(n, nl)) continue;
+            if (mq_gw_strip_client(n, nl, forward_cookie)) continue;
             if (nl >= MQ_GW_HDR_NAME_CAP || req->h[i].vl >= MQ_GW_HDR_VAL_CAP) {
                 gw_reject_write(handle, 400, "Bad Request", "header-too-long");
                 return -1;
@@ -509,6 +533,36 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         }
     }
 
+    /* x-mq-origin-protocol: re-emit the RAW validated token onto the tunnel only when a
+     * recognized choice was parsed (DEFAULT = no preference, not conveyed). The original
+     * X-Mq-* request header is stripped by mq_gw_strip_client; this re-emit carries the
+     * validated selection to the server. (The server reads it in req_each_header, maps it
+     * via mq_gw_parse_http_ver, and passes it to mq_origin_start.) */
+    if (xop_ver != MQ_HTTP_VER_DEFAULT && nh < MQ_GW_MAX_SEND_HDRS) {
+        char *nb = namebuf + nh * NS;
+        char *vb = valbuf + nh * VS;
+        size_t vl = xop_vl < VS - 1 ? xop_vl : VS - 1;
+        memcpy(nb, "x-mq-origin-protocol", 21);
+        memcpy(vb, xop, vl);
+        vb[vl] = '\0';
+        hs[nh].name = nb;
+        hs[nh].value = vb;
+        nh++;
+    }
+
+    /* accept-encoding: emit when X-Mq-Accept-Encoding opt-in is present. */
+    if (inject_ae && nh < MQ_GW_MAX_SEND_HDRS) {
+        char *nb = namebuf + nh * NS;
+        char *vb = valbuf + nh * VS;
+        size_t vl = xae_vl < VS - 1 ? xae_vl : VS - 1;
+        memcpy(nb, "accept-encoding", 16);
+        memcpy(vb, xae, vl);
+        vb[vl] = '\0';
+        hs[nh].name = nb;
+        hs[nh].value = vb;
+        nh++;
+    }
+
     /* content-length: re-emit the recomputed value over the tunnel when the
      * request has a known body length (CL > 0). Design §7.1 ("recompute"): the
      * ORIGINAL Content-Length header is stripped (mq_gw_strip_client) and we
@@ -536,7 +590,8 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     for (size_t i = 0; i < req->nh && nh < MQ_GW_MAX_SEND_HDRS; i++) {
         const char *n = req->h[i].n;
         size_t nl = req->h[i].nl;
-        if (mq_gw_strip_client(n, nl)) continue;
+        if (mq_gw_strip_client(n, nl, forward_cookie)) continue;
+        if (inject_ae && slice_ieq(n, nl, "accept-encoding")) continue;
         char *nb = namebuf + nh * NS;
         char *vb = valbuf + nh * VS;
         size_t cnl = nl < NS - 1 ? nl : NS - 1;

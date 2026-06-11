@@ -386,6 +386,8 @@ typedef struct {
     int done;
     int done_result;
     long done_http_ver;
+    int done_origin_reuse;
+    int done_origin_connect_ms;
 } cap_t;
 
 static void
@@ -444,13 +446,16 @@ cap_pull_body(uint8_t *buf, size_t cap, void *u)
 }
 
 static void
-cap_on_done(int result, long http_ver, long ssl_verify, void *u)
+cap_on_done(int result, long http_ver, long ssl_verify, int origin_reuse,
+            int origin_connect_ms, void *u)
 {
     (void)ssl_verify;
     cap_t *c = (cap_t *)u;
     c->done = 1;
     c->done_result = result;
     c->done_http_ver = http_ver;
+    c->done_origin_reuse = origin_reuse;
+    c->done_origin_connect_ms = origin_connect_ms;
 }
 
 static mq_origin_cbs_t
@@ -505,8 +510,8 @@ test_get_blob(struct event_base *base)
     cap_t c;
     cap_init(&c, N);
     mq_origin_cbs_t cbs = cap_cbs();
-    mq_origin_req_t *r =
-        mq_origin_start(org, make_url(o.port, "/blob"), "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r = mq_origin_start(org, make_url(o.port, "/blob"), "GET", NULL, 0,
+                                         -1, MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     pump_until(base, &c.done, 10000);
@@ -517,6 +522,8 @@ test_get_blob(struct event_base *base)
     MQ_CHECK_EQ_INT(c.saw_tag, 1);
     MQ_CHECK_EQ_INT((long long)c.body_len, (long long)N);
     MQ_CHECK_EQ_INT(c.done_http_ver, CURL_HTTP_VERSION_1_1);
+    MQ_CHECK(c.done_origin_reuse == 0 || c.done_origin_reuse == 1);
+    MQ_CHECK(c.done_origin_connect_ms >= -1);
 
     /* Byte-exact pattern check. */
     int ok = 1;
@@ -544,8 +551,8 @@ test_download_pause(struct event_base *base)
     cap_init(&c, N);
     c.pause_dl_once = 1;
     mq_origin_cbs_t cbs = cap_cbs();
-    mq_origin_req_t *r =
-        mq_origin_start(org, make_url(o.port, "/blob"), "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r = mq_origin_start(org, make_url(o.port, "/blob"), "GET", NULL, 0,
+                                         -1, MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     /* Pump until the pause fires (first on_body returns 0). */
@@ -599,7 +606,7 @@ test_upload_pause(struct event_base *base)
     c.pause_ul_at = 128 * 1024; /* pause once around the midpoint */
     mq_origin_cbs_t cbs = cap_cbs();
     mq_origin_req_t *r = mq_origin_start(org, make_url(o.port, "/up"), "PUT", NULL, 0,
-                                         (int64_t)N, &cbs, &c);
+                                         (int64_t)N, MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
     c.req = r;
 
@@ -638,8 +645,9 @@ test_nxdomain(struct event_base *base)
     cap_t c;
     cap_init(&c, 0);
     mq_origin_cbs_t cbs = cap_cbs();
-    mq_origin_req_t *r = mq_origin_start(org, "http://nxdomain-mqproxy-test.invalid/",
-                                         "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r =
+        mq_origin_start(org, "http://nxdomain-mqproxy-test.invalid/", "GET", NULL, 0, -1,
+                        MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     pump_until(base, &c.done, 10000);
@@ -661,8 +669,8 @@ test_conn_refused(struct event_base *base)
     cap_init(&c, 0);
     mq_origin_cbs_t cbs = cap_cbs();
     /* Port 1 on loopback: nothing listens → ECONNREFUSED. */
-    mq_origin_req_t *r =
-        mq_origin_start(org, "http://127.0.0.1:1/", "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r = mq_origin_start(org, "http://127.0.0.1:1/", "GET", NULL, 0, -1,
+                                         MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     pump_until(base, &c.done, 10000);
@@ -687,8 +695,8 @@ test_abort_midflight(struct event_base *base)
     cap_t c;
     cap_init(&c, 0);
     mq_origin_cbs_t cbs = cap_cbs();
-    mq_origin_req_t *r =
-        mq_origin_start(org, make_url(o.port, "/slow"), "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r = mq_origin_start(org, make_url(o.port, "/slow"), "GET", NULL, 0,
+                                         -1, MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     /* Let the request connect + send, but abort before the 300ms reply timer. */

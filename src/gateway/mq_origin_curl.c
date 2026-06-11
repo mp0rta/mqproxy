@@ -31,8 +31,9 @@
 
 /* ── h3-ready runtime detection (design §5.3) ───────────────────────────────
  * curl_global_init runs once process-wide; we also probe curl_version_info for
- * HTTP/3 support and remember it so easy handles can opt into the h3→h2→h1
- * attempt. System curl 8.5.0 has no HTTP3 — the flag just stays 0 there. */
+ * HTTP/3 support and remember it so a per-request MQ_HTTP_VER_H3 selection is
+ * honored only when this libcurl can actually do HTTP/3 (else it falls back to
+ * the default). System curl 8.5.0 has no HTTP3 — the flag just stays 0 there. */
 static int g_curl_inited;
 static int g_curl_has_http3;
 
@@ -146,6 +147,34 @@ check_multi_info(mq_origin_t *o)
         long ssl_verify = 0;
         curl_easy_getinfo(easy, CURLINFO_SSL_VERIFYRESULT, &ssl_verify);
 
+        long num_connects = 0;
+        CURLcode nc = curl_easy_getinfo(easy, CURLINFO_NUM_CONNECTS, &num_connects);
+        curl_off_t appconnect_us = 0;
+        CURLcode ac = curl_easy_getinfo(easy, CURLINFO_APPCONNECT_TIME_T, &appconnect_us);
+        curl_off_t connect_us = 0;
+        CURLcode cc = curl_easy_getinfo(easy, CURLINFO_CONNECT_TIME_T, &connect_us);
+
+        /* origin_reuse: NUM_CONNECTS==0 means no NEW connection was opened => reused.
+         * Gate on CURLE_OK for BOTH the transfer (result) AND the NUM_CONNECTS getinfo
+         * (nc): a request that failed before connecting ALSO reports 0 connects, and a
+         * getinfo failure would leave num_connects at its 0 init (FALSELY reading as
+         * reuse). origin_connect_ms = origin connection SETUP time in ms: TCP+TLS for an
+         * https origin (APPCONNECT, measured from start through the TLS handshake), and
+         * TCP-only for a plain http:// origin (APPCONNECT is 0 there — no TLS leg — so
+         * fall back to CONNECT_TIME so a fresh http connection is NOT reported as
+         * 0/reuse). 0 on reuse (no new connection); -1 when unknown / getinfo failed. */
+        int origin_reuse = 0;
+        int origin_connect_ms = -1;
+        if (result == CURLE_OK && nc == CURLE_OK) {
+            origin_reuse = (num_connects == 0) ? 1 : 0;
+            if (origin_reuse)
+                origin_connect_ms = 0;
+            else if (ac == CURLE_OK && appconnect_us > 0)
+                origin_connect_ms = (int)(appconnect_us / 1000); /* TCP+TLS (https) */
+            else if (cc == CURLE_OK)
+                origin_connect_ms = (int)(connect_us / 1000); /* TCP only (plain http) */
+        }
+
         if (r) {
             mq_origin_cbs_t cbs = r->cbs;
             void *u = r->u;
@@ -154,7 +183,9 @@ check_multi_info(mq_origin_t *o)
              * handle is removed from the multi inside req_destroy, which is safe
              * here (we are between info_read calls, not mid-action). */
             req_destroy(r);
-            if (cbs.on_done) cbs.on_done((int)result, http_ver, ssl_verify, u);
+            if (cbs.on_done)
+                cbs.on_done((int)result, http_ver, ssl_verify, origin_reuse,
+                            origin_connect_ms, u);
         }
     }
 }
@@ -533,7 +564,7 @@ mq_origin_resume_pull(mq_origin_req_t *r)
 mq_origin_req_t *
 mq_origin_start(mq_origin_t *o, const char *url, const char *method,
                 const mq_h3_header_t *hs, size_t n, int64_t upload_len,
-                const mq_origin_cbs_t *cbs, void *u)
+                mq_http_ver_t http_version, const mq_origin_cbs_t *cbs, void *u)
 {
     if (!o || !url || !method || !cbs) return NULL;
 
@@ -619,11 +650,22 @@ mq_origin_start(mq_origin_t *o, const char *url, const char *method,
     /* Raw passthrough: do NOT advertise Accept-Encoding (no transparent
      * decompression — the gateway forwards the origin's bytes verbatim). */
 
-    /* h3-ready: if libcurl supports HTTP/3, request it with h3→h2→h1 fallback.
-     * On system curl 8.5.0 (no HTTP3) this branch never triggers; the default
-     * (HTTP/2 ALPN with h1 fallback) applies. */
-    if (g_curl_has_http3) {
-        curl_easy_setopt(e, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_3);
+    /* Origin HTTP version: DEFAULT leaves libcurl to choose (TCP h2/h1 ALPN, no QUIC).
+     * H3 only if this libcurl has HTTP/3; otherwise fall back to DEFAULT (graceful). */
+    switch (http_version) {
+    case MQ_HTTP_VER_H1:
+        curl_easy_setopt(e, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
+        break;
+    case MQ_HTTP_VER_H2:
+        curl_easy_setopt(e, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+        break;
+    case MQ_HTTP_VER_H3:
+        if (g_curl_has_http3)
+            curl_easy_setopt(e, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_3);
+        /* else: leave default (graceful fallback) */
+        break;
+    case MQ_HTTP_VER_DEFAULT:
+    default: break; /* libcurl default */
     }
 
     curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, write_cb);

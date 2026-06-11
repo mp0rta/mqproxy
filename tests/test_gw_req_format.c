@@ -15,8 +15,10 @@ base(void)
         .duration_ms = 1200,
         .origin_protocol = "h2",
         .origin_tls = "ok",
+        .content_encoding = "gzip",
         .cache = "bypass",
         .origin_reuse = 0,
+        .origin_connect_ms = 7,
         .mp_state = 1,
         .completion_ms = 1201,
         .reset_reason = "",
@@ -38,7 +40,9 @@ test_clean(void)
     MQ_CHECK(strstr(buf, "resp_bytes=104857600"));
     MQ_CHECK(strstr(buf, "ttfb_ms=42 duration_ms=1200"));
     MQ_CHECK(strstr(buf, "origin_protocol=h2 origin_tls=ok"));
+    MQ_CHECK(strstr(buf, "origin_tls=ok content_encoding=gzip"));
     MQ_CHECK(strstr(buf, "cache=bypass origin_reuse=0"));
+    MQ_CHECK(strstr(buf, "origin_reuse=0 origin_connect_ms=7"));
     MQ_CHECK(strstr(buf, "mp_state=1 completion_ms=1201"));
     MQ_CHECK(strstr(buf, "reset=\"\""));
 }
@@ -92,6 +96,18 @@ test_truncation(void)
 }
 
 static void
+test_reuse(void)
+{
+    char buf[MQ_GW_REQ_LINE_CAP];
+    mq_gw_req_metrics_t m = base();
+    m.origin_reuse = 1;
+    m.origin_connect_ms = 0; /* handshake skipped on a reused connection */
+    int n = mq_gw_format_req_line(buf, sizeof(buf), "0", 9, &m);
+    MQ_CHECK(n > 0);
+    MQ_CHECK(strstr(buf, "origin_reuse=1 origin_connect_ms=0"));
+}
+
+static void
 test_path_cap(void)
 {
     char buf[MQ_GW_REQ_LINE_CAP];
@@ -106,10 +122,23 @@ test_path_cap(void)
     MQ_CHECK(strstr(buf, "\xE2\x80\xA6")); /* truncation marker (U+2026) */
 }
 
+static void
+test_content_encoding_none(void)
+{
+    char buf[MQ_GW_REQ_LINE_CAP];
+    mq_gw_req_metrics_t m = base();
+    m.content_encoding = "none";
+    int n = mq_gw_format_req_line(buf, sizeof(buf), "0", 5, &m);
+    MQ_CHECK(n > 0);
+    MQ_CHECK(strstr(buf, "content_encoding=none"));
+}
+
 MQ_TEST_MAIN({
     test_clean();
     test_unknowns_and_reset();
     test_quote_escape();
     test_truncation();
     test_path_cap();
+    test_reuse();
+    test_content_encoding_none();
 })

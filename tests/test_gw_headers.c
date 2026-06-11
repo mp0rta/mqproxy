@@ -349,7 +349,12 @@ test_method_empty(void)
 static int
 sc(const char *n)
 {
-    return mq_gw_strip_client(n, strlen(n));
+    return mq_gw_strip_client(n, strlen(n), 0);
+}
+static int
+scf(const char *n)
+{
+    return mq_gw_strip_client(n, strlen(n), 1);
 }
 static int
 ss(const char *n)
@@ -525,6 +530,50 @@ test_dup_empty(void)
 }
 
 /* ===================================================================
+ * mq_gw_forward_cookie_requested
+ * =================================================================== */
+
+static void
+test_forward_cookie_requested(void)
+{
+    mq_http1_req_t r;
+    set_h(&r, 0, "X-Mq-Forward-Cookie", "true");
+    r.nh = 1;
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 1);
+    set_h(&r, 0, "x-mq-forward-cookie", "TRUE");
+    r.nh = 1; /* name + value case-insensitive */
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 1);
+    /* No OWS-padded case: mq_http1_parse_req OWS-trims values before the helper sees
+     * them, so the helper sees only trimmed values and intentionally does not trim. */
+    set_h(&r, 0, "X-Mq-Forward-Cookie", "false");
+    r.nh = 1;
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 0);
+    set_h(&r, 0, "X-Mq-Forward-Cookie", "1");
+    r.nh = 1;
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 0);
+    set_h(&r, 0, "X-Mq-Forward-Cookie", "");
+    r.nh = 1;
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 0);
+    set_h(&r, 0, "Accept", "*/*");
+    r.nh = 1; /* header absent */
+    MQ_CHECK_EQ_INT(mq_gw_forward_cookie_requested(&r), 0);
+}
+
+static void
+test_cookie_forward_optin(void)
+{
+    /* forward_cookie=1 (scf): ONLY Cookie's strip decision flips; every other strip is
+     * unaffected by the flag, and the opt-in header itself is still stripped.
+     * (sc("Cookie")==1 for forward_cookie=0 is already covered by test_cookie_asymmetry /
+     * test_strip_client_names.) */
+    MQ_CHECK_EQ_INT(scf("Cookie"), 0); /* opted in: NOT stripped */
+    MQ_CHECK_EQ_INT(scf("cookie"), 0); /* case-insensitive */
+    MQ_CHECK_EQ_INT(scf("Host"), 1);   /* a non-Cookie strip is flag-independent */
+    MQ_CHECK_EQ_INT(scf("X-Mq-Forward-Cookie"),
+                    1); /* the opt-in header is still stripped */
+}
+
+/* ===================================================================
  * mq_gw_status_from_curl
  * =================================================================== */
 
@@ -544,6 +593,24 @@ test_curl_map(void)
     MQ_CHECK_EQ_INT(mq_gw_status_from_curl(999), 502);
     /* 0 (CURLE_OK) — should not be called with success; defensive 502 */
     MQ_CHECK_EQ_INT(mq_gw_status_from_curl(0), 502);
+}
+
+/* ===================================================================
+ * mq_gw_parse_http_ver
+ * =================================================================== */
+
+static void
+test_parse_http_ver(void)
+{
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("h3", 2), MQ_HTTP_VER_H3);
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("H3", 2), MQ_HTTP_VER_H3); /* case-insensitive */
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("h2", 2), MQ_HTTP_VER_H2);
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("h1", 2), MQ_HTTP_VER_H1);
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("h0", 2), MQ_HTTP_VER_DEFAULT); /* unknown */
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("h3x", 3),
+                    MQ_HTTP_VER_DEFAULT); /* valid prefix + junk */
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("http3", 5), MQ_HTTP_VER_DEFAULT); /* unknown */
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("", 0), MQ_HTTP_VER_DEFAULT);      /* empty */
 }
 
 MQ_TEST_MAIN({
@@ -600,6 +667,11 @@ MQ_TEST_MAIN({
     test_dup_non_xmq();
     test_dup_case_insensitive();
     test_dup_empty();
+    /* forward cookie */
+    test_forward_cookie_requested();
+    test_cookie_forward_optin();
     /* curl map */
     test_curl_map();
+    /* origin http version parse */
+    test_parse_http_ver();
 })

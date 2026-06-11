@@ -73,6 +73,16 @@ if(NOT EVENT_CORE_LIB)
                     "Install: apt install libevent-dev")
 endif()
 
+# ---------- HTTP/3-capable libcurl (opt-in) ----------
+#
+# Default build links the system libcurl (no HTTP/3). To speak h3 to an origin
+# (X-Mq-Origin-Protocol: h3), point this at the install prefix produced by
+# scripts/build-h3-curl.sh (ngtcp2 + nghttp3 + libcurl on the pinned BoringSSL):
+#       -DMQPROXY_H3_CURL=${CMAKE_SOURCE_DIR}/third_party/h3-curl/install
+# When set, CMakeLists.txt defines the CURL::libcurl imported target from that
+# prefix instead of find_package(CURL). Unset = system libcurl, unchanged.
+set(MQPROXY_H3_CURL "" CACHE PATH "Install prefix of an HTTP/3-capable libcurl (scripts/build-h3-curl.sh)")
+
 # ---------- Sanitizers ----------
 option(MQPROXY_SANITIZE "Enable ASan + UBSan" OFF)
 

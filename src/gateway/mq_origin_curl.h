@@ -26,7 +26,8 @@
  *   - mq_origin_start returns a borrowed pointer. The owner (the gateway server)
  *     stashes its per-request state in `u`. `u` MUST outlive the request.
  *   - Exactly ONE of two terminal events ends a request:
- *       (a) on_done(result, http_ver, u) fires — the request completed (success
+ *       (a) on_done(result, http_ver, ssl_verify, origin_reuse, origin_connect_ms, u)
+ *           fires — the request completed (success
  *           or error). This is the LAST callback and the LAST time mqproxy
  *           touches the mq_origin_req_t: it is freed immediately after on_done
  *           returns. The owner frees its own `u` state from inside on_done.
@@ -72,7 +73,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "transport/mq_h3.h" /* mq_h3_header_t (reused for request headers) */
+#include "gateway/mq_gw_headers.h" /* mq_http_ver_t (origin HTTP version selection) */
+#include "transport/mq_h3.h"       /* mq_h3_header_t (reused for request headers) */
 
 struct event_base;
 
@@ -108,10 +110,17 @@ typedef struct {
      * CURL_HTTP_VERSION_1_1). ssl_verify is CURLINFO_SSL_VERIFYRESULT (0 =
      * verified ok; nonzero = verify failure). On a connect/handshake failure
      * curl_result is nonzero and ssl_verify may be unset (0) — classify by
-     * curl_result first. This is the LAST touch of the request: the
-     * mq_origin_req_t is freed right after this returns. Fires for completion
-     * and error, but NOT for mq_origin_abort. */
-    void (*on_done)(int curl_result, long http_ver, long ssl_verify, void *u);
+     * curl_result first. origin_reuse is 1 iff the connection was reused
+     * (CURLINFO_NUM_CONNECTS==0 on CURLE_OK), 0 otherwise. origin_connect_ms
+     * is the origin connection setup time in ms: APPCONNECT_TIME_T/1000 (TCP+TLS)
+     * for an https origin, or CONNECT_TIME_T/1000 (TCP only) for a plain http
+     * origin where APPCONNECT is 0; 0 on reuse, -1 when unknown (failed before
+     * connect, or getinfo error). Sub-millisecond setups round to 0. This is the
+     * LAST touch of the request: the mq_origin_req_t is freed right after
+     * this returns. Fires for completion and error, but NOT for
+     * mq_origin_abort. */
+    void (*on_done)(int curl_result, long http_ver, long ssl_verify, int origin_reuse,
+                    int origin_connect_ms, void *u);
 } mq_origin_cbs_t;
 
 /* Create an origin client bound to `base`. ca_file (nullable) sets CURLOPT_CAINFO
@@ -153,11 +162,16 @@ void mq_origin_free(mq_origin_t *o);
  *   MQ_ORIGIN_UPLOAD_CHUNKED   → upload a body of unknown length via chunked TE,
  *                                sourced from cbs->pull_body (EOF = pull -1).
  *   any other negative (e.g. -1) → no request body.
+ * http_version selects the origin HTTP version: MQ_HTTP_VER_DEFAULT leaves
+ * libcurl's own ALPN choice (TCP h2/h1, no QUIC); H1/H2 force that version;
+ * MQ_HTTP_VER_H3 is honored only on an HTTP/3-capable libcurl, else it silently
+ * falls back to DEFAULT (see mq_http_ver_t).
  * cbs/u carry the response callbacks and owner context. Returns the request, or
  * NULL on failure (no callback fires on a NULL return). */
 mq_origin_req_t *mq_origin_start(mq_origin_t *o, const char *url, const char *method,
                                  const mq_h3_header_t *hs, size_t n, int64_t upload_len,
-                                 const mq_origin_cbs_t *cbs, void *u);
+                                 mq_http_ver_t http_version, const mq_origin_cbs_t *cbs,
+                                 void *u);
 
 /* Un-PAUSE the download side after on_body returned 0. Safe to call any time the
  * request is live; the actual curl_easy_pause runs deferred (next loop turn) to

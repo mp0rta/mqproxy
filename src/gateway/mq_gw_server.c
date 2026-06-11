@@ -113,6 +113,9 @@ typedef struct mq_gw_req_s {
     long resp_http_ver;         /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
     int origin_is_tls;          /* origin scheme == https (set in gw_dispatch, Task 5) */
     mq_tls_result_t origin_tls; /* TLS verify outcome, set in origin_on_done */
+    char content_encoding[24];  /* origin response Content-Encoding value; "" => none */
+    int origin_reuse;      /* 0 fresh / not-yet-done; 1 when the origin conn was reused */
+    int origin_connect_ms; /* origin TCP+TLS setup ms; 0 on reuse; -1 unknown */
 
     /* observability (mq.req); captured in gw_dispatch */
     char method[16];
@@ -484,6 +487,12 @@ origin_on_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
      * from the negotiated http_ver, and a duplicate pseudo-ish diagnostic would
      * be confusing. */
     if (slice_ieq(n, nl, "x-mq-origin-protocol")) return;
+    if (slice_ieq(n, nl, "content-encoding")) {
+        size_t cap = sizeof(r->content_encoding) - 1;
+        size_t cn = vl < cap ? vl : cap;
+        memcpy(r->content_encoding, v, cn);
+        r->content_encoding[cn] = '\0';
+    }
     if (r->n_hdrs >= MQ_GWS_MAX_HDRS) {
         r->hdrs_overflow = 1;
         return;
@@ -581,12 +590,15 @@ origin_on_body(const uint8_t *p, size_t len, void *u)
  * (if headers not yet sent) or RESET (if already sent). The origin side is freed
  * right after this returns — null r->oreq + set origin_dead FIRST. */
 static void
-origin_on_done(int curl_result, long http_ver, long ssl_verify, void *u)
+origin_on_done(int curl_result, long http_ver, long ssl_verify, int origin_reuse,
+               int origin_connect_ms, void *u)
 {
     mq_gw_req_t *r = (mq_gw_req_t *)u;
     r->oreq = NULL; /* freed right after on_done returns */
     r->origin_dead = 1;
     r->resp_http_ver = http_ver;
+    r->origin_reuse = origin_reuse;
+    r->origin_connect_ms = origin_connect_ms;
     /* TLS outcome — only meaningful for an https origin. A plain http:// origin
      * (scheme_ok accepts both, mq_gw_server.c:751) has NO TLS result → MQ_TLS_NA,
      * even on success. ok = https + curl OK + verify passed; verify_fail = cert
@@ -667,6 +679,8 @@ typedef struct {
     char cls[128];
     int has_class;
 
+    mq_http_ver_t origin_http_version; /* from x-mq-origin-protocol; DEFAULT if absent */
+
     /* forwarded origin headers (minus x-mq-* / hop-by-hop / pseudo). */
     mq_h3_header_t fwd[MQ_GWS_MAX_HDRS];
     char fwd_name[MQ_GWS_MAX_HDRS][128];
@@ -730,6 +744,12 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
         copy_z(ctx->cls, sizeof(ctx->cls), v, vl);
         ctx->has_class = 1;
         return;
+    }
+    if (slice_ieq(n, nl, "x-mq-origin-protocol")) {
+        /* Reuse the shared parser. Client already validated; DEFAULT here = defensive
+         * no-op. */
+        ctx->origin_http_version = mq_gw_parse_http_ver(v, vl);
+        return; /* control header — do NOT forward to origin */
     }
     /* Remember content-length for the upload framing, but do NOT forward it to
      * the origin: CURLOPT_INFILESIZE_LARGE is the sole framing source, so
@@ -944,7 +964,7 @@ gw_dispatch(mq_gw_req_t *r)
     cbs.on_done = origin_on_done;
 
     r->oreq = mq_origin_start(s->origin, url, ctx.method, ctx.fwd, ctx.n_fwd, upload_len,
-                              &cbs, r);
+                              ctx.origin_http_version, &cbs, r);
     if (!r->oreq) {
         /* Could not start the origin request → 502. Origin side never existed. */
         r->origin_dead = 1;
@@ -1081,8 +1101,10 @@ gw_emit_req_metrics(mq_gw_req_t *r, mq_h3_req_t *hr)
         .origin_protocol =
             origin_proto_token(r->resp_http_ver), /* NONE-default → "none" */
         .origin_tls = otls,
-        .cache = "bypass", /* honest Phase-2 constant; Phase 6 flips */
-        .origin_reuse = 0, /* honest Phase-2 constant; Phase 6 flips */
+        .content_encoding = r->content_encoding[0] ? r->content_encoding : "none",
+        .cache = "bypass",               /* honest Phase-2 constant; Phase 6 flips */
+        .origin_reuse = r->origin_reuse, /* Phase 6: real (was honest 0) */
+        .origin_connect_ms = r->origin_connect_ms, /* Phase 6: 0 reuse / -1 unknown */
         .mp_state = have ? st.mp_state : 0,
         .reset_reason = (have && st.stream_err)
                             ? (st.stream_close_msg ? st.stream_close_msg : "stream-err")
@@ -1184,6 +1206,8 @@ gw_on_new_req(mq_h3_req_t *hr, void *user)
     r->req = hr;
     r->resp_http_ver =
         CURL_HTTP_VERSION_NONE; /* "none" until on_done sets the real version */
+    r->origin_reuse = 0;
+    r->origin_connect_ms = -1;
 
     /* Link before wiring callbacks so teardown can find it. */
     r->next = s->reqs;

@@ -3,7 +3,20 @@ project(mqproxy VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 include(cmake/BuildSetup.cmake)
-find_package(CURL REQUIRED)
+if(MQPROXY_H3_CURL)
+    add_library(CURL::libcurl SHARED IMPORTED)
+    set_target_properties(CURL::libcurl PROPERTIES
+        IMPORTED_LOCATION "${MQPROXY_H3_CURL}/lib/libcurl.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${MQPROXY_H3_CURL}/include")
+    # RPATH: do NOT use a global set(CMAKE_BUILD_RPATH ...) here — this tree sets a
+    # bare per-target BUILD_RPATH "${XQUIC_BUILD_DIR}" on all 20 executables
+    # (e.g. :355 test_gw_server, :473 mqproxy_cli), and set_target_properties REPLACES
+    # (not appends), so a global value would be dropped. USE_LINK_PATH instead ADDS the
+    # imported .so's directory to each target's RPATH, combining with the per-target value.
+    set(CMAKE_BUILD_RPATH_USE_LINK_PATH ON)
+else()
+    find_package(CURL REQUIRED)
+endif()
 
 add_library(mqproxy STATIC
     src/util/mq_log.c
@@ -171,20 +184,23 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     endif()
 
     # Origin TLS cert/key for the gateway e2e (e2e_gateway.sh). UNLIKE test.crt
-    # this cert carries subjectAltName=IP:127.0.0.1 so the gateway server can
-    # verify the origin's hostname (we NEVER disable verification — the server
-    # gets --origin-ca pointed at this cert). Test-only; regenerated if missing.
+    # this cert carries subjectAltName=IP:127.0.0.1,DNS:localhost so the gateway
+    # server can verify the origin's hostname (we NEVER disable verification — the
+    # server gets --origin-ca pointed at this cert). The DNS:localhost SAN lets the
+    # gated h3 sub-case target https://localhost (curl sends SNI for a hostname but
+    # NOT for an IP literal, and xquic's demo_server REQUIRES SNI). Test-only;
+    # regenerated if missing.
     set(MQ_ORIGIN_CERT_FILE "${MQ_CERT_DIR}/origin.crt")
     set(MQ_ORIGIN_KEY_FILE "${MQ_CERT_DIR}/origin.key")
     if(NOT EXISTS "${MQ_ORIGIN_CERT_FILE}" OR NOT EXISTS "${MQ_ORIGIN_KEY_FILE}")
         find_program(OPENSSL_BIN openssl REQUIRED)
         file(MAKE_DIRECTORY "${MQ_CERT_DIR}")
-        message(STATUS "Generating self-signed origin cert (SAN=IP:127.0.0.1) in ${MQ_CERT_DIR}")
+        message(STATUS "Generating self-signed origin cert (SAN=IP:127.0.0.1,DNS:localhost) in ${MQ_CERT_DIR}")
         execute_process(
             COMMAND ${OPENSSL_BIN} req -x509 -newkey rsa:2048 -nodes
                     -keyout "${MQ_ORIGIN_KEY_FILE}" -out "${MQ_ORIGIN_CERT_FILE}"
                     -days 3650 -subj "/CN=mqproxy-origin"
-                    -addext "subjectAltName=IP:127.0.0.1"
+                    -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
             RESULT_VARIABLE _origin_cert_rc
             OUTPUT_QUIET ERROR_QUIET)
         if(NOT _origin_cert_rc EQUAL 0)

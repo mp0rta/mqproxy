@@ -252,6 +252,18 @@ mq_gw_parse_method(const char *s, size_t len, char out[16])
 }
 
 /* ---------------------------------------------------------------------------
+ * Origin HTTP version selection
+ * ------------------------------------------------------------------------- */
+mq_http_ver_t
+mq_gw_parse_http_ver(const char *v, size_t vl)
+{
+    if (name_eq(v, vl, "h3")) return MQ_HTTP_VER_H3;
+    if (name_eq(v, vl, "h2")) return MQ_HTTP_VER_H2;
+    if (name_eq(v, vl, "h1")) return MQ_HTTP_VER_H1;
+    return MQ_HTTP_VER_DEFAULT;
+}
+
+/* ---------------------------------------------------------------------------
  * Strip predicates
  * ------------------------------------------------------------------------- */
 int
@@ -267,13 +279,13 @@ mq_gw_strip_hop(const char *n, size_t nl)
 }
 
 int
-mq_gw_strip_client(const char *n, size_t nl)
+mq_gw_strip_client(const char *n, size_t nl, int forward_cookie)
 {
     if (mq_gw_strip_hop(n, nl)) return 1;
     if (name_has_prefix(n, nl, "X-Mq-")) return 1;
     if (name_eq(n, nl, "Host")) return 1;
     if (name_eq(n, nl, "Content-Length")) return 1;
-    if (name_eq(n, nl, "Cookie")) return 1;
+    if (!forward_cookie && name_eq(n, nl, "Cookie")) return 1;
     return 0;
 }
 
@@ -305,6 +317,20 @@ mq_gw_has_dup_xmq(const mq_http1_req_t *req)
         }
     }
     return 0;
+}
+
+int
+mq_gw_forward_cookie_requested(const mq_http1_req_t *req)
+{
+    for (size_t i = 0; i < req->nh; i++) {
+        if (!name_eq(req->h[i].n, req->h[i].nl, "X-Mq-Forward-Cookie")) continue;
+        /* Values reach us already OWS-trimmed: mq_http1_parse_req (the only producer of
+         * mq_http1_req_t) strips leading/trailing SP/HTAB before storing v/vl, so no trim
+         * is needed here. name_eq is a generic length-checked case-insensitive
+         * slice==cstr. */
+        return name_eq(req->h[i].v, req->h[i].vl, "true");
+    }
+    return 0; /* header absent */
 }
 
 /* ---------------------------------------------------------------------------

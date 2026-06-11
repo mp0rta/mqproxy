@@ -154,3 +154,80 @@ jobs:
           # ctest would pass despite a UB finding — make UBSan actually gate.
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-asan --output-on-failure
+
+  h3-curl:
+    # OPTIONAL / NON-BLOCKING h3-libcurl build (Phase 6 origin-protocol h3).
+    # Builds ngtcp2 + nghttp3 + libcurl on the pinned BoringSSL via
+    # scripts/build-h3-curl.sh, then builds + tests mqproxy linked against it
+    # (-DMQPROXY_H3_CURL). This is heavy (clones + compiles a QUIC+TLS+curl
+    # stack) and version-pin-sensitive (ngtcp2 vs BoringSSL QUIC-API), so it
+    # runs ONLY on manual dispatch and is continue-on-error: it must never block
+    # the default-build CI. The DEFAULT mqproxy build does NOT use this.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libevent-dev golang pkg-config
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (gcc fPIC)
+        id: bssl-cache
+        uses: actions/cache@v5
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-gcc-fpic-v1
+      - name: Clone + build BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl
+          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j"$(nproc)" ssl crypto
+
+      - name: Cache xquic (gcc Release, EVENT_LOG)
+        id: xquic-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-9c95ec7-v1
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_EVENT_LOG=ON \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j"$(nproc)"
+
+      - name: Build h3-libcurl (ngtcp2 + nghttp3 + curl on BoringSSL)
+        run: scripts/build-h3-curl.sh
+
+      - name: Build mqproxy (MQPROXY_H3_CURL)
+        run: |
+          cmake -S . -B build-h3 -DCMAKE_BUILD_TYPE=Release \
+                -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build" \
+                -DMQPROXY_H3_CURL="$PWD/third_party/h3-curl/install"
+          cmake --build build-h3 -j"$(nproc)"
+      - name: Verify RPATH resolves the vendored libcurl
+        run: |
+          bin="$(find build-h3 -type f -name mqproxy | head -1)"
+          echo "binary: $bin"
+          readelf -d "$bin" | grep -iE 'r(un)?path' || { echo "no RPATH/RUNPATH"; exit 1; }
+          readelf -d "$bin" | grep -iE 'r(un)?path' | grep -q "third_party/h3-curl/install/lib" \
+            || { echo "vendored libcurl dir NOT in RPATH"; exit 1; }
+      - name: Unit tests (ctest)
+        run: ctest --test-dir build-h3 --output-on-failure

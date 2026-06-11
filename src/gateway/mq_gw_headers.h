@@ -56,6 +56,26 @@ typedef struct {
 int mq_gw_parse_target(const char *s, size_t len, mq_gw_target_t *out);
 
 /* ---------------------------------------------------------------------------
+ * Origin HTTP version selection
+ * ------------------------------------------------------------------------- */
+
+/* Requested origin HTTP version. DEFAULT = libcurl's own choice (TCP h2/h1
+ * ALPN, NO QUIC attempt). H3 is honored only if libcurl was built with HTTP/3
+ * (else falls back to DEFAULT). */
+typedef enum {
+    MQ_HTTP_VER_DEFAULT = 0,
+    MQ_HTTP_VER_H1,
+    MQ_HTTP_VER_H2,
+    MQ_HTTP_VER_H3
+} mq_http_ver_t;
+
+/* Parse an X-Mq-Origin-Protocol token (case-insensitive "h1"/"h2"/"h3") → mq_http_ver_t.
+ * Absent / empty / unrecognized → MQ_HTTP_VER_DEFAULT. Callers that must REJECT an
+ * invalid value test for DEFAULT on a non-empty input (the client does); the server
+ * treats DEFAULT as "no preference". */
+mq_http_ver_t mq_gw_parse_http_ver(const char *v, size_t vl);
+
+/* ---------------------------------------------------------------------------
  * Token-char classification
  * ------------------------------------------------------------------------- */
 
@@ -81,15 +101,16 @@ int mq_gw_parse_method(const char *s, size_t len, char out[16]);
  *     Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, TE,
  *     Trailer, Transfer-Encoding, Upgrade
  *   client → tunnel  (mq_gw_strip_client): hop-by-hop + X-Mq-* (any) + Host +
- *     Content-Length + Cookie
+ *     Content-Length + Cookie (UNLESS forward_cookie != 0 — the X-Mq-Forward-Cookie
+ *     opt-in; see mq_gw_forward_cookie_requested)
  *   server → origin  (mq_gw_strip_server): hop-by-hop + X-Mq-* (any)
  *
  * NOTE: Authorization is intentionally NOT in any set — it is default-forwarded
- * to the origin so the caller can authenticate to the target. Cookie is
- * stripped client-side only (not server-side); Content-Length is stripped
- * client-side but is NOT hop-by-hop.
+ * to the origin so the caller can authenticate to the target. Cookie is stripped
+ * client-side only (not server-side) and only when forward_cookie == 0;
+ * Content-Length is stripped client-side but is NOT hop-by-hop.
  * ------------------------------------------------------------------------- */
-int mq_gw_strip_client(const char *n, size_t nl);
+int mq_gw_strip_client(const char *n, size_t nl, int forward_cookie);
 int mq_gw_strip_server(const char *n, size_t nl);
 int mq_gw_strip_hop(const char *n, size_t nl);
 
@@ -98,6 +119,13 @@ int mq_gw_strip_hop(const char *n, size_t nl);
  * X-Mq-* names are considered; ordinary duplicate headers (e.g. two Accept)
  * are legal and ignored here. Name comparison is case-insensitive. */
 int mq_gw_has_dup_xmq(const mq_http1_req_t *req);
+
+/* Returns 1 iff the request carries X-Mq-Forward-Cookie whose value (already OWS-trimmed
+ * by mq_http1_parse_req) case-insensitively equals "true" — the spec §14.2 opt-in to
+ * forward the Cookie header upstream. Absent / "false" / "1" / "" / anything else → 0.
+ * (A duplicate X-Mq-Forward-Cookie is rejected upstream by mq_gw_has_dup_xmq; this reads
+ * the first match.) */
+int mq_gw_forward_cookie_requested(const mq_http1_req_t *req);
 
 /* ---------------------------------------------------------------------------
  * Control-byte rejection (defense-in-depth against header / request smuggling)
