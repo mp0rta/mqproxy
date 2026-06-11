@@ -161,24 +161,12 @@ if [ ! -f "$PREFIX/lib/pkgconfig/libngtcp2.pc" ] && \
     cfg_rc=$?
     set -e
     if [ "$cfg_rc" -ne 0 ]; then
-        cat >&2 <<EOF
-
-==============================================================================
-ERROR: ngtcp2's cmake REJECTED the pinned BoringSSL.
-
-This is almost always a QUIC-API incompatibility: ngtcp2 $NGTCP2_TAG needs a
-BoringSSL whose QUIC API matches its crypto backend. The BoringSSL currently
-checked out in the tree is:
-
-    commit:  $BSSL_COMMIT
-    path:    $BSSL_DIR
-
-To resolve, bump the BoringSSL commit (in scripts/build-xquic.sh and the
-.github/workflows/ci.yml cache keys) to one compatible with both xquic AND
-ngtcp2 $NGTCP2_TAG, re-run scripts/build-xquic.sh, then re-run this script.
-Do NOT silently continue — the resulting libcurl would lack working HTTP/3.
-==============================================================================
-EOF
+        echo >&2 ""
+        echo >&2 "ERROR: ngtcp2 ($NGTCP2_TAG) cmake REJECTED the pinned BoringSSL"
+        echo >&2 "  ($BSSL_COMMIT at $BSSL_DIR) — almost always a QUIC-API mismatch."
+        echo >&2 "  Bump the BoringSSL commit (scripts/build-xquic.sh + ci.yml cache keys) to"
+        echo >&2 "  one compatible with both xquic AND ngtcp2 $NGTCP2_TAG, re-run build-xquic.sh,"
+        echo >&2 "  then re-run this. Not continuing — the libcurl would lack working HTTP/3."
         exit 1
     fi
     cmake --build "$NGTCP2_SRC/build" -j"$NPROC"

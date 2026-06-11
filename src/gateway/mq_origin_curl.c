@@ -31,8 +31,9 @@
 
 /* ── h3-ready runtime detection (design §5.3) ───────────────────────────────
  * curl_global_init runs once process-wide; we also probe curl_version_info for
- * HTTP/3 support and remember it so easy handles can opt into the h3→h2→h1
- * attempt. System curl 8.5.0 has no HTTP3 — the flag just stays 0 there. */
+ * HTTP/3 support and remember it so a per-request MQ_HTTP_VER_H3 selection is
+ * honored only when this libcurl can actually do HTTP/3 (else it falls back to
+ * the default). System curl 8.5.0 has no HTTP3 — the flag just stays 0 there. */
 static int g_curl_inited;
 static int g_curl_has_http3;
 
