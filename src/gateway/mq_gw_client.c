@@ -383,6 +383,22 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         memcpy(method, "GET", 4);
     }
 
+    /* 4a. X-Mq-Origin-Protocol if present: validate via the shared parser. A present,
+     * non-empty, UNRECOGNIZED token is a caller bug → 400 (mirrors the other
+     * control-header validations). Absent / empty → DEFAULT (no preference; not
+     * re-emitted below). */
+    size_t xop_vl = 0;
+    const char *xop = find_hdr(req, "x-mq-origin-protocol", &xop_vl);
+    mq_http_ver_t xop_ver = MQ_HTTP_VER_DEFAULT;
+    if (xop && xop_vl > 0) {
+        xop_ver = mq_gw_parse_http_ver(xop, xop_vl);
+        if (xop_ver ==
+            MQ_HTTP_VER_DEFAULT) { /* present + non-empty + unrecognized = caller bug */
+            gw_reject_write(handle, 400, "Bad Request", "bad-origin-protocol");
+            return -1;
+        }
+    }
+
     /* 4b. Reject (locally, BEFORE opening the H3 request) any header that would
      * not fit the forwarding arena, instead of silently clamping it. The arena
      * slots are MQ_GW_HDR_NAME_CAP name / MQ_GW_HDR_VAL_CAP value, holding cap-1
@@ -515,6 +531,24 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
             hs[nh].value = vb;
             nh++;
         }
+    }
+
+    /* x-mq-origin-protocol: re-emit the RAW validated token onto the tunnel only when a
+     * recognized choice was parsed (DEFAULT = no preference, not conveyed). The original
+     * X-Mq-* request header is stripped by mq_gw_strip_client; this re-emit carries the
+     * validated selection to the server. (Server-side consumption — re-parse via
+     * mq_gw_parse_http_ver and pass to mq_origin_start in place of the hard-coded
+     * MQ_HTTP_VER_DEFAULT — lands in the next commit.) */
+    if (xop_ver != MQ_HTTP_VER_DEFAULT && nh < MQ_GW_MAX_SEND_HDRS) {
+        char *nb = namebuf + nh * NS;
+        char *vb = valbuf + nh * VS;
+        size_t vl = xop_vl < VS - 1 ? xop_vl : VS - 1;
+        memcpy(nb, "x-mq-origin-protocol", 21);
+        memcpy(vb, xop, vl);
+        vb[vl] = '\0';
+        hs[nh].name = nb;
+        hs[nh].value = vb;
+        nh++;
     }
 
     /* accept-encoding: emit when X-Mq-Accept-Encoding opt-in is present. */
