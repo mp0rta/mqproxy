@@ -210,22 +210,43 @@ if [ ! -f "$CURL_SRC/configure" ]; then
     tar -C "$SRC_DIR" -xzf "$CURL_TARBALL"
 fi
 
+# Stage a conventional OpenSSL-layout dir for BoringSSL (lib/ + include/), via
+# symlinks (zero copy). EMPIRICAL DISCOVERY (config.log): the env form
+# OPENSSL_CFLAGS/OPENSSL_LIBS is consumed ONLY when curl finds OpenSSL via
+# pkg-config; BoringSSL has no .pc, so `--with-openssl` (bare) fell back to a
+# pathless `-lssl -lcrypto` and curl's QUIC probe link failed with
+# "undefined reference to SSL_set_quic_use_legacy_codepoint" — the symbol IS in
+# libssl.a, the linker just had no -L to find it. `--with-openssl=<dir>` makes
+# curl add `-L<dir>/lib -I<dir>/include`, which resolves it. (Plan Step 1.4:
+# "configure's own error dictates the staged-prefix alternative.")
+BSSL_STAGE="$H3_DIR/boringssl-stage"
+mkdir -p "$BSSL_STAGE/lib"
+ln -sf "$BSSL_BUILD/libssl.a" "$BSSL_STAGE/lib/libssl.a"
+ln -sf "$BSSL_BUILD/libcrypto.a" "$BSSL_STAGE/lib/libcrypto.a"
+ln -sfn "$BSSL_INCLUDE" "$BSSL_STAGE/include"
+
 if [ ! -x "$PREFIX/bin/curl" ] || ! "$PREFIX/bin/curl" --version 2>/dev/null | grep -qi HTTP3; then
     echo "=== Building libcurl $CURL_VER (--enable-shared, h3 via ngtcp2/nghttp3) ==="
     # ngtcp2/nghttp3 are found via PKG_CONFIG_PATH ($PREFIX/lib*/pkgconfig).
-    # BoringSSL has no .pc → feed it via OPENSSL_CFLAGS/OPENSSL_LIBS.
+    # BoringSSL is fed as a path prefix (see staging note above).
+    # BoringSSL's libssl.a/libcrypto.a are C++ ARCHIVES (built from .cc) that
+    # reference the C++ runtime (__cxa_*, std::exception vtables, operator
+    # delete, __gxx_personality_v0). curl's autoconf probes link with the C
+    # driver and no C++ runtime, so "checking for SSL_connect in -lssl" fails
+    # with a wall of undefined C++ symbols → "OpenSSL libs not found". Feed the
+    # C++ runtime + pthread via LIBS so the probes (and the final libcurl.so)
+    # link. (This tree's other targets likewise link `stdc++` — CMakeLists.txt.)
     (
         cd "$CURL_SRC"
         ./configure \
             --prefix="$PREFIX" \
             --enable-shared \
             --disable-static \
-            --with-openssl \
+            --with-openssl="$BSSL_STAGE" \
             --with-ngtcp2 \
             --with-nghttp3 \
             --without-libpsl \
-            OPENSSL_CFLAGS="-I$BSSL_INCLUDE" \
-            OPENSSL_LIBS="$BSSL_BUILD/libssl.a $BSSL_BUILD/libcrypto.a"
+            LIBS="-lstdc++ -lpthread"
         make -j"$NPROC"
         make install
     )
