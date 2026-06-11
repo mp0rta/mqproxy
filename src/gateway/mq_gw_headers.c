@@ -252,6 +252,18 @@ mq_gw_parse_method(const char *s, size_t len, char out[16])
 }
 
 /* ---------------------------------------------------------------------------
+ * Origin HTTP version selection
+ * ------------------------------------------------------------------------- */
+mq_http_ver_t
+mq_gw_parse_http_ver(const char *v, size_t vl)
+{
+    if (name_eq(v, vl, "h3")) return MQ_HTTP_VER_H3;
+    if (name_eq(v, vl, "h2")) return MQ_HTTP_VER_H2;
+    if (name_eq(v, vl, "h1")) return MQ_HTTP_VER_H1;
+    return MQ_HTTP_VER_DEFAULT;
+}
+
+/* ---------------------------------------------------------------------------
  * Strip predicates
  * ------------------------------------------------------------------------- */
 int

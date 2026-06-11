@@ -595,6 +595,22 @@ test_curl_map(void)
     MQ_CHECK_EQ_INT(mq_gw_status_from_curl(0), 502);
 }
 
+/* ===================================================================
+ * mq_gw_parse_http_ver
+ * =================================================================== */
+
+static void
+test_parse_http_ver(void)
+{
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("h3", 2), MQ_HTTP_VER_H3);
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("H3", 2), MQ_HTTP_VER_H3); /* case-insensitive */
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("h2", 2), MQ_HTTP_VER_H2);
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("h1", 2), MQ_HTTP_VER_H1);
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("h0", 2), MQ_HTTP_VER_DEFAULT);    /* unknown */
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("http3", 5), MQ_HTTP_VER_DEFAULT); /* unknown */
+    MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("", 0), MQ_HTTP_VER_DEFAULT);      /* empty */
+}
+
 MQ_TEST_MAIN({
     /* target */
     test_target_https_full();
@@ -654,4 +670,6 @@ MQ_TEST_MAIN({
     test_cookie_forward_optin();
     /* curl map */
     test_curl_map();
+    /* origin http version parse */
+    test_parse_http_ver();
 })

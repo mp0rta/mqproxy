@@ -69,6 +69,12 @@ typedef enum {
     MQ_HTTP_VER_H3
 } mq_http_ver_t;
 
+/* Parse an X-Mq-Origin-Protocol token (case-insensitive "h1"/"h2"/"h3") → mq_http_ver_t.
+ * Absent / empty / unrecognized → MQ_HTTP_VER_DEFAULT. Callers that must REJECT an
+ * invalid value test for DEFAULT on a non-empty input (the client does); the server
+ * treats DEFAULT as "no preference". */
+mq_http_ver_t mq_gw_parse_http_ver(const char *v, size_t vl);
+
 /* ---------------------------------------------------------------------------
  * Token-char classification
  * ------------------------------------------------------------------------- */
