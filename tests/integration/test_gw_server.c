@@ -510,8 +510,8 @@ test_get_blob(struct event_base *base)
     cap_t c;
     cap_init(&c, N);
     mq_origin_cbs_t cbs = cap_cbs();
-    mq_origin_req_t *r =
-        mq_origin_start(org, make_url(o.port, "/blob"), "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r = mq_origin_start(org, make_url(o.port, "/blob"), "GET", NULL, 0,
+                                         -1, MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     pump_until(base, &c.done, 10000);
@@ -551,8 +551,8 @@ test_download_pause(struct event_base *base)
     cap_init(&c, N);
     c.pause_dl_once = 1;
     mq_origin_cbs_t cbs = cap_cbs();
-    mq_origin_req_t *r =
-        mq_origin_start(org, make_url(o.port, "/blob"), "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r = mq_origin_start(org, make_url(o.port, "/blob"), "GET", NULL, 0,
+                                         -1, MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     /* Pump until the pause fires (first on_body returns 0). */
@@ -606,7 +606,7 @@ test_upload_pause(struct event_base *base)
     c.pause_ul_at = 128 * 1024; /* pause once around the midpoint */
     mq_origin_cbs_t cbs = cap_cbs();
     mq_origin_req_t *r = mq_origin_start(org, make_url(o.port, "/up"), "PUT", NULL, 0,
-                                         (int64_t)N, &cbs, &c);
+                                         (int64_t)N, MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
     c.req = r;
 
@@ -645,8 +645,9 @@ test_nxdomain(struct event_base *base)
     cap_t c;
     cap_init(&c, 0);
     mq_origin_cbs_t cbs = cap_cbs();
-    mq_origin_req_t *r = mq_origin_start(org, "http://nxdomain-mqproxy-test.invalid/",
-                                         "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r =
+        mq_origin_start(org, "http://nxdomain-mqproxy-test.invalid/", "GET", NULL, 0, -1,
+                        MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     pump_until(base, &c.done, 10000);
@@ -668,8 +669,8 @@ test_conn_refused(struct event_base *base)
     cap_init(&c, 0);
     mq_origin_cbs_t cbs = cap_cbs();
     /* Port 1 on loopback: nothing listens → ECONNREFUSED. */
-    mq_origin_req_t *r =
-        mq_origin_start(org, "http://127.0.0.1:1/", "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r = mq_origin_start(org, "http://127.0.0.1:1/", "GET", NULL, 0, -1,
+                                         MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     pump_until(base, &c.done, 10000);
@@ -694,8 +695,8 @@ test_abort_midflight(struct event_base *base)
     cap_t c;
     cap_init(&c, 0);
     mq_origin_cbs_t cbs = cap_cbs();
-    mq_origin_req_t *r =
-        mq_origin_start(org, make_url(o.port, "/slow"), "GET", NULL, 0, -1, &cbs, &c);
+    mq_origin_req_t *r = mq_origin_start(org, make_url(o.port, "/slow"), "GET", NULL, 0,
+                                         -1, MQ_HTTP_VER_DEFAULT, &cbs, &c);
     MQ_CHECK(r != NULL);
 
     /* Let the request connect + send, but abort before the 300ms reply timer. */

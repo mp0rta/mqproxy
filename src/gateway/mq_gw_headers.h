@@ -56,6 +56,20 @@ typedef struct {
 int mq_gw_parse_target(const char *s, size_t len, mq_gw_target_t *out);
 
 /* ---------------------------------------------------------------------------
+ * Origin HTTP version selection
+ * ------------------------------------------------------------------------- */
+
+/* Requested origin HTTP version. DEFAULT = libcurl's own choice (TCP h2/h1
+ * ALPN, NO QUIC attempt). H3 is honored only if libcurl was built with HTTP/3
+ * (else falls back to DEFAULT). */
+typedef enum {
+    MQ_HTTP_VER_DEFAULT = 0,
+    MQ_HTTP_VER_H1,
+    MQ_HTTP_VER_H2,
+    MQ_HTTP_VER_H3
+} mq_http_ver_t;
+
+/* ---------------------------------------------------------------------------
  * Token-char classification
  * ------------------------------------------------------------------------- */
 

@@ -956,7 +956,7 @@ gw_dispatch(mq_gw_req_t *r)
     cbs.on_done = origin_on_done;
 
     r->oreq = mq_origin_start(s->origin, url, ctx.method, ctx.fwd, ctx.n_fwd, upload_len,
-                              &cbs, r);
+                              MQ_HTTP_VER_DEFAULT, &cbs, r);
     if (!r->oreq) {
         /* Could not start the origin request → 502. Origin side never existed. */
         r->origin_dead = 1;

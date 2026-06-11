@@ -563,7 +563,7 @@ mq_origin_resume_pull(mq_origin_req_t *r)
 mq_origin_req_t *
 mq_origin_start(mq_origin_t *o, const char *url, const char *method,
                 const mq_h3_header_t *hs, size_t n, int64_t upload_len,
-                const mq_origin_cbs_t *cbs, void *u)
+                mq_http_ver_t http_version, const mq_origin_cbs_t *cbs, void *u)
 {
     if (!o || !url || !method || !cbs) return NULL;
 
@@ -649,11 +649,22 @@ mq_origin_start(mq_origin_t *o, const char *url, const char *method,
     /* Raw passthrough: do NOT advertise Accept-Encoding (no transparent
      * decompression — the gateway forwards the origin's bytes verbatim). */
 
-    /* h3-ready: if libcurl supports HTTP/3, request it with h3→h2→h1 fallback.
-     * On system curl 8.5.0 (no HTTP3) this branch never triggers; the default
-     * (HTTP/2 ALPN with h1 fallback) applies. */
-    if (g_curl_has_http3) {
-        curl_easy_setopt(e, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_3);
+    /* Origin HTTP version: DEFAULT leaves libcurl to choose (TCP h2/h1 ALPN, no QUIC).
+     * H3 only if this libcurl has HTTP/3; otherwise fall back to DEFAULT (graceful). */
+    switch (http_version) {
+    case MQ_HTTP_VER_H1:
+        curl_easy_setopt(e, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
+        break;
+    case MQ_HTTP_VER_H2:
+        curl_easy_setopt(e, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+        break;
+    case MQ_HTTP_VER_H3:
+        if (g_curl_has_http3)
+            curl_easy_setopt(e, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_3);
+        /* else: leave default (graceful fallback) */
+        break;
+    case MQ_HTTP_VER_DEFAULT:
+    default: break; /* libcurl default */
     }
 
     curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, write_cb);
