@@ -184,20 +184,23 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     endif()
 
     # Origin TLS cert/key for the gateway e2e (e2e_gateway.sh). UNLIKE test.crt
-    # this cert carries subjectAltName=IP:127.0.0.1 so the gateway server can
-    # verify the origin's hostname (we NEVER disable verification — the server
-    # gets --origin-ca pointed at this cert). Test-only; regenerated if missing.
+    # this cert carries subjectAltName=IP:127.0.0.1,DNS:localhost so the gateway
+    # server can verify the origin's hostname (we NEVER disable verification — the
+    # server gets --origin-ca pointed at this cert). The DNS:localhost SAN lets the
+    # gated h3 sub-case target https://localhost (curl sends SNI for a hostname but
+    # NOT for an IP literal, and xquic's demo_server REQUIRES SNI). Test-only;
+    # regenerated if missing.
     set(MQ_ORIGIN_CERT_FILE "${MQ_CERT_DIR}/origin.crt")
     set(MQ_ORIGIN_KEY_FILE "${MQ_CERT_DIR}/origin.key")
     if(NOT EXISTS "${MQ_ORIGIN_CERT_FILE}" OR NOT EXISTS "${MQ_ORIGIN_KEY_FILE}")
         find_program(OPENSSL_BIN openssl REQUIRED)
         file(MAKE_DIRECTORY "${MQ_CERT_DIR}")
-        message(STATUS "Generating self-signed origin cert (SAN=IP:127.0.0.1) in ${MQ_CERT_DIR}")
+        message(STATUS "Generating self-signed origin cert (SAN=IP:127.0.0.1,DNS:localhost) in ${MQ_CERT_DIR}")
         execute_process(
             COMMAND ${OPENSSL_BIN} req -x509 -newkey rsa:2048 -nodes
                     -keyout "${MQ_ORIGIN_KEY_FILE}" -out "${MQ_ORIGIN_CERT_FILE}"
                     -days 3650 -subj "/CN=mqproxy-origin"
-                    -addext "subjectAltName=IP:127.0.0.1"
+                    -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
             RESULT_VARIABLE _origin_cert_rc
             OUTPUT_QUIET ERROR_QUIET)
         if(NOT _origin_cert_rc EQUAL 0)

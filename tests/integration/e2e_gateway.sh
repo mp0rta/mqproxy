@@ -643,7 +643,9 @@ ok 13 "X-Mq-Origin-Protocol: invalid→400 (+x-mq-error); h1→honored (origin_p
 # On the system (no-h3) curl build this SKIPs with a note — it NEVER flips RESULT.
 if grep -q 'HTTP3=yes' "${WORK}/server.log" 2>/dev/null; then
     XQUIC_BUILD="${REPO_ROOT}/third_party/xquic/build"
-    DEMO_SERVER="${XQUIC_BUILD}/demo_server"
+    # xquic builds demo_server under build/demo/ (the --target demo_server invocation
+    # below emits it there), NOT directly under build/.
+    DEMO_SERVER="${XQUIC_BUILD}/demo/demo_server"
     if [ ! -x "${DEMO_SERVER}" ]; then
         note "case 13 (h3): building demo_server (XQC_ENABLE_TESTING)..."
         ( cmake -S "${REPO_ROOT}/third_party/xquic" -B "${XQUIC_BUILD}" -DXQC_ENABLE_TESTING=ON >/dev/null 2>&1 \
@@ -669,10 +671,15 @@ if grep -q 'HTTP3=yes' "${WORK}/server.log" 2>/dev/null; then
         # Poll-based readiness (the script's idiom — no fixed sleep): retry the fetch
         # until demo_server's QUIC listener is up (a not-yet-ready origin → non-200).
         code13h3=000
+        # Target https://localhost (NOT 127.0.0.1): the gateway's libcurl sends SNI
+        # only for a hostname, never for an IP literal, and xquic's demo_server REQUIRES
+        # SNI (its cert callback errors "hostname is NULL" → CERT_CB_ERROR → 504). localhost
+        # resolves to 127.0.0.1 where demo_server listens, and the dual-SAN origin cert
+        # (IP:127.0.0.1,DNS:localhost) satisfies the gateway's hostname verification for it.
         for _ in $(seq 1 25); do
             code13h3="$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 \
                 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
-                -H "X-Mq-Target: https://127.0.0.1:${H3_PORT}/h3.bin" \
+                -H "X-Mq-Target: https://localhost:${H3_PORT}/h3.bin" \
                 -H "X-Mq-Origin-Protocol: h3")"
             [ "${code13h3}" = "200" ] && break
             sleep 0.2
