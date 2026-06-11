@@ -113,6 +113,7 @@ typedef struct mq_gw_req_s {
     long resp_http_ver;         /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
     int origin_is_tls;          /* origin scheme == https (set in gw_dispatch, Task 5) */
     mq_tls_result_t origin_tls; /* TLS verify outcome, set in origin_on_done */
+    char content_encoding[24];  /* origin response Content-Encoding value; "" => none */
     int origin_reuse;      /* 0 fresh / not-yet-done; 1 when the origin conn was reused */
     int origin_connect_ms; /* origin TCP+TLS setup ms; 0 on reuse; -1 unknown */
 
@@ -486,6 +487,12 @@ origin_on_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
      * from the negotiated http_ver, and a duplicate pseudo-ish diagnostic would
      * be confusing. */
     if (slice_ieq(n, nl, "x-mq-origin-protocol")) return;
+    if (slice_ieq(n, nl, "content-encoding")) {
+        size_t cap = sizeof(r->content_encoding) - 1;
+        size_t cn = vl < cap ? vl : cap;
+        memcpy(r->content_encoding, v, cn);
+        r->content_encoding[cn] = '\0';
+    }
     if (r->n_hdrs >= MQ_GWS_MAX_HDRS) {
         r->hdrs_overflow = 1;
         return;
@@ -1086,6 +1093,7 @@ gw_emit_req_metrics(mq_gw_req_t *r, mq_h3_req_t *hr)
         .origin_protocol =
             origin_proto_token(r->resp_http_ver), /* NONE-default → "none" */
         .origin_tls = otls,
+        .content_encoding = r->content_encoding[0] ? r->content_encoding : "none",
         .cache = "bypass",               /* honest Phase-2 constant; Phase 6 flips */
         .origin_reuse = r->origin_reuse, /* Phase 6: real (was honest 0) */
         .origin_connect_ms = r->origin_connect_ms, /* Phase 6: 0 reuse / -1 unknown */
