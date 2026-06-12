@@ -122,4 +122,10 @@ unsigned mq_gw_server_live_reqs(const mq_gw_server_t *s);
  * Pass on=1 to enable, on=0 to disable. Safe on NULL (no-op). */
 void mq_gw_server_set_request_metrics(mq_gw_server_t *s, int on);
 
+/* Enable (or reconfigure) the in-memory origin response cache, bounded to
+ * `max_bytes` total. max_bytes == 0 disables it (frees any existing cache, the
+ * default). The per-object cap is min(max_bytes, 4 MiB) floored at one recv
+ * chunk. Opt-in; off by default. Idempotent. Safe on NULL (no-op). */
+void mq_gw_server_set_cache(mq_gw_server_t *s, size_t max_bytes);
+
 #endif /* MQ_GATEWAY_MQ_GW_SERVER_H */

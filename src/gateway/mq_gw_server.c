@@ -39,13 +39,16 @@
  */
 #include "gateway/mq_gw_server.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <curl/curl.h>
 #include <event2/event.h>
 
+#include "gateway/mq_gw_cache.h"
 #include "gateway/mq_gw_headers.h"
 #include "gateway/mq_gw_metrics.h"
 #include "gateway/mq_origin_curl.h"
@@ -62,6 +65,18 @@
 /* Max forwarded origin request headers (the request's non-stripped headers).
  * xqc delivers a bounded header set; 64 is comfortable for the MVP. */
 #define MQ_GWS_MAX_HDRS 64
+
+/* Monotonic millisecond clock for the cache's freshness/LRU accounting (the
+ * cache itself is clock-free — callers inject now_ms). Single caller, so a
+ * file-static rather than a shared util header. */
+static uint64_t gw_now_ms(void) __attribute__((unused));
+static uint64_t
+gw_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 /* ── TLS outcome (origin_tls field) ─────────────────────────────────────────*/
 
@@ -108,9 +123,18 @@ typedef struct mq_gw_req_s {
     int pull_paused;  /* pull_body returned 0 (PAUSE); resume when spill refills */
 
     /* ── download (junction #4): origin response → H3 response ── */
-    int resp_headers_sent;      /* we sent the H3 response header section */
-    int resp_status;            /* origin http_status (from on_status) */
-    long resp_http_ver;         /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
+    int resp_headers_sent; /* we sent the H3 response header section */
+    int resp_status;       /* origin http_status (from on_status) */
+    long resp_http_ver;    /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
+
+    /* ── cacheability (Phase 6; set but unread until the STORE/HIT task) ── */
+    unsigned cache_ttl_s;  /* request X-Mq-Cache opt-in TTL (0 = not opted in) */
+    int has_authorization; /* request carried an Authorization header */
+    int cc_uncacheable;    /* response Cache-Control: no-store/private/no-cache */
+    long cc_max_age;       /* response max-age/s-maxage (smaller of the two); -1 absent */
+    int has_set_cookie;    /* response carried a Set-Cookie header */
+    int has_vary;          /* response carried a Vary header */
+
     int origin_is_tls;          /* origin scheme == https (set in gw_dispatch, Task 5) */
     mq_tls_result_t origin_tls; /* TLS verify outcome, set in origin_on_done */
     char content_encoding[24];  /* origin response Content-Encoding value; "" => none */
@@ -178,6 +202,10 @@ struct mq_gw_server_s {
     mq_gw_req_t *reqs; /* intrusive list of live per-request states */
 
     int request_metrics; /* emit mq.req per-request line (opt-in; default 0) */
+
+    /* In-memory origin response cache (opt-in via --cache-max-bytes; NULL when
+     * disabled = default). Owned: freed in mq_gw_server_free. */
+    mq_gw_cache_t *cache;
 };
 
 /* ── forward decls ──────────────────────────────────────────────────────────*/
@@ -466,6 +494,76 @@ download_flush(mq_gw_req_t *r)
     }
 }
 
+/* Case-insensitive search for `needle` (lowercase literal) in the value slice
+ * [v, v+vl). Returns a pointer to the match (within v) or NULL. Local + simple
+ * (the value is short; this runs once per cache-control header). */
+static const char *
+ci_memmem(const char *v, size_t vl, const char *needle)
+{
+    size_t nl = strlen(needle);
+    if (nl == 0 || nl > vl) return NULL;
+    for (size_t i = 0; i + nl <= vl; i++) {
+        size_t j = 0;
+        for (; j < nl; j++) {
+            char a = v[i + j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (a != needle[j]) break;
+        }
+        if (j == nl) return v + i;
+    }
+    return NULL;
+}
+
+/* Parse the delta-seconds at `p` (just past a `…age=`), within the slice ending
+ * at `end`. Returns the non-negative value, or -1 if no leading digit. Stops at
+ * the first non-digit (',' / ' ' / end). Caps at INT32_MAX (still "cacheable"). */
+static long
+cc_parse_delta(const char *p, const char *end)
+{
+    if (p >= end || *p < '0' || *p > '9') return -1;
+    long n = 0;
+    for (; p < end && *p >= '0' && *p <= '9'; p++) {
+        n = n * 10 + (*p - '0');
+        if (n > 2147483647L) return 2147483647L; /* clamp; still "cacheable, large" */
+    }
+    return n;
+}
+
+/* Fold one parsed delta into cc_max_age, keeping the SMALLER of any already-set
+ * value and this one (the more conservative freshness bound). */
+static void
+cc_take_min_age(mq_gw_req_t *r, long d)
+{
+    if (d >= 0 && (r->cc_max_age < 0 || d < r->cc_max_age)) r->cc_max_age = d;
+}
+
+/* Scan a response Cache-Control value for the cacheability-relevant directives
+ * and fold them into r: no-store/private/no-cache ⇒ cc_uncacheable; max-age= /
+ * s-maxage= ⇒ cc_max_age (the smaller of the two when both are present). The
+ * `s-maxage=` token contains `max-age=` at offset 2, so each `max-age=` match is
+ * accepted only when it is NOT the tail of an `s-maxage=` (the prior char is not
+ * the 's' of "s-max"); both deltas still fold into the min. */
+static void
+cc_scan(mq_gw_req_t *r, const char *v, size_t vl)
+{
+    if (ci_memmem(v, vl, "no-store") || ci_memmem(v, vl, "private") ||
+        ci_memmem(v, vl, "no-cache"))
+        r->cc_uncacheable = 1;
+    const char *end = v + vl;
+    /* All `s-maxage=` occurrences. */
+    for (const char *p = v; (p = ci_memmem(p, (size_t)(end - p), "s-maxage=")) != NULL;) {
+        cc_take_min_age(r, cc_parse_delta(p + 9, end));
+        p += 9;
+    }
+    /* All `max-age=` occurrences that are NOT the tail of an `s-maxage=` (i.e. not
+     * immediately preceded by an 's'/'S'). */
+    for (const char *p = v; (p = ci_memmem(p, (size_t)(end - p), "max-age=")) != NULL;) {
+        char prev = (p > v) ? p[-1] : '\0';
+        if (prev != 's' && prev != 'S') cc_take_min_age(r, cc_parse_delta(p + 8, end));
+        p += 8;
+    }
+}
+
 /* curl on_status: stash the final status code. */
 static void
 origin_on_status(int http_status, void *u)
@@ -493,6 +591,15 @@ origin_on_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
         memcpy(r->content_encoding, v, cn);
         r->content_encoding[cn] = '\0';
     }
+    /* Cacheability capture (Phase 6; set but unread until the STORE/HIT task).
+     * Captured BEFORE the arena-capacity check so a full header set still gates
+     * cacheability correctly. These headers are ALSO forwarded normally below. */
+    if (slice_ieq(n, nl, "set-cookie"))
+        r->has_set_cookie = 1;
+    else if (slice_ieq(n, nl, "vary"))
+        r->has_vary = 1;
+    else if (slice_ieq(n, nl, "cache-control"))
+        cc_scan(r, v, vl);
     if (r->n_hdrs >= MQ_GWS_MAX_HDRS) {
         r->hdrs_overflow = 1;
         return;
@@ -681,6 +788,12 @@ typedef struct {
 
     mq_http_ver_t origin_http_version; /* from x-mq-origin-protocol; DEFAULT if absent */
 
+    /* cache control (Phase 6). cache_ttl_s = parsed X-Mq-Cache opt-in TTL (0 =
+     * absent/not opted in); has_authorization = request carried an Authorization
+     * header (a cacheability gate — the response is per-credential). */
+    unsigned cache_ttl_s;
+    int has_authorization;
+
     /* forwarded origin headers (minus x-mq-* / hop-by-hop / pseudo). */
     mq_h3_header_t fwd[MQ_GWS_MAX_HDRS];
     char fwd_name[MQ_GWS_MAX_HDRS][128];
@@ -750,6 +863,18 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
          * no-op. */
         ctx->origin_http_version = mq_gw_parse_http_ver(v, vl);
         return; /* control header — do NOT forward to origin */
+    }
+    if (slice_ieq(n, nl, "x-mq-cache")) {
+        /* Cache opt-in TTL (the client validated + re-emitted this). 0 = invalid/
+         * absent → not opted in. Control header — auto-stripped, not forwarded. */
+        ctx->cache_ttl_s = mq_gw_parse_cache_ttl(v, vl);
+        return;
+    }
+    if (slice_ieq(n, nl, "authorization")) {
+        /* NOTE the credential for the cacheability gate (a per-credential
+         * response must not be cached) but STILL forward it to the origin — do
+         * NOT return here; fall through to the forward path below. */
+        ctx->has_authorization = 1;
     }
     /* Remember content-length for the upload framing, but do NOT forward it to
      * the origin: CURLOPT_INFILESIZE_LARGE is the sole framing source, so
@@ -947,6 +1072,11 @@ gw_dispatch(mq_gw_req_t *r)
                       truncated in this metrics-only copy. The %.*s precision bound
                       caps output to fit so -Werror=format-truncation can prove it. */
     r->origin_is_tls = (strcmp(ctx.scheme, "https") == 0); /* gates origin_tls (NEW-3) */
+
+    /* Cacheability inputs from the request side (Phase 6; the response-side flags
+     * are captured later in origin_on_header). */
+    r->cache_ttl_s = ctx.cache_ttl_s;
+    r->has_authorization = ctx.has_authorization;
 
     /* Upload framing: body present → known CL (>=0) or chunked sentinel. */
     int64_t upload_len = -1; /* no body */
@@ -1206,6 +1336,7 @@ gw_on_new_req(mq_h3_req_t *hr, void *user)
     r->req = hr;
     r->resp_http_ver =
         CURL_HTTP_VERSION_NONE; /* "none" until on_done sets the real version */
+    r->cc_max_age = -1;         /* -1 = absent (calloc zeroes the other cache flags) */
     r->origin_reuse = 0;
     r->origin_connect_ms = -1;
 
@@ -1291,6 +1422,21 @@ mq_gw_server_set_request_metrics(mq_gw_server_t *s, int on)
 }
 
 void
+mq_gw_server_set_cache(mq_gw_server_t *s, size_t max_bytes)
+{
+    if (!s) return;
+    if (s->cache) {
+        mq_gw_cache_free(s->cache);
+        s->cache = NULL;
+    }
+    if (max_bytes > 0) {
+        size_t obj = max_bytes < (4u << 20) ? max_bytes : (4u << 20); /* min(N,4MiB) */
+        if (obj < MQ_GWS_RECV_CHUNK) obj = MQ_GWS_RECV_CHUNK; /* floor at a chunk */
+        s->cache = mq_gw_cache_new(max_bytes, obj);
+    }
+}
+
+void
 mq_gw_server_free(mq_gw_server_t *s)
 {
     if (!s) return;
@@ -1335,6 +1481,10 @@ mq_gw_server_free(mq_gw_server_t *s)
 
     /* All requests aborted → safe to free the origin (no live easy handles). */
     if (s->origin) mq_origin_free(s->origin);
+
+    /* Free the response cache (NULL when disabled). All in-flight requests are
+     * already reclaimed above, so no live HIT borrows the entries. */
+    if (s->cache) mq_gw_cache_free(s->cache);
 
     /* Do NOT free s->h3 here — the caller frees it (mq_gw_server_h3) in the
      * sanctioned order, before mq_transport_free. */
