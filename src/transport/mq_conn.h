@@ -52,6 +52,33 @@ mq_cc_t mq_cc_from_string(const char *name, int *ok);
 /* Human-readable name for logging ("bbr2"/"bbr"/"cubic"). */
 const char *mq_cc_name(mq_cc_t cc);
 
+/* Multipath packet scheduler for the tunnel conn. minRTT (default) sprays a
+ * stream's packets across paths by RTT — correct for the STREAM lane
+ * (within-stream aggregation). backup keeps all traffic on the primary path
+ * while it is healthy — the single-path control for the DATAGRAM-lane A/B
+ * (see docs/superpowers/specs/2026-06-13-ab-lanes-bench-design.md). wlb is
+ * the fork's weighted scheduler, exposed for scheduler-improvement A/Bs. */
+typedef enum {
+    MQ_SCHED_MINRTT = 0,
+    MQ_SCHED_BACKUP = 1,
+    MQ_SCHED_WLB = 2,
+} mq_sched_t;
+
+#define MQ_SCHED_DEFAULT MQ_SCHED_MINRTT
+
+/* Parse a scheduler name ("minrtt"/"backup"/"wlb") into mq_sched_t. On an
+ * unknown name returns MQ_SCHED_DEFAULT and sets *ok=0 (if ok!=NULL); on a
+ * known name *ok=1. */
+mq_sched_t mq_sched_from_string(const char *name, int *ok);
+
+/* Scheduler name for logs. */
+const char *mq_sched_name(mq_sched_t sched);
+
+/* Select the scheduler applied by mq_conn_apply_mp_settings to every conn
+ * created after this call. Process-global, set once by the CLI before any
+ * conn exists; defaults to MQ_SCHED_DEFAULT when never called. */
+void mq_conn_set_scheduler(mq_sched_t sched);
+
 /* ── Flow-control window sizing (aggregate-BDP target) ──────────────────────
  *
  * The proxy aggregates throughput across multiple paths, so the receive

@@ -629,6 +629,52 @@ mq_cc_name(mq_cc_t cc)
     }
 }
 
+static mq_sched_t g_mq_sched = MQ_SCHED_DEFAULT;
+
+void
+mq_conn_set_scheduler(mq_sched_t sched)
+{
+    g_mq_sched = sched;
+}
+
+mq_sched_t
+mq_sched_from_string(const char *name, int *ok)
+{
+    struct {
+        const char *name;
+        mq_sched_t sched;
+    } table[] = {
+        {"minrtt", MQ_SCHED_MINRTT},
+        {"backup", MQ_SCHED_BACKUP},
+        {"wlb", MQ_SCHED_WLB},
+    };
+    if (name) {
+        for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+            if (strcmp(name, table[i].name) == 0) {
+                if (ok) {
+                    *ok = 1;
+                }
+                return table[i].sched;
+            }
+        }
+    }
+    if (ok) {
+        *ok = 0;
+    }
+    return MQ_SCHED_DEFAULT;
+}
+
+const char *
+mq_sched_name(mq_sched_t sched)
+{
+    switch (sched) {
+    case MQ_SCHED_BACKUP: return "backup";
+    case MQ_SCHED_WLB: return "wlb";
+    case MQ_SCHED_MINRTT:
+    default: return "minrtt";
+    }
+}
+
 void
 mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server, mq_cc_t cc)
 {
@@ -667,8 +713,14 @@ mq_conn_apply_mp_settings(xqc_conn_settings_t *s, int is_server, mq_cc_t cc)
      * PINS inner flows to paths — right for mqvpn's per-datagram flows, wrong
      * here (it would confine the single stream to one path = no aggregation).
      * minRTT is also xquic's current default, but pin it explicitly so a fork
-     * default change can't silently regress 1-B aggregation. */
-    s->scheduler_callback = xqc_minrtt_scheduler_cb;
+     * default change can't silently regress 1-B aggregation.
+     * --scheduler overrides this for A/B benchmarking (mq_conn_set_scheduler). */
+    switch (g_mq_sched) {
+    case MQ_SCHED_BACKUP: s->scheduler_callback = xqc_backup_scheduler_cb; break;
+    case MQ_SCHED_WLB: s->scheduler_callback = xqc_wlb_scheduler_cb; break;
+    case MQ_SCHED_MINRTT:
+    default: s->scheduler_callback = xqc_minrtt_scheduler_cb; break;
+    }
 
     /* Flow-control windows: rely on xquic's default (enable_stream_rate_limit
      * == 0) which advertises max_stream_data_bidi_local = XQC_MAX_RECV_WINDOW
