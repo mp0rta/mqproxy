@@ -29,13 +29,20 @@
 #     6. (NET_ADMIN-gated) 2-path: tc shapes two loopback paths; both paths'
 #        recv bytes > 0 from `mq_conn_dump_stats` in client.log after
 #        SIGTERM. Without NET_ADMIN this sub-case prints a SKIP note; the
-#        script continues and exits 0 (cases 1-5 decide the result, mirroring
+#        script continues and exits 0 (cases 1-5,7 decide the result, mirroring
 #        e2e_gateway semantics).
+#     7. --listen forwarder mode: udpsocks binds a local port, wraps datagrams
+#        toward udp_echo via the SOCKS5 UDP relay; a plain Python UDP client
+#        gets a byte-exact echo end-to-end (Server A).
+#     8. (NET_ADMIN-gated) --scheduler backup primary-pin: same 2-path topology
+#        as case 6, but with --scheduler backup on both sides; >=95% of bytes
+#        must land on one path (Server D).  Inverse of case 6.
 #
 # SERVER GROUPINGS (to minimise restarts while keeping scenario isolation):
-#   Server A (default flags):  cases 1, 2, 3, 5.
+#   Server A (default flags):  cases 1, 2, 3, 5, 7.
 #   Server B (--udp-idle-timeout 1): case 4.
-#   Server C (default, 2-path paths for case 6): NET_ADMIN-gated only.
+#   Server C (default, 2-path for case 6): NET_ADMIN-gated only.
+#   Server D (--scheduler backup, 2-path for case 8): NET_ADMIN-gated only.
 #
 #   Case 2 frag assertion: the frags_sent / frags_reassembled counters live on
 #   the per-conn mq_udp_srv struct and are logged at mq_udp_srv_free time
@@ -45,12 +52,12 @@
 # SKIP DISCIPLINE (matches e2e_gateway):
 #   The WHOLE script exits 77 (SKIP) ONLY if mqproxy/udpsocks/udp_echo
 #   binaries are missing or udp_echo fails to bind — without them nothing
-#   can be tested.  All other failures are real FAILs (exit 1).  Case 6 alone
+#   can be tested.  All other failures are real FAILs (exit 1).  Cases 6 and 8
 #   skipping (no NET_ADMIN) does NOT skip the script.
 #
 # HOW TO RUN:
-#   tests/integration/e2e_udp.sh                  # cases 1-5 (+ case-6 skip)
-#   sudo tests/integration/e2e_udp.sh             # also runs case 6
+#   tests/integration/e2e_udp.sh                  # cases 1-5, 7 (+ cases 6,8 skip)
+#   sudo tests/integration/e2e_udp.sh             # also runs cases 6 and 8
 #   ctest --test-dir build -R e2e_udp --output-on-failure
 #
 # ENV (passed by CMake; overridable):
@@ -569,14 +576,17 @@ ok 6 "2-path: both paths carried bytes (${PATHS_WITH_BYTES} paths)"
 # then assert that the busiest single path holds >=95% of total bytes.
 # The 5% headroom covers path-validation / mp-ping control traffic on the
 # secondary path, which the backup scheduler still uses for keepalives.
+# Inverse of case 6: same shaped 2-path topology, but case 6 asserts the
+# default scheduler SPREADS across both paths while this asserts backup PINS
+# to one.
 note "case 8: --scheduler backup primary-pin smoke"
 
 SERVER_D_PID="$(start_server_at "${QUIC_PORT_D}" "${WORK}/server_d.log" \
     --scheduler backup)"
 
 # Launch client inline: start_client_at slurps ALL extra args as --path IPs,
-# so we cannot pass --scheduler through it. Copy the helper body here and add
-# the flag explicitly before the path args.
+# so we cannot pass --scheduler through it. Replicate the helper's invocation;
+# start_client_at would slurp --scheduler as a path IP.
 "${MQPROXY_BIN}" client \
     --server "${SERVER_IP}:${QUIC_PORT_D}" \
     --token "${TOKEN}" \
@@ -617,6 +627,7 @@ SPLIT="$(grep -E 'mq\.path id=' "${WORK}/client_d.log" \
                  printf "%.3f", max / sum }')"
 note "case 8: busiest-path share = ${SPLIT} (need >= 0.95)"
 if ! awk -v s="${SPLIT}" 'BEGIN { exit !(s+0 >= 0.95) }'; then
+    grep -E 'mq\.path id=' "${WORK}/client_d.log" >&2 || true
     fail 8 "backup scheduler did not pin to one path (share=${SPLIT})"
 fi
 ok 8 "backup pinned ${SPLIT} of bytes to one path"
