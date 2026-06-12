@@ -64,6 +64,9 @@ typedef enum {
     MQ_SCHED_WLB = 2,
 } mq_sched_t;
 
+/* The policy default scheduler used when none is explicitly selected (CLI
+ * --sched unset). minRTT is the correct default for the STREAM lane — it
+ * aggregates bandwidth across paths by always picking the lowest-RTT one. */
 #define MQ_SCHED_DEFAULT MQ_SCHED_MINRTT
 
 /* Parse a scheduler name ("minrtt"/"backup"/"wlb") into mq_sched_t. On an
