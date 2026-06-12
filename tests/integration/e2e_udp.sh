@@ -113,10 +113,11 @@ SOCKS_PORT_B="$(free_port tcp)"
 SOCKS_PORT_C="$(free_port tcp)"
 ECHO_PORT_1="$(free_port udp)"
 ECHO_PORT_2="$(free_port udp)"
+FWD_PORT="$(free_port udp)"
 
 for v in "${QUIC_PORT_A}" "${QUIC_PORT_B}" "${QUIC_PORT_C}" \
          "${SOCKS_PORT_A}" "${SOCKS_PORT_B}" "${SOCKS_PORT_C}" \
-         "${ECHO_PORT_1}" "${ECHO_PORT_2}"; do
+         "${ECHO_PORT_1}" "${ECHO_PORT_2}" "${FWD_PORT}"; do
     if [ -z "${v}" ]; then
         note "free-port selection failed (python3 socket bind). SKIPPING."
         exit "${SKIP}"
@@ -135,13 +136,14 @@ CLIENT_C_PID=""
 ECHO1_PID=""
 ECHO2_PID=""
 C5_BG_PID=""
+FWD_PID=""
 TC_ON=0
 
 cleanup() {
     set +e
     for pid in "${CLIENT_A_PID}" "${CLIENT_B_PID}" "${CLIENT_C_PID}" \
                "${SERVER_A_PID}" "${SERVER_B_PID}" "${SERVER_C_PID}" \
-               "${ECHO1_PID}" "${ECHO2_PID}" "${C5_BG_PID}"; do
+               "${ECHO1_PID}" "${ECHO2_PID}" "${C5_BG_PID}" "${FWD_PID}"; do
         [ -n "${pid}" ] && kill "${pid}" 2>/dev/null
     done
     [ "${TC_ON}" -eq 1 ] && tc qdisc del dev lo root 2>/dev/null
@@ -366,6 +368,39 @@ else
     fail 5 "server unhealthy after udpsocks kill; stderr: $(head -c 200 "${WORK}/c5_health.err"); server_a: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
 fi
 
+# ── case 7: --listen forwarder mode — plain UDP client through the shim ──────
+# udpsocks binds 127.0.0.1:$FWD_PORT, wraps datagrams toward udp_echo via the
+# SOCKS5 UDP relay, unwraps replies back to the learned peer. A plain python
+# UDP client must get a byte-exact echo end-to-end.
+note "case 7: --listen forwarder mode"
+"${UDPSOCKS_BIN}" --proxy "127.0.0.1:${SOCKS_PORT_A}" \
+    --target "127.0.0.1:${ECHO_PORT_1}" \
+    --listen "${FWD_PORT}" >"${WORK}/fwd.log" 2>&1 &
+FWD_PID=$!
+sleep 0.5
+if ! kill -0 "${FWD_PID}" 2>/dev/null; then
+    cat "${WORK}/fwd.log" >&2
+    fail 7 "forwarder died at startup"
+else
+    if python3 - "${FWD_PORT}" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(5)
+payload = bytes(range(256)) * 4
+s.sendto(payload, ("127.0.0.1", int(sys.argv[1])))
+data, _ = s.recvfrom(65536)
+sys.exit(0 if data == payload else 1)
+PY
+    then
+        ok 7 "byte-exact echo through forwarder"
+    else
+        cat "${WORK}/fwd.log" >&2
+        fail 7 "echo through forwarder mismatched/timed out"
+    fi
+fi
+kill "${FWD_PID}" 2>/dev/null; wait "${FWD_PID}" 2>/dev/null
+FWD_PID=""
+
 # ── Tear down Server A group + assert case 2 frags_reassembled > 0 ───────────
 # SIGTERM the client first (normal teardown), then the server.
 # mq_udp_srv_free → mq_udp_srv_dump_stats fires on server conn close, writing
@@ -397,7 +432,7 @@ if [ "${FRAGS_REASSEMBLED}" -le 0 ]; then
 fi
 note "case 2 frag assertion: frags_reassembled=${FRAGS_REASSEMBLED} > 0 (stats: ${STATS_A})"
 
-note "cases 1, 2, 3, 5 PASS (${PASS_COUNT}/4 so far)."
+note "cases 1, 2, 3, 5, 7 PASS (${PASS_COUNT}/5 so far)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── Server B group: case 4 (--udp-idle-timeout 1) ────────────────────────────
@@ -440,8 +475,8 @@ fi
 stop_process "${CLIENT_B_PID}"; CLIENT_B_PID=""
 stop_process "${SERVER_B_PID}"; SERVER_B_PID=""
 
-note "case 4 PASS (5/5 so far)."
-note "cases 1-5 PASS (${PASS_COUNT}/5 checks)."
+note "case 4 PASS (6/6 so far)."
+note "cases 1-5, 7 PASS (${PASS_COUNT}/6 checks)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── case 6: 2-path aggregation smoke (NET_ADMIN-gated) ───────────────────────
@@ -459,7 +494,7 @@ fi
 
 if [ "${can_tc}" -ne 1 ]; then
     note "case 6 skipped (no NET_ADMIN): 2-path smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-5; case 6 skipped)."
+    note "RESULT = PASS (cases 1-5, 7; case 6 skipped)."
     exit 0
 fi
 
@@ -520,5 +555,5 @@ if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
 fi
 ok 6 "2-path: both paths carried bytes (${PATHS_WITH_BYTES} paths)"
 
-note "RESULT = PASS (cases 1-6)."
+note "RESULT = PASS (cases 1-7)."
 exit 0
