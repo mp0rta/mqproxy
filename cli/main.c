@@ -89,50 +89,52 @@ usage_top(FILE *out)
 static void
 usage_server(FILE *out)
 {
-    fprintf(out, "Usage: mqproxy server --listen <ip:port> --token <token>\n"
-                 "                      [--cert <path>] [--key <path>]\n"
-                 "                      [--origin-ca <pem>] [--no-gateway]\n"
-                 "                      [--udp-idle-timeout <sec>] [--no-udp]\n"
-                 "\n"
-                 "Options:\n"
-                 "  --listen <ip:port>  UDP address to accept MPQUIC connections on "
-                 "(required).\n"
-                 "  --token  <token>    Shared auth token clients must present "
-                 "(required).\n"
-                 "  --cert   <path>     TLS certificate (PEM). Defaults to the bundled\n"
-                 "                      test cert when omitted.\n"
-                 "  --key    <path>     TLS private key (PEM). Defaults to the bundled\n"
-                 "                      test key when omitted.\n"
-                 "  --origin-ca <pem>   CA bundle (PEM) used to verify origin TLS for "
-                 "the\n"
-                 "                      HTTP gateway. Defaults to the system trust "
-                 "store.\n"
-                 "  --no-gateway        Disable the HTTP gateway origin bridge "
-                 "(enabled by\n"
-                 "                      default; the server still serves the TCP-proxy "
-                 "core).\n"
-                 "  --udp-idle-timeout <sec>\n"
-                 "                      Idle timeout for UDP relay sessions in seconds\n"
-                 "                      (default: 60; must be > 0).\n"
-                 "  --no-udp            Disable UDP relay (do not advertise "
-                 "MQ_FEAT_UDP_RELAY).\n"
-                 "  --qlog   <dir>      Write xquic qlog (EXTRA importance) to "
-                 "<dir>/server.qlog.\n"
-                 "  --cc     <algo>     Congestion control: bbr (default) | bbr2 | "
-                 "cubic.\n"
-                 "  --metrics-interval <sec>\n"
-                 "                      Periodically log per-path stats "
-                 "(mq.conn/mq.path)\n"
-                 "                      every <sec>s (must be > 0; omit to disable).\n"
-                 "                      Logs the most-recently-accepted TCP and "
-                 "gateway conn.\n"
-                 "  --request-metrics   Emit one mq.req logfmt line per gateway "
-                 "request\n"
-                 "                      (method/status/target/ttfb/origin_protocol/"
-                 "cache/…).\n"
-                 "                      Opt-in; off by default. Independent of "
-                 "--metrics-interval.\n"
-                 "  -h, --help          Show this help and exit.\n");
+    fprintf(out,
+            "Usage: mqproxy server --listen <ip:port> --token <token>\n"
+            "                      [--cert <path>] [--key <path>]\n"
+            "                      [--origin-ca <pem>] [--no-gateway]\n"
+            "                      [--udp-idle-timeout <sec>] [--no-udp]\n"
+            "\n"
+            "Options:\n"
+            "  --listen <ip:port>  UDP address to accept MPQUIC connections on "
+            "(required).\n"
+            "  --token  <token>    Shared auth token clients must present "
+            "(required).\n"
+            "  --cert   <path>     TLS certificate (PEM). Defaults to the bundled\n"
+            "                      test cert when omitted.\n"
+            "  --key    <path>     TLS private key (PEM). Defaults to the bundled\n"
+            "                      test key when omitted.\n"
+            "  --origin-ca <pem>   CA bundle (PEM) used to verify origin TLS for "
+            "the\n"
+            "                      HTTP gateway. Defaults to the system trust "
+            "store.\n"
+            "  --no-gateway        Disable the HTTP gateway origin bridge "
+            "(enabled by\n"
+            "                      default; the server still serves the TCP-proxy "
+            "core).\n"
+            "  --udp-idle-timeout <sec>\n"
+            "                      Idle timeout for UDP relay sessions in seconds\n"
+            "                      (default: 60; must be > 0).\n"
+            "  --no-udp            Disable UDP relay (do not advertise "
+            "MQ_FEAT_UDP_RELAY).\n"
+            "  --qlog   <dir>      Write xquic qlog (EXTRA importance) to "
+            "<dir>/server.qlog.\n"
+            "  --cc     <algo>     Congestion control: bbr (default) | bbr2 | "
+            "cubic.\n"
+            "  --scheduler <s>     Multipath scheduler: minrtt (default) | backup | wlb\n"
+            "  --metrics-interval <sec>\n"
+            "                      Periodically log per-path stats "
+            "(mq.conn/mq.path)\n"
+            "                      every <sec>s (must be > 0; omit to disable).\n"
+            "                      Logs the most-recently-accepted TCP and "
+            "gateway conn.\n"
+            "  --request-metrics   Emit one mq.req logfmt line per gateway "
+            "request\n"
+            "                      (method/status/target/ttfb/origin_protocol/"
+            "cache/…).\n"
+            "                      Opt-in; off by default. Independent of "
+            "--metrics-interval.\n"
+            "  -h, --help          Show this help and exit.\n");
 }
 
 static void
@@ -176,6 +178,8 @@ usage_client(FILE *out)
         "                             (the 1-B blocked-frame instrument).\n"
         "  --cc           <algo>      Congestion control: bbr (default) | bbr2 "
         "| cubic.\n"
+        "  --scheduler    <s>         Multipath scheduler: minrtt (default) | backup | "
+        "wlb\n"
         "  --keepalive-idle <sec>     QUIC idle timeout in seconds, kept alive by\n"
         "                             PINGs (default: 30; 0 = disable; <15 not useful).\n"
         "  --reconnect                Re-establish the server connection on loss\n"
@@ -361,6 +365,8 @@ cmd_server(int argc, char **argv)
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
     mq_cc_t cc = MQ_CC_DEFAULT;
+    const char *sched_arg = NULL;
+    mq_sched_t sched = MQ_SCHED_DEFAULT;
     int gateway_enabled = 1;          /* gateway on by default; --no-gateway opts out */
     long udp_idle_timeout_s = 60;     /* --udp-idle-timeout <sec>, default 60 */
     int udp_enabled = 1;              /* --no-udp clears this */
@@ -378,6 +384,7 @@ cmd_server(int argc, char **argv)
         OPT_NO_UDP,
         OPT_QLOG,
         OPT_CC,
+        OPT_SCHEDULER,
         OPT_METRICS_INTERVAL,
         OPT_REQUEST_METRICS,
     };
@@ -392,6 +399,7 @@ cmd_server(int argc, char **argv)
         {"no-udp", no_argument, NULL, OPT_NO_UDP},
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
+        {"scheduler", required_argument, NULL, OPT_SCHEDULER},
         {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
         {"request-metrics", no_argument, NULL, OPT_REQUEST_METRICS},
         {"help", no_argument, NULL, 'h'},
@@ -426,6 +434,7 @@ cmd_server(int argc, char **argv)
         case OPT_NO_UDP: udp_enabled = 0; break;
         case OPT_QLOG: qlog_dir = optarg; break;
         case OPT_CC: cc_name = optarg; break;
+        case OPT_SCHEDULER: sched_arg = optarg; break;
         case OPT_METRICS_INTERVAL: {
             char *end = NULL;
             errno = 0;
@@ -457,6 +466,18 @@ cmd_server(int argc, char **argv)
             return 2;
         }
     }
+    if (sched_arg) {
+        int sched_ok = 0;
+        sched = mq_sched_from_string(sched_arg, &sched_ok);
+        if (!sched_ok) {
+            fprintf(stderr,
+                    "mqproxy server: invalid --scheduler '%s' (minrtt|backup|wlb)\n\n",
+                    sched_arg);
+            usage_server(stderr);
+            return 2;
+        }
+    }
+    mq_conn_set_scheduler(sched);
 
     /* --request-metrics only takes effect inside the gateway block below; with
      * --no-gateway it is silently ignored. Warn (not error: the flag is opt-in)
@@ -560,10 +581,11 @@ cmd_server(int argc, char **argv)
         goto out;
     }
 
-    MQ_LOGI(
-        "mqproxy server listening on %s:%u (cc=%s, gateway=%s, udp=%s, udp-idle=%lds)",
-        listen_ip, listen_port, mq_cc_name(cc), gateway_enabled ? "on" : "off",
-        udp_enabled ? "on" : "off", udp_idle_timeout_s);
+    MQ_LOGI("mqproxy server listening on %s:%u (cc=%s, sched=%s, gateway=%s, udp=%s, "
+            "udp-idle=%lds)",
+            listen_ip, listen_port, mq_cc_name(cc), mq_sched_name(sched),
+            gateway_enabled ? "on" : "off", udp_enabled ? "on" : "off",
+            udp_idle_timeout_s);
 
     /* Phase 5c periodic metrics (opt-in via --metrics-interval). Dumps the
      * most-recently-accepted conn's per-path stats every interval. */
@@ -674,6 +696,8 @@ cmd_client(int argc, char **argv)
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
     mq_cc_t cc = MQ_CC_DEFAULT;
+    const char *sched_arg = NULL;
+    mq_sched_t sched = MQ_SCHED_DEFAULT;
     const char *paths[MQ_MAX_EXTRA_PATHS];
     size_t npaths = 0;
     long keepalive_idle_s = 30;        /* --keepalive-idle <sec>; 0 = disable */
@@ -691,6 +715,7 @@ cmd_client(int argc, char **argv)
         OPT_CLIENT_ID,
         OPT_QLOG,
         OPT_CC,
+        OPT_SCHEDULER,
         OPT_KEEPALIVE_IDLE,
         OPT_RECONNECT,
         OPT_NO_RECONNECT,
@@ -707,6 +732,7 @@ cmd_client(int argc, char **argv)
         {"client-id", required_argument, NULL, OPT_CLIENT_ID},
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
+        {"scheduler", required_argument, NULL, OPT_SCHEDULER},
         {"keepalive-idle", required_argument, NULL, OPT_KEEPALIVE_IDLE},
         {"reconnect", no_argument, NULL, OPT_RECONNECT},
         {"no-reconnect", no_argument, NULL, OPT_NO_RECONNECT},
@@ -736,6 +762,7 @@ cmd_client(int argc, char **argv)
         case OPT_CLIENT_ID: client_id = optarg; break;
         case OPT_QLOG: qlog_dir = optarg; break;
         case OPT_CC: cc_name = optarg; break;
+        case OPT_SCHEDULER: sched_arg = optarg; break;
         case OPT_KEEPALIVE_IDLE: {
             char *endp = NULL;
             errno = 0;
@@ -798,6 +825,18 @@ cmd_client(int argc, char **argv)
             return 2;
         }
     }
+    if (sched_arg) {
+        int sched_ok = 0;
+        sched = mq_sched_from_string(sched_arg, &sched_ok);
+        if (!sched_ok) {
+            fprintf(stderr,
+                    "mqproxy client: invalid --scheduler '%s' (minrtt|backup|wlb)\n\n",
+                    sched_arg);
+            usage_client(stderr);
+            return 2;
+        }
+    }
+    mq_conn_set_scheduler(sched);
 
     if (!server) {
         fprintf(stderr, "mqproxy client: missing required --server\n\n");
@@ -1035,8 +1074,8 @@ cmd_client(int argc, char **argv)
         if (gateway)
             n += snprintf(ingress + n, sizeof(ingress) - (size_t)n, " gateway=%s:%u",
                           gw_ip, gw_port);
-        MQ_LOGI("mqproxy client: server=%s:%u%s (bind %s, cc=%s)", server_ip, server_port,
-                ingress, primary_ip, mq_cc_name(cc));
+        MQ_LOGI("mqproxy client: server=%s:%u%s (bind %s, cc=%s, sched=%s)", server_ip,
+                server_port, ingress, primary_ip, mq_cc_name(cc), mq_sched_name(sched));
     }
 
     /* Phase 5c periodic metrics (opt-in via --metrics-interval). mctx outlives
