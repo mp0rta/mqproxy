@@ -67,9 +67,8 @@
 #define MQ_GWS_MAX_HDRS 64
 
 /* Monotonic millisecond clock for the cache's freshness/LRU accounting (the
- * cache itself is clock-free — callers inject now_ms). Single caller, so a
- * file-static rather than a shared util header. */
-static uint64_t gw_now_ms(void) __attribute__((unused));
+ * cache itself is clock-free — callers inject now_ms). A file-static rather than
+ * a shared util header (only the cache store/lookup sites need it). */
 static uint64_t
 gw_now_ms(void)
 {
