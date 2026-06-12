@@ -10,6 +10,11 @@
 # Env:  SKEWS="0 20 50" LOSSES="0 0.5 1" SCHEDULERS="minrtt backup" REPEAT=1
 #       RATE=100mbit DELAY=25ms SIZE=32 INNER_CC=bbr CELL_TIMEOUT=120
 #       KEEP_QLOGS=1 PICOQUICDEMO=... MQPROXY_BIN=... MQPROXY_CERT/KEY=...
+#
+# NOTE: decisions need REPEAT>=3 (REPEAT=1 is spec default, adequate for CI
+#       smoke but not for publication-quality conclusions).
+#
+# SIGKILL recovery after aborted run: tc qdisc del dev lo root
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -148,6 +153,17 @@ start_origin() {
 }
 
 # start_pair <logtag> [extra args...] — (re)start mqproxy server+client 2-path.
+# Path-readiness gate: after launching the client we poll (up to 8 s, 0.2 s
+# steps) for evidence that the extra MPQUIC path has been established before
+# returning.  The marker is:
+#
+#   "mq_client: extra path up: bind <ip> -> path_id <n>"
+#   (src/proxy/mq_client.c, client_mp_timer_cb)
+#
+# The bench passes --path PATH_A (primary bind, no log) and --path PATH_B
+# (one extra path, logged once when mp-ready fires).  We therefore poll for 1
+# occurrence of "extra path up" in the client log.  On timeout we continue but
+# emit a loud stderr warning so the CSV row is flagged by the consumer.
 start_pair() {
     local tag="$1"; shift
     stop_pair
@@ -163,7 +179,17 @@ start_pair() {
         --path "${PATH_A_IP}" --path "${PATH_B_IP}" "$@" \
         >"${WORK}/client_${tag}.log" 2>&1 &
     CLIENT_PID=$!
-    sleep 2.0
+    # Poll for the extra-path log marker (up to 8 s).
+    local waited=0 found=0 clog="${WORK}/client_${tag}.log"
+    while [ "${waited}" -lt 40 ]; do
+        sleep 0.2; waited=$((waited + 1))
+        if grep -q 'extra path up:' "${clog}" 2>/dev/null; then
+            found=1; break
+        fi
+    done
+    if [ "${found}" -eq 0 ]; then
+        note "bench_ab_lanes: WARNING: ${tag}: second path not confirmed at start (extra path up not seen after 8 s) — continuing, CSV row may be 1-path only"
+    fi
     kill -0 "${SERVER_PID}" 2>/dev/null && kill -0 "${CLIENT_PID}" 2>/dev/null
 }
 
@@ -174,6 +200,12 @@ stop_pair() {
 
 # path_bytes <client log> — echo "path_a_bytes path_b_bytes" (by ascending id).
 # POSIX-awk only (system awk is mawk — no gawk asorti); sort does the ordering.
+#
+# Assumes each mq.path line appears exactly once per path (the teardown dump
+# emitted at connection close, when --metrics-interval is off).  If
+# --metrics-interval is set, each interval emits a cumulative counter and awk's
+# { tot[$1] += ... } will N×-overcount.  Leave --metrics-interval at its
+# default (off) when using this bench.
 path_bytes() {
     grep -E 'mq\.path id=' "$1" 2>/dev/null \
         | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
@@ -188,10 +220,14 @@ emit() { echo "$1" >>"${CSV}"; note "bench_ab_lanes: ${1}"; }
 # ── block arm: curl bulk download via SOCKS5 TCP -> STREAM lane ──────────────
 run_block_cell() {
     local skew="$1" loss="$2" rep="$3"
-    start_pair "block_${skew}_${loss}_${rep}" || { emit "block,minrtt,${skew},${loss},${rep},FAIL,,,,,,"; return; }
+    # --scheduler minrtt explicit: label must not silently lie if default changes.
+    start_pair "block_${skew}_${loss}_${rep}" --scheduler minrtt || { emit "block,minrtt,${skew},${loss},${rep},FAIL,,,,,,"; return; }
     local d0 d1 t0 t1 rc speed status="OK" elapsed="" goodput="" pa="" pb=""
     d0="$(netem_drops)"; t0="$(date +%s%3N)"
-    speed="$(timeout "${CELL_TIMEOUT}" curl -s -o /dev/null \
+    # Goodput from curl's own %{speed_download} (bytes/s, transfer-only —
+    # excludes SOCKS5 handshake, DNS, connect); convert to Mbps.
+    # elapsed_s is still wall-clock (informational).
+    speed="$(timeout -k 5 "${CELL_TIMEOUT}" curl -s -o /dev/null \
         --socks5-hostname "127.0.0.1:${SOCKS_PORT}" -w '%{speed_download}' \
         "http://127.0.0.1:${ORIGIN_PORT}/bigfile.bin")"
     rc=$?
@@ -204,8 +240,9 @@ run_block_cell() {
     elapsed="$(awk -v a="${t0}" -v b="${t1}" 'BEGIN { printf "%.2f", (b-a)/1000 }')"
     # goodput only for completed transfers — a TIMEOUT row must not carry a
     # fake SIZE/CELL_TIMEOUT number that someone plots later.
+    # speed_download is in bytes/s; × 8 / 1e6 → Mbps.
     if [ "${status}" = "OK" ]; then
-        goodput="$(awk -v sz="${SIZE_BYTES}" -v e="${elapsed}" 'BEGIN { if (e+0<=0) print ""; else printf "%.2f", sz*8/e/1000000 }')"
+        goodput="$(awk -v s="${speed}" 'BEGIN { if (s+0<=0) print ""; else printf "%.2f", s*8/1000000 }')"
     fi
     emit "block,minrtt,${skew},${loss},${rep},${status},${goodput},${elapsed},${pa},${pb},,$((d1-d0))"
 }
@@ -236,11 +273,11 @@ run_relay_cell() {
         return
     fi
 
-    local d0 d1 t0 t1 rc got status="OK" elapsed="" goodput="" pa="" pb="" lost=""
+    local d0 d1 t0 t1 rc got status="OK" elapsed="" goodput="" pa="" pb="" lost="" pq_mbps=""
     d0="$(netem_drops)"; t0="$(date +%s%3N)"
     # -n localhost: required for H3 ALPN negotiation (NULL SNI breaks H3 SETTINGS
     # exchange and causes "Cannot send GET command" even after handshake completes).
-    timeout "${CELL_TIMEOUT}" "${PICOQUICDEMO}" -a h3 -G "${INNER_CC}" \
+    timeout -k 5 "${CELL_TIMEOUT}" "${PICOQUICDEMO}" -a h3 -G "${INNER_CC}" \
         -n localhost -o "${scratch}" 127.0.0.1 "${FWD_PORT}" "/${SIZE_BYTES}" \
         >"${WORK}/pqcli_${tag}.log" 2>&1
     rc=$?
@@ -259,7 +296,23 @@ run_relay_cell() {
     [ "${KEEP_QLOGS:-0}" = "1" ] || rm -rf "${qdir}" "${scratch}"
     elapsed="$(awk -v a="${t0}" -v b="${t1}" 'BEGIN { printf "%.2f", (b-a)/1000 }')"
     if [ "${status}" = "OK" ]; then
-        goodput="$(awk -v sz="${SIZE_BYTES}" -v e="${elapsed}" 'BEGIN { if (e+0<=0) print ""; else printf "%.2f", sz*8/e/1000000 }')"
+        # Prefer picoquicdemo's own transfer-rate summary line (transfer-only,
+        # excludes QUIC handshake).  Format (verbatim from picoquicdemo v1.1.x):
+        #   "Received 1000057 bytes in 0.006582 seconds, 1215.505318 Mbps."
+        # The Mbps figure is bytes_received * 8 / elapsed_transfer, so it is
+        # symmetric with curl's %{speed_download}×8/1e6 on the block arm.
+        # grep -oE + mawk (POSIX awk, no gawk match($0,re,arr) extension).
+        pq_mbps="$(grep -oE '[0-9]+\.[0-9]+ Mbps\.' \
+            "${WORK}/pqcli_${tag}.log" 2>/dev/null \
+            | awk 'NR==1 { sub(/ Mbps\./, ""); print }')"
+        if [ -n "${pq_mbps}" ] && awk -v m="${pq_mbps}" 'BEGIN { exit !(m+0 > 0) }'; then
+            goodput="${pq_mbps}"
+        else
+            # Fallback: wall-clock goodput (includes QUIC handshake, ~2-3 RTT
+            # bias against relay; asymmetric vs block arm's transfer-only rate).
+            goodput="$(awk -v sz="${SIZE_BYTES}" -v e="${elapsed}" \
+                'BEGIN { if (e+0<=0) print ""; else printf "%.2f", sz*8/e/1000000 }')"
+        fi
     fi
     emit "relay,${sched},${skew},${loss},${rep},${status},${goodput},${elapsed},${pa},${pb},${lost},$((d1-d0))"
 }
