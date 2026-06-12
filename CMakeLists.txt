@@ -42,6 +42,7 @@ add_library(mqproxy STATIC
     src/gateway/mq_gw_client.c
     src/gateway/mq_gw_server.c
     src/gateway/mq_gw_metrics.c
+    src/gateway/mq_gw_cache.c
     src/gateway/mq_origin_curl.c
     src/transport/mq_conn.c
     src/transport/mq_h3.c
@@ -100,6 +101,11 @@ add_executable(test_gw_headers tests/test_gw_headers.c)
 target_link_libraries(test_gw_headers mqproxy)
 target_include_directories(test_gw_headers PRIVATE tests)
 add_test(NAME test_gw_headers COMMAND test_gw_headers)
+
+add_executable(test_gw_cache tests/test_gw_cache.c)
+target_link_libraries(test_gw_cache mqproxy)
+target_include_directories(test_gw_cache PRIVATE tests src)
+add_test(NAME test_gw_cache COMMAND test_gw_cache)
 
 add_executable(test_defrag tests/test_defrag.c)
 target_link_libraries(test_defrag mqproxy)
