@@ -638,7 +638,8 @@ mq_h3_conn_add_path(mq_h3_conn_t *c, const char *local_ip, uint16_t port)
      *    logic in mq_conn_add_path). All other schedulers leave AVAILABLE. */
     if (mq_conn_scheduler() == MQ_SCHED_BACKUP) {
         if (xqc_conn_mark_path_standby(xeng, &c->cid, new_path_id) != XQC_OK) {
-            MQ_LOGW("mq_h3: mark_path_standby(path %llu) failed",
+            MQ_LOGW("mq_h3: mark_path_standby(path %llu) failed; path stays "
+                    "AVAILABLE -- backup pin NOT in effect",
                     (unsigned long long)new_path_id);
         } else {
             MQ_LOGI("mq_h3: path id=%llu marked standby (backup scheduler)",
