@@ -82,6 +82,10 @@ const char *mq_sched_name(mq_sched_t sched);
  * conn exists; defaults to MQ_SCHED_DEFAULT when never called. */
 void mq_conn_set_scheduler(mq_sched_t sched);
 
+/* Return the current process-global scheduler selection. Lets path-creation
+ * sites apply scheduler-dependent path policy (e.g. STANDBY under backup). */
+mq_sched_t mq_conn_scheduler(void);
+
 /* ── Flow-control window sizing (aggregate-BDP target) ──────────────────────
  *
  * The proxy aggregates throughput across multiple paths, so the receive

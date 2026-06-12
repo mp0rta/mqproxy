@@ -631,11 +631,25 @@ mq_h3_conn_add_path(mq_h3_conn_t *c, const char *local_ip, uint16_t port)
         return -1;
     }
 
-    /* 3. Mark the path available so the peer may schedule traffic on it. */
-    if (xqc_conn_mark_path_available(xeng, &c->cid, new_path_id) != XQC_OK) {
-        MQ_LOGW("mq_h3: mark_path_available(path %llu) failed",
-                (unsigned long long)new_path_id);
-        /* Non-fatal: the path was created + socket bound; keep it alive. */
+    /* 3. Mark path status.  Under --scheduler backup, mark the extra path
+     *    STANDBY so the backup scheduler's skip-standby logic keeps all
+     *    traffic on the primary; a PATH_STATUS frame is transmitted to the
+     *    peer so the server-side scheduler also honours the pin (mirrors the
+     *    logic in mq_conn_add_path). All other schedulers leave AVAILABLE. */
+    if (mq_conn_scheduler() == MQ_SCHED_BACKUP) {
+        if (xqc_conn_mark_path_standby(xeng, &c->cid, new_path_id) != XQC_OK) {
+            MQ_LOGW("mq_h3: mark_path_standby(path %llu) failed",
+                    (unsigned long long)new_path_id);
+        } else {
+            MQ_LOGI("mq_h3: path id=%llu marked standby (backup scheduler)",
+                    (unsigned long long)new_path_id);
+        }
+    } else {
+        if (xqc_conn_mark_path_available(xeng, &c->cid, new_path_id) != XQC_OK) {
+            MQ_LOGW("mq_h3: mark_path_available(path %llu) failed",
+                    (unsigned long long)new_path_id);
+            /* Non-fatal: the path was created + socket bound; keep it alive. */
+        }
     }
 
     c->extra_path_ids[c->n_extra_paths++] = new_path_id;

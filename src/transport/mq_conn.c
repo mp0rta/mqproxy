@@ -430,13 +430,27 @@ mq_conn_add_path(mq_conn_t *c, const char *local_ip, uint16_t local_port)
         return -1;
     }
 
-    /* 3. Mark the path available so the peer may schedule traffic on it once
-     *    validation completes. */
-    if (xqc_conn_mark_path_available(xeng, &c->cid, new_path_id) != XQC_OK) {
-        MQ_LOGW("mq_conn: mark_path_available(path %llu) failed",
-                (unsigned long long)new_path_id);
-        /* Non-fatal: the path was created + socket bound; validation may still
-         * proceed. Keep the path so its socket stays alive. */
+    /* 3. Mark path status.  Under --scheduler backup, mark the extra path
+     *    STANDBY so the backup scheduler's skip-standby logic keeps all
+     *    traffic on the primary; a PATH_STATUS frame is transmitted to the
+     *    peer so the server-side scheduler also honours the pin (see
+     *    xqc_set_application_path_status → xqc_write_path_status_frame_to_packet).
+     *    All other schedulers leave the path AVAILABLE (existing behaviour). */
+    if (mq_conn_scheduler() == MQ_SCHED_BACKUP) {
+        if (xqc_conn_mark_path_standby(xeng, &c->cid, new_path_id) != XQC_OK) {
+            MQ_LOGW("mq_conn: mark_path_standby(path %llu) failed",
+                    (unsigned long long)new_path_id);
+        } else {
+            MQ_LOGI("mq_conn: path id=%llu marked standby (backup scheduler)",
+                    (unsigned long long)new_path_id);
+        }
+    } else {
+        if (xqc_conn_mark_path_available(xeng, &c->cid, new_path_id) != XQC_OK) {
+            MQ_LOGW("mq_conn: mark_path_available(path %llu) failed",
+                    (unsigned long long)new_path_id);
+            /* Non-fatal: the path was created + socket bound; validation may
+             * still proceed. Keep the path so its socket stays alive. */
+        }
     }
 
     c->extra_path_ids[c->n_extra_paths++] = new_path_id;
@@ -635,6 +649,12 @@ void
 mq_conn_set_scheduler(mq_sched_t sched)
 {
     g_mq_sched = sched;
+}
+
+mq_sched_t
+mq_conn_scheduler(void)
+{
+    return g_mq_sched;
 }
 
 mq_sched_t
