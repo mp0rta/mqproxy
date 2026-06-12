@@ -15,6 +15,7 @@
  *
  * Design references: spec §14.2 / §14.5 (strip rules), §18.3 (error mapping),
  * design doc §7 (header policy) / §10 (curl error → HTTP status).
+ *   §14.2 X-Mq-Cache: opt-in response-cache TTL seconds (mq_gw_parse_cache_ttl).
  */
 
 /* ---------------------------------------------------------------------------
@@ -74,6 +75,13 @@ typedef enum {
  * invalid value test for DEFAULT on a non-empty input (the client does); the server
  * treats DEFAULT as "no preference". */
 mq_http_ver_t mq_gw_parse_http_ver(const char *v, size_t vl);
+
+/* Parse an X-Mq-Cache value: strict decimal seconds in [1, 31536000] (1 year).
+ * Returns the seconds on success, or 0 for
+ * absent/empty/non-numeric/zero/out-of-range/overflow (0 is the "no caching" sentinel —
+ * callers treat >0 as opted-in). */
+#define MQ_GW_CACHE_TTL_MAX 31536000u
+unsigned mq_gw_parse_cache_ttl(const char *v, size_t vl);
 
 /* ---------------------------------------------------------------------------
  * Token-char classification

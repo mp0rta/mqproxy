@@ -137,7 +137,7 @@ trap cleanup EXIT INT TERM
 # interpolated into the python source.
 write_origin_py() {
     cat >"${WORK}/origin.py" <<'PY'
-import gzip, http.server, os, ssl
+import gzip, http.server, os, ssl, urllib.parse
 
 ROOT = os.environ["MQ_ORIGIN_ROOT"]
 SAVE = os.environ["MQ_ORIGIN_SAVE"]
@@ -148,6 +148,12 @@ KEY = os.environ["MQ_ORIGIN_KEY"]
 
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    # Per-path GET counter (cache e2e case 14). Counts FILE fetches only — the
+    # /__count introspection endpoint never bumps it, so /__count?p=<path> reads
+    # back exactly how many times the origin actually served <path>. The cache
+    # HIT proof is "fetch twice, /__count must read 1" (the HIT never reached us).
+    COUNTS = {}
 
     def log_message(self, *a):
         pass
@@ -176,6 +182,22 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(raw)
             return
+        if self.path.split("?", 1)[0] == "/__count":
+            # Introspection: ?p=<path> → body is how many times the origin
+            # served that FILE path (this endpoint itself is NOT counted, and is
+            # fetched with NO X-Mq-Cache so it is never itself cached). Used by
+            # the cache HIT proof (case 14): a HIT must keep the count at 1.
+            qs = urllib.parse.urlparse(self.path).query
+            p = urllib.parse.parse_qs(qs).get("p", [""])[0]
+            body = str(H.COUNTS.get(p, 0)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # FILE path: count this origin hit (NOT /__count, handled above).
+        H.COUNTS[self.path] = H.COUNTS.get(self.path, 0) + 1
         path = os.path.join(ROOT, os.path.basename(self.path))
         if not os.path.isfile(path):
             self.send_response(404)
@@ -187,6 +209,10 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
+        # no-store mode: a basename starting "nostore-" is served with
+        # Cache-Control: no-store so mqproxy must NOT cache it (case 14).
+        if os.path.basename(self.path).startswith("nostore-"):
+            self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
@@ -279,6 +305,7 @@ start_server() {
         --cert "${MQPROXY_CERT}" --key "${MQPROXY_KEY}" \
         --origin-ca "${ORIGIN_CERT}" \
         --request-metrics \
+        --cache-max-bytes 67108864 \
         >"${WORK}/server.log" 2>&1 &
     SERVER_PID=$!
 }
@@ -485,8 +512,9 @@ wait_gateway_ready || exit 1
 # the same origin authority (https://127.0.0.1:${ORIGIN_PORT}).
 # RESERVED sizes — the mq.req anchors below grep server.log by resp_bytes, so each
 # reuse-case body size MUST be unique across the whole script: 3MiB/1MiB (case 9),
-# 2MiB/512KiB (case 10), 8MiB (big.bin, cases 1/2/8), 4MiB (case 13). A new case
-# reusing one of these sizes in the same server.log epoch could mis-anchor (grep|tail -1).
+# 2MiB/512KiB (case 10), 8MiB (big.bin, cases 1/2/8), 4MiB (case 13),
+# 1.5MiB/640KiB (case 14: cache_hit.bin / nostore-x.bin). A new case reusing one of
+# these sizes in the same server.log epoch could mis-anchor (grep|tail -1).
 A_SIZE=3145728   # 3 MiB
 B_SIZE=1048576   # 1 MiB
 head -c "${A_SIZE}" /dev/zero >"${WORK}/a.bin"
@@ -710,6 +738,162 @@ else
     note "case 13 (h3): gateway built without h3-libcurl (HTTP3=no) — h3 SWITCH sub-case skipped (does not affect RESULT)."
 fi
 
+# ── case 14: X-Mq-Cache opt-in response cache (no root required) ──────────────
+# Proves the minimal opt-in server-side cache end-to-end with a FALSIFIABLE
+# origin-once assertion:
+#   HIT     — fetch a cacheable file twice with X-Mq-Cache: 60 → miss then hit,
+#             and the origin served it EXACTLY ONCE (/__count == 1, the HIT never
+#             reached the origin); both downloaded bodies byte-identical.
+#   no-store — an origin Cache-Control: no-store response is NEVER cached: two
+#             X-Mq-Cache fetches both miss and the origin is hit twice (== 2).
+#   bypass  — a normal fetch with NO X-Mq-Cache reports cache=bypass.
+#   invalid — X-Mq-Cache: bogus is rejected client-side with 400 + x-mq-error.
+#
+# Restart server+client clean so the in-memory cache + server.log start EMPTY
+# (cache state does not survive a server restart; the HIT proof needs the SAME
+# server instance to see both fetches — the whole case runs against this one).
+stop_client
+kill "${SERVER_PID}" 2>/dev/null; wait "${SERVER_PID}" 2>/dev/null; SERVER_PID=""
+start_server "" || exit 1
+start_client || exit 1
+wait_gateway_ready || exit 1
+
+# Reserved unique sizes (< 4 MiB per-object cap): cache_hit.bin = 1.5 MiB,
+# nostore-x.bin = 640 KiB. Distinct from every other case's resp_bytes anchor.
+C14_HIT=1572864   # 1.5 MiB
+C14_NS=655360     # 640 KiB
+head -c "${C14_HIT}" /dev/urandom >"${WORK}/cache_hit.bin"
+head -c "${C14_NS}" /dev/urandom >"${WORK}/nostore-x.bin"
+
+# ── (a) HIT: fetch the cacheable file twice → miss, then hit ──────────────────
+RESP14A1="${WORK}/c14a1_resp.bin"
+code14a1="$(curl -s -o "${RESP14A1}" -w '%{http_code}' --max-time 30 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/cache_hit.bin" \
+    -H "X-Mq-Cache: 60")"
+[ "${code14a1}" = "200" ] || fail 14 "(a) first cacheable fetch HTTP code = ${code14a1} (want 200)"
+
+# First fetch must be a miss (anchored to resp_bytes=1572864 cache=miss; field
+# order is resp_bytes=… … cache=… so anchor left-to-right — mq_gw_metrics.c).
+c14_miss_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=1572864 .* cache=miss' "${WORK}/server.log"; then
+        c14_miss_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${c14_miss_found}" -ne 1 ]; then
+    note "case 14 FAIL: no mq.req with resp_bytes=1572864 cache=miss in server.log"
+    grep -E 'mq\.req ' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+
+RESP14A2="${WORK}/c14a2_resp.bin"
+code14a2="$(curl -s -o "${RESP14A2}" -w '%{http_code}' --max-time 30 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/cache_hit.bin" \
+    -H "X-Mq-Cache: 60")"
+[ "${code14a2}" = "200" ] || fail 14 "(a) second cacheable fetch HTTP code = ${code14a2} (want 200)"
+
+# Second fetch must be a HIT served from cache (anchored resp_bytes=1572864 cache=hit).
+c14_hit_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=1572864 .* cache=hit' "${WORK}/server.log"; then
+        c14_hit_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${c14_hit_found}" -ne 1 ]; then
+    note "case 14 FAIL: no mq.req with resp_bytes=1572864 cache=hit in server.log (HIT never served)"
+    grep -E 'mq\.req .* cache=' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+
+# The HIT replay must be byte-identical to the origin's body (and to the miss).
+cmp -s "${WORK}/cache_hit.bin" "${RESP14A1}" || fail 14 "(a) miss body differs from origin"
+cmp -s "${RESP14A1}" "${RESP14A2}" || fail 14 "(a) HIT body differs from the cached miss body"
+
+# FALSIFIABLE origin-once proof: the origin counts each FILE GET it serves. After
+# two gateway fetches (1 miss + 1 cache-served hit) the origin must have served
+# /cache_hit.bin EXACTLY ONCE. Fetch /__count WITHOUT X-Mq-Cache so the count
+# read itself is never cached (it returns cache=bypass).
+count14="$(curl -s --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/__count?p=/cache_hit.bin")"
+[ "${count14}" = "1" ] || fail 14 "(a) origin hit count for /cache_hit.bin = '${count14}' (want 1 — the HIT must NOT reach origin)"
+ok 14 "X-Mq-Cache HIT: miss→hit, body byte-identical, origin served exactly once"
+
+# ── (b) no-store: an origin no-store response is never cached ─────────────────
+code14b1="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/nostore-x.bin" \
+    -H "X-Mq-Cache: 60")"
+[ "${code14b1}" = "200" ] || fail 14 "(b) first no-store fetch HTTP code = ${code14b1} (want 200)"
+code14b2="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/nostore-x.bin" \
+    -H "X-Mq-Cache: 60")"
+[ "${code14b2}" = "200" ] || fail 14 "(b) second no-store fetch HTTP code = ${code14b2} (want 200)"
+
+# BOTH fetches must be misses (Cache-Control: no-store ⇒ never stored). Anchor to
+# the unique resp_bytes=655360 and require at least two cache=miss lines for it.
+c14_ns_misses=0
+for _ in $(seq 1 25); do
+    c14_ns_misses="$(grep -Ec 'mq\.req .* resp_bytes=655360 .* cache=miss' "${WORK}/server.log")"
+    [ "${c14_ns_misses}" -ge 2 ] && break
+    sleep 0.2
+done
+if [ "${c14_ns_misses}" -lt 2 ]; then
+    note "case 14 FAIL: expected 2 cache=miss for resp_bytes=655360 (no-store), got ${c14_ns_misses}"
+    grep -E 'mq\.req .* resp_bytes=655360 ' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+# And the origin must have been hit BOTH times (== 2, not deduplicated by cache).
+count14ns="$(curl -s --max-time 20 -X POST "http://${GW}/_mqproxy/fetch" -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/__count?p=/nostore-x.bin")"
+[ "${count14ns}" = "2" ] || fail 14 "(b) origin hit count for /nostore-x.bin = '${count14ns}' (want 2 — no-store must not cache)"
+ok 14 "X-Mq-Cache no-store: both fetches miss, origin hit twice (not cached)"
+
+# ── (c) bypass: a normal fetch with NO X-Mq-Cache reports cache=bypass ────────
+# Reuse cache_hit.bin (already cached) WITHOUT opting in: a no-opt-in request must
+# bypass the cache entirely (cache=bypass), proving opt-in gating. The origin hit
+# count for /cache_hit.bin will rise to 2 here, which is fine — the HIT proof in
+# (a) already locked in the count==1 assertion before this fetch.
+code14c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" \
+    -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/cache_hit.bin")"
+[ "${code14c}" = "200" ] || fail 14 "(c) bypass fetch HTTP code = ${code14c} (want 200)"
+c14_bypass_found=0
+for _ in $(seq 1 25); do
+    if grep -Eq 'mq\.req .* resp_bytes=1572864 .* cache=bypass' "${WORK}/server.log"; then
+        c14_bypass_found=1; break
+    fi
+    sleep 0.2
+done
+if [ "${c14_bypass_found}" -ne 1 ]; then
+    note "case 14 FAIL: no mq.req with resp_bytes=1572864 cache=bypass (no-opt-in fetch)"
+    grep -E 'mq\.req .* cache=' "${WORK}/server.log" >&2 2>/dev/null || true
+    exit 1
+fi
+ok 14 "X-Mq-Cache bypass: no opt-in ⇒ cache=bypass"
+
+# ── (d) invalid TTL → 400 + x-mq-error: bad-cache-ttl (client-side reject) ────
+# Mirror case 13a: a code-only check would pass on ANY 400, so assert BOTH the
+# 400 code AND the specific x-mq-error reason emitted by the client.
+H14D="${WORK}/c14d_headers.txt"
+code14d="$(curl -s -o /dev/null -D "${H14D}" -w '%{http_code}' --max-time 20 \
+    -X POST "http://${GW}/_mqproxy/fetch" \
+    -H "${AUTH}" -H "X-Mq-Target: https://127.0.0.1:${ORIGIN_PORT}/cache_hit.bin" \
+    -H "X-Mq-Cache: bogus")"
+[ "${code14d}" = "400" ] || fail 14 "(d) invalid X-Mq-Cache: code=${code14d} (want 400)"
+grep -qi '^x-mq-error:[[:space:]]*bad-cache-ttl' "${H14D}" || \
+    fail 14 "(d) invalid X-Mq-Cache: x-mq-error missing; got: $(grep -i x-mq-error "${H14D}" || echo '<none>')"
+ok 14 "X-Mq-Cache invalid TTL → 400 + x-mq-error: bad-cache-ttl"
+
 # ── case 8: 2-path aggregation smoke (NET_ADMIN-gated) ───────────────────────
 # Requires tc/netem on lo (NET_ADMIN). Without it: a note + continue (cases 1-7
 # already passed → exit 0). With it: shape two equal-rate loopback paths, run a
@@ -726,7 +910,7 @@ fi
 
 if [ "${can_tc}" -ne 1 ]; then
     note "case 8 skipped (no NET_ADMIN): 2-path aggregation smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-7 + cases 9 + 11 + 12 + 13; case 8 skipped)."
+    note "RESULT = PASS (cases 1-7 + cases 9 + 11 + 12 + 13 + 14; case 8 skipped)."
     exit 0
 fi
 
@@ -952,5 +1136,5 @@ else
     TC_ON=0
 fi
 
-note "RESULT = PASS (cases 1-9 + 11 + 12 + 13 + L2 case 10 ran under NET_ADMIN)."
+note "RESULT = PASS (cases 1-9 + 11 + 12 + 13 + 14 + L2 case 10 ran under NET_ADMIN)."
 exit 0

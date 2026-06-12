@@ -399,6 +399,21 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         }
     }
 
+    /* 4a'. X-Mq-Cache if present: validate via the shared parser. A present, non-empty,
+     * unparseable TTL (non-decimal / zero / out-of-range / overflow) is a caller bug →
+     * 400 (mirrors the other control-header validations). Absent / empty → no caching
+     * (not re-emitted below). */
+    size_t xmc_vl = 0;
+    const char *xmc = find_hdr(req, "x-mq-cache", &xmc_vl);
+    unsigned xmc_ttl = 0;
+    if (xmc && xmc_vl > 0) {
+        xmc_ttl = mq_gw_parse_cache_ttl(xmc, xmc_vl);
+        if (xmc_ttl == 0) { /* present + non-empty + invalid → caller bug */
+            gw_reject_write(handle, 400, "Bad Request", "bad-cache-ttl");
+            return -1;
+        }
+    }
+
     /* 4b. Reject (locally, BEFORE opening the H3 request) any header that would
      * not fit the forwarding arena, instead of silently clamping it. The arena
      * slots are MQ_GW_HDR_NAME_CAP name / MQ_GW_HDR_VAL_CAP value, holding cap-1
@@ -544,6 +559,23 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         size_t vl = xop_vl < VS - 1 ? xop_vl : VS - 1;
         memcpy(nb, "x-mq-origin-protocol", 21);
         memcpy(vb, xop, vl);
+        vb[vl] = '\0';
+        hs[nh].name = nb;
+        hs[nh].value = vb;
+        nh++;
+    }
+
+    /* x-mq-cache: re-emit the RAW validated TTL token onto the tunnel only when a valid
+     * opt-in TTL was parsed (absent / empty = no caching, not conveyed). The original
+     * X-Mq-* request header is stripped by mq_gw_strip_client; this re-emit carries the
+     * validated opt-in to the server. (The server reads it in req_each_header, re-parses
+     * it via mq_gw_parse_cache_ttl, and gates response caching on it.) */
+    if (xmc_ttl != 0 && nh < MQ_GW_MAX_SEND_HDRS) {
+        char *nb = namebuf + nh * NS;
+        char *vb = valbuf + nh * VS;
+        size_t vl = xmc_vl < VS - 1 ? xmc_vl : VS - 1;
+        memcpy(nb, "x-mq-cache", 11);
+        memcpy(vb, xmc, vl);
         vb[vl] = '\0';
         hs[nh].name = nb;
         hs[nh].value = vb;

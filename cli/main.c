@@ -132,6 +132,12 @@ usage_server(FILE *out)
                  "cache/…).\n"
                  "                      Opt-in; off by default. Independent of "
                  "--metrics-interval.\n"
+                 "  --cache-max-bytes <N>\n"
+                 "                      In-memory origin response cache bounded to N "
+                 "bytes\n"
+                 "                      (0 = off = default; opt-in per request via "
+                 "X-Mq-Cache;\n"
+                 "                      e.g. 67108864 = 64 MiB).\n"
                  "  -h, --help          Show this help and exit.\n");
 }
 
@@ -366,6 +372,7 @@ cmd_server(int argc, char **argv)
     int udp_enabled = 1;              /* --no-udp clears this */
     uint64_t metrics_interval_ms = 0; /* --metrics-interval <sec>; 0 = off */
     int request_metrics = 0;          /* --request-metrics; off by default */
+    size_t cache_max_bytes = 0;       /* --cache-max-bytes <N>; 0 = off (default) */
 
     enum {
         OPT_LISTEN = 256,
@@ -380,6 +387,7 @@ cmd_server(int argc, char **argv)
         OPT_CC,
         OPT_METRICS_INTERVAL,
         OPT_REQUEST_METRICS,
+        OPT_CACHE_MAX_BYTES,
     };
     static const struct option longopts[] = {
         {"listen", required_argument, NULL, OPT_LISTEN},
@@ -394,6 +402,7 @@ cmd_server(int argc, char **argv)
         {"cc", required_argument, NULL, OPT_CC},
         {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
         {"request-metrics", no_argument, NULL, OPT_REQUEST_METRICS},
+        {"cache-max-bytes", required_argument, NULL, OPT_CACHE_MAX_BYTES},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -442,6 +451,31 @@ cmd_server(int argc, char **argv)
             break;
         }
         case OPT_REQUEST_METRICS: request_metrics = 1; break;
+        case OPT_CACHE_MAX_BYTES: {
+            /* SIGNED strtoll: strtoull("-5") silently returns a huge unsigned with
+             * NO error, so a `< 0` check could never fire. 0 is VALID (= disabled =
+             * default); reject only `< 0` (unlike --metrics-interval's `<= 0`). */
+            char *end = NULL;
+            errno = 0;
+            long long v = strtoll(optarg, &end, 10); /* bytes */
+            /* Reject v < 0 first (short-circuits), so the SIZE_MAX guard runs only
+             * for v >= 0 and can compare in the UNSIGNED domain. Do NOT cast
+             * SIZE_MAX to long long: on 64-bit (size_t == unsigned long long) that
+             * cast wraps to -1, rejecting every positive value. The guard is purely
+             * theoretical where size_t is 64-bit (LLONG_MAX < SIZE_MAX), but it makes
+             * the (size_t)v cast total on any platform. */
+            if (errno != 0 || end == optarg || *end != '\0' || v < 0 ||
+                (unsigned long long)v > (unsigned long long)SIZE_MAX) {
+                fprintf(stderr,
+                        "mqproxy server: invalid --cache-max-bytes '%s' (must be >= 0; "
+                        "0 = disabled)\n\n",
+                        optarg);
+                usage_server(stderr);
+                return 2;
+            }
+            cache_max_bytes = (size_t)v;
+            break;
+        }
         case 'h': usage_server(stdout); return 0;
         default: usage_server(stderr); return 2;
         }
@@ -465,6 +499,12 @@ cmd_server(int argc, char **argv)
     if (request_metrics && !gateway_enabled) {
         fprintf(stderr, "mqproxy server: --request-metrics has no effect with "
                         "--no-gateway (request metrics are gateway-only); ignoring\n");
+    }
+    /* --cache-max-bytes is gateway-only too (the cache lives on the gw server);
+     * warn (not error: opt-in) when paired with --no-gateway. */
+    if (cache_max_bytes > 0 && !gateway_enabled) {
+        fprintf(stderr, "mqproxy server: --cache-max-bytes has no effect with "
+                        "--no-gateway (the response cache is gateway-only); ignoring\n");
     }
 
     if (!listen) {
@@ -554,6 +594,7 @@ cmd_server(int argc, char **argv)
             goto out;
         }
         if (request_metrics) mq_gw_server_set_request_metrics(gws, 1);
+        mq_gw_server_set_cache(gws, cache_max_bytes); /* 0 ⇒ disabled (no-op) */
     }
     if (install_signal_handlers(base, rt, &sint, &sterm) != 0) {
         MQ_LOGE("failed to install signal handlers");
