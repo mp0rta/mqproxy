@@ -15,3 +15,4 @@ build_*/
 # Vendored HTTP/3 libcurl build (scripts/build-h3-curl.sh) — build output, like
 # the xquic build dirs; never committed.
 third_party/h3-curl/
+bench_results/
