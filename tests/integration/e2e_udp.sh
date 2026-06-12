@@ -108,15 +108,17 @@ PY
 QUIC_PORT_A="$(free_port udp)"
 QUIC_PORT_B="$(free_port udp)"
 QUIC_PORT_C="$(free_port udp)"
+QUIC_PORT_D="$(free_port udp)"
 SOCKS_PORT_A="$(free_port tcp)"
 SOCKS_PORT_B="$(free_port tcp)"
 SOCKS_PORT_C="$(free_port tcp)"
+SOCKS_PORT_D="$(free_port tcp)"
 ECHO_PORT_1="$(free_port udp)"
 ECHO_PORT_2="$(free_port udp)"
 FWD_PORT="$(free_port udp)"
 
-for v in "${QUIC_PORT_A}" "${QUIC_PORT_B}" "${QUIC_PORT_C}" \
-         "${SOCKS_PORT_A}" "${SOCKS_PORT_B}" "${SOCKS_PORT_C}" \
+for v in "${QUIC_PORT_A}" "${QUIC_PORT_B}" "${QUIC_PORT_C}" "${QUIC_PORT_D}" \
+         "${SOCKS_PORT_A}" "${SOCKS_PORT_B}" "${SOCKS_PORT_C}" "${SOCKS_PORT_D}" \
          "${ECHO_PORT_1}" "${ECHO_PORT_2}" "${FWD_PORT}"; do
     if [ -z "${v}" ]; then
         note "free-port selection failed (python3 socket bind). SKIPPING."
@@ -130,9 +132,11 @@ WORK="$(mktemp -d /tmp/mqproxy_e2e_udp.XXXXXX)"
 SERVER_A_PID=""
 SERVER_B_PID=""
 SERVER_C_PID=""
+SERVER_D_PID=""
 CLIENT_A_PID=""
 CLIENT_B_PID=""
 CLIENT_C_PID=""
+CLIENT_D_PID=""
 ECHO1_PID=""
 ECHO2_PID=""
 C5_BG_PID=""
@@ -141,8 +145,8 @@ TC_ON=0
 
 cleanup() {
     set +e
-    for pid in "${CLIENT_A_PID}" "${CLIENT_B_PID}" "${CLIENT_C_PID}" \
-               "${SERVER_A_PID}" "${SERVER_B_PID}" "${SERVER_C_PID}" \
+    for pid in "${CLIENT_A_PID}" "${CLIENT_B_PID}" "${CLIENT_C_PID}" "${CLIENT_D_PID}" \
+               "${SERVER_A_PID}" "${SERVER_B_PID}" "${SERVER_C_PID}" "${SERVER_D_PID}" \
                "${ECHO1_PID}" "${ECHO2_PID}" "${C5_BG_PID}" "${FWD_PID}"; do
         [ -n "${pid}" ] && kill "${pid}" 2>/dev/null
     done
@@ -494,7 +498,8 @@ fi
 
 if [ "${can_tc}" -ne 1 ]; then
     note "case 6 skipped (no NET_ADMIN): 2-path smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-5, 7; case 6 skipped)."
+    note "case 8 skipped (no NET_ADMIN): backup-pin smoke needs tc on lo."
+    note "RESULT = PASS (cases 1-5, 7; cases 6 and 8 skipped)."
     exit 0
 fi
 
@@ -555,5 +560,68 @@ if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
 fi
 ok 6 "2-path: both paths carried bytes (${PATHS_WITH_BYTES} paths)"
 
-note "RESULT = PASS (cases 1-7)."
+# ─────────────────────────────────────────────────────────────────────────────
+# ── case 8: --scheduler backup pins >=95% of bytes to one path ───────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# tc shaping is already active from case 6 (same two loopback paths).
+# We start a fresh server+client pair with --scheduler backup on BOTH sides,
+# send a substantial burst, SIGTERM the client to flush mq_conn_dump_stats,
+# then assert that the busiest single path holds >=95% of total bytes.
+# The 5% headroom covers path-validation / mp-ping control traffic on the
+# secondary path, which the backup scheduler still uses for keepalives.
+note "case 8: --scheduler backup primary-pin smoke"
+
+SERVER_D_PID="$(start_server_at "${QUIC_PORT_D}" "${WORK}/server_d.log" \
+    --scheduler backup)"
+
+# Launch client inline: start_client_at slurps ALL extra args as --path IPs,
+# so we cannot pass --scheduler through it. Copy the helper body here and add
+# the flag explicitly before the path args.
+"${MQPROXY_BIN}" client \
+    --server "${SERVER_IP}:${QUIC_PORT_D}" \
+    --token "${TOKEN}" \
+    --socks5 "127.0.0.1:${SOCKS_PORT_D}" \
+    --scheduler backup \
+    --path "${PATH_A_IP}" \
+    --path "${PATH_B_IP}" \
+    >"${WORK}/client_d.log" 2>&1 &
+CLIENT_D_PID=$!
+
+# Give the second path time to come up (mirrors case 6 sleep).
+sleep 2
+
+wait_udp_ready "${SOCKS_PORT_D}" "${ECHO_PORT_1}" "${SERVER_D_PID}" "${CLIENT_D_PID}" || {
+    note "case 8 FAIL: backup-scheduler server/client not ready"
+    exit 1
+}
+
+# Send a substantial burst so the path counters are meaningful.
+if ! "${UDPSOCKS_BIN}" \
+        --proxy "127.0.0.1:${SOCKS_PORT_D}" \
+        --target "127.0.0.1:${ECHO_PORT_1}" \
+        --send 1000 --count 200 --timeout-ms 30000 \
+        >/dev/null 2>"${WORK}/c8_udpsocks.err"; then
+    note "case 8 FAIL: udpsocks failed; stderr: $(head -c 200 "${WORK}/c8_udpsocks.err")"
+    exit 1
+fi
+
+# SIGTERM the client → flushes mq_conn_dump_stats per-path counters.
+stop_process "${CLIENT_D_PID}"; CLIENT_D_PID=""
+
+# primary-pin assertion: with --scheduler backup, >=95% of bytes on one path.
+SPLIT="$(grep -E 'mq\.path id=' "${WORK}/client_d.log" \
+    | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
+    | awk '{ tot[$1] += $2 + $3; sum += $2 + $3 }
+           END { max = 0; for (p in tot) if (tot[p] > max) max = tot[p];
+                 if (sum == 0) { print "0"; exit }
+                 printf "%.3f", max / sum }')"
+note "case 8: busiest-path share = ${SPLIT} (need >= 0.95)"
+if ! awk -v s="${SPLIT}" 'BEGIN { exit !(s+0 >= 0.95) }'; then
+    fail 8 "backup scheduler did not pin to one path (share=${SPLIT})"
+fi
+ok 8 "backup pinned ${SPLIT} of bytes to one path"
+
+stop_process "${SERVER_D_PID}"; SERVER_D_PID=""
+
+note "RESULT = PASS (cases 1-8)."
 exit 0
