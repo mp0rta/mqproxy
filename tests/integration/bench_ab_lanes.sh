@@ -277,9 +277,13 @@ run_relay_cell() {
     d0="$(netem_drops)"; t0="$(date +%s%3N)"
     # -n localhost: required for H3 ALPN negotiation (NULL SNI breaks H3 SETTINGS
     # exchange and causes "Cannot send GET command" even after handshake completes).
-    timeout -k 5 "${CELL_TIMEOUT}" "${PICOQUICDEMO}" -a h3 -G "${INNER_CC}" \
+    # cd into WORK: picoquicdemo writes demo_{ticket,token}_store.bin into CWD;
+    # keep them in the temp dir instead of littering the repo root. The token
+    # store also enables 0-RTT on later cells if left shared — same dir for all
+    # cells keeps that behaviour uniform across the matrix.
+    ( cd "${WORK}" && timeout -k 5 "${CELL_TIMEOUT}" "${PICOQUICDEMO}" -a h3 -G "${INNER_CC}" \
         -n localhost -o "${scratch}" 127.0.0.1 "${FWD_PORT}" "/${SIZE_BYTES}" \
-        >"${WORK}/pqcli_${tag}.log" 2>&1
+        >"${WORK}/pqcli_${tag}.log" 2>&1 )
     rc=$?
     t1="$(date +%s%3N)"; d1="$(netem_drops)"
 

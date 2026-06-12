@@ -576,6 +576,10 @@ ok 6 "2-path: both paths carried bytes (${PATHS_WITH_BYTES} paths)"
 # then assert that the busiest single path holds >=95% of total bytes.
 # The 5% headroom covers path-validation / mp-ping control traffic on the
 # secondary path, which the backup scheduler still uses for keepalives.
+# The pin is enforced by the backup scheduler TOGETHER WITH the STANDBY
+# marking of extra paths in mq_conn_add_path / mq_h3_conn_add_path — without
+# the standby marking, backup degenerates to minrtt-with-spill under
+# saturating load (it pins only while the best path has cwnd headroom).
 # Inverse of case 6: same shaped 2-path topology, but case 6 asserts the
 # default scheduler SPREADS across both paths while this asserts backup PINS
 # to one.
