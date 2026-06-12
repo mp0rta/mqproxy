@@ -49,5 +49,7 @@ int mq_gw_cache_insert(mq_gw_cache_t *c, const char *key, int status,
                        size_t body_len, uint64_t ttl_ms, uint64_t now_ms);
 
 size_t mq_gw_cache_bytes(const mq_gw_cache_t *c); /* current total (tests/diag) */
+size_t
+mq_gw_cache_max_obj_bytes(const mq_gw_cache_t *c); /* per-object cap (store gate) */
 
 #endif

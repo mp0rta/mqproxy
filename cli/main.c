@@ -458,7 +458,14 @@ cmd_server(int argc, char **argv)
             char *end = NULL;
             errno = 0;
             long long v = strtoll(optarg, &end, 10); /* bytes */
-            if (errno != 0 || end == optarg || *end != '\0' || v < 0) {
+            /* Reject v < 0 first (short-circuits), so the SIZE_MAX guard runs only
+             * for v >= 0 and can compare in the UNSIGNED domain. Do NOT cast
+             * SIZE_MAX to long long: on 64-bit (size_t == unsigned long long) that
+             * cast wraps to -1, rejecting every positive value. The guard is purely
+             * theoretical where size_t is 64-bit (LLONG_MAX < SIZE_MAX), but it makes
+             * the (size_t)v cast total on any platform. */
+            if (errno != 0 || end == optarg || *end != '\0' || v < 0 ||
+                (unsigned long long)v > (unsigned long long)SIZE_MAX) {
                 fprintf(stderr,
                         "mqproxy server: invalid --cache-max-bytes '%s' (must be >= 0; "
                         "0 = disabled)\n\n",

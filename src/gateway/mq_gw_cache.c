@@ -236,3 +236,9 @@ mq_gw_cache_bytes(const mq_gw_cache_t *c)
 {
     return c ? c->cur_bytes : 0;
 }
+
+size_t
+mq_gw_cache_max_obj_bytes(const mq_gw_cache_t *c)
+{
+    return c ? c->max_obj_bytes : 0;
+}
