@@ -263,6 +263,21 @@ mq_gw_parse_http_ver(const char *v, size_t vl)
     return MQ_HTTP_VER_DEFAULT;
 }
 
+unsigned
+mq_gw_parse_cache_ttl(const char *v, size_t vl)
+{
+    if (!v || vl == 0) return 0;
+    unsigned long n = 0;
+    for (size_t i = 0; i < vl; i++) {
+        char c = v[i];
+        if (c < '0' || c > '9') return 0; /* non-digit (incl. sign/space) */
+        if (n > (MQ_GW_CACHE_TTL_MAX / 10) + 1) return 0; /* early overflow guard */
+        n = n * 10 + (unsigned long)(c - '0');
+    }
+    if (n < 1 || n > MQ_GW_CACHE_TTL_MAX) return 0;
+    return (unsigned)n;
+}
+
 /* ---------------------------------------------------------------------------
  * Strip predicates
  * ------------------------------------------------------------------------- */

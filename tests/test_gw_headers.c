@@ -613,6 +613,26 @@ test_parse_http_ver(void)
     MQ_CHECK_EQ_INT(mq_gw_parse_http_ver("", 0), MQ_HTTP_VER_DEFAULT);      /* empty */
 }
 
+/* ===================================================================
+ * mq_gw_parse_cache_ttl
+ * =================================================================== */
+
+static void
+test_parse_cache_ttl(void)
+{
+    /* returns ttl seconds (>0) for valid; 0 for invalid/absent. */
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("1", 1), 1);
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("60", 2), 60);
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("31536000", 8), 31536000); /* 1y = MAX */
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("0", 1), 0);        /* 0 = invalid (not >=1) */
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("", 0), 0);         /* empty */
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("x", 1), 0);        /* non-numeric */
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("-5", 2), 0);       /* sign */
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("60 ", 3), 0);      /* trailing junk */
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("31536001", 8), 0); /* > MAX */
+    MQ_CHECK_EQ_INT(mq_gw_parse_cache_ttl("99999999999999999999", 20), 0); /* overflow */
+}
+
 MQ_TEST_MAIN({
     /* target */
     test_target_https_full();
@@ -674,4 +694,6 @@ MQ_TEST_MAIN({
     test_curl_map();
     /* origin http version parse */
     test_parse_http_ver();
+    /* X-Mq-Cache ttl parse */
+    test_parse_cache_ttl();
 })
