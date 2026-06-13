@@ -2,14 +2,19 @@
 // Copyright (c) 2026 mp0rta
 
 /*
- * udpsocks.c — SOCKS5 UDP ASSOCIATE client for e2e UDP relay tests.
+ * udpsocks.c — SOCKS5 UDP ASSOCIATE client / forwarder shim for e2e UDP relay
+ * tests.
  *
- * Usage:
+ * Usage (echo-client mode):
  *   udpsocks --proxy <ip:port> --target <host:port>
  *            [--send <hexfile|size>] [--count <N>] [--timeout-ms <T>]
  *            [--verbose]
  *
- * Flow:
+ * Usage (forwarder / bench-shim mode):
+ *   udpsocks --proxy <ip:port> --target <host:port> --listen <port>
+ *            [--verbose]
+ *
+ * ── Echo-client flow ────────────────────────────────────────────────────────
  *   1. TCP connect to --proxy.
  *   2. SOCKS5 greeting (VER=5, 1 method, NO-AUTH).
  *   3. UDP ASSOCIATE request (CMD=0x03, DST=0.0.0.0:0).
@@ -36,6 +41,26 @@
  *   - If host is an IPv4 literal (a.b.c.d): use ATYP=0x01.
  *   - Otherwise: use ATYP=0x03 (domain).
  *
+ * ── Forwarder / bench-shim mode (--listen) ──────────────────────────────────
+ * Performs SOCKS5 ASSOCIATE setup as above, then binds 127.0.0.1:<listen-port>
+ * and relays plain UDP traffic between the local listener and the SOCKS5 relay.
+ *
+ * Forwarder contract:
+ *   - Sticky single peer: the source address of the first inbound datagram is
+ *     remembered for the process lifetime and used as the return address for
+ *     all unwrapped datagrams.  Inner-address / port migration is out of scope.
+ *   - Wrap path (local peer → relay): prepend the prebuilt SOCKS5 UDP header
+ *     (built from --target) and forward to BND.
+ *   - Unwrap path (relay → local peer): parse and strip the SOCKS5 UDP header,
+ *     forward inner payload to the learned peer address.
+ *   - Oversize datagrams that would exceed the tx buffer are silently dropped
+ *     on the wrap path and counted.
+ *   - The process exits (cleanly, status 0) when the ASSOCIATE control TCP
+ *     connection reaches EOF — the proxy session has been torn down.
+ *   - SIGTERM / SIGINT also cause a clean (status 0) exit.
+ *   - In all exit paths a one-line summary is printed to stderr:
+ *       udpsocks: forwarder stats wrap_fail=N unwrap_fail=N no_peer_drop=N
+ *
  * Links mqproxy static library for mq_socks5_build_udp_hdr /
  * mq_socks5_parse_udp_hdr (pure functions — no event loop).
  */
@@ -44,6 +69,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,6 +92,7 @@ usage(void)
         "Usage: udpsocks --proxy <ip:port> --target <host:port>\n"
         "                [--send <hexfile|size>] [--count <N>]\n"
         "                [--timeout-ms <T>] [--verbose]\n"
+        "                [--listen <port>]\n"
         "\n"
         "  --proxy  <ip:port>    SOCKS5 TCP proxy address (required).\n"
         "  --target <host:port>  UDP echo target (required); host is IP literal\n"
@@ -74,7 +101,10 @@ usage(void)
         "                        (deterministic pattern, default 8).\n"
         "  --count  <N>          Send/recv cycles (default 1).\n"
         "  --timeout-ms <T>      Per-response receive deadline in ms (default 3000).\n"
-        "  --verbose             Hex-dump even on successful match.\n");
+        "  --verbose             Hex-dump even on successful match.\n"
+        "  --listen <port>       Forwarder mode: bind 127.0.0.1:<port>, relay plain\n"
+        "                        UDP <-> SOCKS5 UDP encapsulation (bench shim).\n"
+        "                        Mutually exclusive with --send/--count.\n");
 }
 
 /* Write all bytes; returns 0 on success, -1 on error. */
@@ -243,6 +273,166 @@ parse_hostport(const char *arg, char *host_out, size_t host_cap, uint16_t *port_
     return 0;
 }
 
+/* ── forwarder mode (--listen) ───────────────────────────────────────────────
+ * Plain-UDP <-> SOCKS5-UDP shim for the A/B lanes bench: bind
+ * 127.0.0.1:listen_port, learn the single peer from the first datagram
+ * (sticky for the process lifetime — inner port migration is out of scope),
+ * prepend the prebuilt SOCKS5 UDP header toward BND, strip it on the way
+ * back. Runs until killed or the ASSOCIATE control connection drops.
+ */
+
+static volatile sig_atomic_t g_stop = 0;
+
+static void
+sig_handler(int sig)
+{
+    (void)sig;
+    g_stop = 1;
+}
+
+static int
+run_forwarder(uint16_t listen_port, int tcp_fd, int udp_fd,
+              const struct sockaddr_in *bnd_sa, const uint8_t *hdr_buf, int hdr_len,
+              int verbose)
+{
+    /* Install signal handlers so SIGTERM/SIGINT cause a clean exit. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sig_handler;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+    int lfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (lfd < 0) {
+        perror("udpsocks: socket(listen)");
+        return 1;
+    }
+    struct sockaddr_in la;
+    memset(&la, 0, sizeof(la));
+    la.sin_family = AF_INET;
+    inet_pton(AF_INET, "127.0.0.1", &la.sin_addr);
+    la.sin_port = htons(listen_port);
+    if (bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0) {
+        perror("udpsocks: bind(listen)");
+        close(lfd);
+        return 1;
+    }
+
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer)); /* read only after learn, but keep
+                                     * -Wmaybe-uninitialized quiet */
+    socklen_t peer_len = 0;         /* 0 = not learned yet */
+    static uint8_t rx[65535 + 300];
+    static uint8_t tx[65535 + 300];
+
+    uint64_t wrap_fail = 0;    /* sendto < 0 or oversize-skipped on wrap path */
+    uint64_t unwrap_fail = 0;  /* parse failed or sendto < 0 on unwrap path */
+    uint64_t no_peer_drop = 0; /* inbound datagram dropped before peer learned */
+
+    fprintf(stderr, "udpsocks: forwarding 127.0.0.1:%u <-> SOCKS5 UDP relay\n",
+            (unsigned)listen_port);
+
+    for (;;) {
+        if (g_stop) break;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lfd, &rfds);
+        FD_SET(udp_fd, &rfds);
+        FD_SET(tcp_fd, &rfds);
+        int maxfd = lfd;
+        if (udp_fd > maxfd) maxfd = udp_fd;
+        if (tcp_fd > maxfd) maxfd = tcp_fd;
+        if (select(maxfd + 1, &rfds, NULL, NULL, NULL) < 0) {
+            if (errno == EINTR) {
+                /* Interrupted by signal — recheck g_stop at top of loop. */
+                continue;
+            }
+            perror("udpsocks: select");
+            close(lfd);
+            fprintf(stderr,
+                    "udpsocks: forwarder stats wrap_fail=%llu unwrap_fail=%llu"
+                    " no_peer_drop=%llu\n",
+                    (unsigned long long)wrap_fail, (unsigned long long)unwrap_fail,
+                    (unsigned long long)no_peer_drop);
+            return 1;
+        }
+
+        /* ASSOCIATE control EOF => proxy session torn down => exit cleanly. */
+        if (FD_ISSET(tcp_fd, &rfds)) {
+            uint8_t b;
+            if (recv(tcp_fd, &b, 1, 0) <= 0) {
+                fprintf(stderr, "udpsocks: ASSOCIATE control connection closed\n");
+                close(lfd);
+                fprintf(stderr,
+                        "udpsocks: forwarder stats wrap_fail=%llu unwrap_fail=%llu"
+                        " no_peer_drop=%llu\n",
+                        (unsigned long long)wrap_fail, (unsigned long long)unwrap_fail,
+                        (unsigned long long)no_peer_drop);
+                return 0;
+            }
+        }
+
+        /* peer -> proxy: wrap. */
+        if (FD_ISSET(lfd, &rfds)) {
+            struct sockaddr_in from;
+            socklen_t flen = sizeof(from);
+            ssize_t n = recvfrom(lfd, rx, sizeof(rx), 0, (struct sockaddr *)&from, &flen);
+            if (n > 0) {
+                if (peer_len == 0) {
+                    peer = from;
+                    peer_len = flen;
+                    if (verbose) {
+                        fprintf(stderr, "udpsocks: learned peer 127.0.0.1:%u\n",
+                                (unsigned)ntohs(from.sin_port));
+                    }
+                }
+                if ((size_t)n + (size_t)hdr_len <= sizeof(tx)) {
+                    memcpy(tx, hdr_buf, (size_t)hdr_len);
+                    memcpy(tx + hdr_len, rx, (size_t)n);
+                    ssize_t sent =
+                        sendto(udp_fd, tx, (size_t)n + (size_t)hdr_len, 0,
+                               (const struct sockaddr *)bnd_sa, sizeof(*bnd_sa));
+                    if (sent < 0) wrap_fail++;
+                } else {
+                    /* Datagram too large for tx buffer — drop and count. */
+                    wrap_fail++;
+                }
+            }
+        }
+
+        /* proxy -> peer: unwrap. */
+        if (FD_ISSET(udp_fd, &rfds)) {
+            ssize_t n = recvfrom(udp_fd, rx, sizeof(rx), 0, NULL, NULL);
+            if (n > 0) {
+                if (peer_len == 0) {
+                    no_peer_drop++;
+                } else {
+                    mq_socks5_udp_hdr_t h;
+                    memset(&h, 0, sizeof(h));
+                    if (mq_socks5_parse_udp_hdr(rx, (size_t)n, &h) >= 0 &&
+                        (size_t)n >= h.hdr_len) {
+                        ssize_t sent = sendto(lfd, rx + h.hdr_len, (size_t)n - h.hdr_len,
+                                              0, (struct sockaddr *)&peer, peer_len);
+                        if (sent < 0) unwrap_fail++;
+                    } else {
+                        unwrap_fail++;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Signal-initiated exit — clean. */
+    close(lfd);
+    fprintf(stderr,
+            "udpsocks: forwarder stats wrap_fail=%llu unwrap_fail=%llu"
+            " no_peer_drop=%llu\n",
+            (unsigned long long)wrap_fail, (unsigned long long)unwrap_fail,
+            (unsigned long long)no_peer_drop);
+    return 0;
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────────*/
 
 int
@@ -256,6 +446,7 @@ main(int argc, char **argv)
     int count = 1;
     int timeout_ms = 3000;
     int verbose = 0;
+    uint16_t listen_port = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--proxy") == 0 && i + 1 < argc) {
@@ -286,6 +477,15 @@ main(int argc, char **argv)
             }
         } else if (strcmp(argv[i], "--verbose") == 0) {
             verbose = 1;
+        } else if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
+            char *endp = NULL;
+            unsigned long lp = strtoul(argv[++i], &endp, 10);
+            if (!endp || *endp != '\0' || lp < 1 || lp > 65535) {
+                fprintf(stderr, "udpsocks: --listen: invalid port: %s\n", argv[i]);
+                usage();
+                return 1;
+            }
+            listen_port = (uint16_t)lp;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage();
             return 0;
@@ -305,6 +505,12 @@ main(int argc, char **argv)
         fprintf(stderr, "udpsocks: --target is required\n");
         usage();
         return 1;
+    }
+
+    if (listen_port != 0 && (send_arg != NULL || count != 1)) {
+        fprintf(stderr, "udpsocks: --listen is mutually exclusive with --send/--count\n");
+        usage();
+        return 2;
     }
 
     /* ── Build payload ──────────────────────────────────────────────────────*/
@@ -572,6 +778,16 @@ main(int argc, char **argv)
         close(tcp_fd);
         free(payload);
         return 1;
+    }
+
+    /* ── Forwarder mode (--listen) ──────────────────────────────────────────*/
+    if (listen_port != 0) {
+        int frc = run_forwarder(listen_port, tcp_fd, udp_fd, &bnd_sa, hdr_buf, hdr_len,
+                                verbose);
+        close(udp_fd);
+        close(tcp_fd);
+        free(payload);
+        return frc;
     }
 
     /* ── Build full outgoing datagram: header + payload ─────────────────────*/

@@ -138,6 +138,17 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_engine_boot COMMAND test_engine_boot)
 
+    add_executable(test_sched tests/test_sched.c)
+    target_link_libraries(test_sched
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_sched PRIVATE tests src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_sched PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_sched COMMAND test_sched)
+
     add_executable(test_metrics_format tests/test_metrics_format.c)
     target_link_libraries(test_metrics_format
         mqproxy xquic ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB} pthread dl m stdc++)

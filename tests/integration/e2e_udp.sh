@@ -29,13 +29,20 @@
 #     6. (NET_ADMIN-gated) 2-path: tc shapes two loopback paths; both paths'
 #        recv bytes > 0 from `mq_conn_dump_stats` in client.log after
 #        SIGTERM. Without NET_ADMIN this sub-case prints a SKIP note; the
-#        script continues and exits 0 (cases 1-5 decide the result, mirroring
+#        script continues and exits 0 (cases 1-5,7 decide the result, mirroring
 #        e2e_gateway semantics).
+#     7. --listen forwarder mode: udpsocks binds a local port, wraps datagrams
+#        toward udp_echo via the SOCKS5 UDP relay; a plain Python UDP client
+#        gets a byte-exact echo end-to-end (Server A).
+#     8. (NET_ADMIN-gated) --scheduler backup primary-pin: same 2-path topology
+#        as case 6, but with --scheduler backup on both sides; >=95% of bytes
+#        must land on one path (Server D).  Inverse of case 6.
 #
 # SERVER GROUPINGS (to minimise restarts while keeping scenario isolation):
-#   Server A (default flags):  cases 1, 2, 3, 5.
+#   Server A (default flags):  cases 1, 2, 3, 5, 7.
 #   Server B (--udp-idle-timeout 1): case 4.
-#   Server C (default, 2-path paths for case 6): NET_ADMIN-gated only.
+#   Server C (default, 2-path for case 6): NET_ADMIN-gated only.
+#   Server D (--scheduler backup, 2-path for case 8): NET_ADMIN-gated only.
 #
 #   Case 2 frag assertion: the frags_sent / frags_reassembled counters live on
 #   the per-conn mq_udp_srv struct and are logged at mq_udp_srv_free time
@@ -45,12 +52,12 @@
 # SKIP DISCIPLINE (matches e2e_gateway):
 #   The WHOLE script exits 77 (SKIP) ONLY if mqproxy/udpsocks/udp_echo
 #   binaries are missing or udp_echo fails to bind — without them nothing
-#   can be tested.  All other failures are real FAILs (exit 1).  Case 6 alone
+#   can be tested.  All other failures are real FAILs (exit 1).  Cases 6 and 8
 #   skipping (no NET_ADMIN) does NOT skip the script.
 #
 # HOW TO RUN:
-#   tests/integration/e2e_udp.sh                  # cases 1-5 (+ case-6 skip)
-#   sudo tests/integration/e2e_udp.sh             # also runs case 6
+#   tests/integration/e2e_udp.sh                  # cases 1-5, 7 (+ cases 6,8 skip)
+#   sudo tests/integration/e2e_udp.sh             # also runs cases 6 and 8
 #   ctest --test-dir build -R e2e_udp --output-on-failure
 #
 # ENV (passed by CMake; overridable):
@@ -108,15 +115,18 @@ PY
 QUIC_PORT_A="$(free_port udp)"
 QUIC_PORT_B="$(free_port udp)"
 QUIC_PORT_C="$(free_port udp)"
+QUIC_PORT_D="$(free_port udp)"
 SOCKS_PORT_A="$(free_port tcp)"
 SOCKS_PORT_B="$(free_port tcp)"
 SOCKS_PORT_C="$(free_port tcp)"
+SOCKS_PORT_D="$(free_port tcp)"
 ECHO_PORT_1="$(free_port udp)"
 ECHO_PORT_2="$(free_port udp)"
+FWD_PORT="$(free_port udp)"
 
-for v in "${QUIC_PORT_A}" "${QUIC_PORT_B}" "${QUIC_PORT_C}" \
-         "${SOCKS_PORT_A}" "${SOCKS_PORT_B}" "${SOCKS_PORT_C}" \
-         "${ECHO_PORT_1}" "${ECHO_PORT_2}"; do
+for v in "${QUIC_PORT_A}" "${QUIC_PORT_B}" "${QUIC_PORT_C}" "${QUIC_PORT_D}" \
+         "${SOCKS_PORT_A}" "${SOCKS_PORT_B}" "${SOCKS_PORT_C}" "${SOCKS_PORT_D}" \
+         "${ECHO_PORT_1}" "${ECHO_PORT_2}" "${FWD_PORT}"; do
     if [ -z "${v}" ]; then
         note "free-port selection failed (python3 socket bind). SKIPPING."
         exit "${SKIP}"
@@ -129,19 +139,22 @@ WORK="$(mktemp -d /tmp/mqproxy_e2e_udp.XXXXXX)"
 SERVER_A_PID=""
 SERVER_B_PID=""
 SERVER_C_PID=""
+SERVER_D_PID=""
 CLIENT_A_PID=""
 CLIENT_B_PID=""
 CLIENT_C_PID=""
+CLIENT_D_PID=""
 ECHO1_PID=""
 ECHO2_PID=""
 C5_BG_PID=""
+FWD_PID=""
 TC_ON=0
 
 cleanup() {
     set +e
-    for pid in "${CLIENT_A_PID}" "${CLIENT_B_PID}" "${CLIENT_C_PID}" \
-               "${SERVER_A_PID}" "${SERVER_B_PID}" "${SERVER_C_PID}" \
-               "${ECHO1_PID}" "${ECHO2_PID}" "${C5_BG_PID}"; do
+    for pid in "${CLIENT_A_PID}" "${CLIENT_B_PID}" "${CLIENT_C_PID}" "${CLIENT_D_PID}" \
+               "${SERVER_A_PID}" "${SERVER_B_PID}" "${SERVER_C_PID}" "${SERVER_D_PID}" \
+               "${ECHO1_PID}" "${ECHO2_PID}" "${C5_BG_PID}" "${FWD_PID}"; do
         [ -n "${pid}" ] && kill "${pid}" 2>/dev/null
     done
     [ "${TC_ON}" -eq 1 ] && tc qdisc del dev lo root 2>/dev/null
@@ -366,6 +379,39 @@ else
     fail 5 "server unhealthy after udpsocks kill; stderr: $(head -c 200 "${WORK}/c5_health.err"); server_a: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
 fi
 
+# ── case 7: --listen forwarder mode — plain UDP client through the shim ──────
+# udpsocks binds 127.0.0.1:$FWD_PORT, wraps datagrams toward udp_echo via the
+# SOCKS5 UDP relay, unwraps replies back to the learned peer. A plain python
+# UDP client must get a byte-exact echo end-to-end.
+note "case 7: --listen forwarder mode"
+"${UDPSOCKS_BIN}" --proxy "127.0.0.1:${SOCKS_PORT_A}" \
+    --target "127.0.0.1:${ECHO_PORT_1}" \
+    --listen "${FWD_PORT}" >"${WORK}/fwd.log" 2>&1 &
+FWD_PID=$!
+sleep 0.5
+if ! kill -0 "${FWD_PID}" 2>/dev/null; then
+    cat "${WORK}/fwd.log" >&2
+    fail 7 "forwarder died at startup"
+else
+    if python3 - "${FWD_PORT}" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(5)
+payload = bytes(range(256)) * 4
+s.sendto(payload, ("127.0.0.1", int(sys.argv[1])))
+data, _ = s.recvfrom(65536)
+sys.exit(0 if data == payload else 1)
+PY
+    then
+        ok 7 "byte-exact echo through forwarder"
+    else
+        cat "${WORK}/fwd.log" >&2
+        fail 7 "echo through forwarder mismatched/timed out"
+    fi
+fi
+kill "${FWD_PID}" 2>/dev/null; wait "${FWD_PID}" 2>/dev/null
+FWD_PID=""
+
 # ── Tear down Server A group + assert case 2 frags_reassembled > 0 ───────────
 # SIGTERM the client first (normal teardown), then the server.
 # mq_udp_srv_free → mq_udp_srv_dump_stats fires on server conn close, writing
@@ -397,7 +443,7 @@ if [ "${FRAGS_REASSEMBLED}" -le 0 ]; then
 fi
 note "case 2 frag assertion: frags_reassembled=${FRAGS_REASSEMBLED} > 0 (stats: ${STATS_A})"
 
-note "cases 1, 2, 3, 5 PASS (${PASS_COUNT}/4 so far)."
+note "cases 1, 2, 3, 5, 7 PASS (${PASS_COUNT}/5 so far)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── Server B group: case 4 (--udp-idle-timeout 1) ────────────────────────────
@@ -440,8 +486,8 @@ fi
 stop_process "${CLIENT_B_PID}"; CLIENT_B_PID=""
 stop_process "${SERVER_B_PID}"; SERVER_B_PID=""
 
-note "case 4 PASS (5/5 so far)."
-note "cases 1-5 PASS (${PASS_COUNT}/5 checks)."
+note "case 4 PASS (6/6 so far)."
+note "cases 1-5, 7 PASS (${PASS_COUNT}/6 checks)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── case 6: 2-path aggregation smoke (NET_ADMIN-gated) ───────────────────────
@@ -459,7 +505,8 @@ fi
 
 if [ "${can_tc}" -ne 1 ]; then
     note "case 6 skipped (no NET_ADMIN): 2-path smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-5; case 6 skipped)."
+    note "case 8 skipped (no NET_ADMIN): backup-pin smoke needs tc on lo."
+    note "RESULT = PASS (cases 1-5, 7; cases 6 and 8 skipped)."
     exit 0
 fi
 
@@ -520,5 +567,76 @@ if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
 fi
 ok 6 "2-path: both paths carried bytes (${PATHS_WITH_BYTES} paths)"
 
-note "RESULT = PASS (cases 1-6)."
+# ─────────────────────────────────────────────────────────────────────────────
+# ── case 8: --scheduler backup pins >=95% of bytes to one path ───────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# tc shaping is already active from case 6 (same two loopback paths).
+# We start a fresh server+client pair with --scheduler backup on BOTH sides,
+# send a substantial burst, SIGTERM the client to flush mq_conn_dump_stats,
+# then assert that the busiest single path holds >=95% of total bytes.
+# The 5% headroom covers path-validation / mp-ping control traffic on the
+# secondary path, which the backup scheduler still uses for keepalives.
+# The pin is enforced by the backup scheduler TOGETHER WITH the STANDBY
+# marking of extra paths in mq_conn_add_path / mq_h3_conn_add_path — without
+# the standby marking, backup degenerates to minrtt-with-spill under
+# saturating load (it pins only while the best path has cwnd headroom).
+# Inverse of case 6: same shaped 2-path topology, but case 6 asserts the
+# default scheduler SPREADS across both paths while this asserts backup PINS
+# to one.
+note "case 8: --scheduler backup primary-pin smoke"
+
+SERVER_D_PID="$(start_server_at "${QUIC_PORT_D}" "${WORK}/server_d.log" \
+    --scheduler backup)"
+
+# Launch client inline: start_client_at slurps ALL extra args as --path IPs,
+# so we cannot pass --scheduler through it. Replicate the helper's invocation;
+# start_client_at would slurp --scheduler as a path IP.
+"${MQPROXY_BIN}" client \
+    --server "${SERVER_IP}:${QUIC_PORT_D}" \
+    --token "${TOKEN}" \
+    --socks5 "127.0.0.1:${SOCKS_PORT_D}" \
+    --scheduler backup \
+    --path "${PATH_A_IP}" \
+    --path "${PATH_B_IP}" \
+    >"${WORK}/client_d.log" 2>&1 &
+CLIENT_D_PID=$!
+
+# Give the second path time to come up (mirrors case 6 sleep).
+sleep 2
+
+wait_udp_ready "${SOCKS_PORT_D}" "${ECHO_PORT_1}" "${SERVER_D_PID}" "${CLIENT_D_PID}" || {
+    note "case 8 FAIL: backup-scheduler server/client not ready"
+    exit 1
+}
+
+# Send a substantial burst so the path counters are meaningful.
+if ! "${UDPSOCKS_BIN}" \
+        --proxy "127.0.0.1:${SOCKS_PORT_D}" \
+        --target "127.0.0.1:${ECHO_PORT_1}" \
+        --send 1000 --count 200 --timeout-ms 30000 \
+        >/dev/null 2>"${WORK}/c8_udpsocks.err"; then
+    note "case 8 FAIL: udpsocks failed; stderr: $(head -c 200 "${WORK}/c8_udpsocks.err")"
+    exit 1
+fi
+
+# SIGTERM the client → flushes mq_conn_dump_stats per-path counters.
+stop_process "${CLIENT_D_PID}"; CLIENT_D_PID=""
+
+# primary-pin assertion: with --scheduler backup, >=95% of bytes on one path.
+SPLIT="$(grep -E 'mq\.path id=' "${WORK}/client_d.log" \
+    | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
+    | awk '{ tot[$1] += $2 + $3; sum += $2 + $3 }
+           END { max = 0; for (p in tot) if (tot[p] > max) max = tot[p];
+                 if (sum == 0) { print "0"; exit }
+                 printf "%.3f", max / sum }')"
+note "case 8: busiest-path share = ${SPLIT} (need >= 0.95)"
+if ! awk -v s="${SPLIT}" 'BEGIN { exit !(s+0 >= 0.95) }'; then
+    grep -E 'mq\.path id=' "${WORK}/client_d.log" >&2 || true
+    fail 8 "backup scheduler did not pin to one path (share=${SPLIT})"
+fi
+ok 8 "backup pinned ${SPLIT} of bytes to one path"
+
+stop_process "${SERVER_D_PID}"; SERVER_D_PID=""
+
+note "RESULT = PASS (cases 1-8)."
 exit 0

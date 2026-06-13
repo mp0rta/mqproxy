@@ -120,6 +120,8 @@ usage_server(FILE *out)
                  "<dir>/server.qlog.\n"
                  "  --cc     <algo>     Congestion control: bbr (default) | bbr2 | "
                  "cubic.\n"
+                 "  --scheduler <s>     Multipath scheduler: minrtt (default) | "
+                 "backup | wlb.\n"
                  "  --metrics-interval <sec>\n"
                  "                      Periodically log per-path stats "
                  "(mq.conn/mq.path)\n"
@@ -182,6 +184,8 @@ usage_client(FILE *out)
         "                             (the 1-B blocked-frame instrument).\n"
         "  --cc           <algo>      Congestion control: bbr (default) | bbr2 "
         "| cubic.\n"
+        "  --scheduler    <s>         Multipath scheduler: minrtt (default) | backup | "
+        "wlb\n"
         "  --keepalive-idle <sec>     QUIC idle timeout in seconds, kept alive by\n"
         "                             PINGs (default: 30; 0 = disable; <15 not useful).\n"
         "  --reconnect                Re-establish the server connection on loss\n"
@@ -367,6 +371,8 @@ cmd_server(int argc, char **argv)
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
     mq_cc_t cc = MQ_CC_DEFAULT;
+    const char *sched_arg = NULL;
+    mq_sched_t sched = MQ_SCHED_DEFAULT;
     int gateway_enabled = 1;          /* gateway on by default; --no-gateway opts out */
     long udp_idle_timeout_s = 60;     /* --udp-idle-timeout <sec>, default 60 */
     int udp_enabled = 1;              /* --no-udp clears this */
@@ -385,6 +391,7 @@ cmd_server(int argc, char **argv)
         OPT_NO_UDP,
         OPT_QLOG,
         OPT_CC,
+        OPT_SCHEDULER,
         OPT_METRICS_INTERVAL,
         OPT_REQUEST_METRICS,
         OPT_CACHE_MAX_BYTES,
@@ -400,6 +407,7 @@ cmd_server(int argc, char **argv)
         {"no-udp", no_argument, NULL, OPT_NO_UDP},
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
+        {"scheduler", required_argument, NULL, OPT_SCHEDULER},
         {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
         {"request-metrics", no_argument, NULL, OPT_REQUEST_METRICS},
         {"cache-max-bytes", required_argument, NULL, OPT_CACHE_MAX_BYTES},
@@ -435,6 +443,7 @@ cmd_server(int argc, char **argv)
         case OPT_NO_UDP: udp_enabled = 0; break;
         case OPT_QLOG: qlog_dir = optarg; break;
         case OPT_CC: cc_name = optarg; break;
+        case OPT_SCHEDULER: sched_arg = optarg; break;
         case OPT_METRICS_INTERVAL: {
             char *end = NULL;
             errno = 0;
@@ -491,6 +500,18 @@ cmd_server(int argc, char **argv)
             return 2;
         }
     }
+    if (sched_arg) {
+        int sched_ok = 0;
+        sched = mq_sched_from_string(sched_arg, &sched_ok);
+        if (!sched_ok) {
+            fprintf(stderr,
+                    "mqproxy server: invalid --scheduler '%s' (minrtt|backup|wlb)\n\n",
+                    sched_arg);
+            usage_server(stderr);
+            return 2;
+        }
+    }
+    mq_conn_set_scheduler(sched);
 
     /* --request-metrics only takes effect inside the gateway block below; with
      * --no-gateway it is silently ignored. Warn (not error: the flag is opt-in)
@@ -601,10 +622,11 @@ cmd_server(int argc, char **argv)
         goto out;
     }
 
-    MQ_LOGI(
-        "mqproxy server listening on %s:%u (cc=%s, gateway=%s, udp=%s, udp-idle=%lds)",
-        listen_ip, listen_port, mq_cc_name(cc), gateway_enabled ? "on" : "off",
-        udp_enabled ? "on" : "off", udp_idle_timeout_s);
+    MQ_LOGI("mqproxy server listening on %s:%u (cc=%s, sched=%s, gateway=%s, udp=%s, "
+            "udp-idle=%lds)",
+            listen_ip, listen_port, mq_cc_name(cc), mq_sched_name(sched),
+            gateway_enabled ? "on" : "off", udp_enabled ? "on" : "off",
+            udp_idle_timeout_s);
 
     /* Phase 5c periodic metrics (opt-in via --metrics-interval). Dumps the
      * most-recently-accepted conn's per-path stats every interval. */
@@ -715,6 +737,8 @@ cmd_client(int argc, char **argv)
     const char *qlog_dir = NULL;
     const char *cc_name = NULL;
     mq_cc_t cc = MQ_CC_DEFAULT;
+    const char *sched_arg = NULL;
+    mq_sched_t sched = MQ_SCHED_DEFAULT;
     const char *paths[MQ_MAX_EXTRA_PATHS];
     size_t npaths = 0;
     long keepalive_idle_s = 30;        /* --keepalive-idle <sec>; 0 = disable */
@@ -732,6 +756,7 @@ cmd_client(int argc, char **argv)
         OPT_CLIENT_ID,
         OPT_QLOG,
         OPT_CC,
+        OPT_SCHEDULER,
         OPT_KEEPALIVE_IDLE,
         OPT_RECONNECT,
         OPT_NO_RECONNECT,
@@ -748,6 +773,7 @@ cmd_client(int argc, char **argv)
         {"client-id", required_argument, NULL, OPT_CLIENT_ID},
         {"qlog", required_argument, NULL, OPT_QLOG},
         {"cc", required_argument, NULL, OPT_CC},
+        {"scheduler", required_argument, NULL, OPT_SCHEDULER},
         {"keepalive-idle", required_argument, NULL, OPT_KEEPALIVE_IDLE},
         {"reconnect", no_argument, NULL, OPT_RECONNECT},
         {"no-reconnect", no_argument, NULL, OPT_NO_RECONNECT},
@@ -777,6 +803,7 @@ cmd_client(int argc, char **argv)
         case OPT_CLIENT_ID: client_id = optarg; break;
         case OPT_QLOG: qlog_dir = optarg; break;
         case OPT_CC: cc_name = optarg; break;
+        case OPT_SCHEDULER: sched_arg = optarg; break;
         case OPT_KEEPALIVE_IDLE: {
             char *endp = NULL;
             errno = 0;
@@ -839,6 +866,18 @@ cmd_client(int argc, char **argv)
             return 2;
         }
     }
+    if (sched_arg) {
+        int sched_ok = 0;
+        sched = mq_sched_from_string(sched_arg, &sched_ok);
+        if (!sched_ok) {
+            fprintf(stderr,
+                    "mqproxy client: invalid --scheduler '%s' (minrtt|backup|wlb)\n\n",
+                    sched_arg);
+            usage_client(stderr);
+            return 2;
+        }
+    }
+    mq_conn_set_scheduler(sched);
 
     if (!server) {
         fprintf(stderr, "mqproxy client: missing required --server\n\n");
@@ -1076,8 +1115,8 @@ cmd_client(int argc, char **argv)
         if (gateway)
             n += snprintf(ingress + n, sizeof(ingress) - (size_t)n, " gateway=%s:%u",
                           gw_ip, gw_port);
-        MQ_LOGI("mqproxy client: server=%s:%u%s (bind %s, cc=%s)", server_ip, server_port,
-                ingress, primary_ip, mq_cc_name(cc));
+        MQ_LOGI("mqproxy client: server=%s:%u%s (bind %s, cc=%s, sched=%s)", server_ip,
+                server_port, ingress, primary_ip, mq_cc_name(cc), mq_sched_name(sched));
     }
 
     /* Phase 5c periodic metrics (opt-in via --metrics-interval). mctx outlives
