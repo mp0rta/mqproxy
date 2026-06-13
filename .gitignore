@@ -15,6 +15,8 @@ build_*/
 # Vendored HTTP/3 libcurl build (scripts/build-h3-curl.sh) — build output, like
 # the xquic build dirs; never committed.
 third_party/h3-curl/
-bench_results/
+# bench output at the repo root only — committed result snapshots live under
+# docs/report/bench_results/, so scope this to the root dir (leading slash).
+/bench_results/
 demo_ticket_store.bin
 demo_token_store.bin
