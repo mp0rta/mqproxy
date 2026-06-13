@@ -559,6 +559,14 @@ mq_origin_resume_pull(mq_origin_req_t *r)
     schedule_resume(r);
 }
 
+long
+mq_origin_http_ver(const mq_origin_req_t *r)
+{
+    long ver = CURL_HTTP_VERSION_NONE;
+    if (r && r->easy) curl_easy_getinfo(r->easy, CURLINFO_HTTP_VERSION, &ver);
+    return ver;
+}
+
 /* ── start / abort ──────────────────────────────────────────────────────────*/
 
 mq_origin_req_t *

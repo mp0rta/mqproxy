@@ -182,6 +182,14 @@ void mq_origin_resume_body(mq_origin_req_t *r);
  * mq_origin_resume_body. */
 void mq_origin_resume_pull(mq_origin_req_t *r);
 
+/* The negotiated origin HTTP version (CURLINFO_HTTP_VERSION). Valid once the
+ * response headers have been parsed — i.e. from on_status / on_header / on_body
+ * onward. Returns CURL_HTTP_VERSION_NONE before that or on error. The on_done
+ * callback already delivers the final value; this getter lets the owner read it
+ * EARLIER (during on_body) to synthesize a response-side diagnostic before the
+ * response headers go on the wire (after which on_done would be too late). */
+long mq_origin_http_ver(const mq_origin_req_t *r);
+
 /* Cancel a request: remove it from the multi handle and destroy it WITHOUT
  * firing on_done. The pointer is dangling afterward. */
 void mq_origin_abort(mq_origin_req_t *r);

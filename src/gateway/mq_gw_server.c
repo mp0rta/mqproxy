@@ -39,13 +39,16 @@
  */
 #include "gateway/mq_gw_server.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <curl/curl.h>
 #include <event2/event.h>
 
+#include "gateway/mq_gw_cache.h"
 #include "gateway/mq_gw_headers.h"
 #include "gateway/mq_gw_metrics.h"
 #include "gateway/mq_origin_curl.h"
@@ -62,6 +65,17 @@
 /* Max forwarded origin request headers (the request's non-stripped headers).
  * xqc delivers a bounded header set; 64 is comfortable for the MVP. */
 #define MQ_GWS_MAX_HDRS 64
+
+/* Monotonic millisecond clock for the cache's freshness/LRU accounting (the
+ * cache itself is clock-free — callers inject now_ms). A file-static rather than
+ * a shared util header (only the cache store/lookup sites need it). */
+static uint64_t
+gw_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 /* ── TLS outcome (origin_tls field) ─────────────────────────────────────────*/
 
@@ -108,9 +122,43 @@ typedef struct mq_gw_req_s {
     int pull_paused;  /* pull_body returned 0 (PAUSE); resume when spill refills */
 
     /* ── download (junction #4): origin response → H3 response ── */
-    int resp_headers_sent;      /* we sent the H3 response header section */
-    int resp_status;            /* origin http_status (from on_status) */
-    long resp_http_ver;         /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
+    int resp_headers_sent; /* we sent the H3 response header section */
+    int resp_status;       /* origin http_status (from on_status) */
+    long resp_http_ver;    /* CURLINFO_HTTP_VERSION (set on first body/on_done) */
+
+    /* ── cacheability (Phase 6) ── */
+    unsigned cache_ttl_s;  /* request X-Mq-Cache opt-in TTL (0 = not opted in) */
+    int has_authorization; /* request carried an Authorization header */
+    int cc_uncacheable;    /* response Cache-Control: no-store/private/no-cache */
+    long cc_max_age;       /* response max-age/s-maxage (smaller of the two); -1 absent */
+    int has_set_cookie;    /* response carried a Set-Cookie header */
+    int has_vary;          /* response carried a Vary header */
+
+    /* ── cache HIT replay (Phase 6) — copy-on-hit: the source entry can be evicted
+     * by a LATER request's insert across the send turns this request yields on, so
+     * we deep-copy the entry's body into req-owned storage (cache_body) and stage
+     * its header strings into the EXISTING inline r->hdrs[] arrays (they are bounded
+     * by the same 128/1024 arena caps the entry passed through on store, so the copy
+     * is lossless — no separate header backing buffer is needed). The body is
+     * replayed in 16 KiB slices by download_flush's from_cache loop. */
+    int from_cache;        /* this request is being served from the cache (no origin) */
+    uint8_t *cache_body;   /* owned copy of the cached body (NULL = none/empty) */
+    size_t cache_body_len; /* total cached body length */
+    size_t cache_off;      /* replay cursor into cache_body */
+    char cache_key[8 + 256 + 1024 + 8]; /* "GET <url>" (built in gw_dispatch when caching
+                                         * may apply; reused for lookup + store) */
+    int is_get;                         /* request method is GET (cache gate) */
+
+    /* ── cache STORE (Phase 6) — accumulate a cacheable miss's body, capped at the
+     * cache's max_obj_bytes; on a clean 200 done we insert. Overflow / non-cacheable
+     * frees store_buf and clears `storing` (keep streaming to the client). */
+    uint8_t *store_buf; /* growable body accumulator (NULL until first cacheable body) */
+    size_t store_len;   /* bytes accumulated */
+    size_t store_cap;   /* current capacity of store_buf */
+    int storing;        /* 1 while accumulating a cacheable miss */
+
+    enum { MQ_CACHE_BYPASS = 0, MQ_CACHE_HIT, MQ_CACHE_MISS } cache_state;
+
     int origin_is_tls;          /* origin scheme == https (set in gw_dispatch, Task 5) */
     mq_tls_result_t origin_tls; /* TLS verify outcome, set in origin_on_done */
     char content_encoding[24];  /* origin response Content-Encoding value; "" => none */
@@ -178,6 +226,10 @@ struct mq_gw_server_s {
     mq_gw_req_t *reqs; /* intrusive list of live per-request states */
 
     int request_metrics; /* emit mq.req per-request line (opt-in; default 0) */
+
+    /* In-memory origin response cache (opt-in via --cache-max-bytes; NULL when
+     * disabled = default). Owned: freed in mq_gw_server_free. */
+    mq_gw_cache_t *cache;
 };
 
 /* ── forward decls ──────────────────────────────────────────────────────────*/
@@ -187,6 +239,7 @@ static void h3_on_read(mq_h3_req_t *hr, int flag, void *user);
 static void h3_on_write(mq_h3_req_t *hr, void *user);
 static void h3_on_close(mq_h3_req_t *hr, void *user);
 static void download_flush(mq_gw_req_t *r);
+static unsigned gw_response_cacheable(const mq_gw_req_t *r);
 
 /* ── small helpers ──────────────────────────────────────────────────────────*/
 
@@ -252,6 +305,8 @@ gw_req_maybe_free(mq_gw_req_t *r)
     if (!r->origin_dead || !r->h3_dead) return;
     gw_req_unlink(r->srv, r);
     free(r->spill);
+    free(r->cache_body); /* copy-on-hit body (NULL when not a HIT) */
+    free(r->store_buf);  /* STORE accumulator (NULL unless a cacheable miss aborted) */
     free(r);
 }
 
@@ -409,9 +464,15 @@ download_send_headers(mq_gw_req_t *r)
     hs[nh].value = st;
     nh++;
 
-    hs[nh].name = "x-mq-origin-protocol";
-    hs[nh].value = http_ver_token(r->resp_http_ver);
-    nh++;
+    /* x-mq-origin-protocol is a diagnostic of the NEGOTIATED origin protocol. A
+     * cache HIT contacted NO origin, so synthesizing one here would emit a FALSE
+     * `http/1.1` (http_ver_token's NONE default) — the response-version bug fixed
+     * in commit 5136c46. Omit it on the HIT path (design §7). */
+    if (!r->from_cache) {
+        hs[nh].name = "x-mq-origin-protocol";
+        hs[nh].value = http_ver_token(r->resp_http_ver);
+        nh++;
+    }
 
     for (int i = 0; i < r->n_hdrs && nh < (size_t)(MQ_GWS_MAX_HDRS + 2); i++) {
         hs[nh].name = r->hdrs[i].name;
@@ -435,6 +496,39 @@ download_flush(mq_gw_req_t *r)
 {
     if (r->h3_dead || !r->req) return;
     if (!r->resp_headers_sent) return; /* headers must precede body */
+
+    if (r->from_cache) {
+        /* drive the whole in-memory body, yielding only on real H3 backpressure */
+        while (r->cache_off < r->cache_body_len || r->pend_off < r->pend_len) {
+            if (r->pend_off >= r->pend_len &&
+                r->cache_off < r->cache_body_len) { /* refill from cache */
+                size_t rem = r->cache_body_len - r->cache_off;
+                size_t n =
+                    rem < MQ_GWS_RECV_CHUNK
+                        ? rem
+                        : MQ_GWS_RECV_CHUNK; /* inline clamp (no MIN macro in tree) */
+                memcpy(r->pend, r->cache_body + r->cache_off, n);
+                r->cache_off += n;
+                r->pend_len = n;
+                r->pend_off = 0;
+            }
+            long acc = mq_h3_req_send_body(r->req, r->pend + r->pend_off,
+                                           r->pend_len - r->pend_off, /*fin=*/0);
+            if (acc < 0) {
+                if (!r->finished) mq_h3_req_reset(r->req);
+                return;
+            } /* hard error → reset, as curl path */
+            r->pend_off += (size_t)acc;
+            if (r->pend_off < r->pend_len)
+                return; /* H3 blocked → h3_on_write re-drives later */
+        }
+        if (mq_h3_req_send_body(r->req, NULL, 0, /*fin=*/1) < 0) {
+            if (!r->finished) mq_h3_req_reset(r->req);
+            return;
+        }
+        r->finished = 1; /* mirror the curl path's post-finish flag */
+        return;          /* never fall through to the curl tail */
+    }
 
     while (r->pend_off < r->pend_len) {
         long acc = mq_h3_req_send_body(r->req, r->pend + r->pend_off,
@@ -466,6 +560,100 @@ download_flush(mq_gw_req_t *r)
     }
 }
 
+/* Case-insensitive search for `needle` (lowercase literal) in the value slice
+ * [v, v+vl). Returns a pointer to the match (within v) or NULL. Local + simple
+ * (the value is short; this runs once per cache-control header). */
+static const char *
+ci_memmem(const char *v, size_t vl, const char *needle)
+{
+    size_t nl = strlen(needle);
+    if (nl == 0 || nl > vl) return NULL;
+    for (size_t i = 0; i + nl <= vl; i++) {
+        size_t j = 0;
+        for (; j < nl; j++) {
+            char a = v[i + j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (a != needle[j]) break;
+        }
+        if (j == nl) return v + i;
+    }
+    return NULL;
+}
+
+/* Token-boundary test for a valueless Cache-Control directive (no-store /
+ * private / no-cache). `ci_memmem` matches substrings, so a header value like
+ * `x-private-data` or `no-cacheable` would falsely set cc_uncacheable. Require a
+ * delimiter (start-of-value / ',' / SP / HTAB) immediately BEFORE the match and a
+ * terminator (end / ',' / SP / HTAB / ';') immediately AFTER — these directives
+ * carry no `=value`, so an `=` after the token is NOT a valid boundary. Scans all
+ * occurrences (a later token may be a clean match even if an earlier one is a
+ * substring). */
+static int
+cc_has_token(const char *v, size_t vl, const char *tok)
+{
+    size_t tl = strlen(tok);
+    const char *end = v + vl;
+    for (const char *p = v; (p = ci_memmem(p, (size_t)(end - p), tok)) != NULL; p += tl) {
+        char before = (p > v) ? p[-1] : ','; /* synthesize a delimiter at start */
+        const char *a = p + tl;
+        char after = (a < end) ? *a : ','; /* synthesize a delimiter at end */
+        int bok = (before == ',' || before == ' ' || before == '\t');
+        int aok = (after == ',' || after == ' ' || after == '\t' || after == ';');
+        if (bok && aok) return 1;
+    }
+    return 0;
+}
+
+/* Parse the delta-seconds at `p` (just past a `…age=`), within the slice ending
+ * at `end`. Returns the non-negative value, or -1 if no leading digit. Stops at
+ * the first non-digit (',' / ' ' / end). Caps at INT32_MAX (still "cacheable"). */
+static long
+cc_parse_delta(const char *p, const char *end)
+{
+    if (p >= end || *p < '0' || *p > '9') return -1;
+    long n = 0;
+    for (; p < end && *p >= '0' && *p <= '9'; p++) {
+        n = n * 10 + (*p - '0');
+        if (n > 2147483647L) return 2147483647L; /* clamp; still "cacheable, large" */
+    }
+    return n;
+}
+
+/* Fold one parsed delta into cc_max_age, keeping the SMALLER of any already-set
+ * value and this one (the more conservative freshness bound). */
+static void
+cc_take_min_age(mq_gw_req_t *r, long d)
+{
+    if (d >= 0 && (r->cc_max_age < 0 || d < r->cc_max_age)) r->cc_max_age = d;
+}
+
+/* Scan a response Cache-Control value for the cacheability-relevant directives
+ * and fold them into r: no-store/private/no-cache ⇒ cc_uncacheable; max-age= /
+ * s-maxage= ⇒ cc_max_age (the smaller of the two when both are present). The
+ * `s-maxage=` token contains `max-age=` at offset 2, so each `max-age=` match is
+ * accepted only when it is NOT the tail of an `s-maxage=` (the prior char is not
+ * the 's' of "s-max"); both deltas still fold into the min. */
+static void
+cc_scan(mq_gw_req_t *r, const char *v, size_t vl)
+{
+    if (cc_has_token(v, vl, "no-store") || cc_has_token(v, vl, "private") ||
+        cc_has_token(v, vl, "no-cache"))
+        r->cc_uncacheable = 1;
+    const char *end = v + vl;
+    /* All `s-maxage=` occurrences. */
+    for (const char *p = v; (p = ci_memmem(p, (size_t)(end - p), "s-maxage=")) != NULL;) {
+        cc_take_min_age(r, cc_parse_delta(p + 9, end));
+        p += 9;
+    }
+    /* All `max-age=` occurrences that are NOT the tail of an `s-maxage=` (i.e. not
+     * immediately preceded by an 's'/'S'). */
+    for (const char *p = v; (p = ci_memmem(p, (size_t)(end - p), "max-age=")) != NULL;) {
+        char prev = (p > v) ? p[-1] : '\0';
+        if (prev != 's' && prev != 'S') cc_take_min_age(r, cc_parse_delta(p + 8, end));
+        p += 8;
+    }
+}
+
 /* curl on_status: stash the final status code. */
 static void
 origin_on_status(int http_status, void *u)
@@ -493,6 +681,15 @@ origin_on_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
         memcpy(r->content_encoding, v, cn);
         r->content_encoding[cn] = '\0';
     }
+    /* Cacheability capture (Phase 6; set but unread until the STORE/HIT task).
+     * Captured BEFORE the arena-capacity check so a full header set still gates
+     * cacheability correctly. These headers are ALSO forwarded normally below. */
+    if (slice_ieq(n, nl, "set-cookie"))
+        r->has_set_cookie = 1;
+    else if (slice_ieq(n, nl, "vary"))
+        r->has_vary = 1;
+    else if (slice_ieq(n, nl, "cache-control"))
+        cc_scan(r, v, vl);
     if (r->n_hdrs >= MQ_GWS_MAX_HDRS) {
         r->hdrs_overflow = 1;
         return;
@@ -522,6 +719,59 @@ origin_on_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
     r->hdrs[i].value[vl] = '\0';
 }
 
+/* STORE accumulation: append `len` body bytes to r->store_buf while this miss is
+ * being cached. Lazily starts storing on the first chunk if the response is
+ * cacheable. Capped at the cache's per-object limit (max_obj_bytes) — on overflow
+ * (or OOM) we free the buffer and stop storing, but KEEP streaming to the client
+ * (a store failure never breaks the request). Called once per ACCEPTED chunk. */
+static void
+store_accumulate(mq_gw_req_t *r, const uint8_t *p, size_t len)
+{
+    mq_gw_server_t *s = r->srv;
+    if (r->from_cache || !s->cache) return; /* HIT replay or cache disabled */
+
+    /* Decide once, on the first accepted chunk, whether this response is cacheable.
+     * All inputs are known by now (status from on_status, CC/cookie/vary from
+     * on_header, both before the first on_body). */
+    if (!r->storing && r->store_buf == NULL && r->store_len == 0) {
+        if (gw_response_cacheable(r) == 0) return; /* not cacheable → never store */
+        r->storing = 1;
+    }
+    if (!r->storing) return; /* a prior overflow disabled storing */
+    if (len == 0) return;
+
+    size_t cap_max = mq_gw_cache_max_obj_bytes(s->cache);
+    if (r->store_len + len > cap_max) {
+        /* Object exceeds the per-object cap (the insert would refuse it anyway) →
+         * stop storing now and reclaim the buffer; keep streaming to the client. */
+        free(r->store_buf);
+        r->store_buf = NULL;
+        r->store_len = 0;
+        r->store_cap = 0;
+        r->storing = 0;
+        return;
+    }
+    if (r->store_len + len > r->store_cap) {
+        size_t ncap = r->store_cap ? r->store_cap * 2 : MQ_GWS_RECV_CHUNK;
+        while (ncap < r->store_len + len)
+            ncap *= 2;
+        if (ncap > cap_max) ncap = cap_max; /* never grow past the per-object cap */
+        uint8_t *nb = realloc(r->store_buf, ncap);
+        if (!nb) { /* OOM → stop storing, keep streaming */
+            free(r->store_buf);
+            r->store_buf = NULL;
+            r->store_len = 0;
+            r->store_cap = 0;
+            r->storing = 0;
+            return;
+        }
+        r->store_buf = nb;
+        r->store_cap = ncap;
+    }
+    memcpy(r->store_buf + r->store_len, p, len);
+    r->store_len += len;
+}
+
 /* curl on_body: send response headers (if not yet) then the body chunk over H3.
  * Returns the bytes accepted: len (accept all, copying any unsent remainder into
  * the pending buffer + pausing) or 0 (pause) on a hard H3 block. Runs inside a
@@ -532,10 +782,15 @@ origin_on_body(const uint8_t *p, size_t len, void *u)
     mq_gw_req_t *r = (mq_gw_req_t *)u;
     if (r->h3_dead || !r->req) return 0; /* H3 gone: pause (teardown handles it) */
 
-    /* Capture the negotiated protocol lazily (http_ver is reliable by first body).
-     * It is also re-read on on_done; either is fine. */
-
     if (!r->resp_headers_sent) {
+        /* Capture the negotiated origin HTTP version NOW: CURLINFO_HTTP_VERSION is
+         * valid once headers are parsed, and the synthesized x-mq-origin-protocol
+         * response header (download_send_headers) must report the REAL version.
+         * on_done re-reads it later for the mq.req metrics line; both agree. Without
+         * this, resp_http_ver stays NONE here → http_ver_token defaults to "http/1.1",
+         * mislabeling every h2/h3 origin response (on_done fires too late — the
+         * response headers are already on the wire by the first body chunk). */
+        if (r->oreq) r->resp_http_ver = mq_origin_http_ver(r->oreq);
         if (download_send_headers(r) != 0) {
             /* download_send_headers may have already synthesized a clean error
              * response (oversized origin header → 502 + fin); only reset if it
@@ -563,6 +818,11 @@ origin_on_body(const uint8_t *p, size_t len, void *u)
         return 0; /* PAUSE: resumed from download_flush once pend drains */
     }
 
+    /* Past the pend-full pause we are COMMITTED to accepting this whole chunk (both
+     * remaining returns yield `len`), so accumulate it for the cache exactly once —
+     * a paused-then-redelivered chunk never reaches here twice. */
+    store_accumulate(r, p, len);
+
     long acc = mq_h3_req_send_body(r->req, p, len, /*fin=*/0);
     if (acc < 0) {
         mq_h3_req_reset(r->req);
@@ -584,6 +844,48 @@ origin_on_body(const uint8_t *p, size_t len, void *u)
     r->pend_len = rem;
     r->pend_off = 0;
     return (long)len; /* accept all; the remainder is buffered for on_write */
+}
+
+/* STORE finalize: on a clean cacheable miss, deep-copy the accumulated body +
+ * response headers into the cache. Builds a temporary mq_gw_cache_hdr_t[] view of
+ * the inline r->hdrs[] (the cache deep-copies, so the temp array + store_buf are
+ * freed right after). A cache insert failure NEVER affects the already-delivered
+ * response. Frees store_buf unconditionally (it is consumed here). */
+static void
+store_finalize(mq_gw_req_t *r)
+{
+    mq_gw_server_t *s = r->srv;
+    if (!r->storing || !s->cache) {
+        /* Not storing (empty body / overflow-disabled / non-cacheable / disabled):
+         * nothing to insert. store_buf is NULL in all these cases, but free defensively.
+         */
+        free(r->store_buf);
+        r->store_buf = NULL;
+        r->store_len = 0;
+        r->store_cap = 0;
+        r->storing = 0;
+        return;
+    }
+
+    unsigned ttl_s = gw_response_cacheable(r); /* re-check + compute the effective ttl */
+    if (ttl_s > 0 && r->cache_key[0] != '\0') {
+        mq_gw_cache_hdr_t tmp[MQ_GWS_MAX_HDRS];
+        size_t nh = 0;
+        for (int i = 0; i < r->n_hdrs && nh < MQ_GWS_MAX_HDRS; i++) {
+            tmp[nh].name = r->hdrs[i].name;
+            tmp[nh].value = r->hdrs[i].value;
+            nh++;
+        }
+        /* Insert is best-effort: a -1 (per-object cap / OOM) leaves the cache
+         * unchanged and the response already delivered — never a request failure. */
+        (void)mq_gw_cache_insert(s->cache, r->cache_key, 200, tmp, nh, r->store_buf,
+                                 r->store_len, (uint64_t)ttl_s * 1000u, gw_now_ms());
+    }
+    free(r->store_buf);
+    r->store_buf = NULL;
+    r->store_len = 0;
+    r->store_cap = 0;
+    r->storing = 0;
 }
 
 /* curl on_done: terminal. result==CURLE_OK → finish; error → 502/mapped status
@@ -631,6 +933,10 @@ origin_on_done(int curl_result, long http_ver, long ssl_verify, int origin_reuse
         }
         /* Mark the origin done so the fin is sent once any buffered tail drains. */
         r->origin_done_ok = 1;
+        /* STORE the cacheable miss (best-effort; all body chunks have been
+         * accumulated by now — on_done fires after the last on_body). Consumes +
+         * frees store_buf. Done before the flush; insert never touches the H3 side. */
+        store_finalize(r);
         /* Flush any pending body; download_flush sends the fin when pend empties
          * (immediately here if nothing is buffered). */
         download_flush(r);
@@ -680,6 +986,12 @@ typedef struct {
     int has_class;
 
     mq_http_ver_t origin_http_version; /* from x-mq-origin-protocol; DEFAULT if absent */
+
+    /* cache control (Phase 6). cache_ttl_s = parsed X-Mq-Cache opt-in TTL (0 =
+     * absent/not opted in); has_authorization = request carried an Authorization
+     * header (a cacheability gate — the response is per-credential). */
+    unsigned cache_ttl_s;
+    int has_authorization;
 
     /* forwarded origin headers (minus x-mq-* / hop-by-hop / pseudo). */
     mq_h3_header_t fwd[MQ_GWS_MAX_HDRS];
@@ -750,6 +1062,18 @@ req_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
          * no-op. */
         ctx->origin_http_version = mq_gw_parse_http_ver(v, vl);
         return; /* control header — do NOT forward to origin */
+    }
+    if (slice_ieq(n, nl, "x-mq-cache")) {
+        /* Cache opt-in TTL (the client validated + re-emitted this). 0 = invalid/
+         * absent → not opted in. Control header — auto-stripped, not forwarded. */
+        ctx->cache_ttl_s = mq_gw_parse_cache_ttl(v, vl);
+        return;
+    }
+    if (slice_ieq(n, nl, "authorization")) {
+        /* NOTE the credential for the cacheability gate (a per-credential
+         * response must not be cached) but STILL forward it to the origin — do
+         * NOT return here; fall through to the forward path below. */
+        ctx->has_authorization = 1;
     }
     /* Remember content-length for the upload framing, but do NOT forward it to
      * the origin: CURLOPT_INFILESIZE_LARGE is the sole framing source, so
@@ -823,6 +1147,108 @@ static int
 scheme_ok(const char *s)
 {
     return strcmp(s, "http") == 0 || strcmp(s, "https") == 0;
+}
+
+/* Build the cache key "GET <url>" into buf. GET-only (the caller gates on method).
+ * Returns the written length (excl. NUL), or 0 on truncation/failure. */
+static size_t
+gw_cache_key(const char *url, char *buf, size_t cap)
+{
+    int n = snprintf(buf, cap, "GET %s", url);
+    if (n <= 0 || (size_t)n >= cap) {
+        if (cap > 0) buf[0] = '\0';
+        return 0;
+    }
+    return (size_t)n;
+}
+
+/* Cacheability predicate for the ORIGIN response that ran (the STORE gate, and the
+ * ttl source). Returns the storable TTL in SECONDS (>0) iff every rule holds, else
+ * 0 (not cacheable). Rules: GET, 200, opted in (cache_ttl_s>0), no Authorization,
+ * no no-store/private/no-cache, no Set-Cookie, no Vary, and the effective ttl
+ * (min of the request opt-in and any response max-age/s-maxage) is > 0 — so a
+ * `max-age=0` response is NOT cacheable. */
+static unsigned
+gw_response_cacheable(const mq_gw_req_t *r)
+{
+    if (!r->is_get) return 0;
+    if (r->resp_status != 200) return 0;
+    if (r->cache_ttl_s == 0) return 0;
+    if (r->has_authorization) return 0;
+    if (r->cc_uncacheable) return 0;
+    if (r->has_set_cookie) return 0;
+    if (r->has_vary) return 0;
+    unsigned ttl_s = r->cache_ttl_s;
+    if (r->cc_max_age >= 0 && (unsigned long)r->cc_max_age < ttl_s)
+        ttl_s = (unsigned)r->cc_max_age; /* the more conservative bound (incl. 0) */
+    return ttl_s;                        /* 0 ⇒ not cacheable (e.g. max-age=0) */
+}
+
+/* COPY-ON-HIT + replay: serve `e` (a fresh borrowed cache entry) as this request's
+ * response. The entry can be evicted by a LATER request's insert across the send
+ * turns we yield on, so we DEEP-COPY the body into r->cache_body and stage the
+ * header strings into the inline r->hdrs[] arrays BEFORE sending anything. Then we
+ * send the headers and kick off the from_cache body replay (download_flush drives
+ * the whole in-memory body, yielding only on real H3 backpressure; h3_on_write
+ * re-drives).
+ *
+ * Returns 0 when the HIT was HANDLED (the response is in flight, OR the request is
+ * already being torn down by a hard H3 send failure — either way the caller must
+ * NOT start an origin). Returns -1 ONLY on a pre-send OOM (the body deep-copy
+ * failed and NOTHING was sent), where the caller safely degrades to a normal
+ * proxied response. On -1 all partial state is cleared. */
+static int
+gw_serve_from_cache(mq_gw_req_t *r, const mq_gw_cache_entry_t *e)
+{
+    if (r->h3_dead || !r->req) return -1;
+
+    /* Deep-copy the body first (the only heap we own on the HIT path). Done BEFORE
+     * any send so a -1 (OOM) leaves the H3 side untouched → safe to degrade. */
+    uint8_t *body = NULL;
+    if (e->body_len > 0) {
+        body = malloc(e->body_len);
+        if (!body) return -1; /* OOM → degrade; nothing sent yet */
+        memcpy(body, e->body, e->body_len);
+    }
+
+    /* Stage the cached headers into the inline r->hdrs[] arrays. The entry's header
+     * strings passed the SAME 128/1024 arena caps on store (origin_on_header), so
+     * copy_z here is lossless; cap defensively at MQ_GWS_MAX_HDRS regardless. */
+    r->n_hdrs = 0;
+    for (size_t i = 0; i < e->n_hdrs && r->n_hdrs < MQ_GWS_MAX_HDRS; i++) {
+        int j = r->n_hdrs++;
+        copy_z(r->hdrs[j].name, sizeof(r->hdrs[j].name), e->hdrs[i].name,
+               strlen(e->hdrs[i].name));
+        copy_z(r->hdrs[j].value, sizeof(r->hdrs[j].value), e->hdrs[i].value,
+               strlen(e->hdrs[i].value));
+    }
+
+    r->resp_status = e->status;
+    r->cache_body = body; /* owned; freed at both teardown sites */
+    r->cache_body_len = e->body_len;
+    r->cache_off = 0;
+    r->from_cache = 1;
+
+    /* Send the response header section (the x-mq-origin-protocol diagnostic is
+     * suppressed for from_cache in download_send_headers). From here on the request
+     * is COMMITTED to the HIT path: even a hard H3 send failure tears the request
+     * down (reset) rather than degrading — falling back to the origin after bytes
+     * (or a reset) hit the wire is not possible. So we return 0 (handled) in all
+     * post-send outcomes; the from_cache replay state + cache_body remain owned and
+     * are freed at teardown. */
+    if (download_send_headers(r) != 0) {
+        /* Hard H3 send failure (sh<0) OR a synthesized clean error (oversized header
+         * → 502 fin; not reachable for cached headers but handled defensively).
+         * Mirror origin_on_body: reset only if the error path did NOT already finish
+         * cleanly. Leave from_cache state intact (download_flush is a no-op once
+         * r->req is gone / finished); teardown frees cache_body once. */
+        if (!r->finished) mq_h3_req_reset(r->req);
+        return 0;
+    }
+    /* Prime the body replay (the from_cache outer loop fills pend on first iter).
+     * h3_on_write re-drives on H3 backpressure. */
+    download_flush(r);
+    return 0;
 }
 
 /* on_new_req has fired and headers are ready: parse, auth, validate, start the
@@ -947,6 +1373,41 @@ gw_dispatch(mq_gw_req_t *r)
                       truncated in this metrics-only copy. The %.*s precision bound
                       caps output to fit so -Werror=format-truncation can prove it. */
     r->origin_is_tls = (strcmp(ctx.scheme, "https") == 0); /* gates origin_tls (NEW-3) */
+
+    /* Cacheability inputs from the request side (Phase 6; the response-side flags
+     * are captured later in origin_on_header). */
+    r->cache_ttl_s = ctx.cache_ttl_s;
+    r->has_authorization = ctx.has_authorization;
+    r->is_get = (strcmp(ctx.method, "GET") == 0);
+
+    /* CACHE HIT path (Phase 6) — check the cache BEFORE starting the origin. A hit
+     * serves the stored 200 from memory and contacts NO origin. Gated on: caching
+     * enabled, opted in (X-Mq-Cache), GET, and no Authorization (a per-credential
+     * response is never served from a shared cache). A cache failure NEVER breaks
+     * the request — on any error we fall through to a normal proxied response. */
+    if (s->cache && r->cache_ttl_s > 0 && r->is_get && !r->has_authorization) {
+        /* Eligible for caching → this is at least a MISS (flips to HIT below, or
+         * stays MISS once the origin runs). The store-on-miss happens in
+         * origin_on_done; the key built here is reused there. */
+        r->cache_state = MQ_CACHE_MISS;
+        if (gw_cache_key(url, r->cache_key, sizeof(r->cache_key)) > 0) {
+            const mq_gw_cache_entry_t *e =
+                mq_gw_cache_lookup(s->cache, r->cache_key, gw_now_ms());
+            if (e && gw_serve_from_cache(r, e) == 0) {
+                /* HIT: response is now in flight from memory; no origin started.
+                 * origin_dead stays 0 here → h3_on_close flips it (oreq==NULL, the
+                 * reject precedent) → gw_req_maybe_free reclaims. */
+                r->cache_state = MQ_CACHE_HIT;
+                return;
+            }
+            /* lookup miss OR a copy-on-hit OOM: degrade to a normal proxied response
+             * (cache_state stays MISS). gw_serve_from_cache cleared any partial state. */
+        } else {
+            /* Key too long to cache (pathological URL): leave cache_key empty so the
+             * store path skips insert; still a normal proxied response. */
+            r->cache_key[0] = '\0';
+        }
+    }
 
     /* Upload framing: body present → known CL (>=0) or chunked sentinel. */
     int64_t upload_len = -1; /* no body */
@@ -1102,8 +1563,12 @@ gw_emit_req_metrics(mq_gw_req_t *r, mq_h3_req_t *hr)
             origin_proto_token(r->resp_http_ver), /* NONE-default → "none" */
         .origin_tls = otls,
         .content_encoding = r->content_encoding[0] ? r->content_encoding : "none",
-        .cache = "bypass",               /* honest Phase-2 constant; Phase 6 flips */
-        .origin_reuse = r->origin_reuse, /* Phase 6: real (was honest 0) */
+        .cache = r->cache_state == MQ_CACHE_HIT ? "hit"
+                 : r->cache_state == MQ_CACHE_MISS
+                     ? "miss"
+                     : "bypass",                   /* not opted in / disabled /
+                                                      non-GET / Authorization */
+        .origin_reuse = r->origin_reuse,           /* Phase 6: real (was honest 0) */
         .origin_connect_ms = r->origin_connect_ms, /* Phase 6: 0 reuse / -1 unknown */
         .mp_state = have ? st.mp_state : 0,
         .reset_reason = (have && st.stream_err)
@@ -1206,6 +1671,7 @@ gw_on_new_req(mq_h3_req_t *hr, void *user)
     r->req = hr;
     r->resp_http_ver =
         CURL_HTTP_VERSION_NONE; /* "none" until on_done sets the real version */
+    r->cc_max_age = -1;         /* -1 = absent (calloc zeroes the other cache flags) */
     r->origin_reuse = 0;
     r->origin_connect_ms = -1;
 
@@ -1291,6 +1757,21 @@ mq_gw_server_set_request_metrics(mq_gw_server_t *s, int on)
 }
 
 void
+mq_gw_server_set_cache(mq_gw_server_t *s, size_t max_bytes)
+{
+    if (!s) return;
+    if (s->cache) {
+        mq_gw_cache_free(s->cache);
+        s->cache = NULL;
+    }
+    if (max_bytes > 0) {
+        size_t obj = max_bytes < (4u << 20) ? max_bytes : (4u << 20); /* min(N,4MiB) */
+        if (obj < MQ_GWS_RECV_CHUNK) obj = MQ_GWS_RECV_CHUNK; /* floor at a chunk */
+        s->cache = mq_gw_cache_new(max_bytes, obj);
+    }
+}
+
+void
 mq_gw_server_free(mq_gw_server_t *s)
 {
     if (!s) return;
@@ -1328,6 +1809,8 @@ mq_gw_server_free(mq_gw_server_t *s)
             r->h3_dead = 1;
         }
         free(r->spill);
+        free(r->cache_body); /* copy-on-hit body — a HIT can be live at shutdown */
+        free(r->store_buf);  /* STORE accumulator — a cacheable miss can be in flight */
         free(r);
         r = next;
     }
@@ -1335,6 +1818,10 @@ mq_gw_server_free(mq_gw_server_t *s)
 
     /* All requests aborted → safe to free the origin (no live easy handles). */
     if (s->origin) mq_origin_free(s->origin);
+
+    /* Free the response cache (NULL when disabled). All in-flight requests are
+     * already reclaimed above, so no live HIT borrows the entries. */
+    if (s->cache) mq_gw_cache_free(s->cache);
 
     /* Do NOT free s->h3 here — the caller frees it (mq_gw_server_h3) in the
      * sanctioned order, before mq_transport_free. */
