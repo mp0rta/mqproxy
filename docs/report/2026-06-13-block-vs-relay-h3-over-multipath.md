@@ -1,13 +1,5 @@
 # HTTP/3 over multipath: terminate-and-restream (block) vs opaque datagram relay
 
-**Date:** 2026-06-13
-**Author:** mqproxy A/B lanes bench
-**Status:** Decision-grade experiment; result feeds the OpenMPTCProuter (OMR) integration design.
-**Reproduce:** `tests/integration/bench_ab_lanes.sh` (commit on branch `ab-lanes-bench`)
-**Raw data:** `docs/report/bench_results/2026-06-13-full-matrix-release.csv` (the
-release-build full matrix this report's §3 table is computed from; fresh runs land in
-the gitignored `bench_results/` at the repo root)
-
 ---
 
 ## 1. The question
