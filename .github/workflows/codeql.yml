@@ -17,6 +17,7 @@ jobs:
     permissions:
       security-events: write
       contents: read
+      actions: read   # CodeQL status-report/telemetry calls the workflow-runs API
     steps:
       - uses: actions/checkout@v6
         with:
