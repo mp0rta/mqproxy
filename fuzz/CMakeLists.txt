@@ -32,3 +32,14 @@ endfunction()
 set(WIRE ${SRC}/wire/mq_wire.c ${SRC}/wire/mq_varint.c)
 
 define_fuzzer(fuzz_varint fuzz_varint.c ${SRC}/wire/mq_varint.c)
+
+define_fuzzer(fuzz_wire_auth_req          fuzz_wire_auth_req.c          ${WIRE})
+define_fuzzer(fuzz_wire_auth_resp         fuzz_wire_auth_resp.c         ${WIRE})
+define_fuzzer(fuzz_wire_connect_tcp_req   fuzz_wire_connect_tcp_req.c   ${WIRE})
+define_fuzzer(fuzz_wire_connect_tcp_resp  fuzz_wire_connect_tcp_resp.c  ${WIRE})
+define_fuzzer(fuzz_wire_udp_session_open  fuzz_wire_udp_session_open.c  ${WIRE})
+define_fuzzer(fuzz_wire_udp_session_resp  fuzz_wire_udp_session_resp.c  ${WIRE})
+define_fuzzer(fuzz_udp_msg_hdr            fuzz_udp_msg_hdr.c            ${SRC}/wire/mq_udp_msg.c)
+
+# fuzz/scripts/gen_wire_seeds.c is NOT a build target — it is a standalone helper
+# compiled by hand (see its header comment) only when (re)generating wire seeds.
