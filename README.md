@@ -239,7 +239,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 
 | Flag | Description |
 |---|---|
-| `--no-gateway` | Disable the HTTP gateway (it is enabled by default) |
+| `--no-gateway` | **Disables HTTP Gateway mode for this server** (it is enabled by default). The TCP-proxy core keeps running; only the gateway origin bridge is turned off, so a client's `--gateway` ingress has nothing to talk to. |
 | `--origin-ca <pem>` | Extra CA bundle for origin TLS verification (private CAs / tests); verification itself is always on |
 | `--request-metrics` | Emit one `mq.req` logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of `--metrics-interval`. |
 
@@ -258,7 +258,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | Flag | Description |
 |---|---|
 | `--udp-idle-timeout <sec>` | UDP session idle timeout (default 60); the effective value is `min(client request, this)` |
-| `--no-udp` | Disable UDP relay (do not advertise the capability; refuse all sessions) |
+| `--no-udp` | **Disables UDP Relay mode entirely for this server** — the capability is not advertised at auth (clients see it as unavailable) and any session that is still attempted is refused. There is no client-side override. |
 
 **Client**
 
