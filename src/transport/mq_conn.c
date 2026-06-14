@@ -64,6 +64,9 @@ struct mq_conn_s {
     xqc_cid_t cid;
     int have_cid;
     int is_server;
+    int counted; /* 1 once this conn was counted in transport->n_conns (server,
+                  * admitted). Guards the close_notify decrement so client and
+                  * rejected conns never decrement (no underflow). */
 
     mq_conn_on_state_fn on_state;
     void *on_state_user;
@@ -126,6 +129,12 @@ mq_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_u
     }
 
     /* Server side: build an mq_conn for the accepted connection. */
+    /* Engine-wide conn cap (authoritative guard): reject before allocating.
+     * server_accept already refuses the common case pre-handshake; this catches
+     * a half-open conn that slipped past that check during a flood (design §6). */
+    if (mq_transport_conn_at_limit(t)) {
+        return -1;
+    }
     mq_conn_t *c = calloc(1, sizeof(*c));
     if (!c) {
         return -1;
@@ -139,6 +148,8 @@ mq_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_u
     xqc_conn_set_alp_user_data(conn, c);
     /* Bind the dgram user_data slot to the mq_conn (see client path above). */
     xqc_datagram_set_user_data(conn, c);
+    mq_transport_conn_inc(t);
+    c->counted = 1;
     if (actx) {
         actx->active_server_conn = c;
     }
@@ -171,6 +182,13 @@ mq_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *conn_us
     mq_conn_t *c = (mq_conn_t *)conn_proto_data;
     if (!c) {
         return 0;
+    }
+    /* Release the conn-cap slot (design 2026-06-15). Use c->transport, NOT actx:
+     * the counter lives on the transport, which outlives actx in the teardown
+     * path described below. counted guards against client/rejected conns. */
+    if (c->counted) {
+        mq_transport_conn_dec(c->transport);
+        c->counted = 0;
     }
     /* NB: do NOT touch the ALP ctx (actx) here. During xqc_engine_destroy,
      * xquic frees the ALPN registration list (and thus actx) BEFORE destroying
