@@ -1,6 +1,7 @@
 # Claude Code local (personal) settings — never commit
 .claude/settings.local.json
 .claude/worktrees/
+.worktrees/
 
 # Scratch / reference clones — never commit
 tmp/
