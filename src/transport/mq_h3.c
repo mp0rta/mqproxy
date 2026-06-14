@@ -55,6 +55,7 @@ struct mq_h3_conn_s {
     xqc_cid_t cid;
     int have_cid;
     int is_server;
+    int counted; /* 1 once counted in transport->n_conns (mirrors mq_conn_s). */
 
     mq_h3_conn_state_fn on_state;
     void *on_state_user;
@@ -238,6 +239,12 @@ mq_h3_conn_create_notify(xqc_h3_conn_t *h3c, const xqc_cid_t *cid, void *h3c_use
     }
 
     /* Server side: build a wrapper for the accepted connection. */
+    /* Engine-wide conn cap (authoritative guard): reject before allocating
+     * (mirrors mq_conn_create_notify; catches half-open slips past server_accept,
+     * design §6). */
+    if (mq_transport_conn_at_limit(t)) {
+        return -1;
+    }
     mq_h3_conn_t *c = calloc(1, sizeof(*c));
     if (!c) {
         return -1;
@@ -252,6 +259,8 @@ mq_h3_conn_create_notify(xqc_h3_conn_t *h3c, const xqc_cid_t *cid, void *h3c_use
         free(c);
         return -1;
     }
+    mq_transport_conn_inc(t);
+    c->counted = 1;
     h->active_server_conn = c;
 
     if (h->on_conn) {
@@ -287,6 +296,13 @@ mq_h3_conn_close_notify(xqc_h3_conn_t *h3c, const xqc_cid_t *cid, void *h3c_user
     }
     if (h->active_server_conn == c) {
         h->active_server_conn = NULL;
+    }
+    /* Release the conn-cap slot (design 2026-06-15), guarded by counted so client
+     * and rejected conns never decrement. NOT in mq_h3_conn_handshake_finished —
+     * that is the establishment path, not teardown. */
+    if (c->counted) {
+        mq_transport_conn_dec(c->transport);
+        c->counted = 0;
     }
     mq_h3_conn_table_remove(h, c);
     free(c);
