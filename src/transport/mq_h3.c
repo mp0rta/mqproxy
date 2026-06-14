@@ -502,6 +502,14 @@ mq_h3_free(mq_h3_t *h)
         }
         if (h->transport) {
             mq_transport_remove_mp_ready_cb(h->transport, mq_h3_conn_on_mp_ready, c);
+            /* Release the conn-cap slot here too: this loop is the close_notify
+             * substitute for conns the owner never closed (the ALPN callbacks are
+             * already unregistered, so h3_conn_close_notify won't fire for them).
+             * Keeps n_conns symmetric even on owner-driven teardown. */
+            if (c->counted) {
+                mq_transport_conn_dec(h->transport);
+                c->counted = 0;
+            }
         }
         free(c);
         h->conns[i] = NULL;

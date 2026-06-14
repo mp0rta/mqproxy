@@ -495,14 +495,19 @@ cmd_server(int argc, char **argv)
         }
         case OPT_MAX_CONNS: {
             /* 0 is a VALID "unlimited" sentinel (like --cache-max-bytes); reject
-             * only < 0. SIGNED strtol so a negative is caught (strtoul would wrap). */
+             * only < 0. SIGNED strtol so a negative is caught (strtoul would wrap).
+             * Reject > UINT32_MAX too: max_conns is a uint32_t, and a bare cast
+             * would silently truncate (notably 2^32 -> 0 = unlimited, the opposite
+             * of what the operator asked). Compare in the unsigned domain after the
+             * v<0 short-circuit, mirroring --cache-max-bytes's SIZE_MAX guard. */
             char *endp = NULL;
             errno = 0;
             long v = strtol(optarg, &endp, 10);
-            if (errno != 0 || endp == optarg || *endp != '\0' || v < 0) {
+            if (errno != 0 || endp == optarg || *endp != '\0' || v < 0 ||
+                (unsigned long long)v > (unsigned long long)UINT32_MAX) {
                 fprintf(stderr,
                         "mqproxy server: invalid --max-conns '%s' "
-                        "(must be >= 0; 0 = unlimited)\n\n",
+                        "(must be 0..4294967295; 0 = unlimited)\n\n",
                         optarg);
                 usage_server(stderr);
                 return 2;
