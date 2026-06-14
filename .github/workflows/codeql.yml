@@ -1,0 +1,88 @@
+name: CodeQL
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '23 4 * * 1'   # weekly, Monday 04:23 UTC
+  workflow_dispatch:
+
+# Cache-key convention mirrors ci.yml: keys carry a trailing `-vN`. Bump in
+# lockstep with ci.yml if the cached BoringSSL/xquic config changes.
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libevent-dev libcurl4-openssl-dev golang
+
+      # --- BoringSSL + xquic: mirror ci.yml `build` so mqproxy compiles for
+      # extraction. Same cache keys as ci.yml to ride the existing caches. ---
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (gcc fPIC)
+        id: bssl-cache
+        uses: actions/cache@v5
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-gcc-fpic-v1
+      - name: Clone + build BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl
+          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j"$(nproc)" ssl crypto
+
+      - name: Cache xquic (gcc Release, EVENT_LOG)
+        id: xquic-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-9c95ec7-v1
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_EVENT_LOG=ON \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j"$(nproc)"
+
+      # CodeQL traces commands run AFTER init — build xquic above (ignored via
+      # paths-ignore), init here, then build mqproxy so only our code is extracted.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          queries: security-extended
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Build mqproxy
+        run: |
+          # EXACT flags from ci.yml `build` job so extraction compiles
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
+          cmake --build build -j"$(nproc)"
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:c-cpp
