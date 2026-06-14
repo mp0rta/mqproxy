@@ -257,8 +257,8 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 
 | Flag | Description |
 |---|---|
-| `--udp-idle-timeout <sec>` | UDP session idle timeout (default 60); the effective value is `min(client request, this)` |
 | `--no-udp` | **Disables UDP Relay mode entirely for this server** — the capability is not advertised at auth (clients see it as unavailable) and any session that is still attempted is refused. There is no client-side override. |
+| `--udp-idle-timeout <sec>` | UDP session idle timeout (default 60); the effective value is `min(client request, this)` |
 
 **Client**
 
