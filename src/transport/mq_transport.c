@@ -59,6 +59,13 @@ struct mq_transport_s {
     /* Deadline recorded by set_event_timer; the runtime polls it (Chunk 4). */
     uint64_t next_deadline_us;
     int have_deadline;
+
+    /* Engine-wide cap on established inbound conns (pre-auth DoS, 2026-06-15).
+     * max_conns == 0 disables. last_refuse_log_us throttles the refusal WARN to
+     * once/sec. */
+    uint32_t max_conns;
+    uint32_t n_conns;
+    uint64_t last_refuse_log_us;
 };
 
 /* Wall-clock microseconds since the epoch — the SAME epoch as xquic's xqc_now /
@@ -491,6 +498,42 @@ xqc_engine_t *
 mq_transport_xqc(mq_transport_t *t)
 {
     return t ? t->engine : NULL;
+}
+
+void
+mq_transport_set_max_conns(mq_transport_t *t, uint32_t max_conns)
+{
+    if (t) {
+        t->max_conns = max_conns;
+    }
+}
+
+int
+mq_transport_conn_at_limit(const mq_transport_t *t)
+{
+    return t && t->max_conns != 0 && t->n_conns >= t->max_conns;
+}
+
+void
+mq_transport_conn_inc(mq_transport_t *t)
+{
+    if (t) {
+        t->n_conns++;
+    }
+}
+
+void
+mq_transport_conn_dec(mq_transport_t *t)
+{
+    if (t && t->n_conns > 0) {
+        t->n_conns--;
+    }
+}
+
+uint32_t
+mq_transport_n_conns(const mq_transport_t *t)
+{
+    return t ? t->n_conns : 0;
 }
 
 int

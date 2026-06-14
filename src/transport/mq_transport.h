@@ -106,6 +106,35 @@ int mq_transport_next_timeout_ms(mq_transport_t *t);
 /* Accessor for the underlying xquic engine (used by mq_conn / cli). */
 xqc_engine_t *mq_transport_xqc(mq_transport_t *t);
 
+/* ── Connection-count cap (pre-auth DoS resistance, design 2026-06-15) ───────
+ * Engine-wide bound on simultaneously-established INBOUND (server-accepted)
+ * connections, across all ALPNs (raw-QUIC TCP-proxy + H3). The counter lives on
+ * the transport (one engine == one transport); both ALPNs share it.
+ *
+ * conn_at_limit (pure read) and conn_inc are intentionally SEPARATE: server_accept
+ * must peek WITHOUT counting (it fires pre-handshake; half-open conns stay
+ * uncounted per design §6), while the create_notify guard checks-then-counts. */
+
+/* Configure the cap. max_conns == 0 disables it (unlimited). Default is 0 until
+ * set (the CLI sets 16); a pure client never configures it. */
+void mq_transport_set_max_conns(mq_transport_t *t, uint32_t max_conns);
+
+/* 1 if a new inbound connection would exceed the cap (max_conns != 0 &&
+ * n_conns >= max_conns); 0 otherwise. Read-only; used by server_accept (early
+ * reject) and each ALP create_notify (authoritative guard). */
+int mq_transport_conn_at_limit(const mq_transport_t *t);
+
+/* Count one admitted inbound connection. Call exactly once, in the ALP
+ * create_notify server branch, AFTER the at-limit guard passes. */
+void mq_transport_conn_inc(mq_transport_t *t);
+
+/* Release one admitted inbound connection. Call exactly once, in the ALP
+ * close_notify, guarded by the per-conn `counted` flag. Saturates at 0. */
+void mq_transport_conn_dec(mq_transport_t *t);
+
+/* Current established inbound connection count (test / observability accessor). */
+uint32_t mq_transport_n_conns(const mq_transport_t *t);
+
 /* Request that the caller open a socket for an additional path (the xquic path-id
  * is passed in; mq_conn obtained it from xqc_conn_create_path). Invokes the
  * runtime's open_path_socket callback. Returns its result, or -1 if no callback

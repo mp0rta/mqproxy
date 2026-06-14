@@ -157,6 +157,16 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_metrics_format PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_metrics_format COMMAND test_metrics_format)
 
+    # Connection-count cap (--max-conns) counter API — pre-auth DoS. Pure counter
+    # logic, no handshake.
+    add_executable(test_max_conns tests/test_max_conns.c)
+    target_link_libraries(test_max_conns
+        mqproxy xquic ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB} pthread dl m stdc++)
+    target_include_directories(test_max_conns PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_max_conns PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_max_conns COMMAND test_max_conns)
+
     # mq_h3_req_get_stats + mq_h3_req_stream_id NULL-guard unit tests.
     # Links mq_h3.o -> xqc_* so it lives in the xquic-gated block.
     add_executable(test_h3_req_stats tests/test_h3_req_stats.c)
