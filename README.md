@@ -184,37 +184,87 @@ The client automatically re-establishes its MPQUIC tunnel after a transient loss
 
 > **Limitation:** flows that are in flight at the moment of a total connection loss are failed — they are not resurrected after recovery. New flows opened after the tunnel is back work automatically.
 
-### Server options
+## Options reference
+
+Both binaries take a small set of **common flags** (connection, TLS, paths, metrics) that apply no matter which mode you run. Each operating mode then adds a few mode-specific flags — and crucially, a mode is *selected on the client* by which ingress flag you pass (`--socks5`, `--http-connect`, `--gateway`). The server simply offers all enabled capabilities; the client decides what to use.
+
+The tables below are split: **common flags first**, then one block per mode. Within each mode, server- and client-side flags are listed separately.
+
+### Common flags (all modes)
+
+**Server** — `mqproxy server …`
 
 | Flag | Description |
 |---|---|
-| `--listen <ip:port>` | UDP address to accept MPQUIC connections on (required) |
-| `--token <token>` | Shared auth token clients must present (required) |
+| `--listen <ip:port>` | **(required)** UDP address to accept MPQUIC connections on |
+| `--token <token>` | **(required)** Shared auth token clients must present |
 | `--cert <path>` / `--key <path>` | TLS cert/key (PEM); defaults to the bundled test cert |
-| `--origin-ca <pem>` | Extra CA bundle for origin TLS verification (private CAs / tests); verification itself is always on |
-| `--no-gateway` | Disable the HTTP gateway (enabled by default) |
-| `--udp-idle-timeout <sec>` | UDP session idle timeout (default 60); the effective value is `min(client request, this)` |
-| `--no-udp` | Disable UDP relay (do not advertise the capability; refuse all sessions) |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/server.qlog` |
 | `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s (must be > 0; omit to disable). Logs the most-recently-accepted TCP and gateway conn. |
-| `--request-metrics` | Emit one `mq.req` logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of `--metrics-interval`. |
 
-### Client options
+**Client** — `mqproxy client …`
 
 | Flag | Description |
 |---|---|
-| `--server <ip:port>` | UDP address of the mqproxy server (required) |
-| `--token <token>` | Shared auth token (required) |
-| `--socks5 <ip:port>` | Local address for the SOCKS5 ingress (TCP CONNECT + UDP ASSOCIATE) |
-| `--http-connect <ip:port>` | Local TCP address for the HTTP CONNECT ingress |
-| `--gateway <ip:port>` | Local TCP address for the HTTP gateway fetch API (`POST /_mqproxy/fetch`) |
-| `--path <local ip>` | Local IP to bind a path to (repeatable) |
+| `--server <ip:port>` | **(required)** UDP address of the mqproxy server |
+| `--token <token>` | **(required)** Shared auth token |
+| `--path <local ip>` | Local IP to bind a path to — **repeat for multipath aggregation** (e.g. WiFi + LTE) |
 | `--client-id <id>` | Client identifier sent at auth |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/client.qlog` |
 | `--reconnect` / `--no-reconnect` | Auto-reconnect on tunnel loss (default: enabled) |
 | `--reconnect-max-backoff <sec>` | Cap on exponential reconnect backoff in seconds (default 30; floored to 1) |
 | `--keepalive-idle <sec>` | Send QUIC PINGs when idle for this many seconds (default 30; 0 = disable; values <15 have no additional effect since xquic's PING cadence is ~15 s) |
 | `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s (must be > 0; omit to disable). Logs the proxy conn (and the gateway conn when `--gateway` is set). |
+
+> At least one client ingress flag (`--socks5`, `--http-connect`, or `--gateway`) is what actually puts the client to work — see the per-mode blocks below.
+
+### TCP Proxy mode
+
+*1 TCP flow → 1 MPQUIC bidi stream. TLS stays end-to-end between app and origin (no termination).*
+
+**Server:** no mode-specific flags — TCP proxying is always available.
+
+**Client**
+
+| Flag | Description |
+|---|---|
+| `--socks5 <ip:port>` | Local SOCKS5 ingress (TCP CONNECT). Also serves UDP ASSOCIATE — see UDP Relay mode. |
+| `--http-connect <ip:port>` | Local HTTP CONNECT ingress (use via `curl --proxy http://<ip:port> …`) |
+
+### HTTP Gateway mode
+
+*1 HTTP request → 1 H3 stream over MPQUIC; the server executes the delegated request against the origin. Enabled on the server by default.*
+
+**Server**
+
+| Flag | Description |
+|---|---|
+| `--no-gateway` | **Disables HTTP Gateway mode for this server** (it is enabled by default). The TCP-proxy core keeps running; only the gateway origin bridge is turned off, so a client's `--gateway` ingress has nothing to talk to. |
+| `--origin-ca <pem>` | Extra CA bundle for origin TLS verification (private CAs / tests); verification itself is always on |
+| `--request-metrics` | Emit one `mq.req` logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of `--metrics-interval`. |
+
+**Client**
+
+| Flag | Description |
+|---|---|
+| `--gateway <ip:port>` | Local TCP address for the HTTP gateway fetch API (`POST /_mqproxy/fetch`). Works with or without `--socks5`. |
+
+### UDP Relay mode
+
+*1 UDP session → MPQUIC DATAGRAMs. Exposed on the same `--socks5` listener via SOCKS5 UDP ASSOCIATE; rides the `mqproxy-tcp/1` connection (a `--gateway`-only client does not get it).*
+
+**Server**
+
+| Flag | Description |
+|---|---|
+| `--no-udp` | **Disables UDP Relay mode entirely for this server** — the capability is not advertised at auth (clients see it as unavailable) and any session that is still attempted is refused. There is no client-side override. |
+| `--udp-idle-timeout <sec>` | UDP session idle timeout (default 60); the effective value is `min(client request, this)` |
+
+**Client**
+
+| Flag | Description |
+|---|---|
+| `--socks5 <ip:port>` | Same listener as TCP Proxy mode — any SOCKS5 client speaking UDP ASSOCIATE uses it. No separate flag needed. |
 
 > The bundled test certificate is for local testing only. For real deployments, pass your own `--cert`/`--key` and a strong `--token`.
 
