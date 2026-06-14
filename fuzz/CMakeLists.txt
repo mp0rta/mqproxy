@@ -43,3 +43,8 @@ define_fuzzer(fuzz_udp_msg_hdr            fuzz_udp_msg_hdr.c            ${SRC}/w
 
 # fuzz/scripts/gen_wire_seeds.c is NOT a build target — it is a standalone helper
 # compiled by hand (see its header comment) only when (re)generating wire seeds.
+
+set(INGRESS ${SRC}/ingress/mq_socks5.c ${WIRE})
+define_fuzzer(fuzz_socks5_feed     fuzz_socks5_feed.c     ${INGRESS})
+define_fuzzer(fuzz_socks5_udp_hdr  fuzz_socks5_udp_hdr.c  ${INGRESS})
+define_fuzzer(fuzz_http_connect    fuzz_http_connect.c    ${SRC}/ingress/mq_http_connect.c ${WIRE})

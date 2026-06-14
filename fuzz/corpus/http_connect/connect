@@ -1,0 +1,2 @@
+CONNECT example.com:443 HTTP/1.1
+
