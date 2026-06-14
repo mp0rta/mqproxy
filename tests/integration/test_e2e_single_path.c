@@ -30,6 +30,13 @@
  *   3. HTTP CONNECT echo e2e: same as (2) through the HTTP CONNECT listener.
  *   4. Error mapping: SOCKS5 CONNECT to a closed port → REP 0x05 (refused);
  *      HTTP CONNECT to a closed port → HTTP/1.1 502.
+ *   5/6. Pipelined early payload coalesced with the SOCKS5 / HTTP CONNECT head.
+ *   7. Concurrent ingress: a SOCKS5 flow and an HTTP CONNECT flow run at the
+ *      SAME time over the ONE client / MPQUIC connection (both listeners share
+ *      the same tcp_open core, exactly as cli/main.c wires them when --socks5
+ *      and --http-connect are passed together). Each carries a distinct payload
+ *      and must echo back byte-exact — a regression guard against the two
+ *      simultaneous streams being mis-attributed across the shared connection.
  */
 #include "mqtest.h"
 
@@ -826,6 +833,122 @@ test_http_pipelined_payload(void)
     fixture_down(&f);
 }
 
+/* ── shared open helpers (used by the concurrent-ingress case) ──────────────── */
+
+/* Full SOCKS5 open: greet + CONNECT v4 + success reply. Returns 0 on success. */
+static int
+socks5_open(struct event_base *base, int fd, uint16_t port)
+{
+    if (socks5_greet(base, fd) != 0) return -1;
+    if (socks5_connect_v4(base, fd, port) != 0) return -1;
+    uint8_t reply[10] = {0};
+    if (recv_exact(base, fd, reply, 10, 8000) != 10) return -1;
+    if (reply[0] != 0x05 || reply[1] != 0x00) return -1;
+    return 0;
+}
+
+/* Full HTTP CONNECT open: send the CONNECT head, read the 200 status line, then
+ * drain headers up to the blank line. Returns 0 on success. */
+static int
+http_connect_open(struct event_base *base, int fd, uint16_t port)
+{
+    char line[128];
+    int ln = snprintf(line, sizeof(line),
+                      "CONNECT 127.0.0.1:%u HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n\r\n",
+                      (unsigned)port, (unsigned)port);
+    if (send_all_nb(base, fd, (const uint8_t *)line, (size_t)ln, 2000) != 0) return -1;
+    uint8_t status[12] = {0};
+    if (recv_exact(base, fd, status, 12, 8000) != 12) return -1;
+    if (memcmp(status, "HTTP/1.1 200", 12) != 0) return -1;
+    uint8_t hdr[256];
+    size_t hlen = 0;
+    uint64_t deadline = now_ms() + 4000;
+    int done = 0;
+    while (!done && now_ms() < deadline) {
+        event_base_loop(base, EVLOOP_NONBLOCK);
+        while (hlen < sizeof(hdr)) {
+            ssize_t n = recv(fd, hdr + hlen, 1, 0);
+            if (n == 1) {
+                hlen++;
+                if (hlen >= 4 && memcmp(hdr + hlen - 4, "\r\n\r\n", 4) == 0) {
+                    done = 1;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    return done ? 0 : -1;
+}
+
+/* ── Case 7: concurrent SOCKS5 + HTTP CONNECT over the one client conn ──────── */
+static void
+test_concurrent_ingress(void)
+{
+    fixture_t f;
+    if (fixture_up(&f) != 0) {
+        fixture_down(&f);
+        return;
+    }
+
+    /* Two independent echo origins — one per ingress — so a mis-attributed flow
+     * would echo the other ingress's payload back. */
+    echo_origin_t oa, ob;
+    uint16_t pa = 0, pb = 0;
+    MQ_CHECK_EQ_INT(echo_origin_up(&oa, f.base, &pa), 0);
+    MQ_CHECK_EQ_INT(echo_origin_up(&ob, f.base, &pb), 0);
+
+    /* One flow per ingress, both live on the SAME client / MPQUIC connection. */
+    int cs = dial_nb(mq_listener_local_port(f.socks5));
+    int ch = dial_nb(mq_listener_local_port(f.http));
+    MQ_CHECK(cs >= 0 && ch >= 0);
+    if (cs < 0 || ch < 0) {
+        if (cs >= 0) close(cs);
+        if (ch >= 0) close(ch);
+        echo_origin_down(&oa);
+        echo_origin_down(&ob);
+        fixture_down(&f);
+        return;
+    }
+
+    MQ_CHECK_EQ_INT(socks5_open(f.base, cs, pa), 0);
+    MQ_CHECK_EQ_INT(http_connect_open(f.base, ch, pb), 0);
+
+    /* Distinct payloads: if the two concurrent streams were swapped on the
+     * shared connection the byte-exact compares below would fail. */
+    const size_t M = 4096;
+    uint8_t *sa = malloc(M), *sh = malloc(M);
+    MQ_CHECK(sa != NULL && sh != NULL);
+    for (size_t i = 0; i < M; i++) {
+        sa[i] = (uint8_t)((i * 31 + 7) & 0xff);          /* SOCKS5 pattern */
+        sh[i] = (uint8_t)(((i * 17 + 3) & 0xff) ^ 0xa5); /* distinct HTTP pattern */
+    }
+
+    /* Both streams in flight at once on the one connection. */
+    MQ_CHECK_EQ_INT(send_all_nb(f.base, cs, sa, M, 4000), 0);
+    MQ_CHECK_EQ_INT(send_all_nb(f.base, ch, sh, M, 4000), 0);
+
+    uint8_t *ba = malloc(M), *bh = malloc(M);
+    MQ_CHECK(ba != NULL && bh != NULL);
+    MQ_CHECK_EQ_INT((long long)recv_exact(f.base, cs, ba, M, 8000), (long long)M);
+    MQ_CHECK_EQ_INT((long long)recv_exact(f.base, ch, bh, M, 8000), (long long)M);
+
+    /* Each ingress gets exactly its own bytes back — no cross-talk. */
+    MQ_CHECK(memcmp(sa, ba, M) == 0);
+    MQ_CHECK(memcmp(sh, bh, M) == 0);
+
+    free(sa);
+    free(sh);
+    free(ba);
+    free(bh);
+    close(cs);
+    close(ch);
+    echo_origin_down(&oa);
+    echo_origin_down(&ob);
+    fixture_down(&f);
+}
+
 /* ── Case 4a: SOCKS5 error mapping → REP 0x05 (connection refused) ───────── */
 static void
 test_socks5_refused(void)
@@ -898,6 +1021,7 @@ test_e2e_single_path(void)
     test_http_echo();
     test_socks5_pipelined_payload();
     test_http_pipelined_payload();
+    test_concurrent_ingress();
     test_socks5_refused();
     test_http_refused();
 }
