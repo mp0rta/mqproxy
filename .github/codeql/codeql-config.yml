@@ -1,0 +1,7 @@
+name: mqproxy CodeQL config
+
+# Analyze our own code only; skip vendored submodules and build trees.
+paths-ignore:
+  - third_party
+  - build
+  - build-*

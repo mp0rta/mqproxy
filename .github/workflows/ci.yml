@@ -231,3 +231,51 @@ jobs:
             || { echo "vendored libcurl dir NOT in RPATH"; exit 1; }
       - name: Unit tests (ctest)
         run: ctest --test-dir build-h3 --output-on-failure
+
+  fuzz:
+    # libFuzzer harnesses over the wire/ingress parse surface. Self-contained:
+    # the parsers depend only on libc, so NO submodules / NO boringssl+xquic
+    # build / NO cache are needed (see fuzz/CMakeLists.txt).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FUZZ_SECONDS: 30   # per-target exploration budget (tune here)
+    steps:
+      - uses: actions/checkout@v6
+        # no submodules: fuzz harnesses compile only src/wire + src/ingress
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - name: Configure + build harnesses
+        run: |
+          cmake -S fuzz -B build-fuzz -DCMAKE_C_COMPILER=clang
+          cmake --build build-fuzz -j"$(nproc)"
+      - name: Replay committed corpus (deterministic gate)
+        run: |
+          set -e
+          for t in build-fuzz/fuzz_*; do
+            name=$(basename "$t"); dir="fuzz/corpus/${name#fuzz_}"
+            if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+              echo "== replay $name =="; "$t" "$dir"/*
+            else
+              echo "== $name: no corpus, skipping replay =="
+            fi
+          done
+      - name: Short exploration (best-effort, fails on any new crash)
+        run: |
+          set -e
+          for t in build-fuzz/fuzz_*; do
+            name=$(basename "$t"); dir="fuzz/corpus/${name#fuzz_}"; mkdir -p "$dir"
+            echo "== explore $name (${FUZZ_SECONDS}s) =="
+            "$t" "$dir" -max_total_time="${FUZZ_SECONDS}" -print_final_stats=1
+          done
+      - name: Upload crashes on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
