@@ -157,6 +157,16 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_metrics_format PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_metrics_format COMMAND test_metrics_format)
 
+    # Connection-count cap (--max-conns) counter API — pre-auth DoS. Pure counter
+    # logic, no handshake.
+    add_executable(test_max_conns tests/test_max_conns.c)
+    target_link_libraries(test_max_conns
+        mqproxy xquic ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB} pthread dl m stdc++)
+    target_include_directories(test_max_conns PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    set_target_properties(test_max_conns PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_max_conns COMMAND test_max_conns)
+
     # mq_h3_req_get_stats + mq_h3_req_stream_id NULL-guard unit tests.
     # Links mq_h3.o -> xqc_* so it lives in the xquic-gated block.
     add_executable(test_h3_req_stats tests/test_h3_req_stats.c)
@@ -270,6 +280,20 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     set_target_properties(test_metrics_active_conn PROPERTIES
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_metrics_active_conn COMMAND test_metrics_active_conn)
+
+    # --max-conns engine-wide connection cap: falsifiable real client+server proof
+    # (A admitted, B refused, A closed→slot frees, C re-admitted). Needs the cert.
+    add_executable(test_max_conns_e2e tests/integration/test_max_conns_e2e.c)
+    target_link_libraries(test_max_conns_e2e
+        mqproxy xquic ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB} pthread dl m stdc++)
+    target_include_directories(test_max_conns_e2e PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_max_conns_e2e PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_max_conns_e2e PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_max_conns_e2e COMMAND test_max_conns_e2e)
 
     # UDP relay server-side full-path integration (Task 5.3): real client+server
     # over loopback UDP + a local UDP echo socket; the test drives 0x02 streams
