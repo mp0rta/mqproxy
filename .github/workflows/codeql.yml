@@ -1,8 +1,14 @@
 name: CodeQL
 
 on:
+  # Scoped to the default branch: CodeQL builds xquic (heavy) and uploads to the
+  # repo code-scanning store, so run it on main pushes + PRs targeting main +
+  # weekly, not on every feature-branch push. (The lightweight fuzz job in
+  # ci.yml still runs on all branches.)
   push:
+    branches: [ main ]
   pull_request:
+    branches: [ main ]
   schedule:
     - cron: '23 4 * * 1'   # weekly, Monday 04:23 UTC
   workflow_dispatch:
