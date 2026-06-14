@@ -182,10 +182,35 @@ mq_transport_write_socket(const unsigned char *buf, size_t size,
                                         peer_addrlen, conn_user_data);
 }
 
+/* At most one refusal WARN per second. server_accept fires per connection
+ * ATTEMPT (pre-handshake), so under a flood an unthrottled WARN is self-inflicted
+ * log-DoS; the throttle bounds it. mq_tr_now_us() is the file's wall-clock (the
+ * engine's clock); an NTP step could momentarily mis-throttle a best-effort log
+ * line — acceptable, and it keeps one clock source. */
+#define MQ_REFUSE_LOG_INTERVAL_US (1000000ULL)
+
+static void
+mq_transport_note_refusal(mq_transport_t *t)
+{
+    if (!t) {
+        return;
+    }
+    uint64_t now = mq_tr_now_us();
+    if (t->last_refuse_log_us != 0 &&
+        (now - t->last_refuse_log_us) < MQ_REFUSE_LOG_INTERVAL_US) {
+        return; /* throttle */
+    }
+    MQ_LOGW("mq_transport: connection refused, at max-conns limit (max=%u)",
+            t->max_conns);
+    t->last_refuse_log_us = now;
+}
+
 /* Server accept callback (REQUIRED for server). user_data is the engine_user_data
- * == the mq_transport. Bind the transport as the connection's transport user_data
- * so the send callback can recover it, then accept. The application-protocol
- * mq_conn is created by the ALP conn_create_notify (see mq_conn.c). */
+ * == the mq_transport. Refuse when the engine-wide connection cap is reached
+ * (pre-handshake CONNECTION_REFUSED); otherwise bind the transport as the
+ * connection's transport user_data so the send callback can recover it, then
+ * accept. The application-protocol mq_conn is created by the ALP
+ * conn_create_notify (see mq_conn.c). */
 static int
 mq_transport_server_accept(xqc_engine_t *engine, xqc_connection_t *conn,
                            const xqc_cid_t *cid, void *user_data)
@@ -193,6 +218,10 @@ mq_transport_server_accept(xqc_engine_t *engine, xqc_connection_t *conn,
     (void)engine;
     (void)cid;
     mq_transport_t *t = (mq_transport_t *)user_data;
+    if (mq_transport_conn_at_limit(t)) {
+        mq_transport_note_refusal(t);
+        return -1; /* -> xquic emits TRA_CONNECTION_REFUSED_ERROR (0x02) */
+    }
     xqc_conn_set_transport_user_data(conn, t);
     return 0;
 }
