@@ -140,6 +140,11 @@ usage_server(FILE *out)
                  "                      (0 = off = default; opt-in per request via "
                  "X-Mq-Cache;\n"
                  "                      e.g. 67108864 = 64 MiB).\n"
+                 "  --max-conns <N>     Max simultaneous QUIC connections "
+                 "(default: 16;\n"
+                 "                      0 = unlimited). Caps established "
+                 "connections;\n"
+                 "                      excess are refused (CONNECTION_REFUSED).\n"
                  "  -h, --help          Show this help and exit.\n");
 }
 
@@ -379,6 +384,7 @@ cmd_server(int argc, char **argv)
     uint64_t metrics_interval_ms = 0; /* --metrics-interval <sec>; 0 = off */
     int request_metrics = 0;          /* --request-metrics; off by default */
     size_t cache_max_bytes = 0;       /* --cache-max-bytes <N>; 0 = off (default) */
+    long max_conns = 16;              /* --max-conns <N>; default 16, 0 = unlimited */
 
     enum {
         OPT_LISTEN = 256,
@@ -395,6 +401,7 @@ cmd_server(int argc, char **argv)
         OPT_METRICS_INTERVAL,
         OPT_REQUEST_METRICS,
         OPT_CACHE_MAX_BYTES,
+        OPT_MAX_CONNS,
     };
     static const struct option longopts[] = {
         {"listen", required_argument, NULL, OPT_LISTEN},
@@ -411,6 +418,7 @@ cmd_server(int argc, char **argv)
         {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
         {"request-metrics", no_argument, NULL, OPT_REQUEST_METRICS},
         {"cache-max-bytes", required_argument, NULL, OPT_CACHE_MAX_BYTES},
+        {"max-conns", required_argument, NULL, OPT_MAX_CONNS},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -483,6 +491,23 @@ cmd_server(int argc, char **argv)
                 return 2;
             }
             cache_max_bytes = (size_t)v;
+            break;
+        }
+        case OPT_MAX_CONNS: {
+            /* 0 is a VALID "unlimited" sentinel (like --cache-max-bytes); reject
+             * only < 0. SIGNED strtol so a negative is caught (strtoul would wrap). */
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(optarg, &endp, 10);
+            if (errno != 0 || endp == optarg || *endp != '\0' || v < 0) {
+                fprintf(stderr,
+                        "mqproxy server: invalid --max-conns '%s' "
+                        "(must be >= 0; 0 = unlimited)\n\n",
+                        optarg);
+                usage_server(stderr);
+                return 2;
+            }
+            max_conns = v;
             break;
         }
         case 'h': usage_server(stdout); return 0;
@@ -576,6 +601,7 @@ cmd_server(int argc, char **argv)
         MQ_LOGE("failed to create server transport (cert=%s key=%s)", cert, key);
         goto out;
     }
+    mq_transport_set_max_conns(transport, (uint32_t)max_conns);
     if (qlog_dir) {
         const char *qpath = NULL;
         if (mq_transport_enable_qlog(transport, qlog_dir, &qpath) != 0) {
