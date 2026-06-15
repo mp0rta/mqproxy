@@ -86,15 +86,6 @@ mq_gw_client_t *mq_gw_client_new(mq_transport_t *t, mq_runtime_t *rt, mq_h3_t *h
                                  uint64_t keepalive_idle_ms, int reconnect_enabled,
                                  uint64_t reconnect_max_backoff_ms);
 
-/* The mq_fetch_cbs_t implementation to wire into mq_fetch_listener_new. The
- * returned pointer is to a static, immutable vtable (valid for the program
- * lifetime). */
-const mq_fetch_cbs_t *mq_gw_client_fetch_cbs(void);
-
-/* The `user` pointer to pass alongside mq_gw_client_fetch_cbs() into
- * mq_fetch_listener_new (it is the mq_gw_client_t itself). */
-void *mq_gw_client_fetch_user(mq_gw_client_t *c);
-
 /* Register up to `n` extra local bind IPs to bring up as additional MPQUIC
  * paths on the tunnel conn once it becomes multipath-ready. Mirrors
  * mq_client_add_paths (deferred via a recurring mp-poll timer on rt's base).
@@ -119,12 +110,11 @@ void mq_gw_client_dump_stats(mq_gw_client_t *c);
  * engine still exists. */
 void mq_gw_client_free(mq_gw_client_t *c);
 
-/* ── Neutral intake boundary (Phase 7 MITM, Task 3) ─────────────────────────
+/* ── Neutral intake boundary (Phase 7 MITM, Tasks 3–4) ──────────────────────
  *
- * Protocol-agnostic request boundary onto the gateway tunnel. The existing H1
- * fetch path (mq_gw_client_fetch_cbs) drives this internally via an inline H1
- * sink; a future H2/H3 MITM adapter (Task 4) plugs into the SAME boundary so
- * the core tunnel-forwarding + response-relay logic is shared, not duplicated.
+ * Protocol-agnostic request boundary onto the gateway tunnel. Adapters (e.g.
+ * mq_gw_fetch_adapter for H1, future H2/H3 MITM adapters) plug into this
+ * boundary so the core tunnel-forwarding + response-relay logic is shared.
  *
  * Reject ORDER is observable (tests/e2e assert X-Mq-Error byte-for-byte) and is
  * split across two phases to preserve it:

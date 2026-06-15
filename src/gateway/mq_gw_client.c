@@ -42,22 +42,11 @@
  * returning -1 (the listener handle is dead) — we treat a -1 from any write/
  * resume as "local dead" and reset the tunnel.
  *
- * HANDLE INVARIANT: r->handle is set exactly once (at accept) and is nulled in
- * the SAME step that sets r->local_dead=1 (every such site does both). Therefore
- * `!r->local_dead` ⟹ `r->handle != NULL`. Code that has already established
- * `!r->local_dead` (e.g. download_pump, which returns early if local_dead) may
- * call mq_fetch_conn_* on r->handle WITHOUT a redundant NULL guard. The few
- * `if (r->handle)` guards that remain are at points reachable independent of
- * that early check and are kept for defence-in-depth.
- *
- * NEUTRAL-BOUNDARY NOTE (Task 3): the per-request state is the opaque
- * mq_gw_xreq_t handed to adapters. Today the H1 fetch path also carries `handle`
- * (the listener fd) + H1-rendering scratch, and the in-file H1 sink writes via
- * mq_fetch_conn_* on it. Once Task 4 rewires the listener through the neutral
- * boundary and removes `handle`, the invariant becomes the SINK's liveness:
- * `!intake_dead` ⟹ `sink_user != NULL` (the sink is set once at req_begin and
- * cleared in lockstep with local_dead). For Task 3 the sink and `handle` track
- * each other 1:1 (the H1 sink's user IS the handle), so both invariants hold.
+ * SINK INVARIANT (Task 4): `!local_dead` ⟹ `sink != NULL && sink_user != NULL`.
+ * The sink is set once at req_begin (mq_gw_client_req_begin) and cleared in
+ * lockstep with local_dead at every local-side termination site. Code that has
+ * already established `!local_dead` (e.g. download_pump, which returns early if
+ * local_dead) may call sink ops WITHOUT a redundant NULL guard.
  */
 #include "gateway/mq_gw_client.h"
 
@@ -70,7 +59,6 @@
 #include <event2/event.h>
 
 #include "gateway/mq_gw_headers.h"
-#include "gateway/mq_http1.h"
 #include "util/mq_backoff.h"
 #include "util/mq_log.h"
 
@@ -106,11 +94,9 @@
 /* ── per-request state ──────────────────────────────────────────────────────*/
 
 /* This is the definition of the opaque mq_gw_xreq_t (typedef'd in
- * mq_gw_intake.h as `struct mq_gw_xreq_s`). The legacy `mq_gw_req_t` alias is
- * kept (below) so the in-file H1 fetch path reads unchanged this task; both name
- * the same struct. The `handle` + H1-rendering fields (resp_chunked etc.) belong
- * to the in-file H1 sink and are removed in Task 4 once the listener is rewired
- * onto the neutral boundary. The neutral side drives the sink via sink/sink_user. */
+ * mq_gw_intake.h as `struct mq_gw_xreq_s`). The neutral core owns only the
+ * tunnel state and the sink boundary; all protocol-specific fields (H1 handle,
+ * resp_chunked, etc.) live in the adapter (mq_gw_fetch_adapter.c). */
 struct mq_gw_xreq_s {
     mq_gw_client_t *cli;
 
@@ -118,8 +104,7 @@ struct mq_gw_xreq_s {
     const mq_gw_sink_ops_t *sink; /* adapter callbacks (NULL == intake detached) */
     void *sink_user;              /* adapter per-request cookie */
 
-    /* local (listener) side — H1 sink scratch; removed in Task 4. */
-    void *handle; /* the fetch handle; NULL once detached (dead) */
+    /* local (sink) side liveness flag */
     int local_dead;
 
     /* tunnel (H3) side */
@@ -135,16 +120,14 @@ struct mq_gw_xreq_s {
     size_t spill_off;    /* bytes already flushed from spill */
 
     /* ── download (junction #2) ── */
-    int resp_started;  /* we wrote the response status line locally */
-    int resp_chunked;  /* response is framed as Transfer-Encoding: chunked */
-    int read_deferred; /* local write hit highwater; stop recv_body until drain */
+    int resp_started;  /* we called sink->resp_head (response started) */
+    int read_deferred; /* adapter output highwater; stop recv_body until drain */
     int resp_status;   /* parsed :status (for diagnostics) */
 
     struct mq_gw_xreq_s *next; /* intrusive list of live requests on the client */
 };
 
-/* Legacy in-file alias: the H1 fetch path still spells the per-request state
- * `mq_gw_req_t`. Same struct as the public opaque mq_gw_xreq_t. */
+/* In-file alias so the internal code can spell the struct `mq_gw_req_t`. */
 typedef struct mq_gw_xreq_s mq_gw_req_t;
 
 /* ── client state ───────────────────────────────────────────────────────────*/
@@ -193,72 +176,22 @@ struct mq_gw_client_s {
 static void gw_req_unlink(mq_gw_client_t *c, mq_gw_req_t *r);
 static void gw_req_maybe_free(mq_gw_req_t *r);
 static void gw_local_dead(mq_gw_req_t *r);
+static void gw_local_finish(mq_gw_req_t *r);
+static void gw_local_abort(mq_gw_req_t *r);
 static void h3_on_read(mq_h3_req_t *hr, int flag, void *user);
 static void h3_on_write(mq_h3_req_t *hr, void *user);
 static void h3_on_close(mq_h3_req_t *hr, void *user);
-static void local_drain_cb(void *user);
 static void upload_pump(mq_gw_req_t *r);
 static void download_pump(mq_gw_req_t *r);
-static void gw_local_error_req(mq_gw_req_t *r, int code, const char *reason,
-                               const char *xmq);
+static void gw_local_error_req(mq_gw_req_t *r, int code, const char *xmq);
 /* Reconnect controller + the re-issuable connect body (defined below). */
 static int gw_issue_connect(mq_gw_client_t *c);
 static void gw_reconnect_arm(mq_gw_client_t *c);
 static void gw_reconnect_stop(mq_gw_client_t *c);
 static void gw_mp_timer_arm(mq_gw_client_t *c);
 static void gw_mp_timer_stop(mq_gw_client_t *c);
-/* In-file H1 response sink (defined with the download path below). */
-static const mq_gw_sink_ops_t g_h1_sink;
 
 /* ── small helpers ──────────────────────────────────────────────────────────*/
-
-/* Serialize a complete HTTP/1.1 error response (status + Connection: close +
- * Content-Length: 0 + X-Mq-Error: <reason>) into buf. Returns the byte length,
- * or 0 if it did not fit. */
-static size_t
-gw_build_error(char *buf, size_t cap, int code, const char *reason, const char *xmq_error)
-{
-    int o = 0, n;
-    n = mq_http1_write_status(buf + o, cap - o, code, reason);
-    if (n <= 0) return 0;
-    o += n;
-    n = mq_http1_write_header(buf + o, cap - o, "Connection", "close");
-    if (n <= 0) return 0;
-    o += n;
-    n = mq_http1_write_header(buf + o, cap - o, "Content-Length", "0");
-    if (n <= 0) return 0;
-    o += n;
-    n = mq_http1_write_header(buf + o, cap - o, "X-Mq-Error", xmq_error);
-    if (n <= 0) return 0;
-    o += n;
-    if ((size_t)o + 2 > cap) return 0;
-    buf[o++] = '\r';
-    buf[o++] = '\n';
-    return (size_t)o;
-}
-
-/* on_request REJECTION path: write the error response and return -1. The
- * listener's on_request==-1 contract flushes + closes the connection itself
- * (detached), so we MUST NOT call mq_fetch_conn_finish here (that would double
- * the teardown). Write only. */
-static void
-gw_reject_write(void *handle, int code, const char *reason, const char *xmq_error)
-{
-    char buf[512];
-    size_t n = gw_build_error(buf, sizeof(buf), code, reason, xmq_error);
-    if (n) mq_fetch_conn_write(handle, buf, n);
-}
-
-/* POST-ACCEPT error path (the request was accepted, the listener is in RESP
- * phase waiting for finish/abort): write the error response THEN finish. */
-static void
-gw_local_error(void *handle, int code, const char *reason, const char *xmq_error)
-{
-    char buf[512];
-    size_t n = gw_build_error(buf, sizeof(buf), code, reason, xmq_error);
-    if (n) mq_fetch_conn_write(handle, buf, n);
-    mq_fetch_conn_finish(handle);
-}
 
 /* Case-insensitive equality for a slice vs a NUL-terminated lowercase literal. */
 static int
@@ -272,20 +205,6 @@ slice_ieq(const char *s, size_t sl, const char *lit)
         if (a != lit[i]) return 0;
     }
     return 1;
-}
-
-/* Find the value slice of header `name` (case-insensitive) in req; NULL if
- * absent. *out_vl receives the value length. */
-static const char *
-find_hdr(const mq_http1_req_t *req, const char *name, size_t *out_vl)
-{
-    for (size_t i = 0; i < req->nh; i++) {
-        if (slice_ieq(req->h[i].n, req->h[i].nl, name)) {
-            if (out_vl) *out_vl = req->h[i].vl;
-            return req->h[i].v;
-        }
-    }
-    return NULL;
 }
 
 /* ── neutral header-list helpers (mq_h3_header_t, NUL-terminated) ────────────*/
@@ -357,15 +276,17 @@ gw_req_maybe_free(mq_gw_req_t *r)
     free(r);
 }
 
-/* The LOCAL side terminated (finish/abort already issued, OR on_aborted, OR a
- * handle op returned -1). Detach the handle and, if the tunnel is still live,
- * reset it so its on_close eventually frees the struct. */
+/* The LOCAL side terminated (adapter output dead: resp_body returned -1, or
+ * local peer died mid-upload). Detach the sink and, if the tunnel is still
+ * live, reset it so its on_close eventually frees the struct. Does NOT call
+ * any sink op — the adapter already knows the local side is dead. */
 static void
 gw_local_dead(mq_gw_req_t *r)
 {
     if (r->local_dead) return;
     r->local_dead = 1;
-    r->handle = NULL; /* dead — never touch again */
+    r->sink = NULL;
+    r->sink_user = NULL;
     if (!r->h3_dead && r->req) {
         /* Mid-stream local death: reset the H3 request (truncated). on_close
          * fires later and finishes the teardown. */
@@ -374,28 +295,33 @@ gw_local_dead(mq_gw_req_t *r)
     gw_req_maybe_free(r);
 }
 
-/* Finish the local side cleanly (response fully relayed). Detaches the handle. */
+/* Finish the local side cleanly (response fully relayed). Calls the sink's
+ * resp_finish, then marks local done and frees if both sides are dead. */
 static void
 gw_local_finish(mq_gw_req_t *r)
 {
     if (r->local_dead) return;
-    void *h = r->handle;
+    const mq_gw_sink_ops_t *sink = r->sink;
+    void *su = r->sink_user;
     r->local_dead = 1;
-    r->handle = NULL;
-    if (h) mq_fetch_conn_finish(h);
+    r->sink = NULL;
+    r->sink_user = NULL;
+    if (sink) sink->resp_finish(su);
     gw_req_maybe_free(r);
 }
 
 /* Abort the local side (mid-stream truncation visible to the local peer).
- * Detaches the handle. */
+ * Calls the sink's resp_abort, then marks local done and frees if both dead. */
 static void
 gw_local_abort(mq_gw_req_t *r)
 {
     if (r->local_dead) return;
-    void *h = r->handle;
+    const mq_gw_sink_ops_t *sink = r->sink;
+    void *su = r->sink_user;
     r->local_dead = 1;
-    r->handle = NULL;
-    if (h) mq_fetch_conn_abort(h);
+    r->sink = NULL;
+    r->sink_user = NULL;
+    if (sink) sink->resp_abort(su);
     gw_req_maybe_free(r);
 }
 
@@ -741,166 +667,6 @@ mq_gw_client_req_begin(mq_gw_client_t *c, const mq_gw_req_head_t *head,
     return r;
 }
 
-/* ── H1 fetch path: shim onto the neutral boundary ──────────────────────────
- *
- * The listener-facing fetch callbacks (mq_gw_client_fetch_cbs) build neutral
- * inputs from the mq_http1_req_t and drive the core API. The X-Mq-Target/Method
- * parse (the fetch envelope) stays HERE (it is fetch-specific), sequenced
- * BETWEEN prevalidate and req_begin so the observable reject ORDER is preserved:
- *   dup -> auth -> target -> method -> [req_begin: origin-proto/cache/size/tunnel]
- * The in-file H1 sink (g_h1_sink) renders the response; on a req_begin reject we
- * map the reason enum to the byte-identical (status, X-Mq-Error) error. */
-
-static const char *
-gw_reason_xmq(mq_gw_reject_reason_t reason)
-{
-    switch (reason) {
-    case MQ_GW_REJ_DUP_CONTROL: return "duplicate-control-header";
-    case MQ_GW_REJ_MISSING_AUTH: return "missing-auth";
-    case MQ_GW_REJ_BAD_AUTH: return "bad-auth-format";
-    case MQ_GW_REJ_BAD_TARGET: return "bad-target";
-    case MQ_GW_REJ_BAD_METHOD: return "bad-method";
-    case MQ_GW_REJ_BAD_ORIGIN_PROTO: return "bad-origin-protocol";
-    case MQ_GW_REJ_BAD_CACHE_TTL: return "bad-cache-ttl";
-    case MQ_GW_REJ_HEADER_TOO_LONG: return "header-too-long";
-    case MQ_GW_REJ_TUNNEL_UNAVAIL: return "tunnel-unavailable";
-    case MQ_GW_REJ_INTERNAL: return "internal-error";
-    default: return "internal-error";
-    }
-}
-
-/* H1 reason → status-line reason phrase (mirrors the original literals). */
-static const char *
-gw_status_phrase(int code)
-{
-    return code == 502 ? "Bad Gateway" : "Bad Request";
-}
-
-static int
-gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ctx)
-{
-    mq_gw_client_t *c = (mq_gw_client_t *)user;
-    *req_ctx = NULL;
-
-    /* Build a NEUTRAL, NUL-terminated, UNtruncated copy of the request headers so
-     * the core's strlen-based size checks observe the true lengths (the same
-     * semantics the original slice-based checks had). Allocated on the heap to
-     * hold arbitrary header sizes; freed before we return. */
-    size_t hn = req->nh;
-    mq_h3_header_t *H = NULL;
-    char *namearena = NULL, *valarena = NULL;
-    /* Per-slot caps generous enough that any header the original would have
-     * forwarded fits; oversized ones still get a correct strlen (>= cap) so the
-     * core's header-too-long check fires identically. */
-    if (hn > 0) {
-        H = calloc(hn, sizeof(*H));
-        /* +2 for NUL terminators; size each slot to the actual slice length. */
-        size_t names_sz = 0, vals_sz = 0;
-        for (size_t i = 0; i < hn; i++) {
-            names_sz += req->h[i].nl + 1;
-            vals_sz += req->h[i].vl + 1;
-        }
-        namearena = malloc(names_sz ? names_sz : 1);
-        valarena = malloc(vals_sz ? vals_sz : 1);
-        if (!H || !namearena || !valarena) {
-            free(H);
-            free(namearena);
-            free(valarena);
-            gw_reject_write(handle, 502, "Bad Gateway", "internal-error");
-            return -1;
-        }
-        char *np = namearena, *vp = valarena;
-        for (size_t i = 0; i < hn; i++) {
-            memcpy(np, req->h[i].n, req->h[i].nl);
-            np[req->h[i].nl] = '\0';
-            H[i].name = np;
-            np += req->h[i].nl + 1;
-            memcpy(vp, req->h[i].v, req->h[i].vl);
-            vp[req->h[i].vl] = '\0';
-            H[i].value = vp;
-            vp += req->h[i].vl + 1;
-        }
-    }
-
-    int status = 0;
-
-    /* Phase 1 (header-only): dup-control-header, X-Mq-Auth. */
-    mq_gw_reject_reason_t pre = mq_gw_client_prevalidate(c, H, hn, &status);
-    if (pre != MQ_GW_OK) {
-        gw_reject_write(handle, status, gw_status_phrase(status), gw_reason_xmq(pre));
-        free(H);
-        free(namearena);
-        free(valarena);
-        return -1;
-    }
-
-    /* Fetch envelope (fetch-specific; stays in the shim): X-Mq-Target. */
-    size_t tgt_vl = 0;
-    const char *tgt = find_hdr(req, "x-mq-target", &tgt_vl);
-    mq_gw_target_t target;
-    if (!tgt || mq_gw_parse_target(tgt, tgt_vl, &target) != 0) {
-        gw_reject_write(handle, 400, "Bad Request", "bad-target");
-        free(H);
-        free(namearena);
-        free(valarena);
-        return -1;
-    }
-
-    /* X-Mq-Method if present parses; default GET. */
-    char method[16];
-    size_t mth_vl = 0;
-    const char *mth = find_hdr(req, "x-mq-method", &mth_vl);
-    if (mth) {
-        if (mq_gw_parse_method(mth, mth_vl, method) != 0) {
-            gw_reject_write(handle, 400, "Bad Request", "bad-method");
-            free(H);
-            free(namearena);
-            free(valarena);
-            return -1;
-        }
-    } else {
-        memcpy(method, "GET", 4);
-    }
-
-    /* Phase 2 (core): origin-proto / cache / header-size / tunnel + open+forward.
-     * The H1 sink_user is the per-request state itself (g_h1_sink reuses r). */
-    mq_gw_req_head_t head;
-    head.method = method;
-    head.scheme = target.scheme;
-    head.authority = target.authority;
-    head.path = target.path;
-    head.headers = H;
-    head.n_headers = hn;
-    head.content_length = req->content_length;
-
-    /* sink_user is set to the returned xreq once we have it; req_begin links the
-     * request first, then we patch handle + sink_user (the H1 sink needs r->handle
-     * and uses r as its user). Pass r as sink_user via a two-step: req_begin needs
-     * sink_user up front, but for the H1 sink the user IS the (not-yet-created)
-     * xreq. Resolve by passing a placeholder and fixing it on success — but the
-     * sink is not invoked during req_begin (only on later response/upload), so
-     * patching sink_user immediately after return is safe. */
-    int err_status = 0;
-    mq_gw_reject_reason_t reason = MQ_GW_OK;
-    mq_gw_xreq_t *r =
-        mq_gw_client_req_begin(c, &head, &g_h1_sink, NULL, &err_status, &reason);
-
-    free(H);
-    free(namearena);
-    free(valarena);
-
-    if (!r) {
-        gw_reject_write(handle, err_status, gw_status_phrase(err_status),
-                        gw_reason_xmq(reason));
-        return -1;
-    }
-
-    /* Bind the H1 sink + listener handle to the request (sink_user == r). */
-    r->handle = handle;
-    r->sink_user = r;
-    *req_ctx = r;
-    return 0;
-}
 
 /* ── upload (junction #1) ───────────────────────────────────────────────────*/
 
@@ -1034,14 +800,14 @@ mq_gw_client_req_body_done(mq_gw_xreq_t *r)
 }
 
 /* Neutral intake: the adapter's input side died mid-request (truncated). Reset
- * the H3 request (never finish) and detach the local/sink side. The adapter is
- * already tearing down — do NOT call any sink op. Body of the former
- * gw_on_aborted. */
+ * the H3 request (never finish) and detach the sink side. The adapter is
+ * already tearing down — do NOT call any sink op (the adapter handles its own
+ * cleanup). */
 void
 mq_gw_client_req_aborted(mq_gw_xreq_t *r)
 {
-    r->handle = NULL; /* gw_local_dead would reset+null; do the reset path here */
     r->sink = NULL;
+    r->sink_user = NULL;
     if (r->local_dead) {
         gw_req_maybe_free(r);
         return;
@@ -1191,8 +957,14 @@ download_start_response(mq_gw_req_t *r)
     if (hr < 0) return -1;
     r->resp_started = 1;
 
-    /* If headers carried fin (no body), finish immediately. */
-    if (fin) r->sink->resp_finish(r->sink_user);
+    /* If headers carried fin (no body), finish immediately. Use gw_local_finish
+     * (not a direct resp_finish call) so that r->local_dead + r->sink are cleared
+     * atomically — gw_local_finish sets local_dead=1 BEFORE calling resp_finish,
+     * ensuring h3_on_close (which fires LATER on the same event loop iteration)
+     * sees local_dead and skips any further sink op. A direct resp_finish call
+     * here would free the adapter's per-request state without clearing r->sink /
+     * r->sink_user, causing h3_on_close to call resp_abort on freed memory. */
+    if (fin) gw_local_finish(r);
     return 0;
 }
 
@@ -1210,7 +982,7 @@ download_pump(mq_gw_req_t *r)
         long n = mq_h3_req_recv_body(r->req, buf, sizeof(buf), &fin);
         if (n < 0) {
             /* Hard recv error mid-download → abort (truncation must be visible). */
-            r->sink->resp_abort(r->sink_user);
+            gw_local_abort(r);
             return;
         }
         if (n > 0) {
@@ -1226,141 +998,11 @@ download_pump(mq_gw_req_t *r)
             }
         }
         if (fin) {
-            r->sink->resp_finish(r->sink_user);
+            gw_local_finish(r);
             return;
         }
         if (n == 0) return; /* no more body available right now */
     }
-}
-
-/* ── in-file H1 sink: renders today's exact HTTP/1.1 response bytes ──────────
- *
- * sink_user is the mq_gw_req_t itself (the H1 sink lives in this file and reuses
- * r->handle + r->resp_chunked). A future MITM adapter (Task 4) supplies its own
- * sink with its own user cookie. Output here is byte-identical to the previous
- * inline rendering (status line, Transfer-Encoding/Connection: close, chunked
- * framing, terminator). */
-
-static int
-h1_sink_resp_head(void *u, int status, const mq_h3_header_t *hs, size_t n,
-                  mq_gw_body_mode_t body_mode)
-{
-    mq_gw_req_t *r = (mq_gw_req_t *)u;
-    if (!r->handle) return -1;
-
-    char head[8192];
-    size_t head_len = 0;
-
-    int sn = mq_http1_write_status(head, sizeof(head), status, "");
-    if (sn <= 0) return -1;
-    head_len += (size_t)sn;
-
-    for (size_t i = 0; i < n; i++) {
-        int n2 = mq_http1_write_header(head + head_len, sizeof(head) - head_len,
-                                       hs[i].name, hs[i].value);
-        if (n2 <= 0) return -1;
-        head_len += (size_t)n2;
-    }
-
-    /* Unknown length → chunked framing for the body. */
-    if (body_mode == MQ_GW_BODY_STREAM) {
-        r->resp_chunked = 1;
-        int n2 = mq_http1_write_header(head + head_len, sizeof(head) - head_len,
-                                       "Transfer-Encoding", "chunked");
-        if (n2 <= 0) return -1;
-        head_len += (size_t)n2;
-    }
-
-    /* Connection: close (one request per local connection). */
-    {
-        int n2 = mq_http1_write_header(head + head_len, sizeof(head) - head_len,
-                                       "Connection", "close");
-        if (n2 <= 0) return -1;
-        head_len += (size_t)n2;
-    }
-
-    /* Terminating blank line. */
-    if (head_len + 2 > sizeof(head)) return -1;
-    head[head_len++] = '\r';
-    head[head_len++] = '\n';
-
-    /* Register the drain cb so a highwater hit during the body relay re-kicks
-     * the download read path. */
-    mq_fetch_conn_set_drain_cb(r->handle, local_drain_cb, r);
-    int wr = mq_fetch_conn_write(r->handle, head, head_len);
-    if (wr < 0) return -1;
-    return 1;
-}
-
-static int
-h1_sink_resp_body(void *u, const uint8_t *p, size_t len)
-{
-    mq_gw_req_t *r = (mq_gw_req_t *)u;
-    if (r->local_dead || !r->handle) return -1;
-
-    if (r->resp_chunked) {
-        /* Frame the chunk: "<hex>\r\n<data>\r\n". Worst-case framing overhead is
-         * small; write head then body then CRLF separately to avoid a second
-         * large copy. The chunk-size line's highwater (0) is NOT a defer trigger
-         * (it always fits in practice); only the body / trailing CRLF zero is. */
-        char hdr[32];
-        int hn = snprintf(hdr, sizeof(hdr), "%lx\r\n", (unsigned long)len);
-        if (hn <= 0) return -1;
-        int wr = mq_fetch_conn_write(r->handle, hdr, (size_t)hn);
-        if (wr < 0) return -1;
-        wr = mq_fetch_conn_write(r->handle, p, len);
-        if (wr < 0) return -1;
-        int wr2 = mq_fetch_conn_write(r->handle, "\r\n", 2);
-        if (wr2 < 0) return -1;
-        if (wr == 0 || wr2 == 0) return 0; /* body or CRLF highwater → defer */
-        return 1;
-    }
-
-    int wr = mq_fetch_conn_write(r->handle, p, len);
-    if (wr < 0) return -1;
-    return wr == 0 ? 0 : 1; /* highwater → defer */
-}
-
-static void
-h1_sink_resp_finish(void *u)
-{
-    mq_gw_req_t *r = (mq_gw_req_t *)u;
-    /* Chunked response → write the terminating zero-length chunk before close. */
-    if (r->resp_chunked && r->handle) {
-        char term[8];
-        size_t tn = mq_http1_chunk_frame(term, sizeof(term), NULL, 0);
-        if (tn > 0) mq_fetch_conn_write(r->handle, term, tn);
-    }
-    gw_local_finish(r);
-}
-
-static void
-h1_sink_resp_abort(void *u)
-{
-    gw_local_abort((mq_gw_req_t *)u);
-}
-
-static void
-h1_sink_resume_read(void *u)
-{
-    mq_gw_req_t *r = (mq_gw_req_t *)u;
-    if (!r->local_dead && r->handle) mq_fetch_conn_resume_read(r->handle);
-}
-
-static const mq_gw_sink_ops_t g_h1_sink = {
-    .resp_head = h1_sink_resp_head,
-    .resp_body = h1_sink_resp_body,
-    .resp_finish = h1_sink_resp_finish,
-    .resp_abort = h1_sink_resp_abort,
-    .resume_read = h1_sink_resume_read,
-};
-
-/* Local output drained below the low watermark (listener drain_cb) → notify the
- * core via the neutral drained boundary, which resumes the download read path. */
-static void
-local_drain_cb(void *user)
-{
-    mq_gw_client_req_drained((mq_gw_req_t *)user);
 }
 
 /* ── H3 request callbacks ───────────────────────────────────────────────────*/
@@ -1389,7 +1031,7 @@ h3_on_read(mq_h3_req_t *hr, int flag, void *user)
                 if (r->resp_started)
                     gw_local_abort(r);
                 else
-                    gw_local_error_req(r, 502, "Bad Gateway", "upstream-protocol");
+                    gw_local_error_req(r, 502, "upstream-protocol");
                 return;
             }
         } else {
@@ -1426,34 +1068,58 @@ h3_on_close(mq_h3_req_t *hr, void *user)
     r->req = NULL; /* freed right after this returns */
 
     if (!r->local_dead) {
-        /* Tunnel closed. If the response never started, synthesize 502; else the
-         * local side must see a truncation (abort, not a fake clean finish).
-         * Detach the local handle INLINE (do NOT call the gw_local_* helpers —
-         * they call gw_req_maybe_free, which would free r out from under the
+        /* Tunnel closed. If the response never started, synthesize 502 via the
+         * sink; else the local side must see a truncation (abort, not a fake
+         * clean finish). Detach the sink INLINE (do NOT call gw_local_* helpers
+         * — they call gw_req_maybe_free, which would free r out from under the
          * final maybe_free below → use-after-free). */
-        void *h = r->handle;
+        const mq_gw_sink_ops_t *sink = r->sink;
+        void *su = r->sink_user;
         r->local_dead = 1;
-        r->handle = NULL;
-        if (h) {
-            if (!r->resp_started)
-                gw_local_error(h, 502, "Bad Gateway", "upstream-reset");
-            else
-                mq_fetch_conn_abort(h);
+        r->sink = NULL;
+        r->sink_user = NULL;
+        if (sink) {
+            if (!r->resp_started) {
+                /* Synthesize 502 with X-Mq-Error: upstream-reset. */
+                mq_h3_header_t eh[2];
+                eh[0].name = "X-Mq-Error";
+                eh[0].value = "upstream-reset";
+                eh[1].name = "Content-Length";
+                eh[1].value = "0";
+                int hr2 = sink->resp_head(su, 502, eh, 2, MQ_GW_BODY_CONTENT_LENGTH);
+                if (hr2 >= 0)
+                    sink->resp_finish(su);
+                else
+                    sink->resp_abort(su);
+            } else {
+                sink->resp_abort(su);
+            }
         }
     }
     gw_req_maybe_free(r); /* both sides now dead → frees r exactly once */
 }
 
-/* Synthesize an error response on a request whose handle is still live (used
- * from the read path when the response head is malformed before we started). */
+/* Synthesize an error response via the sink on a request whose local side is
+ * still live (used from the read path when the response head is malformed). */
 static void
-gw_local_error_req(mq_gw_req_t *r, int code, const char *reason, const char *xmq)
+gw_local_error_req(mq_gw_req_t *r, int code, const char *xmq)
 {
-    if (r->local_dead || !r->handle) return;
-    void *h = r->handle;
+    if (r->local_dead || !r->sink) return;
+    const mq_gw_sink_ops_t *sink = r->sink;
+    void *su = r->sink_user;
     r->local_dead = 1;
-    r->handle = NULL;
-    gw_local_error(h, code, reason, xmq);
+    r->sink = NULL;
+    r->sink_user = NULL;
+    mq_h3_header_t eh[2];
+    eh[0].name = "X-Mq-Error";
+    eh[0].value = (char *)xmq;
+    eh[1].name = "Content-Length";
+    eh[1].value = "0";
+    int hr = sink->resp_head(su, code, eh, 2, MQ_GW_BODY_CONTENT_LENGTH);
+    if (hr >= 0)
+        sink->resp_finish(su);
+    else
+        sink->resp_abort(su);
     if (!r->h3_dead && r->req) mq_h3_req_reset(r->req);
     gw_req_maybe_free(r);
 }
@@ -1553,45 +1219,6 @@ gw_mp_timer_arm(mq_gw_client_t *c)
 }
 
 /* ── public API ─────────────────────────────────────────────────────────────*/
-
-/* H1 listener body callbacks: thin shims onto the neutral intake boundary. The
- * listener's req_ctx IS the mq_gw_xreq_t (set in gw_on_request). */
-static int
-gw_on_body(void *req_ctx, const uint8_t *p, size_t len)
-{
-    return mq_gw_client_req_body((mq_gw_xreq_t *)req_ctx, p, len);
-}
-
-static void
-gw_on_body_done(void *req_ctx)
-{
-    mq_gw_client_req_body_done((mq_gw_xreq_t *)req_ctx);
-}
-
-static void
-gw_on_aborted(void *req_ctx)
-{
-    mq_gw_client_req_aborted((mq_gw_xreq_t *)req_ctx);
-}
-
-static const mq_fetch_cbs_t g_gw_cbs = {
-    .on_request = gw_on_request,
-    .on_body = gw_on_body,
-    .on_body_done = gw_on_body_done,
-    .on_aborted = gw_on_aborted,
-};
-
-const mq_fetch_cbs_t *
-mq_gw_client_fetch_cbs(void)
-{
-    return &g_gw_cbs;
-}
-
-void *
-mq_gw_client_fetch_user(mq_gw_client_t *c)
-{
-    return c;
-}
 
 /* Issue the (re-)connect: open a fresh H3 tunnel conn with keepalive and wire the
  * state callback. Re-invoked by the reconnect timer. Returns 0 on success, -1 on
@@ -1765,7 +1392,7 @@ mq_gw_client_free(mq_gw_client_t *c)
      *      mq_h3_req_reset schedules cannot re-enter h3_on_close on the
      *      mq_gw_req_t we are about to free (that would be a UAF + double free).
      *   2. RESET the H3 request (truncate the tunnel side cleanly).
-     *   3. ABORT the local handle (the local peer sees a truncated response).
+     *   3. ABORT the local side via the sink (the local peer sees truncation).
      *   4. Free the per-request state ourselves (we own it; both sides detached).
      * Because we cleared the callbacks, the subsequent mq_h3_free engine teardown
      * fires no callback back into us — our wrappers and r are already gone. */
@@ -1776,8 +1403,8 @@ mq_gw_client_free(mq_gw_client_t *c)
             mq_h3_req_set_cbs(r->req, NULL, NULL, NULL, NULL);
             mq_h3_req_reset(r->req);
         }
-        if (!r->local_dead && r->handle) {
-            mq_fetch_conn_abort(r->handle);
+        if (!r->local_dead && r->sink) {
+            r->sink->resp_abort(r->sink_user);
         }
         free(r->spill);
         free(r);

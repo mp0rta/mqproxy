@@ -39,6 +39,7 @@
 
 #include "gateway/mq_fetch_listener.h"
 #include "gateway/mq_gw_client.h"
+#include "gateway/mq_gw_fetch_adapter.h"
 #include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h"
 #include "transport/mq_h3.h"
@@ -982,6 +983,7 @@ typedef struct {
     mq_h3_t *srv_h3;
     mq_h3_t *cli_h3;
     mq_gw_client_t *gw;
+    mq_gw_fetch_adapter_t *fetch_adp;
     mq_fetch_listener_t *listener;
     uint16_t lport;
 } gw_fixture_t;
@@ -1030,9 +1032,12 @@ gw_fixture_up(gw_fixture_t *f, const char *token)
                              /*reconnect_enabled=*/0, /*reconnect_max_backoff_ms=*/30000);
     if (!f->gw) return -1;
 
-    /* Real fetch listener wired to the gw client's cbs. */
-    f->listener = mq_fetch_listener_new(f->base, "127.0.0.1", 0, mq_gw_client_fetch_cbs(),
-                                        mq_gw_client_fetch_user(f->gw));
+    /* Real fetch listener wired to the gw client via the fetch adapter. */
+    f->fetch_adp = mq_gw_fetch_adapter_new(f->gw);
+    if (!f->fetch_adp) return -1;
+    f->listener = mq_fetch_listener_new(f->base, "127.0.0.1", 0,
+                                        mq_gw_fetch_adapter_cbs(f->fetch_adp),
+                                        mq_gw_fetch_adapter_user(f->fetch_adp));
     if (!f->listener) return -1;
     f->lport = mq_fetch_listener_port(f->listener);
     if (!f->lport) return -1;
@@ -1070,8 +1075,11 @@ gw_fixture_up_dead(gw_fixture_t *f)
                              MQ_CC_BBR2, /*keepalive_idle_ms=*/0,
                              /*reconnect_enabled=*/0, /*reconnect_max_backoff_ms=*/30000);
     if (!f->gw) return -1;
-    f->listener = mq_fetch_listener_new(f->base, "127.0.0.1", 0, mq_gw_client_fetch_cbs(),
-                                        mq_gw_client_fetch_user(f->gw));
+    f->fetch_adp = mq_gw_fetch_adapter_new(f->gw);
+    if (!f->fetch_adp) return -1;
+    f->listener = mq_fetch_listener_new(f->base, "127.0.0.1", 0,
+                                        mq_gw_fetch_adapter_cbs(f->fetch_adp),
+                                        mq_gw_fetch_adapter_user(f->fetch_adp));
     if (!f->listener) return -1;
     f->lport = mq_fetch_listener_port(f->listener);
     if (!f->lport) return -1;
@@ -1096,6 +1104,7 @@ gw_fixture_down(gw_fixture_t *f)
     if (f->cli_rt) mq_runtime_free(f->cli_rt);
     if (f->srv_rt) mq_runtime_free(f->srv_rt);
     if (f->listener) mq_fetch_listener_free(f->listener);
+    if (f->fetch_adp) mq_gw_fetch_adapter_free(f->fetch_adp);
     if (f->base) event_base_free(f->base);
 }
 

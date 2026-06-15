@@ -46,6 +46,7 @@
 
 #include "gateway/mq_fetch_listener.h"
 #include "gateway/mq_gw_client.h"
+#include "gateway/mq_gw_fetch_adapter.h"
 #include "gateway/mq_gw_server.h"
 #include "ingress/mq_listener.h"
 #include "proxy/mq_client.h"
@@ -1083,6 +1084,7 @@ cmd_client(int argc, char **argv)
     mq_listener_t *http_l = NULL;
     mq_h3_t *h3 = NULL;
     mq_gw_client_t *gwc = NULL;
+    mq_gw_fetch_adapter_t *fetch_adp = NULL;
     mq_fetch_listener_t *fetch_l = NULL;
     struct event *sint = NULL, *sterm = NULL;
     struct event *metrics_ev = NULL;
@@ -1218,9 +1220,14 @@ cmd_client(int argc, char **argv)
             }
             MQ_LOGI("registered %d extra gateway multipath bind(s)", added);
         }
-        fetch_l =
-            mq_fetch_listener_new(mq_runtime_base(rt), gw_ip, gw_port,
-                                  mq_gw_client_fetch_cbs(), mq_gw_client_fetch_user(gwc));
+        fetch_adp = mq_gw_fetch_adapter_new(gwc);
+        if (!fetch_adp) {
+            MQ_LOGE("failed to create gateway fetch adapter (OOM)");
+            goto out;
+        }
+        fetch_l = mq_fetch_listener_new(mq_runtime_base(rt), gw_ip, gw_port,
+                                        mq_gw_fetch_adapter_cbs(fetch_adp),
+                                        mq_gw_fetch_adapter_user(fetch_adp));
         if (!fetch_l) {
             MQ_LOGE("failed to bind gateway fetch listener on %s:%u", gw_ip, gw_port);
             goto out;
@@ -1346,6 +1353,7 @@ out:
     if (sterm) event_free(sterm);
     if (gwc) mq_gw_client_free(gwc);
     if (fetch_l) mq_fetch_listener_free(fetch_l);
+    if (fetch_adp) mq_gw_fetch_adapter_free(fetch_adp);
     if (h3) mq_h3_free(h3);
     if (transport) mq_transport_free(transport);
     if (rt) mq_runtime_free(rt);

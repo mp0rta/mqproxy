@@ -42,6 +42,7 @@ add_library(mqproxy STATIC
     src/gateway/mq_gw_headers.c
     src/gateway/mq_fetch_listener.c
     src/gateway/mq_gw_client.c
+    src/gateway/mq_gw_fetch_adapter.c
     src/gateway/mq_gw_server.c
     src/gateway/mq_gw_metrics.c
     src/gateway/mq_gw_cache.c
