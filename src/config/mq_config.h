@@ -47,8 +47,9 @@ typedef struct mq_file_config_t {
     char tproxy_mode[16];         /* [Ingress] Mode ("redirect" | "tproxy") */
     long tproxy_fwmark;           /* [Ingress] Fwmark (default 1) */
     long tproxy_table;            /* [Ingress] Table (default 100) */
-    int setup_redirect;           /* [Ingress] SetupRedirect (default false) */
-    long tproxy_skip_uid;         /* [Ingress] SkipUid (default -1 = geteuid()) */
+    long tproxy_dport;    /* [Ingress] Dport — captured TCP dport (default 443) */
+    int setup_redirect;   /* [Ingress] SetupRedirect (default false) */
+    long tproxy_skip_uid; /* [Ingress] SkipUid (default -1 = geteuid()) */
 } mq_file_config_t;
 
 /* Fill cfg with the same defaults as the CLI locals. */

@@ -240,6 +240,8 @@ usage_client(FILE *out)
         "                             tproxy mode only).\n"
         "  --tproxy-table <n>         ip routing table for TPROXY (default: 100;\n"
         "                             tproxy mode only).\n"
+        "  --tproxy-dport <port>      TCP destination port the --setup-redirect rule\n"
+        "                             captures (default: 443).\n"
         "  --setup-redirect           Install nft/ip-rule firewall rules on start\n"
         "                             and remove them on exit (requires root or\n"
         "                             CAP_NET_ADMIN; off by default).\n"
@@ -865,6 +867,7 @@ cmd_client(int argc, char **argv)
     const char *tproxy_mode_s = "redirect"; /* --tproxy-mode */
     long tproxy_fwmark = 1;                 /* --tproxy-fwmark */
     long tproxy_table = 100;                /* --tproxy-table */
+    long tproxy_dport = 443;                /* --tproxy-dport (captured TCP dport) */
     int setup_redirect = 0;                 /* --setup-redirect */
     long tproxy_uid = -1;                   /* --tproxy-uid; -1 = geteuid() */
 
@@ -901,6 +904,7 @@ cmd_client(int argc, char **argv)
         if (fcfg.tproxy_mode[0]) tproxy_mode_s = fcfg.tproxy_mode;
         tproxy_fwmark = fcfg.tproxy_fwmark;
         tproxy_table = fcfg.tproxy_table;
+        tproxy_dport = fcfg.tproxy_dport;
         setup_redirect = fcfg.setup_redirect;
         tproxy_uid = fcfg.tproxy_skip_uid;
     }
@@ -926,6 +930,7 @@ cmd_client(int argc, char **argv)
         OPT_TPROXY_MODE,
         OPT_TPROXY_FWMARK,
         OPT_TPROXY_TABLE,
+        OPT_TPROXY_DPORT,
         OPT_SETUP_REDIRECT,
         OPT_TPROXY_UID,
     };
@@ -950,6 +955,7 @@ cmd_client(int argc, char **argv)
         {"tproxy-mode", required_argument, NULL, OPT_TPROXY_MODE},
         {"tproxy-fwmark", required_argument, NULL, OPT_TPROXY_FWMARK},
         {"tproxy-table", required_argument, NULL, OPT_TPROXY_TABLE},
+        {"tproxy-dport", required_argument, NULL, OPT_TPROXY_DPORT},
         {"setup-redirect", no_argument, NULL, OPT_SETUP_REDIRECT},
         {"tproxy-uid", required_argument, NULL, OPT_TPROXY_UID},
         {"help", no_argument, NULL, 'h'},
@@ -1054,6 +1060,21 @@ cmd_client(int argc, char **argv)
                 return 2;
             }
             tproxy_table = v;
+            break;
+        }
+        case OPT_TPROXY_DPORT: {
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(optarg, &endp, 10);
+            if (errno != 0 || endp == optarg || *endp != '\0' || v <= 0 || v > 65535) {
+                fprintf(
+                    stderr,
+                    "mqproxy client: invalid --tproxy-dport '%s' (must be 1..65535)\n\n",
+                    optarg);
+                usage_client(stderr);
+                return 2;
+            }
+            tproxy_dport = v;
             break;
         }
         case OPT_SETUP_REDIRECT: setup_redirect = 1; break;
@@ -1311,9 +1332,10 @@ cmd_client(int argc, char **argv)
             if (setup_redirect) {
                 uid_t skip_uid =
                     (tproxy_uid < 0) ? (uid_t)-1 : (uid_t)(unsigned long)tproxy_uid;
-                tproxy_setup = mq_tproxy_setup_new(
-                    tproxy_capture_mode, tproxy_ip, mq_tproxy_listener_port(tproxy_l),
-                    443 /*dport*/, skip_uid, (int)tproxy_fwmark, (int)tproxy_table);
+                tproxy_setup = mq_tproxy_setup_new(tproxy_capture_mode, tproxy_ip,
+                                                   mq_tproxy_listener_port(tproxy_l),
+                                                   (uint16_t)tproxy_dport, skip_uid,
+                                                   (int)tproxy_fwmark, (int)tproxy_table);
                 if (tproxy_setup) {
                     if (mq_tproxy_setup_install(tproxy_setup) != 0)
                         MQ_LOGW("tproxy: firewall setup failed (rules may be partial)");

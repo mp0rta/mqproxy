@@ -76,15 +76,18 @@ ORIGIN_KEY="${MQPROXY_ORIGIN_KEY:-${REPO_ROOT}/tests/certs/origin.key}"
 
 TOKEN="tproxy-e2e-token"
 SERVER_IP="127.0.0.1"
-ORIGIN_PORT=443            # dport is hardcoded to 443 in --setup-redirect
+# ORIGIN_PORT is a free TCP port chosen below; the client captures exactly that
+# port via --tproxy-dport, so the test does not collide with anything already on
+# :443 on the host.
+ORIGIN_PORT=""
 
 PATH_A_IP="127.0.0.2"
 PATH_B_IP="127.0.0.3"
 
 # ── SKIP GATE (must be FIRST, before any privileged operation) ───────────────
-# Condition 1: must be root (CAP_NET_ADMIN + ability to bind port 443).
+# Condition 1: must be root (CAP_NET_ADMIN for nft + IP_TRANSPARENT).
 if [ "$(id -u)" -ne 0 ]; then
-    note "SKIP: not root.  Transparent capture needs root for nft + IP_TRANSPARENT + port 443."
+    note "SKIP: not root.  Transparent capture needs root for nft + IP_TRANSPARENT."
     note "  Run with: sudo $0"
     note "  Or via ctest: sudo ctest --test-dir build -R e2e_tproxy --output-on-failure"
     exit "${SKIP}"
@@ -154,7 +157,12 @@ PY
 
 QUIC_PORT="$(free_port udp)"
 TPROXY_PORT="$(free_port tcp)"
-if [ -z "${QUIC_PORT}" ] || [ -z "${TPROXY_PORT}" ]; then
+ORIGIN_PORT="$(free_port tcp)"
+# Back-to-back ephemeral binds can hand back the same number; ensure distinct.
+while [ -n "${ORIGIN_PORT}" ] && [ "${ORIGIN_PORT}" = "${TPROXY_PORT}" ]; do
+    ORIGIN_PORT="$(free_port tcp)"
+done
+if [ -z "${QUIC_PORT}" ] || [ -z "${TPROXY_PORT}" ] || [ -z "${ORIGIN_PORT}" ]; then
     note "ERROR: free-port selection failed (python3 socket bind)."
     exit 1
 fi
@@ -291,6 +299,7 @@ start_client() {
         --token "${TOKEN}" \
         --tproxy "127.0.0.1:${TPROXY_PORT}" \
         --tproxy-mode redirect \
+        --tproxy-dport "${ORIGIN_PORT}" \
         --setup-redirect \
         --tproxy-uid 0 \
         "${path_args[@]}" \
@@ -394,13 +403,13 @@ CURL_CODE="${WORK}/curl_code.txt"
 # Pre-create world-writable: `nobody` writes these inside root's WORK dir.
 : >"${CURL_OUT}"; : >"${CURL_CODE}"; chmod 666 "${CURL_OUT}" "${CURL_CODE}"
 
-note "case 1: running curl as nobody (uid ${NOBODY_UID}) to 127.0.0.1:443 ..."
+note "case 1: running curl as nobody (uid ${NOBODY_UID}) to 127.0.0.1:${ORIGIN_PORT} ..."
 code1="000"
 for attempt in $(seq 1 10); do
     sudo -u nobody curl -s -o "${CURL_OUT}" -w '%{http_code}' \
         --max-time 15 \
         --cacert "${ORIGIN_CERT}" \
-        "https://127.0.0.1/" >"${CURL_CODE}" 2>/dev/null || true
+        "https://127.0.0.1:${ORIGIN_PORT}/" >"${CURL_CODE}" 2>/dev/null || true
     code1="$(cat "${CURL_CODE}" 2>/dev/null || echo 000)"
     [ "${code1}" = "200" ] && break
     note "case 1: attempt ${attempt}/10 got HTTP ${code1}; tunnel may still be handshaking, retrying ..."
@@ -469,7 +478,7 @@ else
         sudo -u nobody curl -s -o "${CURL_OUT2}" -w '%{http_code}' \
             --max-time 15 \
             --cacert "${ORIGIN_CERT}" \
-            "https://127.0.0.1/" >"${CURL_CODE2}" 2>/dev/null || true
+            "https://127.0.0.1:${ORIGIN_PORT}/" >"${CURL_CODE2}" 2>/dev/null || true
         code2="$(cat "${CURL_CODE2}" 2>/dev/null || echo 000)"
         [ "${code2}" = "200" ] && break
         note "case 2: attempt ${attempt}/10 got HTTP ${code2}; retrying ..."

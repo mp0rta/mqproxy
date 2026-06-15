@@ -210,7 +210,7 @@ sudo ./build/mqproxy client \
 curl https://example.com/
 ```
 
-`--setup-redirect` tells mqproxy to install the nft rules on start and remove them on exit. It needs `root` or `CAP_NET_ADMIN`. The self-installed rule captures **TCP destination port 443 only**; to capture other ports (or for finer control) install the firewall rules yourself (or let OMR manage them) and just point the traffic at the listener — mqproxy reads the original destination of whatever the rules redirect.
+`--setup-redirect` tells mqproxy to install the nft rules on start and remove them on exit. It needs `root` or `CAP_NET_ADMIN`. The self-installed rule captures **TCP destination port 443 by default**; use `--tproxy-dport <port>` to capture a different port. For multiple ports or finer control, install the firewall rules yourself (or let OMR manage them) and just point the traffic at the listener — mqproxy reads the original destination of whatever the rules redirect.
 
 **OMR/router deployment (tproxy mode):**
 
@@ -276,7 +276,7 @@ mqproxy server --config /etc/mqproxy/edge1.conf
 | `[TLS]` | `Cert`, `Key` | — |
 | `[Auth]` | `Key` (token) | `Key` (token) |
 | `[Multipath]` | `CC`, `Scheduler` | `CC`, `Scheduler`, `Path` (repeatable) |
-| `[Ingress]` | — | `Socks5`, `HttpConnect`, `Gateway`, `TProxy`, `Mode`, `Fwmark`, `Table`, `SetupRedirect`, `SkipUid` |
+| `[Ingress]` | — | `Socks5`, `HttpConnect`, `Gateway`, `TProxy`, `Mode`, `Fwmark`, `Table`, `Dport`, `SetupRedirect`, `SkipUid` |
 | `[Gateway]` | `Enabled`, `Masquerade`, `OriginCA`, `CacheMaxBytes` | — |
 | `[UDP]` | `Enabled`, `IdleTimeout` | — |
 | `[Metrics]` | `Interval`, `PerRequest` | `Interval` |
@@ -430,6 +430,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | `--tproxy-mode redirect\|tproxy` | Kernel capture mechanism (default: `redirect`). `redirect` — `nft nat OUTPUT` REDIRECT target; captures the local machine's own outbound TCP; no `IP_TRANSPARENT` on the socket. `tproxy` — `nft mangle PREROUTING` TPROXY target; captures forwarded LAN traffic on a router/OMR; needs `CAP_NET_ADMIN` for `IP_TRANSPARENT`. |
 | `--tproxy-fwmark <n>` | Packet mark for policy routing in tproxy mode (default: 1; tproxy mode only). |
 | `--tproxy-table <n>` | IP routing table for tproxy reply routing (default: 100; tproxy mode only). |
+| `--tproxy-dport <port>` | TCP destination port the `--setup-redirect` rule captures (default: 443). |
 | `--setup-redirect` | Install `nft`/`ip rule` firewall rules on start and remove them on exit (requires root or `CAP_NET_ADMIN`; off by default). For single-host self-contained use; leave OFF under OMR and let OMR manage the rules. |
 | `--tproxy-uid <uid>` | UID whose outbound traffic is exempt from redirection (default: `geteuid()` of the process). Used for loop avoidance — mqproxy's own tunnel connections are not re-captured into itself. |
 

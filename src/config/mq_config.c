@@ -36,6 +36,7 @@ mq_config_defaults(mq_file_config_t *cfg)
     snprintf(cfg->tproxy_mode, sizeof(cfg->tproxy_mode), "%s", "redirect");
     cfg->tproxy_fwmark = 1;
     cfg->tproxy_table = 100;
+    cfg->tproxy_dport = 443;
     cfg->tproxy_skip_uid = -1;
 }
 
@@ -259,6 +260,8 @@ handle_kv(mq_file_config_t *cfg, int section, const char *key, const char *val,
             LONGV(tproxy_fwmark, 1, LONG_MAX);
         else if (strcasecmp(key, "Table") == 0)
             LONGV(tproxy_table, 1, 65535);
+        else if (strcasecmp(key, "Dport") == 0)
+            LONGV(tproxy_dport, 1, 65535);
         else if (strcasecmp(key, "SetupRedirect") == 0)
             cfg->setup_redirect = parse_bool(val);
         else if (strcasecmp(key, "SkipUid") == 0)
