@@ -3,6 +3,7 @@ project(mqproxy VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 include(cmake/BuildSetup.cmake)
+include(GNUInstallDirs)
 if(MQPROXY_H3_CURL)
     add_library(CURL::libcurl SHARED IMPORTED)
     set_target_properties(CURL::libcurl PROPERTIES
@@ -638,4 +639,32 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_KEY=${MQ_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_udp.sh)
     set_tests_properties(e2e_udp PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ---- packaging / install ----
+    configure_file(packaging/systemd/mqproxy-server@.service.in
+        ${CMAKE_BINARY_DIR}/packaging/mqproxy-server@.service @ONLY)
+    configure_file(packaging/systemd/mqproxy-client@.service.in
+        ${CMAKE_BINARY_DIR}/packaging/mqproxy-client@.service @ONLY)
+
+    install(TARGETS mqproxy_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+    # systemd units / sysusers / tmpfiles are NOT multiarch — literal lib/ paths.
+    install(FILES
+        ${CMAKE_BINARY_DIR}/packaging/mqproxy-server@.service
+        ${CMAKE_BINARY_DIR}/packaging/mqproxy-client@.service
+        DESTINATION lib/systemd/system)
+    install(FILES packaging/sysusers.d/mqproxy.conf  DESTINATION lib/sysusers.d)
+    install(FILES packaging/tmpfiles.d/mqproxy.conf  DESTINATION lib/tmpfiles.d)
+
+    install(FILES server.conf.example client.conf.example
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+    # License bundling (Apache-2.0 §4(a)). The binary statically links xquic AND
+    # BoringSSL, so both LICENSEs are mandatory. OPTIONAL only so CI jobs that skip
+    # the xquic submodule don't fail the install rule.
+    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+    install(FILES third_party/xquic/LICENSE
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third-party RENAME xquic.txt OPTIONAL)
+    install(FILES third_party/xquic/third_party/boringssl/LICENSE
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third-party RENAME boringssl.txt OPTIONAL)
 endif()
