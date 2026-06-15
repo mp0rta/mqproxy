@@ -37,6 +37,7 @@ add_library(mqproxy STATIC
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
     src/ingress/mq_origdst.c
+    src/ingress/mq_tproxy.c
     src/ingress/mq_listener.c
     src/ingress/mq_udp_assoc.c
     src/gateway/mq_http1.c
