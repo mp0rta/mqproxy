@@ -842,6 +842,9 @@ cmd_client(int argc, char **argv)
         if (fcfg.socks5[0]) socks5 = fcfg.socks5;
         if (fcfg.http_connect[0]) http_connect = fcfg.http_connect;
         if (fcfg.gw_listen[0]) gateway = fcfg.gw_listen;
+        /* client_id default ("mqproxy") is mirrored in mq_config_defaults, so
+         * this always repoints to fcfg.client_id — value-identical, lifetime-safe.
+         * (The fcfg.x[0] guard can't tell file-set from default here; harmless.) */
         if (fcfg.client_id[0]) client_id = fcfg.client_id;
         if (fcfg.qlog[0]) qlog_dir = fcfg.qlog;
         if (fcfg.cc[0]) cc_name = fcfg.cc;
