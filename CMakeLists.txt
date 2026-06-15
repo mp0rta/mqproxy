@@ -22,6 +22,7 @@ add_library(mqproxy STATIC
     src/util/mq_log.c
     src/util/mq_buf.c
     src/util/mq_backoff.c
+    src/config/mq_config.c
     src/wire/mq_varint.c
     src/wire/mq_wire.c
     src/wire/mq_udp_msg.c
@@ -76,6 +77,11 @@ add_executable(test_buf tests/test_buf.c)
 target_link_libraries(test_buf mqproxy)
 target_include_directories(test_buf PRIVATE tests)
 add_test(NAME test_buf COMMAND test_buf)
+
+add_executable(test_config tests/test_config.c)
+target_link_libraries(test_config mqproxy)
+target_include_directories(test_config PRIVATE tests)
+add_test(NAME test_config COMMAND test_config)
 
 add_executable(test_relay tests/test_relay.c)
 target_link_libraries(test_relay mqproxy)

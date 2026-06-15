@@ -1,0 +1,35 @@
+# mqproxy client config — copy and edit. CLI flags override values set here.
+# At least one [Ingress] entry is required.
+# NOTE: comments must be on their OWN line — an inline "# ..." after a value is
+# read as part of the value, not stripped.
+[Server]
+Address = your-server.example.com:4433
+# ClientId = mqproxy
+
+[Auth]
+Key = CHANGE_ME_shared_token
+
+# At least one ingress is required (uncomment the ones you want):
+[Ingress]
+Socks5 = 127.0.0.1:1080
+# HttpConnect = 127.0.0.1:8080
+# Gateway     = 127.0.0.1:8888
+
+[Multipath]
+CC        = bbr
+Scheduler = minrtt
+# Path: repeat per local source IP for multipath aggregation
+# Path = 10.0.0.1
+# Path = 10.0.0.2
+
+# Auto-reconnect is ENABLED by default. Uncomment Reconnect to turn it off.
+[Interface]
+# Reconnect = false
+# KeepaliveIdle in seconds; 0 = disable PINGs (default 30)
+# KeepaliveIdle = 30
+# ReconnectMaxBackoff: cap on reconnect backoff in seconds (default 30)
+# ReconnectMaxBackoff = 30
+
+[Log]
+# QLog: write xquic qlog to this dir
+# QLog = /var/log/mqproxy/client

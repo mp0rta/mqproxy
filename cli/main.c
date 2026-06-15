@@ -51,6 +51,7 @@
 #include "proxy/mq_client.h"
 #include "proxy/mq_server.h"
 #include "runtime/mq_runtime_libevent.h"
+#include "config/mq_config.h"
 #include "transport/mq_h3.h"
 #include "transport/mq_transport.h"
 #include "util/mq_log.h"
@@ -70,6 +71,19 @@
  * mq_conn_apply_mp_settings — no CLI window flags in Phase 1. */
 
 #define MQ_MAX_EXTRA_PATHS 8
+
+/* Scan argv for --config <path> or --config=<path>; returns the path or NULL.
+ * Independent of getopt so the file can be loaded before the override pass.
+ * If --config is passed twice, the first wins (spec is silent; undocumented). */
+static const char *
+find_config_arg(int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) return argv[i + 1];
+        if (strncmp(argv[i], "--config=", 9) == 0) return argv[i] + 9;
+    }
+    return NULL;
+}
 
 /* ── usage text ─────────────────────────────────────────────────────────────*/
 
@@ -145,6 +159,8 @@ usage_server(FILE *out)
                  "                      0 = unlimited). Caps established "
                  "connections;\n"
                  "                      excess are refused (CONNECTION_REFUSED).\n"
+                 "  --config <path>     Load settings from an INI file (CLI flags\n"
+                 "                      override file values).\n"
                  "  -h, --help          Show this help and exit.\n");
 }
 
@@ -206,6 +222,8 @@ usage_client(FILE *out)
         "disable). Logs the\n"
         "                             proxy conn (and the gateway conn with "
         "--gateway).\n"
+        "  --config <path>            Load settings from an INI file (CLI flags\n"
+        "                             override file values).\n"
         "  -h, --help                 Show this help and exit.\n");
 }
 
@@ -386,6 +404,35 @@ cmd_server(int argc, char **argv)
     size_t cache_max_bytes = 0;       /* --cache-max-bytes <N>; 0 = off (default) */
     long max_conns = 16;              /* --max-conns <N>; default 16, 0 = unlimited */
 
+    /* Seed locals from --config (if present) BEFORE getopt, so CLI flags override
+     * file values (precedence: defaults < file < CLI). fcfg is function-scoped so
+     * the const char* aliases below stay valid for the whole function. */
+    mq_file_config_t fcfg;
+    mq_config_defaults(&fcfg);
+    const char *config_path = find_config_arg(argc, argv);
+    if (config_path) {
+        if (mq_config_load(&fcfg, config_path, 1 /*server*/) != 0) return 2;
+        if (mq_config_perms_insecure(config_path))
+            MQ_LOGW("config %s is group/world-readable; chmod 0600 to protect the token",
+                    config_path);
+        if (fcfg.listen[0]) listen = fcfg.listen;
+        if (fcfg.token[0]) token = fcfg.token;
+        if (fcfg.cert[0]) cert = fcfg.cert;
+        if (fcfg.key[0]) key = fcfg.key;
+        if (fcfg.origin_ca[0]) origin_ca = fcfg.origin_ca;
+        if (fcfg.qlog[0]) qlog_dir = fcfg.qlog;
+        if (fcfg.cc[0]) cc_name = fcfg.cc;
+        if (fcfg.scheduler[0]) sched_arg = fcfg.scheduler;
+        gateway_enabled = fcfg.gateway_enabled;
+        udp_enabled = fcfg.udp_enabled;
+        udp_idle_timeout_s = fcfg.udp_idle_timeout_s;
+        max_conns = fcfg.max_conns;
+        cache_max_bytes = fcfg.cache_max_bytes;
+        request_metrics = fcfg.request_metrics;
+        if (fcfg.metrics_interval_s > 0)
+            metrics_interval_ms = (uint64_t)fcfg.metrics_interval_s * 1000;
+    }
+
     enum {
         OPT_LISTEN = 256,
         OPT_TOKEN,
@@ -402,6 +449,7 @@ cmd_server(int argc, char **argv)
         OPT_REQUEST_METRICS,
         OPT_CACHE_MAX_BYTES,
         OPT_MAX_CONNS,
+        OPT_CONFIG,
     };
     static const struct option longopts[] = {
         {"listen", required_argument, NULL, OPT_LISTEN},
@@ -419,6 +467,7 @@ cmd_server(int argc, char **argv)
         {"request-metrics", no_argument, NULL, OPT_REQUEST_METRICS},
         {"cache-max-bytes", required_argument, NULL, OPT_CACHE_MAX_BYTES},
         {"max-conns", required_argument, NULL, OPT_MAX_CONNS},
+        {"config", required_argument, NULL, OPT_CONFIG},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -515,6 +564,7 @@ cmd_server(int argc, char **argv)
             max_conns = v;
             break;
         }
+        case OPT_CONFIG: break; /* already consumed pre-getopt by find_config_arg */
         case 'h': usage_server(stdout); return 0;
         default: usage_server(stderr); return 2;
         }
@@ -777,6 +827,37 @@ cmd_client(int argc, char **argv)
     long reconnect_max_backoff_s = 30; /* --reconnect-max-backoff <sec> */
     uint64_t metrics_interval_ms = 0;  /* --metrics-interval <sec>; 0 = off */
 
+    /* Seed from --config before getopt (defaults < file < CLI). fcfg is
+     * function-scoped so the const char* aliases stay valid for the function. */
+    mq_file_config_t fcfg;
+    mq_config_defaults(&fcfg);
+    const char *config_path = find_config_arg(argc, argv);
+    if (config_path) {
+        if (mq_config_load(&fcfg, config_path, 0 /*client*/) != 0) return 2;
+        if (mq_config_perms_insecure(config_path))
+            MQ_LOGW("config %s is group/world-readable; chmod 0600 to protect the token",
+                    config_path);
+        if (fcfg.server_addr[0]) server = fcfg.server_addr;
+        if (fcfg.token[0]) token = fcfg.token;
+        if (fcfg.socks5[0]) socks5 = fcfg.socks5;
+        if (fcfg.http_connect[0]) http_connect = fcfg.http_connect;
+        if (fcfg.gw_listen[0]) gateway = fcfg.gw_listen;
+        /* client_id default ("mqproxy") is mirrored in mq_config_defaults, so
+         * this always repoints to fcfg.client_id — value-identical, lifetime-safe.
+         * (The fcfg.x[0] guard can't tell file-set from default here; harmless.) */
+        if (fcfg.client_id[0]) client_id = fcfg.client_id;
+        if (fcfg.qlog[0]) qlog_dir = fcfg.qlog;
+        if (fcfg.cc[0]) cc_name = fcfg.cc;
+        if (fcfg.scheduler[0]) sched_arg = fcfg.scheduler;
+        keepalive_idle_s = fcfg.keepalive_idle_s;
+        reconnect_enabled = fcfg.reconnect;
+        reconnect_max_backoff_s = fcfg.reconnect_max_backoff_s;
+        if (fcfg.metrics_interval_s > 0)
+            metrics_interval_ms = (uint64_t)fcfg.metrics_interval_s * 1000;
+        for (int i = 0; i < fcfg.n_paths && npaths < MQ_MAX_EXTRA_PATHS; i++)
+            paths[npaths++] = fcfg.paths[i];
+    }
+
     enum {
         OPT_SERVER = 256,
         OPT_TOKEN,
@@ -793,6 +874,7 @@ cmd_client(int argc, char **argv)
         OPT_NO_RECONNECT,
         OPT_RECONNECT_MAX_BACKOFF,
         OPT_METRICS_INTERVAL,
+        OPT_CONFIG,
     };
     static const struct option longopts[] = {
         {"server", required_argument, NULL, OPT_SERVER},
@@ -810,6 +892,7 @@ cmd_client(int argc, char **argv)
         {"no-reconnect", no_argument, NULL, OPT_NO_RECONNECT},
         {"reconnect-max-backoff", required_argument, NULL, OPT_RECONNECT_MAX_BACKOFF},
         {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
+        {"config", required_argument, NULL, OPT_CONFIG},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -882,6 +965,7 @@ cmd_client(int argc, char **argv)
             metrics_interval_ms = (uint64_t)v * 1000;
             break;
         }
+        case OPT_CONFIG: break; /* already consumed pre-getopt by find_config_arg */
         case 'h': usage_client(stdout); return 0;
         default: usage_client(stderr); return 2;
         }
