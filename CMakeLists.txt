@@ -634,6 +634,26 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_gateway.sh)
     set_tests_properties(e2e_gateway PROPERTIES SKIP_RETURN_CODE 77)
 
+    # ---- Phase 7 Slice 0+1: transparent capture + opaque relay e2e ----
+    # Drives the transparent-capture (REDIRECT) path end-to-end against a real
+    # python3 TLS origin on 127.0.0.1:443:
+    #   case 1: TLS opacity proof — curl as nobody through the nft REDIRECT rule
+    #           → tunnel → server relay → origin; curl verifies the origin's cert
+    #           (--cacert origin.crt); a MITM would break cert verification.
+    #   case 2: (NET_ADMIN) 2-path multipath smoke — same capture with tc shaping.
+    #   case 3: teardown assertion — nft table gone after client exit.
+    # REQUIRES root + CAP_NET_ADMIN (nft + IP_TRANSPARENT + port 443).
+    # Exits 77 (SKIP) when not root, nft absent, or no CAP_NET_ADMIN in container.
+    add_test(NAME e2e_tproxy
+        COMMAND ${CMAKE_COMMAND} -E env
+            MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+            MQPROXY_CERT=${MQ_CERT_FILE}
+            MQPROXY_KEY=${MQ_KEY_FILE}
+            MQPROXY_ORIGIN_CERT=${MQ_ORIGIN_CERT_FILE}
+            MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
+            bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_tproxy.sh)
+    set_tests_properties(e2e_tproxy PROPERTIES SKIP_RETURN_CODE 77)
+
     # ---- Phase 3 Task 7.1: e2e UDP relay test utilities ----
     # These are standalone CLI helpers driven by e2e_udp.sh (Task 7.2).
     # They are NOT registered as ctest tests (no add_test).
