@@ -295,10 +295,8 @@ find_hdr(const mq_http1_req_t *req, const char *name, size_t *out_vl)
 static const char *
 nfind_hdr(const mq_h3_header_t *hs, size_t n, const char *name, size_t *out_vl)
 {
-    size_t nl = strlen(name);
     for (size_t i = 0; i < n; i++) {
         if (slice_ieq(hs[i].name, strlen(hs[i].name), name)) {
-            (void)nl;
             if (out_vl) *out_vl = strlen(hs[i].value);
             return hs[i].value;
         }
@@ -1073,22 +1071,29 @@ mq_gw_client_req_drained(mq_gw_xreq_t *r)
  * (status line, Connection: close, chunked framing) so observable output is
  * byte-identical; a future H2/H3 adapter renders natively. */
 
-/* Per-response header arena caps (mirror the original inline nb[128]/vb[2048]). */
+/* Per-response header caps. The HARD limit on the response head is the H1 sink's
+ * 8192-byte render buffer (h1_resp_head); MQ_GW_RESP_MAX_HDRS / _ARENA are sized
+ * so that buffer fills FIRST. This reproduces the pre-refactor behavior, which had
+ * per-field caps + an 8192 render buffer and NO header-COUNT cap — an origin
+ * sending many small headers (e.g. 100+ Set-Cookie) must relay, not 502. */
 #define MQ_GW_RESP_NAME_CAP 128
 #define MQ_GW_RESP_VAL_CAP  2048
-#define MQ_GW_RESP_MAX_HDRS 96
+#define MQ_GW_RESP_MAX_HDRS 2048
+#define MQ_GW_RESP_ARENA    16384
 
 /* Header-capture context for recv_headers (download). Collects the response
- * headers into a NEUTRAL mq_h3_header_t list (NUL-terminated arena) instead of
- * serializing HTTP/1.1 inline — the sink renders. */
+ * headers into a NEUTRAL mq_h3_header_t list (pointers into a shared NUL-
+ * terminated arena) instead of serializing HTTP/1.1 inline — the sink renders.
+ * Slots/arena are sized generously so the sink's 8192-byte buffer is the binding
+ * limit (not a count cap), matching the original byte-bounded behavior. */
 typedef struct {
     mq_gw_req_t *r;
     int status;
     int has_cl; /* response carried a content-length */
     mq_h3_header_t hs[MQ_GW_RESP_MAX_HDRS];
     size_t nh;
-    char names[MQ_GW_RESP_MAX_HDRS][MQ_GW_RESP_NAME_CAP];
-    char vals[MQ_GW_RESP_MAX_HDRS][MQ_GW_RESP_VAL_CAP];
+    char arena[MQ_GW_RESP_ARENA]; /* name\0 value\0 ... for all collected headers */
+    size_t arena_off;
     int ok; /* head fit + well-formed */
 } dl_hdr_ctx_t;
 
@@ -1134,16 +1139,25 @@ dl_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
         ctx->ok = 0;
         return;
     }
+    /* Fail closed if we run out of header slots or arena space. Both are sized so
+     * the sink's 8192-byte render buffer fills first, so in practice the binding
+     * limit is the byte buffer (matching pre-refactor behavior), not a count. */
     if (ctx->nh >= MQ_GW_RESP_MAX_HDRS) {
         ctx->ok = 0;
         return;
     }
-    char *nb = ctx->names[ctx->nh];
-    char *vb = ctx->vals[ctx->nh];
+    if (ctx->arena_off + nl + 1 + vl + 1 > sizeof(ctx->arena)) {
+        ctx->ok = 0;
+        return;
+    }
+    char *nb = ctx->arena + ctx->arena_off;
     memcpy(nb, n, nl);
     nb[nl] = '\0';
+    ctx->arena_off += nl + 1;
+    char *vb = ctx->arena + ctx->arena_off;
     memcpy(vb, v, vl);
     vb[vl] = '\0';
+    ctx->arena_off += vl + 1;
     ctx->hs[ctx->nh].name = nb;
     ctx->hs[ctx->nh].value = vb;
     ctx->nh++;
