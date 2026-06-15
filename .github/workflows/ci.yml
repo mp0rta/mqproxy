@@ -175,6 +175,22 @@ jobs:
           sudo journalctl -u mqproxy-server@test --no-pager | tail -30
           sudo systemctl is-active mqproxy-server@test   # fails the job if the unit died
           sudo systemctl stop mqproxy-server@test
+      - name: Client unit live start smoke
+        run: |
+          # Client unit: dummy unreachable server + a local SOCKS5 ingress. Reconnect is
+          # on by default, so it binds the ingress and stays up retrying — is-active holds.
+          # No TLS cert needed (client side). Proves the client ExecStart/path + ingress
+          # bind work under the same hardening sandbox as the server.
+          printf '[Server]\nAddress = 127.0.0.1:14999\n[Auth]\nKey = citoken\n[Ingress]\nSocks5 = 127.0.0.1:1080\n' \
+            | sudo tee /etc/mqproxy/testclient.conf >/dev/null
+          sudo chown mqproxy:mqproxy /etc/mqproxy/testclient.conf
+          sudo chmod 0600 /etc/mqproxy/testclient.conf
+          sudo systemctl daemon-reload
+          sudo systemctl start mqproxy-client@testclient
+          sleep 2
+          sudo journalctl -u mqproxy-client@testclient --no-pager | tail -30
+          sudo systemctl is-active mqproxy-client@testclient   # fails the job if the unit died
+          sudo systemctl stop mqproxy-client@testclient
 
   sanitizer:
     # ASan/UBSan build + unit suite (the configuration the proxy was developed
