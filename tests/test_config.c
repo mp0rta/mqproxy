@@ -73,6 +73,8 @@ test_client_roundtrip(void)
               "[Server]\nAddress = [2001:db8::1]:443\nClientId = edge\n"
               "[Auth]\nKey = tok\n"
               "[Ingress]\nSocks5 = 127.0.0.1:1080\n"
+              "TProxy = 127.0.0.1:8443\nMode = tproxy\nFwmark = 7\nTable = 200\n"
+              "SetupRedirect = true\nSkipUid = 1000\n"
               "[Interface]\nReconnect = false\nKeepaliveIdle = 15\n"
               "[Multipath]\nPath = 10.0.0.1\nPath = 10.0.0.2\n");
     mq_file_config_t c;
@@ -81,6 +83,13 @@ test_client_roundtrip(void)
     MQ_CHECK(strcmp(c.server_addr, "[2001:db8::1]:443") == 0);
     MQ_CHECK(strcmp(c.client_id, "edge") == 0);
     MQ_CHECK(strcmp(c.socks5, "127.0.0.1:1080") == 0);
+    /* [Ingress] transparent-capture keys (Phase 7 Slice 1) round-trip. */
+    MQ_CHECK(strcmp(c.tproxy, "127.0.0.1:8443") == 0);
+    MQ_CHECK(strcmp(c.tproxy_mode, "tproxy") == 0);
+    MQ_CHECK_EQ_INT(c.tproxy_fwmark, 7);
+    MQ_CHECK_EQ_INT(c.tproxy_table, 200);
+    MQ_CHECK_EQ_INT(c.setup_redirect, 1);
+    MQ_CHECK_EQ_INT(c.tproxy_skip_uid, 1000);
     MQ_CHECK_EQ_INT(c.reconnect, 0);
     MQ_CHECK_EQ_INT(c.keepalive_idle_s, 15);
     MQ_CHECK_EQ_INT(c.n_paths, 2);
