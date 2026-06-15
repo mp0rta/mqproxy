@@ -1,0 +1,43 @@
+[Unit]
+Description=mqproxy client (%i)
+Documentation=https://github.com/mp0rta/mqproxy
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=@CMAKE_INSTALL_PREFIX@/bin/mqproxy client --config /etc/mqproxy/%i.conf
+Restart=on-failure
+RestartSec=2
+
+User=mqproxy
+Group=mqproxy
+
+# --- hardening: unprivileged userspace proxy, needs no caps / kernel access ---
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# AF_UNIX + AF_NETLINK are required for glibc getaddrinfo() (DOMAIN targets).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# /var/log/mqproxy for qlog (operator must set [Log] QLog=/var/log/mqproxy).
+LogsDirectory=mqproxy
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,7 @@ project(mqproxy VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 include(cmake/BuildSetup.cmake)
+include(GNUInstallDirs)
 if(MQPROXY_H3_CURL)
     add_library(CURL::libcurl SHARED IMPORTED)
     set_target_properties(CURL::libcurl PROPERTIES
@@ -519,12 +520,43 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # distinct target name but emit it as the `mqproxy` binary.
     add_executable(mqproxy_cli cli/main.c)
     set_target_properties(mqproxy_cli PROPERTIES OUTPUT_NAME mqproxy)
-    target_link_libraries(mqproxy_cli
-        mqproxy
-        xquic
-        ${EVENT_CORE_LIB}
-        ${EVENT_EXTRA_LIB}
-        pthread dl m stdc++)
+    if(MQPROXY_STATIC_XQUIC)
+        # Self-contained binary for packaging: statically link xquic + the BoringSSL
+        # it was built against (libxquic-static.a leaves ~118 BoringSSL SSL_*/EVP_AEAD_*/
+        # CRYPTO_BUFFER_* symbols undefined; system OpenSSL does not export these QUIC
+        # APIs, so they must resolve against BoringSSL's static archives). No BUILD_RPATH:
+        # nothing non-standard is loaded at runtime (the residual libssl.so.3 in ldd is
+        # libcurl's, not xquic's).
+        if(NOT TARGET xquic-static)
+            message(FATAL_ERROR
+                "MQPROXY_STATIC_XQUIC=ON but xquic-static was not imported "
+                "(no libxquic-static.a at ${XQUIC_BUILD_DIR}).")
+        endif()
+        set(_bssl_ssl    "${MQPROXY_BORINGSSL_DIR}/libssl.a")
+        set(_bssl_crypto "${MQPROXY_BORINGSSL_DIR}/libcrypto.a")
+        if(NOT EXISTS "${_bssl_ssl}" OR NOT EXISTS "${_bssl_crypto}")
+            message(FATAL_ERROR
+                "MQPROXY_STATIC_XQUIC=ON but BoringSSL static archives not found at "
+                "${MQPROXY_BORINGSSL_DIR} (expected libssl.a + libcrypto.a). Build xquic "
+                "via scripts/build-xquic.sh or set -DMQPROXY_BORINGSSL_DIR=<dir>.")
+        endif()
+        # Link order: xquic-static references BoringSSL symbols, so the archives follow it.
+        target_link_libraries(mqproxy_cli
+            mqproxy
+            xquic-static
+            "${_bssl_ssl}" "${_bssl_crypto}"
+            ${EVENT_CORE_LIB}
+            ${EVENT_EXTRA_LIB}
+            pthread dl m stdc++)
+    else()
+        target_link_libraries(mqproxy_cli
+            mqproxy
+            xquic
+            ${EVENT_CORE_LIB}
+            ${EVENT_EXTRA_LIB}
+            pthread dl m stdc++)
+        set_target_properties(mqproxy_cli PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    endif()
     target_include_directories(mqproxy_cli PRIVATE src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     # Default cert/key for `server` come from the bundled test cert (so the
@@ -532,8 +564,6 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     target_compile_definitions(mqproxy_cli PRIVATE
         TEST_CERT_FILE="${MQ_CERT_FILE}"
         TEST_KEY_FILE="${MQ_KEY_FILE}")
-    set_target_properties(mqproxy_cli PROPERTIES
-        BUILD_RPATH "${XQUIC_BUILD_DIR}")
 
     # CLI help / smoke test (shell): asserts --help works and unknown
     # subcommands fail. Passes the binary path via $<TARGET_FILE:mqproxy>.
@@ -609,4 +639,39 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_KEY=${MQ_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_udp.sh)
     set_tests_properties(e2e_udp PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ---- packaging / install ----
+    configure_file(packaging/systemd/mqproxy-server@.service.in
+        ${CMAKE_BINARY_DIR}/packaging/mqproxy-server@.service @ONLY)
+    configure_file(packaging/systemd/mqproxy-client@.service.in
+        ${CMAKE_BINARY_DIR}/packaging/mqproxy-client@.service @ONLY)
+
+    install(TARGETS mqproxy_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+    # systemd units / sysusers / tmpfiles are NOT multiarch — literal lib/ paths.
+    install(FILES
+        ${CMAKE_BINARY_DIR}/packaging/mqproxy-server@.service
+        ${CMAKE_BINARY_DIR}/packaging/mqproxy-client@.service
+        DESTINATION lib/systemd/system)
+    install(FILES packaging/sysusers.d/mqproxy.conf  DESTINATION lib/sysusers.d)
+    install(FILES packaging/tmpfiles.d/mqproxy.conf  DESTINATION lib/tmpfiles.d)
+
+    install(FILES server.conf.example client.conf.example
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+    # License bundling (Apache-2.0 §4(a)). The binary statically links xquic AND
+    # BoringSSL, so both LICENSEs are mandatory. OPTIONAL only so CI jobs that skip
+    # the xquic submodule don't fail the install rule.
+    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+    install(FILES third_party/xquic/LICENSE
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third-party RENAME xquic.txt OPTIONAL)
+    install(FILES third_party/xquic/third_party/boringssl/LICENSE
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third-party RENAME boringssl.txt OPTIONAL)
+
+    # Verify the install layout + static self-containment. SKIPs (77) unless the
+    # build was configured with -DCMAKE_INSTALL_PREFIX=/usr (packaging build).
+    add_test(NAME packaging_install_static
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/packaging/verify_install.sh
+                ${CMAKE_BINARY_DIR})
+    set_tests_properties(packaging_install_static PROPERTIES SKIP_RETURN_CODE 77)
 endif()
