@@ -28,23 +28,17 @@
  *   b2  chunked (no content-length) response: resp_head reports MQ_GW_BODY_STREAM
  *   b3  upload backpressure: mq_gw_client_req_body returns -1 (pause) for a large
  *        upload; resume_read fires later; upload completes
- *   b4  download highwater: resp_body returns 0 (highwater); req_drained resumes;
- *        full body eventually delivered
- *       NOTE: highwater is detected by the fake sink, not enforced internally.
- *       The resp_body callback returning 0 from the sink is the highwater signal.
- *       We verify the core calls req_drained correctly to resume.
+ *   b4  download highwater: resp_body returns 0 (highwater) on the 1st 16-KiB
+ *        chunk of a 50-KiB body (fin==0 guaranteed); req_drained resumes; full
+ *        body delivered byte-exact.  Guard: resp_finish must NOT have fired before
+ *        req_drained is called — test FAILs if req_drained is a no-op.
  *   b5  abort (intake-first): req_aborted mid-flight; clean teardown, no leak/UAF
- *   b6  abort (tunnel-first): server resets mid-download; resp_abort fires (NOT
- *        resp_finish)
- *
- * Cases deferred to e2e:
- *   - Forcing download highwater deterministically without adding production hooks
- *     is impractical in this in-process harness (the fake sink must coordinate with
- *     the event loop in a race-free way). b4 is covered partially: resp_body
- *     highwater (return 0) triggers read_deferred; req_drained resumes. We verify
- *     this by observing resume_read is called after the highwater signal, and that
- *     the body eventually arrives complete. The determinism relies on the fake sink
- *     being the sole highwater controller (no production hook added).
+ *   b6a abort (tunnel-first, truncation path): server sends 200+64B+RESET; since
+ *        resp_started==true h3_on_close calls resp_abort (not resp_finish);
+ *        64 partial bytes are delivered before the reset.
+ *   b6b abort (tunnel-first, before-head path): server sends RESET before any
+ *        response headers; h3_on_close synthesizes a clean 502 via resp_finish
+ *        (not resp_abort); status==502, body_len==0.
  */
 #include "mqtest.h"
 
@@ -229,11 +223,12 @@ typedef struct {
 
 /* Scenario controls (set before each test case) */
 enum {
-    SC_200_CL = 0,      /* 200 + content-length + g_dl_body */
-    SC_200_NOCL = 1,    /* 200 without content-length (MQ_GW_BODY_STREAM) */
-    SC_ECHO_UPLOAD = 2, /* 200 + echo the received upload body back */
-    SC_RESET_MID = 3,   /* partial body then reset (triggers resp_abort) */
-    SC_HANG = 4,        /* receive everything but NEVER respond */
+    SC_200_CL = 0,            /* 200 + content-length + g_dl_body */
+    SC_200_NOCL = 1,          /* 200 without content-length (MQ_GW_BODY_STREAM) */
+    SC_ECHO_UPLOAD = 2,       /* 200 + echo the received upload body back */
+    SC_RESET_MID = 3,         /* partial body then reset (triggers resp_abort) */
+    SC_HANG = 4,              /* receive everything but NEVER respond */
+    SC_RESET_BEFORE_HEAD = 5, /* reset WITHOUT sending any response headers */
 };
 
 typedef struct {
@@ -307,14 +302,32 @@ srv_respond(gw_srv_t *s)
 
     s->responded = 1;
 
+    if (s->scenario == SC_RESET_BEFORE_HEAD) {
+        /* Reset immediately — never send response headers.  h3_on_close on the
+         * client will fire with resp_started==false, so the core synthesizes a
+         * clean 502 via resp_head+resp_finish (not resp_abort). */
+        mq_h3_req_reset(s->req);
+        s->req = NULL;
+        return;
+    }
+
     if (s->scenario == SC_RESET_MID) {
-        /* Send partial headers + partial body, then reset. */
+        /* Send 200 headers + partial body, but DO NOT reset here.  The test
+         * pumps until the client processes the headers (resp_head_called==1),
+         * THEN calls mq_h3_req_reset(g_srv.req) directly.  This guarantees that
+         * resp_started==true when h3_on_close fires, so the truncation branch
+         * (resp_abort) is taken — not the synthesized-502 branch.
+         *
+         * Set snd_fin_done=1 to prevent srv_body_pump (called from
+         * srv_on_req_write) from accidentally sending a fin on the stream
+         * while the test is waiting to issue the reset. */
         mq_h3_header_t h[] = {{":status", "200"}};
         mq_h3_req_send_headers(s->req, h, 1, 0);
         static const uint8_t part[64] = {'P'};
         mq_h3_req_send_body(s->req, part, sizeof(part), 0);
-        mq_h3_req_reset(s->req);
-        s->req = NULL;
+        s->snd_fin_done = 1; /* suppress any further writes from write-ready cb */
+        /* NOTE: no reset here — the test drives the reset after confirming
+         * the client has seen the headers. */
         return;
     }
 
@@ -977,14 +990,19 @@ test_b3_upload_backpressure(void)
  *     call; we call mq_gw_client_req_drained; the download resumes and
  *     resp_finish fires with all bytes delivered.
  *
- *     NOTE on determinism: returning 0 from resp_body causes the core to set
- *     read_deferred=1 and stop calling resp_body until mq_gw_client_req_drained
- *     is called.  We verify this by checking that after the highwater signal,
- *     the body_len does NOT grow until we call req_drained, then grows to
- *     completion.  There is no guaranteed "other resp_body calls won't arrive
- *     before we call drained" timing guarantee in a purely event-driven loop
- *     without blocking the loop; we use a best-effort check.  The primary
- *     assertion is that resp_finish fires and the full body is delivered. */
+ *     ROBUSTNESS: the download body is 50 KiB — larger than 3× MQ_GW_DOWNLOAD_CHUNK
+ *     (16 KiB).  This guarantees that when the first 16-KiB chunk is delivered
+ *     and the fake sink returns 0 (highwater), there is STILL pending body with
+ *     fin==0; the download_pump early-return path (read_deferred, !fin) is taken
+ *     and the response can ONLY complete after mq_gw_client_req_drained re-kicks
+ *     download_pump.  With a tiny body (< 16 KiB) the entire body + fin arrive in
+ *     the first recv, so the fin fall-through calls gw_local_finish immediately
+ *     even when read_deferred is set — neutering req_drained would still pass.
+ *
+ *     REGRESSION GUARD: after highwater fires and BEFORE req_drained is called,
+ *     we assert resp_finish_called==0.  If req_drained is a no-op the download
+ *     never resumes, resp_finish never fires, and pump_until times out → b4 FAILs.
+ */
 static void
 test_b4_download_highwater(void)
 {
@@ -995,9 +1013,15 @@ test_b4_download_highwater(void)
         return;
     }
 
-    static const uint8_t DL[] = "download-highwater-test-body-0123456789ABCDEF";
-    g_dl_body = DL;
-    g_dl_body_len = sizeof(DL) - 1;
+    /* 50 KiB download body — spans >3 MQ_GW_DOWNLOAD_CHUNK (16 KiB) reads.
+     * Use a deterministic pattern so byte-exact comparison catches corruption. */
+    static const size_t DL_SIZE = 50 * 1024;
+    static uint8_t dl_body[50 * 1024];
+    for (size_t i = 0; i < DL_SIZE; i++)
+        dl_body[i] = (uint8_t)((i * 97 + 13) & 0xff);
+
+    g_dl_body = dl_body;
+    g_dl_body_len = DL_SIZE;
     g_srv.scenario = SC_200_CL;
 
     mq_h3_header_t hdrs[] = {
@@ -1007,10 +1031,19 @@ test_b4_download_highwater(void)
 
     fake_sink_t sink_state;
     memset(&sink_state, 0, sizeof(sink_state));
-    uint8_t body_out[512] = {0};
+    uint8_t *body_out = malloc(DL_SIZE);
+    MQ_CHECK(body_out != NULL);
+    if (!body_out) {
+        relay_fixture_down(&f);
+        return;
+    }
+    memset(body_out, 0, DL_SIZE);
     sink_state.body_buf = body_out;
-    sink_state.body_cap = sizeof(body_out);
-    /* Signal highwater on the 1st resp_body call. */
+    sink_state.body_cap = DL_SIZE;
+    /* Signal highwater on the 1st resp_body call.  Because the body is 50 KiB,
+     * the first chunk (16 KiB) arrives with fin==0; download_pump sets
+     * read_deferred and returns WITHOUT calling gw_local_finish.  The response
+     * can ONLY complete after mq_gw_client_req_drained re-kicks download_pump. */
     sink_state.highwater_at = 1;
     mq_gw_sink_ops_t ops = fake_sink_ops();
 
@@ -1020,22 +1053,29 @@ test_b4_download_highwater(void)
         mq_gw_client_req_begin(f.gw, &head, &ops, &sink_state, &err_status, &reason);
     MQ_CHECK(xr != NULL);
     if (!xr) {
+        free(body_out);
         relay_fixture_down(&f);
         return;
     }
 
-    /* Thread the xreq into the sink so fake_resp_body can call drained. */
     sink_state.xreq = xr;
     mq_gw_client_req_body_done(xr);
 
-    /* Pump until the highwater fires (resp_body called at least once). */
+    /* Pump until the highwater fires (1st resp_body call returns 0). */
     uint64_t deadline = now_ms() + 8000;
     while (!sink_state.highwater_fired && now_ms() < deadline)
         event_base_loop(f.base, EVLOOP_NONBLOCK);
 
     MQ_CHECK_EQ_INT(sink_state.highwater_fired, 1);
 
-    /* Now call drained to resume the download. */
+    /* REGRESSION GUARD: resp_finish must NOT have fired yet — download_pump is
+     * stalled at read_deferred.  If this assertion fails it means the body was
+     * small enough to arrive with fin==1 in the first chunk and req_drained is
+     * not actually needed (false-confidence failure). */
+    MQ_CHECK_EQ_INT(sink_state.resp_finish_called, 0);
+
+    /* Call drained to un-stall download_pump.  If this is a no-op the download
+     * never resumes and the pump_until below will time out → test FAILs. */
     mq_gw_client_req_drained(xr);
 
     /* Pump until resp_finish fires. */
@@ -1045,9 +1085,10 @@ test_b4_download_highwater(void)
     MQ_CHECK_EQ_INT(sink_state.resp_status, 200);
     MQ_CHECK_EQ_INT(sink_state.resp_finish_called, 1);
     MQ_CHECK_EQ_INT(sink_state.resp_abort_called, 0);
-    MQ_CHECK_EQ_INT((int)sink_state.body_len, (int)(sizeof(DL) - 1));
-    MQ_CHECK_MEM(body_out, DL, sizeof(DL) - 1);
+    MQ_CHECK_EQ_INT((int)sink_state.body_len, (int)DL_SIZE);
+    MQ_CHECK_MEM(body_out, dl_body, DL_SIZE);
 
+    free(body_out);
     relay_fixture_down(&f);
 }
 
@@ -1112,10 +1153,26 @@ test_b5_intake_abort(void)
     relay_fixture_down(&f);
 }
 
-/* b6: tunnel-first abort — server resets mid-download; resp_abort fires
- *     (never resp_finish). */
+/* b6a: tunnel-first abort — truncation path (resp_started == true).
+ *
+ *      SC_RESET_MID sends 200 headers + 64 bytes of body (no reset yet).  The
+ *      test pumps until the CLIENT has processed the headers (resp_head_called==1),
+ *      establishing resp_started==true, THEN calls mq_h3_req_reset(g_srv.req)
+ *      directly.  This guarantees h3_on_close fires with resp_started==true, so
+ *      the truncation branch is taken: resp_abort (NOT resp_finish).
+ *
+ *      Two-phase reset (pump-then-reset) eliminates the race where the RESET_STREAM
+ *      frame arrives before the client event loop processes the HEADERS frame.
+ *
+ *      Strict assertions:
+ *        - resp_abort_called == 1
+ *        - resp_finish_called == 0  (no fake clean finish on a truncated response)
+ *        - 64 partial-body bytes were received before the reset
+ *
+ *      This test FAILS if h3_on_close takes the synthesized-502 branch instead.
+ */
 static void
-test_b6_tunnel_abort(void)
+test_b6a_tunnel_abort_truncation(void)
 {
     relay_fixture_t f;
     if (relay_fixture_up(&f, "sekrit") != 0) {
@@ -1124,7 +1181,10 @@ test_b6_tunnel_abort(void)
         return;
     }
 
+    /* SC_RESET_MID: server sends 200 + 64-byte partial body, no fin, no reset.
+     * The test calls the reset after the client has seen the headers. */
     g_srv.scenario = SC_RESET_MID;
+    static const size_t PARTIAL_LEN = 64;
 
     mq_h3_header_t hdrs[] = {
         {"x-mq-auth", "Bearer sekrit"},
@@ -1150,30 +1210,104 @@ test_b6_tunnel_abort(void)
 
     mq_gw_client_req_body_done(xr);
 
-    /* Pump until either resp_abort or resp_finish fires.  Per test_gw_client.c
-     * case 6 (mid-download reset), both outcomes are valid: if the 200 headers
-     * arrived before the RESET_STREAM the core starts the response and then
-     * drives resp_abort when the reset arrives; if the reset won the race it
-     * synthesizes a 502 internally and drives resp_abort without resp_head.
-     * In all cases resp_finish must NOT fire (no fake clean finish). */
+    /* Phase 1: pump until the client has processed the 200 headers.
+     * At this point resp_started==true on the gw_req, so the next h3_on_close
+     * will take the truncation path (resp_abort). */
+    pump_until(f.base, &sink_state.resp_head_called, 8000);
+    MQ_CHECK_EQ_INT(sink_state.resp_head_called, 1);
+    MQ_CHECK_EQ_INT(sink_state.resp_status, 200);
+
+    /* Phase 2: reset the server stream now that the client has resp_started==true.
+     * g_srv.req is still live (SC_RESET_MID does not reset in srv_respond). */
+    MQ_CHECK(g_srv.req != NULL);
+    if (g_srv.req) {
+        mq_h3_req_reset(g_srv.req);
+        g_srv.req = NULL;
+    }
+
+    /* Pump until resp_abort or resp_finish fires. */
     uint64_t deadline = now_ms() + 8000;
     while (!sink_state.resp_abort_called && !sink_state.resp_finish_called &&
            now_ms() < deadline) {
         event_base_loop(f.base, EVLOOP_NONBLOCK);
     }
 
-    /* resp_abort must have fired (clean finish is never valid here). */
-    MQ_CHECK(sink_state.resp_abort_called > 0 || sink_state.resp_finish_called > 0);
-    /* The primary invariant: a tunnel-side reset must NEVER produce resp_finish
-     * when the response was truncated. */
-    if (sink_state.resp_abort_called == 0 && sink_state.resp_finish_called > 0) {
-        /* Check: if resp_finish fired, the body must NOT be the full g_dl_body.
-         * SC_RESET_MID sends exactly 64 bytes then resets; if finish fired we
-         * accept it only if the body is the 64-byte partial (which is fine: the
-         * reset arrived AFTER the partial body finished on the wire). */
-        /* Both outcomes are allowed per the existing test_gw_client case 6
-         * contract. This check just ensures we don't silently swallow the race. */
+    /* Strict truncation-path invariants:
+     *   h3_on_close with resp_started==true → resp_abort, never resp_finish. */
+    MQ_CHECK_EQ_INT(sink_state.resp_abort_called, 1);
+    MQ_CHECK_EQ_INT(sink_state.resp_finish_called, 0);
+    /* Partial body (64 bytes, first byte 'P', rest 0x00) was delivered before
+     * the reset arrived. */
+    MQ_CHECK_EQ_INT((int)sink_state.body_len, (int)PARTIAL_LEN);
+    MQ_CHECK_EQ_INT(body_out[0], 'P');
+    MQ_CHECK_EQ_INT(g_srv.request_count, 1);
+
+    relay_fixture_down(&f);
+}
+
+/* b6b: tunnel-first abort — synthesized-502 path (resp_started == false).
+ *
+ *      SC_RESET_BEFORE_HEAD sends RESET_STREAM without any response headers.
+ *      The client never sets resp_started; h3_on_close synthesizes a clean 502
+ *      via resp_head(502) + resp_finish (NOT resp_abort).
+ *
+ *      Strict assertions:
+ *        - resp_finish_called == 1
+ *        - resp_abort_called == 0
+ *        - status == 502
+ *        - body_len == 0  (synthesized response has Content-Length: 0)
+ */
+static void
+test_b6b_tunnel_abort_before_head(void)
+{
+    relay_fixture_t f;
+    if (relay_fixture_up(&f, "sekrit") != 0) {
+        relay_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
     }
+
+    g_srv.scenario = SC_RESET_BEFORE_HEAD;
+
+    mq_h3_header_t hdrs[] = {
+        {"x-mq-auth", "Bearer sekrit"},
+    };
+    mq_gw_req_head_t head = make_head(hdrs, 1, 0);
+
+    fake_sink_t sink_state;
+    memset(&sink_state, 0, sizeof(sink_state));
+    uint8_t body_out[64] = {0};
+    sink_state.body_buf = body_out;
+    sink_state.body_cap = sizeof(body_out);
+    mq_gw_sink_ops_t ops = fake_sink_ops();
+
+    int err_status = 0;
+    mq_gw_reject_reason_t reason = MQ_GW_OK;
+    mq_gw_xreq_t *xr =
+        mq_gw_client_req_begin(f.gw, &head, &ops, &sink_state, &err_status, &reason);
+    MQ_CHECK(xr != NULL);
+    if (!xr) {
+        relay_fixture_down(&f);
+        return;
+    }
+
+    mq_gw_client_req_body_done(xr);
+
+    /* Pump until either resp_abort or resp_finish fires. */
+    uint64_t deadline = now_ms() + 8000;
+    while (!sink_state.resp_abort_called && !sink_state.resp_finish_called &&
+           now_ms() < deadline) {
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+    }
+
+    /* Strict synthesized-502-path invariants:
+     *   h3_on_close with resp_started==false → resp_head(502)+resp_finish, never
+     *   resp_abort. */
+    MQ_CHECK_EQ_INT(sink_state.resp_finish_called, 1);
+    MQ_CHECK_EQ_INT(sink_state.resp_abort_called, 0);
+    MQ_CHECK_EQ_INT(sink_state.resp_head_called, 1);
+    MQ_CHECK_EQ_INT(sink_state.resp_status, 502);
+    MQ_CHECK_EQ_INT((int)sink_state.body_len, 0);
     MQ_CHECK_EQ_INT(g_srv.request_count, 1);
 
     relay_fixture_down(&f);
@@ -1201,7 +1335,8 @@ run_all(void)
     test_b3_upload_backpressure();
     test_b4_download_highwater();
     test_b5_intake_abort();
-    test_b6_tunnel_abort();
+    test_b6a_tunnel_abort_truncation();
+    test_b6b_tunnel_abort_before_head();
 }
 
 MQ_TEST_MAIN(run_all())
