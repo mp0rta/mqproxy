@@ -49,6 +49,8 @@
 #include "gateway/mq_gw_fetch_adapter.h"
 #include "gateway/mq_gw_server.h"
 #include "ingress/mq_listener.h"
+#include "ingress/mq_tproxy.h"
+#include "ingress/mq_tproxy_setup.h"
 #include "proxy/mq_client.h"
 #include "proxy/mq_server.h"
 #include "runtime/mq_runtime_libevent.h"
@@ -226,6 +228,23 @@ usage_client(FILE *out)
         "disable). Logs the\n"
         "                             proxy conn (and the gateway conn with "
         "--gateway).\n"
+        "  --tproxy       <ip:port>   Local TCP address for the transparent capture\n"
+        "                             ingress (REDIRECT or TPROXY mode).\n"
+        "  --tproxy-mode  redirect|tproxy\n"
+        "                             Kernel capture mechanism (default: redirect).\n"
+        "                             redirect — nft nat REDIRECT (single-host, no\n"
+        "                             CAP_NET_ADMIN on the socket).\n"
+        "                             tproxy   — nft mangle TPROXY (router, needs\n"
+        "                             CAP_NET_ADMIN for IP_TRANSPARENT).\n"
+        "  --tproxy-fwmark <n>        Packet mark for TPROXY routing (default: 1;\n"
+        "                             tproxy mode only).\n"
+        "  --tproxy-table <n>         ip routing table for TPROXY (default: 100;\n"
+        "                             tproxy mode only).\n"
+        "  --setup-redirect           Install nft/ip-rule firewall rules on start\n"
+        "                             and remove them on exit (requires root or\n"
+        "                             CAP_NET_ADMIN; off by default).\n"
+        "  --tproxy-uid <uid>         UID whose outbound traffic is NOT redirected\n"
+        "                             (default: geteuid() of the process).\n"
         "  --config <path>            Load settings from an INI file (CLI flags\n"
         "                             override file values).\n"
         "  -h, --help                 Show this help and exit.\n");
@@ -838,10 +857,16 @@ cmd_client(int argc, char **argv)
     mq_sched_t sched = MQ_SCHED_DEFAULT;
     const char *paths[MQ_MAX_EXTRA_PATHS];
     size_t npaths = 0;
-    long keepalive_idle_s = 30;        /* --keepalive-idle <sec>; 0 = disable */
-    int reconnect_enabled = 1;         /* --reconnect / --no-reconnect */
-    long reconnect_max_backoff_s = 30; /* --reconnect-max-backoff <sec> */
-    uint64_t metrics_interval_ms = 0;  /* --metrics-interval <sec>; 0 = off */
+    long keepalive_idle_s = 30;             /* --keepalive-idle <sec>; 0 = disable */
+    int reconnect_enabled = 1;              /* --reconnect / --no-reconnect */
+    long reconnect_max_backoff_s = 30;      /* --reconnect-max-backoff <sec> */
+    uint64_t metrics_interval_ms = 0;       /* --metrics-interval <sec>; 0 = off */
+    const char *tproxy_addr = NULL;         /* --tproxy <ip:port>; NULL = disabled */
+    const char *tproxy_mode_s = "redirect"; /* --tproxy-mode */
+    long tproxy_fwmark = 1;                 /* --tproxy-fwmark */
+    long tproxy_table = 100;                /* --tproxy-table */
+    int setup_redirect = 0;                 /* --setup-redirect */
+    long tproxy_uid = -1;                   /* --tproxy-uid; -1 = geteuid() */
 
     /* Seed from --config before getopt (defaults < file < CLI). fcfg is
      * function-scoped so the const char* aliases stay valid for the function. */
@@ -872,6 +897,12 @@ cmd_client(int argc, char **argv)
             metrics_interval_ms = (uint64_t)fcfg.metrics_interval_s * 1000;
         for (int i = 0; i < fcfg.n_paths && npaths < MQ_MAX_EXTRA_PATHS; i++)
             paths[npaths++] = fcfg.paths[i];
+        if (fcfg.tproxy[0]) tproxy_addr = fcfg.tproxy;
+        if (fcfg.tproxy_mode[0]) tproxy_mode_s = fcfg.tproxy_mode;
+        tproxy_fwmark = fcfg.tproxy_fwmark;
+        tproxy_table = fcfg.tproxy_table;
+        setup_redirect = fcfg.setup_redirect;
+        tproxy_uid = fcfg.tproxy_skip_uid;
     }
 
     enum {
@@ -891,6 +922,12 @@ cmd_client(int argc, char **argv)
         OPT_RECONNECT_MAX_BACKOFF,
         OPT_METRICS_INTERVAL,
         OPT_CONFIG,
+        OPT_TPROXY,
+        OPT_TPROXY_MODE,
+        OPT_TPROXY_FWMARK,
+        OPT_TPROXY_TABLE,
+        OPT_SETUP_REDIRECT,
+        OPT_TPROXY_UID,
     };
     static const struct option longopts[] = {
         {"server", required_argument, NULL, OPT_SERVER},
@@ -909,6 +946,12 @@ cmd_client(int argc, char **argv)
         {"reconnect-max-backoff", required_argument, NULL, OPT_RECONNECT_MAX_BACKOFF},
         {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
         {"config", required_argument, NULL, OPT_CONFIG},
+        {"tproxy", required_argument, NULL, OPT_TPROXY},
+        {"tproxy-mode", required_argument, NULL, OPT_TPROXY_MODE},
+        {"tproxy-fwmark", required_argument, NULL, OPT_TPROXY_FWMARK},
+        {"tproxy-table", required_argument, NULL, OPT_TPROXY_TABLE},
+        {"setup-redirect", no_argument, NULL, OPT_SETUP_REDIRECT},
+        {"tproxy-uid", required_argument, NULL, OPT_TPROXY_UID},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -982,6 +1025,52 @@ cmd_client(int argc, char **argv)
             break;
         }
         case OPT_CONFIG: break; /* already consumed pre-getopt by find_config_arg */
+        case OPT_TPROXY: tproxy_addr = optarg; break;
+        case OPT_TPROXY_MODE: tproxy_mode_s = optarg; break;
+        case OPT_TPROXY_FWMARK: {
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(optarg, &endp, 10);
+            if (errno != 0 || endp == optarg || *endp != '\0' || v <= 0) {
+                fprintf(stderr,
+                        "mqproxy client: invalid --tproxy-fwmark '%s' (must be > 0)\n\n",
+                        optarg);
+                usage_client(stderr);
+                return 2;
+            }
+            tproxy_fwmark = v;
+            break;
+        }
+        case OPT_TPROXY_TABLE: {
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(optarg, &endp, 10);
+            if (errno != 0 || endp == optarg || *endp != '\0' || v <= 0 || v > 65535) {
+                fprintf(
+                    stderr,
+                    "mqproxy client: invalid --tproxy-table '%s' (must be 1..65535)\n\n",
+                    optarg);
+                usage_client(stderr);
+                return 2;
+            }
+            tproxy_table = v;
+            break;
+        }
+        case OPT_SETUP_REDIRECT: setup_redirect = 1; break;
+        case OPT_TPROXY_UID: {
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(optarg, &endp, 10);
+            if (errno != 0 || endp == optarg || *endp != '\0' || v < 0) {
+                fprintf(stderr,
+                        "mqproxy client: invalid --tproxy-uid '%s' (must be >= 0)\n\n",
+                        optarg);
+                usage_client(stderr);
+                return 2;
+            }
+            tproxy_uid = v;
+            break;
+        }
         case 'h': usage_client(stdout); return 0;
         default: usage_client(stderr); return 2;
         }
@@ -1010,6 +1099,22 @@ cmd_client(int argc, char **argv)
     }
     mq_conn_set_scheduler(sched);
 
+    /* Validate --tproxy-mode: only "redirect" and "tproxy" are accepted. */
+    mq_capture_mode_t tproxy_capture_mode = MQ_CAPTURE_REDIRECT;
+    if (tproxy_mode_s) {
+        if (strcmp(tproxy_mode_s, "redirect") == 0) {
+            tproxy_capture_mode = MQ_CAPTURE_REDIRECT;
+        } else if (strcmp(tproxy_mode_s, "tproxy") == 0) {
+            tproxy_capture_mode = MQ_CAPTURE_TPROXY;
+        } else {
+            fprintf(stderr,
+                    "mqproxy client: invalid --tproxy-mode '%s' (redirect|tproxy)\n\n",
+                    tproxy_mode_s);
+            usage_client(stderr);
+            return 2;
+        }
+    }
+
     if (!server) {
         fprintf(stderr, "mqproxy client: missing required --server\n\n");
         usage_client(stderr);
@@ -1020,9 +1125,9 @@ cmd_client(int argc, char **argv)
         usage_client(stderr);
         return 2;
     }
-    if (!socks5 && !http_connect && !gateway) {
+    if (!socks5 && !http_connect && !gateway && !tproxy_addr) {
         fprintf(stderr, "mqproxy client: at least one ingress is required "
-                        "(--socks5, --http-connect, or --gateway)\n\n");
+                        "(--socks5, --http-connect, --gateway, or --tproxy)\n\n");
         usage_client(stderr);
         return 2;
     }
@@ -1054,12 +1159,20 @@ cmd_client(int argc, char **argv)
         fprintf(stderr, "mqproxy client: invalid --gateway address: %s\n", gateway);
         return 2;
     }
+    char tproxy_ip[INET6_ADDRSTRLEN];
+    uint16_t tproxy_port = 0;
+    if (tproxy_addr &&
+        parse_ip_port(tproxy_addr, tproxy_ip, sizeof(tproxy_ip), &tproxy_port) != 0) {
+        fprintf(stderr, "mqproxy client: invalid --tproxy address: %s\n", tproxy_addr);
+        return 2;
+    }
 
-    /* The TCP-proxy core (mq_client) is needed iff a SOCKS5 or HTTP CONNECT
-     * ingress is requested — both ride mq_client's tcp_open core. The gateway
-     * ingress is independent (its own mq_gw_client conn + auth), so a gateway-
-     * only client skips mq_client entirely. */
-    const int need_client = (socks5 != NULL) || (http_connect != NULL);
+    /* The TCP-proxy core (mq_client) is needed iff a SOCKS5, HTTP CONNECT, or
+     * transparent-capture (tproxy) ingress is requested — all three ride
+     * mq_client's tcp_open core. The gateway ingress is independent (its own
+     * mq_gw_client conn + auth), so a gateway-only client skips mq_client. */
+    const int need_client =
+        (socks5 != NULL) || (http_connect != NULL) || (tproxy_addr != NULL);
 
     /* The primary local bind for the client path. If --path was given, the
      * first one is the primary bind; each extra --path is brought up as an
@@ -1082,6 +1195,8 @@ cmd_client(int argc, char **argv)
     mq_client_t *client = NULL;
     mq_listener_t *socks5_l = NULL;
     mq_listener_t *http_l = NULL;
+    mq_tproxy_listener_t *tproxy_l = NULL;
+    mq_tproxy_setup_t *tproxy_setup = NULL;
     mq_h3_t *h3 = NULL;
     mq_gw_client_t *gwc = NULL;
     mq_gw_fetch_adapter_t *fetch_adp = NULL;
@@ -1180,6 +1295,33 @@ cmd_client(int argc, char **argv)
                 goto out;
             }
         }
+        if (tproxy_addr) {
+            /* Transparent capture: kernel redirects intercepted TCP connections
+             * to this listener; no in-band protocol is spoken toward the client.
+             * open_fn/open_core are the same TCP-proxy boundary used for
+             * SOCKS5 / HTTP CONNECT above. */
+            tproxy_l = mq_tproxy_listener_new(mq_runtime_base(rt), tproxy_ip, tproxy_port,
+                                              tproxy_capture_mode, open_fn, open_core);
+            if (!tproxy_l) {
+                MQ_LOGE("failed to bind tproxy listener on %s:%u", tproxy_ip,
+                        tproxy_port);
+                goto out;
+            }
+
+            if (setup_redirect) {
+                uid_t skip_uid =
+                    (tproxy_uid < 0) ? (uid_t)-1 : (uid_t)(unsigned long)tproxy_uid;
+                tproxy_setup = mq_tproxy_setup_new(
+                    tproxy_capture_mode, tproxy_ip, mq_tproxy_listener_port(tproxy_l),
+                    443 /*dport*/, skip_uid, (int)tproxy_fwmark, (int)tproxy_table);
+                if (tproxy_setup) {
+                    if (mq_tproxy_setup_install(tproxy_setup) != 0)
+                        MQ_LOGW("tproxy: firewall setup failed (rules may be partial)");
+                } else {
+                    MQ_LOGW("tproxy: OOM allocating setup handle; skipping rule install");
+                }
+            }
+        }
 
         /* Wire the auth-result callback: on auth settle, propagate the UDP
          * relay availability tri-state to the SOCKS5 listener so it can
@@ -1252,6 +1394,9 @@ cmd_client(int argc, char **argv)
         if (gateway)
             n += snprintf(ingress + n, sizeof(ingress) - (size_t)n, " gateway=%s:%u",
                           gw_ip, gw_port);
+        if (tproxy_addr)
+            n += snprintf(ingress + n, sizeof(ingress) - (size_t)n, " tproxy=%s:%u(%s)",
+                          tproxy_ip, mq_tproxy_listener_port(tproxy_l), tproxy_mode_s);
         MQ_LOGI("mqproxy client: server=%s:%u%s (bind %s, cc=%s, sched=%s)", server_ip,
                 server_port, ingress, primary_ip, mq_cc_name(cc), mq_sched_name(sched));
     }
@@ -1343,7 +1488,8 @@ out:
      *                             into the live runtime/client/socks5/http)
      *   -> runtime free          (closes sockets/timer; does not free base)
      *   -> mq_client_free
-     *   -> socks5 / http listener free
+     *   -> socks5 / http / tproxy listener free (tproxy_setup uninstall + free
+     *      also here: no callbacks after this point, ordering is safe)
      *   -> base free (CLI owns base). */
     if (metrics_ev) {
         event_del(metrics_ev);
@@ -1360,6 +1506,14 @@ out:
     if (client) mq_client_free(client);
     if (socks5_l) mq_listener_free(socks5_l);
     if (http_l) mq_listener_free(http_l);
+    /* tproxy: uninstall firewall rules BEFORE freeing the listener (rules
+     * reference the port; listener close is harmless either way, but keeping
+     * the ordering deterministic makes it easier to audit). */
+    if (tproxy_setup) {
+        mq_tproxy_setup_uninstall(tproxy_setup);
+        mq_tproxy_setup_free(tproxy_setup);
+    }
+    if (tproxy_l) mq_tproxy_listener_free(tproxy_l);
     if (base) event_base_free(base);
     return rc;
 }

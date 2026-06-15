@@ -32,6 +32,11 @@ mq_config_defaults(mq_file_config_t *cfg)
     cfg->keepalive_idle_s = 30;
     cfg->reconnect_max_backoff_s = 30;
     snprintf(cfg->client_id, sizeof(cfg->client_id), "%s", "mqproxy");
+    /* tproxy defaults: mode=redirect, fwmark=1, table=100, skip_uid=-1 (geteuid()) */
+    snprintf(cfg->tproxy_mode, sizeof(cfg->tproxy_mode), "%s", "redirect");
+    cfg->tproxy_fwmark = 1;
+    cfg->tproxy_table = 100;
+    cfg->tproxy_skip_uid = -1;
 }
 
 /* ---- helpers (templated from mqvpn/src/config.c) ---- */
@@ -246,6 +251,18 @@ handle_kv(mq_file_config_t *cfg, int section, const char *key, const char *val,
             CSTR(http_connect);
         else if (strcasecmp(key, "Gateway") == 0)
             CSTR(gw_listen);
+        else if (strcasecmp(key, "TProxy") == 0)
+            CSTR(tproxy);
+        else if (strcasecmp(key, "Mode") == 0)
+            CSTR(tproxy_mode);
+        else if (strcasecmp(key, "Fwmark") == 0)
+            LONGV(tproxy_fwmark, 1, LONG_MAX);
+        else if (strcasecmp(key, "Table") == 0)
+            LONGV(tproxy_table, 1, 65535);
+        else if (strcasecmp(key, "SetupRedirect") == 0)
+            cfg->setup_redirect = parse_bool(val);
+        else if (strcasecmp(key, "SkipUid") == 0)
+            LONGV(tproxy_skip_uid, -1, LONG_MAX);
         else
             MQ_LOGW("%s:%d: unknown key '%s' in [Ingress]", path, lineno, key);
         break;
