@@ -6,14 +6,17 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * PER-REQUEST OWNERSHIP (mq_gw_req_t)
  * ─────────────────────────────────────────────────────────────────────────────
- * Each accepted fetch request owns one mq_gw_req_t. It is referenced from two
- * independent sides that can each die first or race:
+ * This is the protocol-agnostic NEUTRAL CORE: it knows nothing about HTTP/1.1 or
+ * the fetch listener. The local protocol lives entirely behind the sink boundary
+ * (mq_gw_sink_ops_t), implemented today by mq_gw_fetch_adapter.c. Each request
+ * owns one mq_gw_req_t referenced from two independent sides that can each die
+ * first or race:
  *
- *   LOCAL side  (the mq_fetch_listener handle): set on accept; cleared when we
- *     call mq_fetch_conn_finish/abort, OR when the listener tells us the local
- *     peer died (on_aborted). After any of those the handle is DEAD — we null it
- *     and never touch it again. The req_ctx the listener threads back to us
- *     stays valid until then.
+ *   LOCAL side  (the sink: sink + sink_user): set on accept (mq_gw_client_req_
+ *     begin); cleared when we terminate the response (sink->resp_finish/resp_abort)
+ *     OR when the adapter tells us the local peer died (mq_gw_client_req_aborted).
+ *     After any of those the sink is DEAD — we null sink/sink_user and never touch
+ *     it again. The sink_user the adapter threads back to us stays valid until then.
  *
  *   TUNNEL side (the mq_h3_req): set on accept (mq_h3_req_open); cleared in the
  *     H3 on_close callback (the wrapper is freed right after). After on_close we
@@ -24,23 +27,23 @@
  * Every termination path routes through exactly one of:
  *
  *   - local terminates first: we mq_h3_req_reset (if h3 still live) → h3 on_close
- *     fires later → both dead → free. We set local_dead immediately and drop the
- *     handle so no further handle op runs.
- *   - tunnel terminates first (h3 on_close): we finish/abort the local handle
- *     (if still live) → that detaches local → both dead → free. on_close sets
- *     h3_dead and nulls the req pointer.
+ *     fires later → both dead → free. We set local_dead immediately and clear the
+ *     sink so no further sink op runs.
+ *   - tunnel terminates first (h3 on_close): we drive sink->resp_finish/resp_abort
+ *     (if local still live) → that detaches local → both dead → free. on_close
+ *     sets h3_dead and nulls the req pointer.
  *   - both race: idempotent flags; maybe_free runs only when both set, so the
  *     struct is freed exactly once regardless of order.
  *
- * The listener guarantees no cbs fire after finish/abort; mq_h3 guarantees
- * on_close fires exactly once. So each side flips its flag exactly once.
+ * mq_h3 guarantees on_close fires exactly once, and the adapter guarantees no
+ * sink op is delivered after we detach (resp_finish/resp_abort/req_aborted are
+ * each terminal). So each side flips its flag exactly once.
  *
- * One subtlety: when we call mq_fetch_conn_finish/abort from inside an H3
- * callback, that does NOT synchronously re-enter our fetch cbs (the listener
- * detaches first). So no reentrancy hazard there. Conversely, when the LOCAL
- * side dies we learn it either via on_aborted (explicit) or via a handle op
- * returning -1 (the listener handle is dead) — we treat a -1 from any write/
- * resume as "local dead" and reset the tunnel.
+ * One subtlety: when we drive a terminal sink op from inside an H3 callback, it
+ * does NOT synchronously re-enter the core (the adapter is terminal). So no
+ * reentrancy hazard there. Conversely, when the LOCAL side dies we learn it
+ * either via mq_gw_client_req_aborted (explicit) or via a sink op returning -1 —
+ * we treat a -1 from any sink write/resume as "local dead" and reset the tunnel.
  *
  * SINK INVARIANT (Task 4): `!local_dead` ⟹ `sink != NULL && sink_user != NULL`.
  * The sink is set once at req_begin (mq_gw_client_req_begin) and cleared in
