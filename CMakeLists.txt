@@ -397,6 +397,27 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_gw_reconnect COMMAND test_gw_reconnect)
 
+    # Neutral intake boundary relay test (Task 5, Phase 7 MITM Slice 0+1):
+    # drives mq_gw_client_prevalidate / mq_gw_client_req_begin / req_body /
+    # req_body_done / req_aborted / req_drained directly with a fake
+    # mq_gw_sink_ops_t (no fetch adapter / fetch listener), locking the
+    # boundary a future H2/H3 MITM adapter will also rely on.
+    add_executable(test_gw_relay tests/integration/test_gw_relay.c)
+    target_link_libraries(test_gw_relay
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_gw_relay PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_gw_relay PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_gw_relay PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_gw_relay COMMAND test_gw_relay)
+
     # mq_origin_curl (Task 4.2): the libcurl-multi origin client on libevent.
     # Drives the mq_origin_* API against an in-process evhttp origin over plain
     # loopback HTTP/1.1. evhttp lives in libevent_extra (EVENT_EXTRA_LIB); curl
