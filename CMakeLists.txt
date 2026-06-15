@@ -519,12 +519,43 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # distinct target name but emit it as the `mqproxy` binary.
     add_executable(mqproxy_cli cli/main.c)
     set_target_properties(mqproxy_cli PROPERTIES OUTPUT_NAME mqproxy)
-    target_link_libraries(mqproxy_cli
-        mqproxy
-        xquic
-        ${EVENT_CORE_LIB}
-        ${EVENT_EXTRA_LIB}
-        pthread dl m stdc++)
+    if(MQPROXY_STATIC_XQUIC)
+        # Self-contained binary for packaging: statically link xquic + the BoringSSL
+        # it was built against (libxquic-static.a leaves ~118 BoringSSL SSL_*/EVP_AEAD_*/
+        # CRYPTO_BUFFER_* symbols undefined; system OpenSSL does not export these QUIC
+        # APIs, so they must resolve against BoringSSL's static archives). No BUILD_RPATH:
+        # nothing non-standard is loaded at runtime (the residual libssl.so.3 in ldd is
+        # libcurl's, not xquic's).
+        if(NOT TARGET xquic-static)
+            message(FATAL_ERROR
+                "MQPROXY_STATIC_XQUIC=ON but xquic-static was not imported "
+                "(no libxquic-static.a at ${XQUIC_BUILD_DIR}).")
+        endif()
+        set(_bssl_ssl    "${MQPROXY_BORINGSSL_DIR}/libssl.a")
+        set(_bssl_crypto "${MQPROXY_BORINGSSL_DIR}/libcrypto.a")
+        if(NOT EXISTS "${_bssl_ssl}" OR NOT EXISTS "${_bssl_crypto}")
+            message(FATAL_ERROR
+                "MQPROXY_STATIC_XQUIC=ON but BoringSSL static archives not found at "
+                "${MQPROXY_BORINGSSL_DIR} (expected libssl.a + libcrypto.a). Build xquic "
+                "via scripts/build-xquic.sh or set -DMQPROXY_BORINGSSL_DIR=<dir>.")
+        endif()
+        # Link order: xquic-static references BoringSSL symbols, so the archives follow it.
+        target_link_libraries(mqproxy_cli
+            mqproxy
+            xquic-static
+            "${_bssl_ssl}" "${_bssl_crypto}"
+            ${EVENT_CORE_LIB}
+            ${EVENT_EXTRA_LIB}
+            pthread dl m stdc++)
+    else()
+        target_link_libraries(mqproxy_cli
+            mqproxy
+            xquic
+            ${EVENT_CORE_LIB}
+            ${EVENT_EXTRA_LIB}
+            pthread dl m stdc++)
+        set_target_properties(mqproxy_cli PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    endif()
     target_include_directories(mqproxy_cli PRIVATE src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
     # Default cert/key for `server` come from the bundled test cert (so the
@@ -532,8 +563,6 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     target_compile_definitions(mqproxy_cli PRIVATE
         TEST_CERT_FILE="${MQ_CERT_FILE}"
         TEST_KEY_FILE="${MQ_KEY_FILE}")
-    set_target_properties(mqproxy_cli PROPERTIES
-        BUILD_RPATH "${XQUIC_BUILD_DIR}")
 
     # CLI help / smoke test (shell): asserts --help works and unknown
     # subcommands fail. Passes the binary path via $<TARGET_FILE:mqproxy>.

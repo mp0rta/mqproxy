@@ -21,6 +21,14 @@ set(XQUIC_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/third_party/xquic/include)
 
 set(XQUIC_BUILD_DIR "" CACHE PATH "Path to pre-built xquic build directory")
 
+# Static-link xquic + its BoringSSL into shipped binaries (packaging). Default OFF
+# keeps the dynamic build + all test executables on the shared libxquic.so.
+option(MQPROXY_STATIC_XQUIC "Statically link libxquic-static.a + BoringSSL into mqproxy (packaging)" OFF)
+# BoringSSL static archives that libxquic-static.a was built against. Default matches
+# the in-tree scripts/build-xquic.sh layout; override for out-of-tree xquic builds.
+set(MQPROXY_BORINGSSL_DIR "${XQUIC_BUILD_DIR}/../third_party/boringssl/build"
+    CACHE PATH "Dir containing BoringSSL libssl.a/libcrypto.a for static linking")
+
 # Hint string shown whenever XQUIC_BUILD_DIR is unset or the lib looks like it
 # was built WITHOUT qlog (XQC_ENABLE_EVENT_LOG). Kept as one variable so both
 # branches below print the same actionable guidance.
