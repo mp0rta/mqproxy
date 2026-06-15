@@ -49,6 +49,15 @@
  * call mq_fetch_conn_* on r->handle WITHOUT a redundant NULL guard. The few
  * `if (r->handle)` guards that remain are at points reachable independent of
  * that early check and are kept for defence-in-depth.
+ *
+ * NEUTRAL-BOUNDARY NOTE (Task 3): the per-request state is the opaque
+ * mq_gw_xreq_t handed to adapters. Today the H1 fetch path also carries `handle`
+ * (the listener fd) + H1-rendering scratch, and the in-file H1 sink writes via
+ * mq_fetch_conn_* on it. Once Task 4 rewires the listener through the neutral
+ * boundary and removes `handle`, the invariant becomes the SINK's liveness:
+ * `!intake_dead` ⟹ `sink_user != NULL` (the sink is set once at req_begin and
+ * cleared in lockstep with local_dead). For Task 3 the sink and `handle` track
+ * each other 1:1 (the H1 sink's user IS the handle), so both invariants hold.
  */
 #include "gateway/mq_gw_client.h"
 
@@ -96,10 +105,20 @@
 
 /* ── per-request state ──────────────────────────────────────────────────────*/
 
-typedef struct mq_gw_req_s {
+/* This is the definition of the opaque mq_gw_xreq_t (typedef'd in
+ * mq_gw_intake.h as `struct mq_gw_xreq_s`). The legacy `mq_gw_req_t` alias is
+ * kept (below) so the in-file H1 fetch path reads unchanged this task; both name
+ * the same struct. The `handle` + H1-rendering fields (resp_chunked etc.) belong
+ * to the in-file H1 sink and are removed in Task 4 once the listener is rewired
+ * onto the neutral boundary. The neutral side drives the sink via sink/sink_user. */
+struct mq_gw_xreq_s {
     mq_gw_client_t *cli;
 
-    /* local (listener) side */
+    /* ── neutral intake (sink) side ── */
+    const mq_gw_sink_ops_t *sink; /* adapter callbacks (NULL == intake detached) */
+    void *sink_user;              /* adapter per-request cookie */
+
+    /* local (listener) side — H1 sink scratch; removed in Task 4. */
     void *handle; /* the fetch handle; NULL once detached (dead) */
     int local_dead;
 
@@ -121,8 +140,12 @@ typedef struct mq_gw_req_s {
     int read_deferred; /* local write hit highwater; stop recv_body until drain */
     int resp_status;   /* parsed :status (for diagnostics) */
 
-    struct mq_gw_req_s *next; /* intrusive list of live requests on the client */
-} mq_gw_req_t;
+    struct mq_gw_xreq_s *next; /* intrusive list of live requests on the client */
+};
+
+/* Legacy in-file alias: the H1 fetch path still spells the per-request state
+ * `mq_gw_req_t`. Same struct as the public opaque mq_gw_xreq_t. */
+typedef struct mq_gw_xreq_s mq_gw_req_t;
 
 /* ── client state ───────────────────────────────────────────────────────────*/
 
@@ -184,6 +207,8 @@ static void gw_reconnect_arm(mq_gw_client_t *c);
 static void gw_reconnect_stop(mq_gw_client_t *c);
 static void gw_mp_timer_arm(mq_gw_client_t *c);
 static void gw_mp_timer_stop(mq_gw_client_t *c);
+/* In-file H1 response sink (defined with the download path below). */
+static const mq_gw_sink_ops_t g_h1_sink;
 
 /* ── small helpers ──────────────────────────────────────────────────────────*/
 
@@ -263,6 +288,51 @@ find_hdr(const mq_http1_req_t *req, const char *name, size_t *out_vl)
     return NULL;
 }
 
+/* ── neutral header-list helpers (mq_h3_header_t, NUL-terminated) ────────────*/
+
+/* Find header `name` (case-insensitive) in a neutral list; NULL if absent.
+ * *out_vl receives strlen(value). */
+static const char *
+nfind_hdr(const mq_h3_header_t *hs, size_t n, const char *name, size_t *out_vl)
+{
+    size_t nl = strlen(name);
+    for (size_t i = 0; i < n; i++) {
+        if (slice_ieq(hs[i].name, strlen(hs[i].name), name)) {
+            (void)nl;
+            if (out_vl) *out_vl = strlen(hs[i].value);
+            return hs[i].value;
+        }
+    }
+    return NULL;
+}
+
+/* Returns 1 if the neutral list carries the same X-Mq-* name twice or more
+ * (case-insensitive). Mirrors mq_gw_has_dup_xmq for the neutral representation. */
+static int
+nhas_dup_xmq(const mq_h3_header_t *hs, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        size_t il = strlen(hs[i].name);
+        if (!slice_ieq(hs[i].name, il < 5 ? il : 5, "x-mq-")) continue;
+        for (size_t j = i + 1; j < n; j++) {
+            /* Both names come from the wire with arbitrary case; slice_ieq only
+             * folds its first arg, so compare both sides case-insensitively here
+             * (matches the original mq_gw_has_dup_xmq which lc()'d both). */
+            size_t jl = strlen(hs[j].name);
+            if (jl != il) continue;
+            size_t k = 0;
+            for (; k < il; k++) {
+                char a = hs[i].name[k], b = hs[j].name[k];
+                if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+                if (a != b) break;
+            }
+            if (k == il) return 1;
+        }
+    }
+    return 0;
+}
+
 /* ── per-request lifecycle ──────────────────────────────────────────────────*/
 
 static void
@@ -331,164 +401,162 @@ gw_local_abort(mq_gw_req_t *r)
     gw_req_maybe_free(r);
 }
 
-/* ── on_request: validate + open the H3 request + forward headers ───────────*/
+/* ── neutral intake: prevalidate + req_begin (core) ─────────────────────────*/
 
-static int
-gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ctx)
+/* Phase 1: header-only checks that run BEFORE the adapter parses the fetch
+ * envelope's target/method — duplicate X-Mq-* control headers, then X-Mq-Auth
+ * presence + "Bearer <non-empty>" format. Returns MQ_GW_OK or the reject reason
+ * (+ *status). No tunnel touch. */
+mq_gw_reject_reason_t
+mq_gw_client_prevalidate(mq_gw_client_t *c, const mq_h3_header_t *headers, size_t n,
+                         int *status)
 {
-    mq_gw_client_t *c = (mq_gw_client_t *)user;
-    *req_ctx = NULL;
-
+    (void)c;
     /* 1. duplicate X-Mq-* control headers → 400. */
-    if (mq_gw_has_dup_xmq(req)) {
-        gw_reject_write(handle, 400, "Bad Request", "duplicate-control-header");
-        return -1;
+    if (nhas_dup_xmq(headers, n)) {
+        if (status) *status = 400;
+        return MQ_GW_REJ_DUP_CONTROL;
     }
-
     /* 2. X-Mq-Auth present + "Bearer <non-empty>" format check (client-side). */
     size_t auth_vl = 0;
-    const char *auth = find_hdr(req, "x-mq-auth", &auth_vl);
+    const char *auth = nfind_hdr(headers, n, "x-mq-auth", &auth_vl);
     if (!auth) {
-        gw_reject_write(handle, 400, "Bad Request", "missing-auth");
-        return -1;
+        if (status) *status = 400;
+        return MQ_GW_REJ_MISSING_AUTH;
     }
     {
         const char *pfx = "Bearer ";
         size_t pl = strlen(pfx);
         if (auth_vl <= pl || strncmp(auth, pfx, pl) != 0) {
-            gw_reject_write(handle, 400, "Bad Request", "bad-auth-format");
-            return -1;
+            if (status) *status = 400;
+            return MQ_GW_REJ_BAD_AUTH;
         }
     }
+    return MQ_GW_OK;
+}
 
-    /* 3. X-Mq-Target parses. */
-    size_t tgt_vl = 0;
-    const char *tgt = find_hdr(req, "x-mq-target", &tgt_vl);
-    mq_gw_target_t target;
-    if (!tgt || mq_gw_parse_target(tgt, tgt_vl, &target) != 0) {
-        gw_reject_write(handle, 400, "Bad Request", "bad-target");
-        return -1;
-    }
-
-    /* 4. X-Mq-Method if present parses; default GET. */
-    char method[16];
-    size_t mth_vl = 0;
-    const char *mth = find_hdr(req, "x-mq-method", &mth_vl);
-    if (mth) {
-        if (mq_gw_parse_method(mth, mth_vl, method) != 0) {
-            gw_reject_write(handle, 400, "Bad Request", "bad-method");
-            return -1;
-        }
-    } else {
-        memcpy(method, "GET", 4);
-    }
+/* Phase 2: begin a request (head already split + prevalidated). The core does,
+ * IN ORDER: X-Mq-Origin-Protocol(400), X-Mq-Cache(400), header-size(400), tunnel
+ * liveness(502); then opens the H3 request, forwards pseudo + x-mq-* + ordinary
+ * headers, and streams the body via the sink. On reject sets *err_status +
+ * *reason and returns NULL (the adapter renders the error). */
+mq_gw_xreq_t *
+mq_gw_client_req_begin(mq_gw_client_t *c, const mq_gw_req_head_t *head,
+                       const mq_gw_sink_ops_t *sink, void *sink_user, int *err_status,
+                       mq_gw_reject_reason_t *reason)
+{
+    const mq_h3_header_t *H = head->headers;
+    size_t HN = head->n_headers;
 
     /* 4a. X-Mq-Origin-Protocol if present: validate via the shared parser. A present,
-     * non-empty, UNRECOGNIZED token is a caller bug → 400 (mirrors the other
-     * control-header validations). Absent / empty → DEFAULT (no preference; not
-     * re-emitted below). */
+     * non-empty, UNRECOGNIZED token is a caller bug → 400. Absent / empty → DEFAULT
+     * (no preference; not re-emitted below). */
     size_t xop_vl = 0;
-    const char *xop = find_hdr(req, "x-mq-origin-protocol", &xop_vl);
+    const char *xop = nfind_hdr(H, HN, "x-mq-origin-protocol", &xop_vl);
     mq_http_ver_t xop_ver = MQ_HTTP_VER_DEFAULT;
     if (xop && xop_vl > 0) {
         xop_ver = mq_gw_parse_http_ver(xop, xop_vl);
-        if (xop_ver ==
-            MQ_HTTP_VER_DEFAULT) { /* present + non-empty + unrecognized = caller bug */
-            gw_reject_write(handle, 400, "Bad Request", "bad-origin-protocol");
-            return -1;
+        if (xop_ver == MQ_HTTP_VER_DEFAULT) {
+            *err_status = 400;
+            *reason = MQ_GW_REJ_BAD_ORIGIN_PROTO;
+            return NULL;
         }
     }
 
     /* 4a'. X-Mq-Cache if present: validate via the shared parser. A present, non-empty,
-     * unparseable TTL (non-decimal / zero / out-of-range / overflow) is a caller bug →
-     * 400 (mirrors the other control-header validations). Absent / empty → no caching
-     * (not re-emitted below). */
+     * unparseable TTL is a caller bug → 400. Absent / empty → no caching. */
     size_t xmc_vl = 0;
-    const char *xmc = find_hdr(req, "x-mq-cache", &xmc_vl);
+    const char *xmc = nfind_hdr(H, HN, "x-mq-cache", &xmc_vl);
     unsigned xmc_ttl = 0;
     if (xmc && xmc_vl > 0) {
         xmc_ttl = mq_gw_parse_cache_ttl(xmc, xmc_vl);
-        if (xmc_ttl == 0) { /* present + non-empty + invalid → caller bug */
-            gw_reject_write(handle, 400, "Bad Request", "bad-cache-ttl");
-            return -1;
+        if (xmc_ttl == 0) {
+            *err_status = 400;
+            *reason = MQ_GW_REJ_BAD_CACHE_TTL;
+            return NULL;
         }
     }
 
-    /* 4b. Reject (locally, BEFORE opening the H3 request) any header that would
-     * not fit the forwarding arena, instead of silently clamping it. The arena
-     * slots are MQ_GW_HDR_NAME_CAP name / MQ_GW_HDR_VAL_CAP value, holding cap-1
-     * bytes + NUL — so a name >= NAME_CAP or value >= VAL_CAP would be truncated.
-     * A clamped X-Mq-Auth can't authenticate anyway, and a clamped forwarded value
-     * is a corruption / smuggling surface; fail closed with 400 header-too-long.
-     * (The download-side pseudo + diagnostic headers are validated where they are
-     * emitted.) */
-    int forward_cookie = mq_gw_forward_cookie_requested(req);
+    /* 4b. Reject (BEFORE opening the H3 request) any header that would not fit the
+     * forwarding arena, instead of silently clamping it. A clamped X-Mq-Auth can't
+     * authenticate anyway, and a clamped forwarded value is a corruption / smuggling
+     * surface; fail closed with 400 header-too-long. */
+    int forward_cookie = 0;
+    {
+        const char *fc = nfind_hdr(H, HN, "x-mq-forward-cookie", NULL);
+        if (fc) forward_cookie = slice_ieq(fc, strlen(fc), "true");
+    }
+    size_t auth_vl = 0;
+    const char *auth = nfind_hdr(H, HN, "x-mq-auth", &auth_vl);
     size_t xae_vl = 0;
-    const char *xae = find_hdr(req, "x-mq-accept-encoding", &xae_vl);
+    const char *xae = nfind_hdr(H, HN, "x-mq-accept-encoding", &xae_vl);
     int inject_ae = (xae && xae_vl > 0); /* present AND non-empty (empty => no-op) */
     {
         if (auth_vl >= MQ_GW_HDR_VAL_CAP) {
-            gw_reject_write(handle, 400, "Bad Request", "header-too-long");
-            return -1;
+            *err_status = 400;
+            *reason = MQ_GW_REJ_HEADER_TOO_LONG;
+            return NULL;
         }
         size_t xcl_vl = 0;
-        const char *xcl = find_hdr(req, "x-mq-class", &xcl_vl);
+        const char *xcl = nfind_hdr(H, HN, "x-mq-class", &xcl_vl);
         if (xcl && xcl_vl >= MQ_GW_HDR_VAL_CAP) {
-            gw_reject_write(handle, 400, "Bad Request", "header-too-long");
-            return -1;
+            *err_status = 400;
+            *reason = MQ_GW_REJ_HEADER_TOO_LONG;
+            return NULL;
         }
         if (inject_ae && xae_vl >= MQ_GW_HDR_VAL_CAP) {
-            gw_reject_write(handle, 400, "Bad Request", "header-too-long");
-            return -1;
+            *err_status = 400;
+            *reason = MQ_GW_REJ_HEADER_TOO_LONG;
+            return NULL;
         }
-        for (size_t i = 0; i < req->nh; i++) {
-            const char *n = req->h[i].n;
-            size_t nl = req->h[i].nl;
+        for (size_t i = 0; i < HN; i++) {
+            const char *n = H[i].name;
+            size_t nl = strlen(n);
             if (mq_gw_strip_client(n, nl, forward_cookie)) continue;
-            if (nl >= MQ_GW_HDR_NAME_CAP || req->h[i].vl >= MQ_GW_HDR_VAL_CAP) {
-                gw_reject_write(handle, 400, "Bad Request", "header-too-long");
-                return -1;
+            if (nl >= MQ_GW_HDR_NAME_CAP || strlen(H[i].value) >= MQ_GW_HDR_VAL_CAP) {
+                *err_status = 400;
+                *reason = MQ_GW_REJ_HEADER_TOO_LONG;
+                return NULL;
             }
         }
     }
 
     /* 5. tunnel must be up. */
     if (!c->conn_up || !c->conn) {
-        gw_reject_write(handle, 502, "Bad Gateway", "tunnel-unavailable");
-        return -1;
+        *err_status = 502;
+        *reason = MQ_GW_REJ_TUNNEL_UNAVAIL;
+        return NULL;
     }
 
     /* Accept: open the H3 request. */
     mq_h3_req_t *hr = mq_h3_req_open(c->conn);
     if (!hr) {
-        gw_reject_write(handle, 502, "Bad Gateway", "tunnel-unavailable");
-        return -1;
+        *err_status = 502;
+        *reason = MQ_GW_REJ_TUNNEL_UNAVAIL;
+        return NULL;
     }
 
     mq_gw_req_t *r = calloc(1, sizeof(*r));
     if (!r) {
         mq_h3_req_reset(hr);
-        gw_reject_write(handle, 502, "Bad Gateway", "internal-error");
-        return -1;
+        *err_status = 502;
+        *reason = MQ_GW_REJ_INTERNAL;
+        return NULL;
     }
     r->cli = c;
-    r->handle = handle;
+    r->sink = sink;
+    r->sink_user = sink_user;
     r->req = hr;
     r->resp_status = 0;
 
     /* fin = no body. CL==-1 (absent) OR CL<=0 → no body. */
-    int no_body = (req->content_length <= 0);
+    int no_body = (head->content_length <= 0);
 
     /* Build the forwarded header list. NUL-terminated C strings are required by
      * mq_h3_req_send_headers, so copy each (name,value) into a per-request arena.
      * The arena lives only for the duration of this call (send_headers copies the
-     * iovecs synchronously), so a stack arena is sufficient. */
+     * iovecs synchronously). */
     mq_h3_header_t hs[MQ_GW_MAX_SEND_HDRS];
-    /* Per-header storage: target fields are already NUL-terminated in `target`;
-     * pseudo-headers point at static / target storage. For ordinary forwarded
-     * headers we copy name+value into name/value scratch. */
-    /* Local aliases for the file-scope arena caps (used below for per-slot
-     * pointer math + bounded copies). Same constants as the §4b reject check. */
     static const size_t NS = MQ_GW_HDR_NAME_CAP, VS = MQ_GW_HDR_VAL_CAP;
     char *namebuf = malloc(MQ_GW_MAX_SEND_HDRS * NS);
     char *valbuf = malloc(MQ_GW_MAX_SEND_HDRS * VS);
@@ -498,24 +566,25 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         mq_h3_req_reset(hr);
         r->req = NULL;
         r->h3_dead = 1;
-        gw_reject_write(handle, 502, "Bad Gateway", "internal-error");
         free(r);
-        return -1;
+        *err_status = 502;
+        *reason = MQ_GW_REJ_INTERNAL;
+        return NULL;
     }
     size_t nh = 0;
 
     /* :method / :scheme / :authority / :path (pseudo-headers first). */
     hs[nh].name = ":method";
-    hs[nh].value = method;
+    hs[nh].value = head->method;
     nh++;
     hs[nh].name = ":scheme";
-    hs[nh].value = target.scheme;
+    hs[nh].value = head->scheme;
     nh++;
     hs[nh].name = ":authority";
-    hs[nh].value = target.authority;
+    hs[nh].value = head->authority;
     nh++;
     hs[nh].name = ":path";
-    hs[nh].value = target.path;
+    hs[nh].value = head->path;
     nh++;
 
     /* x-mq-auth: forward the ORIGINAL header value (server verifies). */
@@ -534,7 +603,7 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     /* x-mq-class if present. */
     {
         size_t cl_vl = 0;
-        const char *cls = find_hdr(req, "x-mq-class", &cl_vl);
+        const char *cls = nfind_hdr(H, HN, "x-mq-class", &cl_vl);
         if (cls && nh < MQ_GW_MAX_SEND_HDRS) {
             char *nb = namebuf + nh * NS;
             char *vb = valbuf + nh * VS;
@@ -548,11 +617,8 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         }
     }
 
-    /* x-mq-origin-protocol: re-emit the RAW validated token onto the tunnel only when a
-     * recognized choice was parsed (DEFAULT = no preference, not conveyed). The original
-     * X-Mq-* request header is stripped by mq_gw_strip_client; this re-emit carries the
-     * validated selection to the server. (The server reads it in req_each_header, maps it
-     * via mq_gw_parse_http_ver, and passes it to mq_origin_start.) */
+    /* x-mq-origin-protocol: re-emit the RAW validated token only when a recognized
+     * choice was parsed (DEFAULT = no preference, not conveyed). */
     if (xop_ver != MQ_HTTP_VER_DEFAULT && nh < MQ_GW_MAX_SEND_HDRS) {
         char *nb = namebuf + nh * NS;
         char *vb = valbuf + nh * VS;
@@ -565,11 +631,8 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
         nh++;
     }
 
-    /* x-mq-cache: re-emit the RAW validated TTL token onto the tunnel only when a valid
-     * opt-in TTL was parsed (absent / empty = no caching, not conveyed). The original
-     * X-Mq-* request header is stripped by mq_gw_strip_client; this re-emit carries the
-     * validated opt-in to the server. (The server reads it in req_each_header, re-parses
-     * it via mq_gw_parse_cache_ttl, and gates response caching on it.) */
+    /* x-mq-cache: re-emit the RAW validated TTL token only when a valid opt-in TTL
+     * was parsed (absent / empty = no caching, not conveyed). */
     if (xmc_ttl != 0 && nh < MQ_GW_MAX_SEND_HDRS) {
         char *nb = namebuf + nh * NS;
         char *vb = valbuf + nh * VS;
@@ -596,19 +659,16 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     }
 
     /* content-length: re-emit the recomputed value over the tunnel when the
-     * request has a known body length (CL > 0). Design §7.1 ("recompute"): the
-     * ORIGINAL Content-Length header is stripped (mq_gw_strip_client) and we
-     * emit our own validated value (req->content_length), so the value the
-     * server sees is the one this client actually committed to streaming — not
-     * an attacker-controlled duplicate. CL == 0 means fin-on-headers / no body
-     * (no_body above), so no content-length header is needed in that case. The
-     * server honors this via ctx.content_length → CURLOPT_INFILESIZE_LARGE;
-     * absent CL on a body request falls back to the chunked sentinel. */
-    if (req->content_length > 0 && nh < MQ_GW_MAX_SEND_HDRS) {
+     * request has a known body length (CL > 0). The ORIGINAL Content-Length header
+     * is stripped (mq_gw_strip_client) and we emit our own validated value so the
+     * value the server sees is the one this client committed to streaming. CL == 0
+     * means fin-on-headers / no body (no_body above), so no content-length is
+     * needed in that case. */
+    if (head->content_length > 0 && nh < MQ_GW_MAX_SEND_HDRS) {
         char *nb = namebuf + nh * NS;
         char *vb = valbuf + nh * VS;
         memcpy(nb, "content-length", 15);
-        int vn = snprintf(vb, VS, "%lld", (long long)req->content_length);
+        int vn = snprintf(vb, VS, "%lld", (long long)head->content_length);
         if (vn > 0 && (size_t)vn < VS) {
             hs[nh].name = nb;
             hs[nh].value = vb;
@@ -619,9 +679,9 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     /* Remaining request headers, EXCEPT those stripped client-side (hop-by-hop,
      * X-Mq-*, Host, Content-Length, Cookie). Lowercase the name (H3 requires
      * lowercase field names). */
-    for (size_t i = 0; i < req->nh && nh < MQ_GW_MAX_SEND_HDRS; i++) {
-        const char *n = req->h[i].n;
-        size_t nl = req->h[i].nl;
+    for (size_t i = 0; i < HN && nh < MQ_GW_MAX_SEND_HDRS; i++) {
+        const char *n = H[i].name;
+        size_t nl = strlen(n);
         if (mq_gw_strip_client(n, nl, forward_cookie)) continue;
         if (inject_ae && slice_ieq(n, nl, "accept-encoding")) continue;
         char *nb = namebuf + nh * NS;
@@ -633,8 +693,9 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
             nb[j] = ch;
         }
         nb[cnl] = '\0';
-        size_t vl = req->h[i].vl < VS - 1 ? req->h[i].vl : VS - 1;
-        memcpy(vb, req->h[i].v, vl);
+        size_t hvl = strlen(H[i].value);
+        size_t vl = hvl < VS - 1 ? hvl : VS - 1;
+        memcpy(vb, H[i].value, vl);
         vb[vl] = '\0';
         hs[nh].name = nb;
         hs[nh].value = vb;
@@ -649,45 +710,196 @@ gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ct
     free(valbuf);
 
     if (sh < 0) {
-        /* Hard send error: reset H3, synthesize 502. Callbacks are already wired
-         * (set_cbs above), and mq_h3_req_reset is DEFERRED — its on_close fires
-         * later. We are about to free r, so we MUST detach the callbacks FIRST
-         * or that deferred on_close would run h3_on_close on freed memory (UAF →
-         * double free via gw_req_maybe_free). r is not yet linked into c->reqs. */
+        /* Hard send error: reset H3, synthesize 502. Detach the callbacks FIRST or
+         * the deferred on_close would run on freed memory. r is not yet linked. */
         mq_h3_req_set_cbs(hr, NULL, NULL, NULL, NULL);
         mq_h3_req_reset(hr);
         r->req = NULL;
         r->h3_dead = 1;
-        gw_reject_write(handle, 502, "Bad Gateway", "tunnel-unavailable");
         free(r);
-        return -1;
+        *err_status = 502;
+        *reason = MQ_GW_REJ_TUNNEL_UNAVAIL;
+        return NULL;
     }
     if (sh == 0) {
-        /* EAGAIN on the header send (0 == NOTHING accepted; xqc_h3 never partially
-         * accepts a header section). A fresh H3 request's stream flow-control
-         * window comfortably holds a request header block, so this is essentially
-         * unreachable in practice. The header iovecs were built in a call-scoped
-         * arena (already freed above), so there is no buffer to retry from without
-         * a heap snapshot. Rather than carry that complexity for an unreachable
-         * path — or risk sending a malformed request — we fail closed with 502.
-         * (Documented design decision: header-EAGAIN is a hard 502, not a retry.) */
+        /* EAGAIN on the header send (0 == NOTHING accepted). Essentially
+         * unreachable; we fail closed with 502 rather than carry retry complexity. */
         MQ_LOGW("mq_gw_client: header send EAGAIN (flow-control); failing closed");
-        /* Same UAF hazard as the sh<0 path: detach the deferred on_close before
-         * freeing r. */
         mq_h3_req_set_cbs(hr, NULL, NULL, NULL, NULL);
         mq_h3_req_reset(hr);
         r->req = NULL;
         r->h3_dead = 1;
-        gw_reject_write(handle, 502, "Bad Gateway", "tunnel-unavailable");
         free(r);
-        return -1;
+        *err_status = 502;
+        *reason = MQ_GW_REJ_TUNNEL_UNAVAIL;
+        return NULL;
     }
 
     if (no_body) r->upload_fin_sent = 1;
 
-    /* Link the live request and hand the ctx back to the listener. */
+    /* Link the live request. */
     r->next = c->reqs;
     c->reqs = r;
+    return r;
+}
+
+/* ── H1 fetch path: shim onto the neutral boundary ──────────────────────────
+ *
+ * The listener-facing fetch callbacks (mq_gw_client_fetch_cbs) build neutral
+ * inputs from the mq_http1_req_t and drive the core API. The X-Mq-Target/Method
+ * parse (the fetch envelope) stays HERE (it is fetch-specific), sequenced
+ * BETWEEN prevalidate and req_begin so the observable reject ORDER is preserved:
+ *   dup -> auth -> target -> method -> [req_begin: origin-proto/cache/size/tunnel]
+ * The in-file H1 sink (g_h1_sink) renders the response; on a req_begin reject we
+ * map the reason enum to the byte-identical (status, X-Mq-Error) error. */
+
+static const char *
+gw_reason_xmq(mq_gw_reject_reason_t reason)
+{
+    switch (reason) {
+    case MQ_GW_REJ_DUP_CONTROL: return "duplicate-control-header";
+    case MQ_GW_REJ_MISSING_AUTH: return "missing-auth";
+    case MQ_GW_REJ_BAD_AUTH: return "bad-auth-format";
+    case MQ_GW_REJ_BAD_TARGET: return "bad-target";
+    case MQ_GW_REJ_BAD_METHOD: return "bad-method";
+    case MQ_GW_REJ_BAD_ORIGIN_PROTO: return "bad-origin-protocol";
+    case MQ_GW_REJ_BAD_CACHE_TTL: return "bad-cache-ttl";
+    case MQ_GW_REJ_HEADER_TOO_LONG: return "header-too-long";
+    case MQ_GW_REJ_TUNNEL_UNAVAIL: return "tunnel-unavailable";
+    case MQ_GW_REJ_INTERNAL: return "internal-error";
+    default: return "internal-error";
+    }
+}
+
+/* H1 reason → status-line reason phrase (mirrors the original literals). */
+static const char *
+gw_status_phrase(int code)
+{
+    return code == 502 ? "Bad Gateway" : "Bad Request";
+}
+
+static int
+gw_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_ctx)
+{
+    mq_gw_client_t *c = (mq_gw_client_t *)user;
+    *req_ctx = NULL;
+
+    /* Build a NEUTRAL, NUL-terminated, UNtruncated copy of the request headers so
+     * the core's strlen-based size checks observe the true lengths (the same
+     * semantics the original slice-based checks had). Allocated on the heap to
+     * hold arbitrary header sizes; freed before we return. */
+    size_t hn = req->nh;
+    mq_h3_header_t *H = NULL;
+    char *namearena = NULL, *valarena = NULL;
+    /* Per-slot caps generous enough that any header the original would have
+     * forwarded fits; oversized ones still get a correct strlen (>= cap) so the
+     * core's header-too-long check fires identically. */
+    if (hn > 0) {
+        H = calloc(hn, sizeof(*H));
+        /* +2 for NUL terminators; size each slot to the actual slice length. */
+        size_t names_sz = 0, vals_sz = 0;
+        for (size_t i = 0; i < hn; i++) {
+            names_sz += req->h[i].nl + 1;
+            vals_sz += req->h[i].vl + 1;
+        }
+        namearena = malloc(names_sz ? names_sz : 1);
+        valarena = malloc(vals_sz ? vals_sz : 1);
+        if (!H || !namearena || !valarena) {
+            free(H);
+            free(namearena);
+            free(valarena);
+            gw_reject_write(handle, 502, "Bad Gateway", "internal-error");
+            return -1;
+        }
+        char *np = namearena, *vp = valarena;
+        for (size_t i = 0; i < hn; i++) {
+            memcpy(np, req->h[i].n, req->h[i].nl);
+            np[req->h[i].nl] = '\0';
+            H[i].name = np;
+            np += req->h[i].nl + 1;
+            memcpy(vp, req->h[i].v, req->h[i].vl);
+            vp[req->h[i].vl] = '\0';
+            H[i].value = vp;
+            vp += req->h[i].vl + 1;
+        }
+    }
+
+    int status = 0;
+
+    /* Phase 1 (header-only): dup-control-header, X-Mq-Auth. */
+    mq_gw_reject_reason_t pre = mq_gw_client_prevalidate(c, H, hn, &status);
+    if (pre != MQ_GW_OK) {
+        gw_reject_write(handle, status, gw_status_phrase(status), gw_reason_xmq(pre));
+        free(H);
+        free(namearena);
+        free(valarena);
+        return -1;
+    }
+
+    /* Fetch envelope (fetch-specific; stays in the shim): X-Mq-Target. */
+    size_t tgt_vl = 0;
+    const char *tgt = find_hdr(req, "x-mq-target", &tgt_vl);
+    mq_gw_target_t target;
+    if (!tgt || mq_gw_parse_target(tgt, tgt_vl, &target) != 0) {
+        gw_reject_write(handle, 400, "Bad Request", "bad-target");
+        free(H);
+        free(namearena);
+        free(valarena);
+        return -1;
+    }
+
+    /* X-Mq-Method if present parses; default GET. */
+    char method[16];
+    size_t mth_vl = 0;
+    const char *mth = find_hdr(req, "x-mq-method", &mth_vl);
+    if (mth) {
+        if (mq_gw_parse_method(mth, mth_vl, method) != 0) {
+            gw_reject_write(handle, 400, "Bad Request", "bad-method");
+            free(H);
+            free(namearena);
+            free(valarena);
+            return -1;
+        }
+    } else {
+        memcpy(method, "GET", 4);
+    }
+
+    /* Phase 2 (core): origin-proto / cache / header-size / tunnel + open+forward.
+     * The H1 sink_user is the per-request state itself (g_h1_sink reuses r). */
+    mq_gw_req_head_t head;
+    head.method = method;
+    head.scheme = target.scheme;
+    head.authority = target.authority;
+    head.path = target.path;
+    head.headers = H;
+    head.n_headers = hn;
+    head.content_length = req->content_length;
+
+    /* sink_user is set to the returned xreq once we have it; req_begin links the
+     * request first, then we patch handle + sink_user (the H1 sink needs r->handle
+     * and uses r as its user). Pass r as sink_user via a two-step: req_begin needs
+     * sink_user up front, but for the H1 sink the user IS the (not-yet-created)
+     * xreq. Resolve by passing a placeholder and fixing it on success — but the
+     * sink is not invoked during req_begin (only on later response/upload), so
+     * patching sink_user immediately after return is safe. */
+    int err_status = 0;
+    mq_gw_reject_reason_t reason = MQ_GW_OK;
+    mq_gw_xreq_t *r =
+        mq_gw_client_req_begin(c, &head, &g_h1_sink, NULL, &err_status, &reason);
+
+    free(H);
+    free(namearena);
+    free(valarena);
+
+    if (!r) {
+        gw_reject_write(handle, err_status, gw_status_phrase(err_status),
+                        gw_reason_xmq(reason));
+        return -1;
+    }
+
+    /* Bind the H1 sink + listener handle to the request (sink_user == r). */
+    r->handle = handle;
+    r->sink_user = r;
     *req_ctx = r;
     return 0;
 }
@@ -721,13 +933,13 @@ upload_pump(mq_gw_req_t *r)
             r->upload_fin_sent = 1; /* fin went out with the last byte */
     }
 
-    /* Spill drained? Reset the buffer + (maybe) resume the listener. */
+    /* Spill drained? Reset the buffer + (maybe) resume the adapter input. */
     if (r->spill && r->spill_off >= r->spill_len) {
         r->spill_len = 0;
         r->spill_off = 0;
-        if (r->paused && !r->local_dead && r->handle) {
+        if (r->paused && !r->local_dead && r->sink) {
             r->paused = 0;
-            mq_fetch_conn_resume_read(r->handle);
+            r->sink->resume_read(r->sink_user);
         }
     }
 
@@ -747,10 +959,12 @@ upload_pump(mq_gw_req_t *r)
     }
 }
 
-static int
-gw_on_body(void *req_ctx, const uint8_t *p, size_t len)
+/* Neutral upload intake: feed `len` body bytes toward the tunnel. Returns 0 to
+ * keep reading, -1 to pause (the bytes ARE consumed — the adapter must not
+ * re-deliver them). Body of the former gw_on_body. */
+int
+mq_gw_client_req_body(mq_gw_xreq_t *r, const uint8_t *p, size_t len)
 {
-    mq_gw_req_t *r = (mq_gw_req_t *)req_ctx;
     if (r->local_dead) return 0;
     if (r->h3_dead || !r->req) {
         /* Tunnel gone but listener still feeding: drop bytes, ask for pause to
@@ -810,24 +1024,26 @@ gw_on_body(void *req_ctx, const uint8_t *p, size_t len)
     return -1;
 }
 
-static void
-gw_on_body_done(void *req_ctx)
+/* Neutral upload intake: the adapter will deliver no more body bytes. Body of
+ * the former gw_on_body_done. */
+void
+mq_gw_client_req_body_done(mq_gw_xreq_t *r)
 {
-    mq_gw_req_t *r = (mq_gw_req_t *)req_ctx;
     r->upload_done = 1;
     if (r->local_dead || r->h3_dead || !r->req) return;
     /* Flush any spill and send the fin if everything is out. */
     upload_pump(r);
 }
 
-static void
-gw_on_aborted(void *req_ctx)
+/* Neutral intake: the adapter's input side died mid-request (truncated). Reset
+ * the H3 request (never finish) and detach the local/sink side. The adapter is
+ * already tearing down — do NOT call any sink op. Body of the former
+ * gw_on_aborted. */
+void
+mq_gw_client_req_aborted(mq_gw_xreq_t *r)
 {
-    mq_gw_req_t *r = (mq_gw_req_t *)req_ctx;
-    /* Local peer died mid-upload: truncated. Reset the H3 request (never finish)
-     * and detach the local side. The handle is already being torn down — do NOT
-     * call any handle op. */
     r->handle = NULL; /* gw_local_dead would reset+null; do the reset path here */
+    r->sink = NULL;
     if (r->local_dead) {
         gw_req_maybe_free(r);
         return;
@@ -837,29 +1053,44 @@ gw_on_aborted(void *req_ctx)
     gw_req_maybe_free(r);
 }
 
-/* ── download (junction #2): H3 response → local connection ─────────────────*/
+/* Neutral intake: the adapter's output drained below its low watermark — resume
+ * relaying the response body (replaces the listener drain_cb notification). */
+void
+mq_gw_client_req_drained(mq_gw_xreq_t *r)
+{
+    if (r->local_dead) return;
+    if (r->read_deferred) {
+        r->read_deferred = 0;
+        download_pump(r);
+    }
+}
 
-/* Header-capture context for recv_headers (download). */
+/* ── download (junction #2): H3 response → adapter SINK ─────────────────────
+ *
+ * The core extracts the H3 response head into a NEUTRAL (status, header-list,
+ * body_mode) tuple and drives the adapter sink (resp_head/resp_body/resp_finish/
+ * resp_abort). The in-file H1 sink (below) renders today's exact HTTP/1.1 bytes
+ * (status line, Connection: close, chunked framing) so observable output is
+ * byte-identical; a future H2/H3 adapter renders natively. */
+
+/* Per-response header arena caps (mirror the original inline nb[128]/vb[2048]). */
+#define MQ_GW_RESP_NAME_CAP 128
+#define MQ_GW_RESP_VAL_CAP  2048
+#define MQ_GW_RESP_MAX_HDRS 96
+
+/* Header-capture context for recv_headers (download). Collects the response
+ * headers into a NEUTRAL mq_h3_header_t list (NUL-terminated arena) instead of
+ * serializing HTTP/1.1 inline — the sink renders. */
 typedef struct {
     mq_gw_req_t *r;
     int status;
-    int has_cl;      /* response carried a content-length */
-    char head[8192]; /* assembled HTTP/1.1 response head */
-    size_t head_len;
-    int ok; /* head fit */
+    int has_cl; /* response carried a content-length */
+    mq_h3_header_t hs[MQ_GW_RESP_MAX_HDRS];
+    size_t nh;
+    char names[MQ_GW_RESP_MAX_HDRS][MQ_GW_RESP_NAME_CAP];
+    char vals[MQ_GW_RESP_MAX_HDRS][MQ_GW_RESP_VAL_CAP];
+    int ok; /* head fit + well-formed */
 } dl_hdr_ctx_t;
-
-static void
-dl_emit_header(dl_hdr_ctx_t *ctx, const char *n, const char *v)
-{
-    int n2 = mq_http1_write_header(ctx->head + ctx->head_len,
-                                   sizeof(ctx->head) - ctx->head_len, n, v);
-    if (n2 <= 0) {
-        ctx->ok = 0;
-        return;
-    }
-    ctx->head_len += (size_t)n2;
-}
 
 static void
 dl_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
@@ -881,13 +1112,6 @@ dl_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
         int code = (v[0] - '0') * 100 + (v[1] - '0') * 10 + (v[2] - '0');
         if (code < 100 || code > 599) code = 502;
         ctx->status = code;
-        int n2 = mq_http1_write_status(ctx->head + ctx->head_len,
-                                       sizeof(ctx->head) - ctx->head_len, code, "");
-        if (n2 <= 0) {
-            ctx->ok = 0;
-            return;
-        }
-        ctx->head_len += (size_t)n2;
         return;
     }
 
@@ -906,171 +1130,223 @@ dl_each_header(const char *n, size_t nl, const char *v, size_t vl, void *u)
      * the failure path), not be silently truncated: a clipped value corrupts the
      * downstream response, and origin headers this large are pathological — failing
      * closed beats corrupting. */
-    char nb[128], vb[2048];
-    if (nl >= sizeof(nb) || vl >= sizeof(vb)) {
+    if (nl >= MQ_GW_RESP_NAME_CAP || vl >= MQ_GW_RESP_VAL_CAP) {
         ctx->ok = 0;
         return;
     }
+    if (ctx->nh >= MQ_GW_RESP_MAX_HDRS) {
+        ctx->ok = 0;
+        return;
+    }
+    char *nb = ctx->names[ctx->nh];
+    char *vb = ctx->vals[ctx->nh];
     memcpy(nb, n, nl);
     nb[nl] = '\0';
     memcpy(vb, v, vl);
     vb[vl] = '\0';
-    dl_emit_header(ctx, nb, vb);
+    ctx->hs[ctx->nh].name = nb;
+    ctx->hs[ctx->nh].value = vb;
+    ctx->nh++;
 }
 
-/* Build + write the local response head from the H3 response headers. Returns 0
- * on success (head written), -1 on a hard failure (caller aborts). */
+/* Extract the H3 response head and drive the sink's resp_head. Returns 0 on
+ * success (head delivered), -1 on a hard failure (caller aborts). */
 static int
 download_start_response(mq_gw_req_t *r)
 {
-    dl_hdr_ctx_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.r = r;
-    ctx.ok = 1;
-    ctx.status = 0;
-    ctx.head_len = 0;
+    dl_hdr_ctx_t *ctx = malloc(sizeof(*ctx));
+    if (!ctx) return -1;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->r = r;
+    ctx->ok = 1;
 
     int fin = 0;
-    int n = mq_h3_req_recv_headers(r->req, dl_each_header, &ctx, &fin);
-    if (n < 0 || !ctx.ok) return -1;
-    if (ctx.status == 0) {
-        /* No :status: malformed response. */
+    int n = mq_h3_req_recv_headers(r->req, dl_each_header, ctx, &fin);
+    if (n < 0 || !ctx->ok || ctx->status == 0) {
+        /* recv error / malformed / no :status → malformed response. */
+        free(ctx);
         return -1;
     }
-    r->resp_status = ctx.status;
+    r->resp_status = ctx->status;
 
-    /* No content-length → chunked framing for the body. */
-    if (!ctx.has_cl) {
-        r->resp_chunked = 1;
-        int n2 = mq_http1_write_header(ctx.head + ctx.head_len,
-                                       sizeof(ctx.head) - ctx.head_len,
-                                       "Transfer-Encoding", "chunked");
-        if (n2 <= 0) return -1;
-        ctx.head_len += (size_t)n2;
-    }
+    /* No content-length → unknown length (the H1 sink frames the body chunked). */
+    mq_gw_body_mode_t mode = ctx->has_cl ? MQ_GW_BODY_CONTENT_LENGTH : MQ_GW_BODY_STREAM;
 
-    /* Connection: close (one request per local connection). */
-    {
-        int n2 =
-            mq_http1_write_header(ctx.head + ctx.head_len,
-                                  sizeof(ctx.head) - ctx.head_len, "Connection", "close");
-        if (n2 <= 0) return -1;
-        ctx.head_len += (size_t)n2;
-    }
-
-    /* Terminating blank line. */
-    if (ctx.head_len + 2 > sizeof(ctx.head)) return -1;
-    ctx.head[ctx.head_len++] = '\r';
-    ctx.head[ctx.head_len++] = '\n';
-
-    if (!r->handle) return -1;
-    /* Register the drain cb so a highwater hit during the body relay re-kicks
-     * the download read path. */
-    mq_fetch_conn_set_drain_cb(r->handle, local_drain_cb, r);
-    int wr = mq_fetch_conn_write(r->handle, ctx.head, ctx.head_len);
-    if (wr < 0) return -1;
+    int hr = r->sink->resp_head(r->sink_user, ctx->status, ctx->hs, ctx->nh, mode);
+    free(ctx);
+    if (hr < 0) return -1;
     r->resp_started = 1;
 
-    /* If headers carried fin (no body), finish immediately. For a chunked
-     * response with no body we still need the terminator. */
-    if (fin) {
-        if (r->resp_chunked) {
-            char term[8];
-            size_t tn = mq_http1_chunk_frame(term, sizeof(term), NULL, 0);
-            if (tn > 0) mq_fetch_conn_write(r->handle, term, tn);
-        }
-        gw_local_finish(r);
-    }
+    /* If headers carried fin (no body), finish immediately. */
+    if (fin) r->sink->resp_finish(r->sink_user);
     return 0;
 }
 
-/* Drain H3 body and write it to the local connection (framed as needed). Honors
- * the local highwater: a write returning 0 sets read_deferred and stops; the
- * local drain_cb re-kicks. */
+/* Drain H3 body and feed it to the sink. Honors the sink highwater: resp_body
+ * returning 0 sets read_deferred and stops; the drain notification re-kicks. */
 static void
 download_pump(mq_gw_req_t *r)
 {
     if (r->local_dead || r->h3_dead || !r->req) return;
-    if (r->read_deferred) return; /* waiting for local drain */
+    if (r->read_deferred) return; /* waiting for sink drain */
 
     uint8_t buf[MQ_GW_DOWNLOAD_CHUNK];
     for (;;) {
         int fin = 0;
         long n = mq_h3_req_recv_body(r->req, buf, sizeof(buf), &fin);
         if (n < 0) {
-            /* Hard recv error mid-download → abort the local side (truncation
-             * must be visible). */
-            gw_local_abort(r);
+            /* Hard recv error mid-download → abort (truncation must be visible). */
+            r->sink->resp_abort(r->sink_user);
             return;
         }
         if (n > 0) {
-            int wr;
-            if (r->resp_chunked) {
-                /* Frame the chunk: "<hex>\r\n<data>\r\n". Worst-case framing
-                 * overhead is small; write head then body then CRLF separately
-                 * to avoid a second large copy. */
-                char hdr[32];
-                int hn = snprintf(hdr, sizeof(hdr), "%lx\r\n", (unsigned long)n);
-                if (hn <= 0) {
-                    gw_local_abort(r);
-                    return;
-                }
-                wr = mq_fetch_conn_write(r->handle, hdr, (size_t)hn);
-                if (wr < 0) {
-                    gw_local_dead(r);
-                    return;
-                }
-                wr = mq_fetch_conn_write(r->handle, buf, (size_t)n);
-                if (wr < 0) {
-                    gw_local_dead(r);
-                    return;
-                }
-                int wr2 = mq_fetch_conn_write(r->handle, "\r\n", 2);
-                if (wr2 < 0) {
-                    gw_local_dead(r);
-                    return;
-                }
-                /* If either the body or trailing CRLF hit highwater, defer. */
-                if (wr == 0 || wr2 == 0) {
-                    r->read_deferred = 1;
-                    if (!fin) return;
-                }
-            } else {
-                wr = mq_fetch_conn_write(r->handle, buf, (size_t)n);
-                if (wr < 0) {
-                    gw_local_dead(r);
-                    return;
-                }
-                if (wr == 0) {
-                    r->read_deferred = 1;
-                    if (!fin) return;
-                }
+            int wr = r->sink->resp_body(r->sink_user, buf, (size_t)n);
+            if (wr < 0) {
+                /* Sink/local output dead → tear down the request (resets H3). */
+                gw_local_dead(r);
+                return;
+            }
+            if (wr == 0) {
+                r->read_deferred = 1;
+                if (!fin) return;
             }
         }
         if (fin) {
-            if (r->resp_chunked) {
-                char term[8];
-                size_t tn = mq_http1_chunk_frame(term, sizeof(term), NULL, 0);
-                if (tn > 0 && r->handle) mq_fetch_conn_write(r->handle, term, tn);
-            }
-            gw_local_finish(r);
+            r->sink->resp_finish(r->sink_user);
             return;
         }
         if (n == 0) return; /* no more body available right now */
     }
 }
 
-/* Local output drained below the low watermark → resume the download read path
- * (or flush more upload). Guard against re-entrancy. */
+/* ── in-file H1 sink: renders today's exact HTTP/1.1 response bytes ──────────
+ *
+ * sink_user is the mq_gw_req_t itself (the H1 sink lives in this file and reuses
+ * r->handle + r->resp_chunked). A future MITM adapter (Task 4) supplies its own
+ * sink with its own user cookie. Output here is byte-identical to the previous
+ * inline rendering (status line, Transfer-Encoding/Connection: close, chunked
+ * framing, terminator). */
+
+static int
+h1_sink_resp_head(void *u, int status, const mq_h3_header_t *hs, size_t n,
+                  mq_gw_body_mode_t body_mode)
+{
+    mq_gw_req_t *r = (mq_gw_req_t *)u;
+    if (!r->handle) return -1;
+
+    char head[8192];
+    size_t head_len = 0;
+
+    int sn = mq_http1_write_status(head, sizeof(head), status, "");
+    if (sn <= 0) return -1;
+    head_len += (size_t)sn;
+
+    for (size_t i = 0; i < n; i++) {
+        int n2 = mq_http1_write_header(head + head_len, sizeof(head) - head_len,
+                                       hs[i].name, hs[i].value);
+        if (n2 <= 0) return -1;
+        head_len += (size_t)n2;
+    }
+
+    /* Unknown length → chunked framing for the body. */
+    if (body_mode == MQ_GW_BODY_STREAM) {
+        r->resp_chunked = 1;
+        int n2 = mq_http1_write_header(head + head_len, sizeof(head) - head_len,
+                                       "Transfer-Encoding", "chunked");
+        if (n2 <= 0) return -1;
+        head_len += (size_t)n2;
+    }
+
+    /* Connection: close (one request per local connection). */
+    {
+        int n2 = mq_http1_write_header(head + head_len, sizeof(head) - head_len,
+                                       "Connection", "close");
+        if (n2 <= 0) return -1;
+        head_len += (size_t)n2;
+    }
+
+    /* Terminating blank line. */
+    if (head_len + 2 > sizeof(head)) return -1;
+    head[head_len++] = '\r';
+    head[head_len++] = '\n';
+
+    /* Register the drain cb so a highwater hit during the body relay re-kicks
+     * the download read path. */
+    mq_fetch_conn_set_drain_cb(r->handle, local_drain_cb, r);
+    int wr = mq_fetch_conn_write(r->handle, head, head_len);
+    if (wr < 0) return -1;
+    return 1;
+}
+
+static int
+h1_sink_resp_body(void *u, const uint8_t *p, size_t len)
+{
+    mq_gw_req_t *r = (mq_gw_req_t *)u;
+    if (r->local_dead || !r->handle) return -1;
+
+    if (r->resp_chunked) {
+        /* Frame the chunk: "<hex>\r\n<data>\r\n". Worst-case framing overhead is
+         * small; write head then body then CRLF separately to avoid a second
+         * large copy. The chunk-size line's highwater (0) is NOT a defer trigger
+         * (it always fits in practice); only the body / trailing CRLF zero is. */
+        char hdr[32];
+        int hn = snprintf(hdr, sizeof(hdr), "%lx\r\n", (unsigned long)len);
+        if (hn <= 0) return -1;
+        int wr = mq_fetch_conn_write(r->handle, hdr, (size_t)hn);
+        if (wr < 0) return -1;
+        wr = mq_fetch_conn_write(r->handle, p, len);
+        if (wr < 0) return -1;
+        int wr2 = mq_fetch_conn_write(r->handle, "\r\n", 2);
+        if (wr2 < 0) return -1;
+        if (wr == 0 || wr2 == 0) return 0; /* body or CRLF highwater → defer */
+        return 1;
+    }
+
+    int wr = mq_fetch_conn_write(r->handle, p, len);
+    if (wr < 0) return -1;
+    return wr == 0 ? 0 : 1; /* highwater → defer */
+}
+
+static void
+h1_sink_resp_finish(void *u)
+{
+    mq_gw_req_t *r = (mq_gw_req_t *)u;
+    /* Chunked response → write the terminating zero-length chunk before close. */
+    if (r->resp_chunked && r->handle) {
+        char term[8];
+        size_t tn = mq_http1_chunk_frame(term, sizeof(term), NULL, 0);
+        if (tn > 0) mq_fetch_conn_write(r->handle, term, tn);
+    }
+    gw_local_finish(r);
+}
+
+static void
+h1_sink_resp_abort(void *u)
+{
+    gw_local_abort((mq_gw_req_t *)u);
+}
+
+static void
+h1_sink_resume_read(void *u)
+{
+    mq_gw_req_t *r = (mq_gw_req_t *)u;
+    if (!r->local_dead && r->handle) mq_fetch_conn_resume_read(r->handle);
+}
+
+static const mq_gw_sink_ops_t g_h1_sink = {
+    .resp_head = h1_sink_resp_head,
+    .resp_body = h1_sink_resp_body,
+    .resp_finish = h1_sink_resp_finish,
+    .resp_abort = h1_sink_resp_abort,
+    .resume_read = h1_sink_resume_read,
+};
+
+/* Local output drained below the low watermark (listener drain_cb) → notify the
+ * core via the neutral drained boundary, which resumes the download read path. */
 static void
 local_drain_cb(void *user)
 {
-    mq_gw_req_t *r = (mq_gw_req_t *)user;
-    if (r->local_dead) return;
-    if (r->read_deferred) {
-        r->read_deferred = 0;
-        download_pump(r);
-    }
+    mq_gw_client_req_drained((mq_gw_req_t *)user);
 }
 
 /* ── H3 request callbacks ───────────────────────────────────────────────────*/
@@ -1263,6 +1539,26 @@ gw_mp_timer_arm(mq_gw_client_t *c)
 }
 
 /* ── public API ─────────────────────────────────────────────────────────────*/
+
+/* H1 listener body callbacks: thin shims onto the neutral intake boundary. The
+ * listener's req_ctx IS the mq_gw_xreq_t (set in gw_on_request). */
+static int
+gw_on_body(void *req_ctx, const uint8_t *p, size_t len)
+{
+    return mq_gw_client_req_body((mq_gw_xreq_t *)req_ctx, p, len);
+}
+
+static void
+gw_on_body_done(void *req_ctx)
+{
+    mq_gw_client_req_body_done((mq_gw_xreq_t *)req_ctx);
+}
+
+static void
+gw_on_aborted(void *req_ctx)
+{
+    mq_gw_client_req_aborted((mq_gw_xreq_t *)req_ctx);
+}
 
 static const mq_fetch_cbs_t g_gw_cbs = {
     .on_request = gw_on_request,

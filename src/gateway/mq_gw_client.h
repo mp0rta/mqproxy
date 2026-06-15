@@ -46,6 +46,7 @@
 #include <stdint.h>
 
 #include "gateway/mq_fetch_listener.h"
+#include "gateway/mq_gw_intake.h"
 #include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h" /* mq_cc_t */
 #include "transport/mq_h3.h"
@@ -117,5 +118,42 @@ void mq_gw_client_dump_stats(mq_gw_client_t *c);
  * it touches r->req on live in-flight requests, which is only valid while the H3
  * engine still exists. */
 void mq_gw_client_free(mq_gw_client_t *c);
+
+/* ── Neutral intake boundary (Phase 7 MITM, Task 3) ─────────────────────────
+ *
+ * Protocol-agnostic request boundary onto the gateway tunnel. The existing H1
+ * fetch path (mq_gw_client_fetch_cbs) drives this internally via an inline H1
+ * sink; a future H2/H3 MITM adapter (Task 4) plugs into the SAME boundary so
+ * the core tunnel-forwarding + response-relay logic is shared, not duplicated.
+ *
+ * Reject ORDER is observable (tests/e2e assert X-Mq-Error byte-for-byte) and is
+ * split across two phases to preserve it:
+ *   prevalidate  → dup-control-header, X-Mq-Auth (missing/format)
+ *   [adapter parses the fetch envelope: X-Mq-Target/Method]
+ *   req_begin    → X-Mq-Origin-Protocol, X-Mq-Cache, header-size, tunnel liveness
+ */
+
+/* Phase 1 of intake: header-only checks that, in the CURRENT code, run BEFORE the fetch
+ * envelope's target/method parse — duplicate-control-header, then X-Mq-Auth format.
+ * Returns MQ_GW_OK or the reject reason (+ *status). The adapter calls this FIRST so
+ * observable reject ORDER is preserved: dup -> auth -> [adapter parses target/method] ->
+ * req_begin. */
+mq_gw_reject_reason_t mq_gw_client_prevalidate(mq_gw_client_t *c,
+                                               const mq_h3_header_t *headers, size_t n,
+                                               int *status);
+
+/* Phase 2: begin a request (head already split + prevalidated). On acceptance returns the
+ * handle. On rejection returns NULL and sets *err_status AND *reason. Core checks here IN
+ * ORDER: X-Mq-Origin-Protocol(400), X-Mq-Cache(400), header-size(400), tunnel
+ * liveness(502). */
+mq_gw_xreq_t *mq_gw_client_req_begin(mq_gw_client_t *c, const mq_gw_req_head_t *head,
+                                     const mq_gw_sink_ops_t *sink, void *sink_user,
+                                     int *err_status, mq_gw_reject_reason_t *reason);
+int mq_gw_client_req_body(mq_gw_xreq_t *r, const uint8_t *p,
+                          size_t len); /* 0 go, -1 pause (consumed) */
+void mq_gw_client_req_body_done(mq_gw_xreq_t *r);
+void mq_gw_client_req_aborted(mq_gw_xreq_t *r);
+void mq_gw_client_req_drained(
+    mq_gw_xreq_t *r); /* adapter output drained below low watermark */
 
 #endif /* MQ_GATEWAY_MQ_GW_CLIENT_H */
