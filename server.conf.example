@@ -21,6 +21,9 @@ Scheduler = minrtt
 # HTTP gateway is ENABLED by default. Uncomment Enabled to turn it off.
 [Gateway]
 # Enabled = false
+# Masquerade: answer unauthenticated requests with a bare 404 (hide from probes;
+# recommended for internet-exposed servers)
+# Masquerade = true
 # OriginCA: CA bundle (PEM) used to verify origin TLS
 # OriginCA = /etc/ssl/certs/ca-certificates.crt
 # CacheMaxBytes: response cache size in bytes (0 = off)

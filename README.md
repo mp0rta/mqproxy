@@ -224,7 +224,7 @@ mqproxy server --config /etc/mqproxy/edge1.conf
 | `[Auth]` | `Key` (token) | `Key` (token) |
 | `[Multipath]` | `CC`, `Scheduler` | `CC`, `Scheduler`, `Path` (repeatable) |
 | `[Ingress]` | — | `Socks5`, `HttpConnect`, `Gateway` |
-| `[Gateway]` | `Enabled`, `OriginCA`, `CacheMaxBytes` | — |
+| `[Gateway]` | `Enabled`, `Masquerade`, `OriginCA`, `CacheMaxBytes` | — |
 | `[UDP]` | `Enabled`, `IdleTimeout` | — |
 | `[Metrics]` | `Interval`, `PerRequest` | `Interval` |
 | `[Log]` | `QLog` | `QLog` |
@@ -332,6 +332,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | `--no-gateway` | **Disables HTTP Gateway mode for this server** (it is enabled by default). The TCP-proxy core keeps running; only the gateway origin bridge is turned off, so a client's `--gateway` ingress has nothing to talk to. |
 | `--origin-ca <pem>` | Extra CA bundle for origin TLS verification (private CAs / tests); verification itself is always on |
 | `--request-metrics` | Emit one `mq.req` logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of `--metrics-interval`. |
+| `--masquerade` | Answer **unauthenticated** gateway requests with a bare `404` (no `X-Mq-*` headers), so probes/scanners see a generic HTTP/3 server instead of a fingerprintable `403 auth-failed`. Authenticated requests are unaffected. Gateway-only; off by default; recommended for internet-exposed servers. |
 
 **Client**
 
