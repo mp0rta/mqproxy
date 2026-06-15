@@ -105,6 +105,10 @@ run_cmd(const char *prog, const char *const argv[])
 
 /* ── REDIRECT install ───────────────────────────────────────────────────── */
 
+/* Best-effort, partial-state-tolerated: on a mid-sequence command failure we set
+ * rc=-1 but CONTINUE issuing the remaining commands (and the caller logs the
+ * failure). uninstall is idempotent and removes whatever did get installed, so a
+ * partial install is cleaned up at teardown rather than left to accumulate. */
 static int
 install_redirect(const mq_tproxy_setup_t *s)
 {

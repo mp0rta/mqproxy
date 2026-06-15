@@ -204,13 +204,13 @@ sudo ./build/mqproxy client \
   --tproxy 127.0.0.1:12443 \
   --setup-redirect
 
-# Any app on this host connecting outbound to TCP :443 (or whatever the nft rule matches)
-# is now transparently captured, aggregated over MPQUIC, and forwarded to the origin.
+# Any app on this host connecting outbound to TCP :443 is now transparently
+# captured, aggregated over MPQUIC, and forwarded to the origin.
 # No curl --socks5 / --proxy flags needed.
 curl https://example.com/
 ```
 
-`--setup-redirect` tells mqproxy to install the nft rules on start and remove them on exit. It needs `root` or `CAP_NET_ADMIN`. Without it, you install the firewall rules yourself (or let OMR manage them) and just point the traffic at the listener.
+`--setup-redirect` tells mqproxy to install the nft rules on start and remove them on exit. It needs `root` or `CAP_NET_ADMIN`. The self-installed rule captures **TCP destination port 443 only**; to capture other ports (or for finer control) install the firewall rules yourself (or let OMR manage them) and just point the traffic at the listener — mqproxy reads the original destination of whatever the rules redirect.
 
 **OMR/router deployment (tproxy mode):**
 

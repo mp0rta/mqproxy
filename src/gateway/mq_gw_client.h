@@ -35,7 +35,7 @@
  *     no UAF. If mq_h3_free ran first, the per-request wrappers would already be
  *     destroyed and any gw_client touch of r->req (set_cbs/reset) would be a UAF.
  *     mq_h3_free BEFORE mq_transport_free is the separate mq_h3.h contract.
- *   - Per-request state (mq_gw_req_t, internal) is owned by the bridge and freed
+ *   - Per-request state (mq_gw_xreq_t, internal) is owned by the bridge and freed
  *     exactly once on EVERY termination order — see mq_gw_client.c for the
  *     ownership rules across local-first / tunnel-first / racing teardown.
  */
