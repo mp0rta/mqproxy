@@ -207,6 +207,8 @@ handle_kv(mq_file_config_t *cfg, int section, const char *key, const char *val,
             WRONG_MODE("Gateway");
         else if (strcasecmp(key, "Enabled") == 0)
             cfg->gateway_enabled = parse_bool(val);
+        else if (strcasecmp(key, "Masquerade") == 0)
+            cfg->masquerade = parse_bool(val);
         else if (strcasecmp(key, "OriginCA") == 0)
             CSTR(origin_ca);
         else if (strcasecmp(key, "CacheMaxBytes") == 0) {
