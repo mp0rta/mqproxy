@@ -667,4 +667,11 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third-party RENAME xquic.txt OPTIONAL)
     install(FILES third_party/xquic/third_party/boringssl/LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third-party RENAME boringssl.txt OPTIONAL)
+
+    # Verify the install layout + static self-containment. SKIPs (77) unless the
+    # build was configured with -DCMAKE_INSTALL_PREFIX=/usr (packaging build).
+    add_test(NAME packaging_install_static
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/packaging/verify_install.sh
+                ${CMAKE_BINARY_DIR})
+    set_tests_properties(packaging_install_static PROPERTIES SKIP_RETURN_CODE 77)
 endif()
