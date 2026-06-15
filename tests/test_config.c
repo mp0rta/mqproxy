@@ -93,11 +93,14 @@ static void
 test_bool_variants(void)
 {
     char p[64];
-    write_tmp(p, sizeof(p), "[Gateway]\nEnabled = yes\n[UDP]\nEnabled = 0\n");
+    write_tmp(p, sizeof(p),
+              "[Gateway]\nEnabled = yes\nMasquerade = true\n[UDP]\nEnabled = 0\n");
     mq_file_config_t c;
     mq_config_defaults(&c);
+    MQ_CHECK_EQ_INT(c.masquerade, 0); /* default off (memset) */
     mq_config_load(&c, p, 1);
     MQ_CHECK_EQ_INT(c.gateway_enabled, 1); /* yes */
+    MQ_CHECK_EQ_INT(c.masquerade, 1);      /* true */
     MQ_CHECK_EQ_INT(c.udp_enabled, 0);     /* 0 = off */
     remove(p);
 }

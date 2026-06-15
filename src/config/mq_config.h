@@ -25,6 +25,7 @@ typedef struct mq_file_config_t {
     char cert[256];          /* [TLS] Cert */
     char key[256];           /* [TLS] Key */
     int gateway_enabled;     /* [Gateway] Enabled */
+    int masquerade;          /* [Gateway] Masquerade */
     char origin_ca[256];     /* [Gateway] OriginCA */
     size_t cache_max_bytes;  /* [Gateway] CacheMaxBytes */
     int udp_enabled;         /* [UDP] Enabled */

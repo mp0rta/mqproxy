@@ -148,6 +148,9 @@ usage_server(FILE *out)
                  "cache/…).\n"
                  "                      Opt-in; off by default. Independent of "
                  "--metrics-interval.\n"
+                 "  --masquerade        Answer unauthenticated requests with a bare "
+                 "404\n"
+                 "                      (hides mqproxy from probes; gateway only).\n"
                  "  --cache-max-bytes <N>\n"
                  "                      In-memory origin response cache bounded to N "
                  "bytes\n"
@@ -401,6 +404,7 @@ cmd_server(int argc, char **argv)
     int udp_enabled = 1;              /* --no-udp clears this */
     uint64_t metrics_interval_ms = 0; /* --metrics-interval <sec>; 0 = off */
     int request_metrics = 0;          /* --request-metrics; off by default */
+    int masquerade = 0;               /* --masquerade; off by default */
     size_t cache_max_bytes = 0;       /* --cache-max-bytes <N>; 0 = off (default) */
     long max_conns = 16;              /* --max-conns <N>; default 16, 0 = unlimited */
 
@@ -429,6 +433,7 @@ cmd_server(int argc, char **argv)
         max_conns = fcfg.max_conns;
         cache_max_bytes = fcfg.cache_max_bytes;
         request_metrics = fcfg.request_metrics;
+        masquerade = fcfg.masquerade;
         if (fcfg.metrics_interval_s > 0)
             metrics_interval_ms = (uint64_t)fcfg.metrics_interval_s * 1000;
     }
@@ -447,6 +452,7 @@ cmd_server(int argc, char **argv)
         OPT_SCHEDULER,
         OPT_METRICS_INTERVAL,
         OPT_REQUEST_METRICS,
+        OPT_MASQUERADE,
         OPT_CACHE_MAX_BYTES,
         OPT_MAX_CONNS,
         OPT_CONFIG,
@@ -465,6 +471,7 @@ cmd_server(int argc, char **argv)
         {"scheduler", required_argument, NULL, OPT_SCHEDULER},
         {"metrics-interval", required_argument, NULL, OPT_METRICS_INTERVAL},
         {"request-metrics", no_argument, NULL, OPT_REQUEST_METRICS},
+        {"masquerade", no_argument, NULL, OPT_MASQUERADE},
         {"cache-max-bytes", required_argument, NULL, OPT_CACHE_MAX_BYTES},
         {"max-conns", required_argument, NULL, OPT_MAX_CONNS},
         {"config", required_argument, NULL, OPT_CONFIG},
@@ -517,6 +524,7 @@ cmd_server(int argc, char **argv)
             break;
         }
         case OPT_REQUEST_METRICS: request_metrics = 1; break;
+        case OPT_MASQUERADE: masquerade = 1; break;
         case OPT_CACHE_MAX_BYTES: {
             /* SIGNED strtoll: strtoull("-5") silently returns a huge unsigned with
              * NO error, so a `< 0` check could never fire. 0 is VALID (= disabled =
@@ -607,6 +615,12 @@ cmd_server(int argc, char **argv)
         fprintf(stderr, "mqproxy server: --cache-max-bytes has no effect with "
                         "--no-gateway (the response cache is gateway-only); ignoring\n");
     }
+    /* --masquerade is gateway-only (it changes the gw server's unauth response);
+     * warn (not error: opt-in) when paired with --no-gateway. */
+    if (masquerade && !gateway_enabled) {
+        fprintf(stderr, "mqproxy server: --masquerade has no effect with "
+                        "--no-gateway (masquerade is gateway-only); ignoring\n");
+    }
 
     if (!listen) {
         fprintf(stderr, "mqproxy server: missing required --listen\n\n");
@@ -696,6 +710,7 @@ cmd_server(int argc, char **argv)
             goto out;
         }
         if (request_metrics) mq_gw_server_set_request_metrics(gws, 1);
+        if (masquerade) mq_gw_server_set_masquerade(gws, 1);
         mq_gw_server_set_cache(gws, cache_max_bytes); /* 0 ⇒ disabled (no-op) */
     }
     if (install_signal_handlers(base, rt, &sint, &sterm) != 0) {
