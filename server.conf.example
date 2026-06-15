@@ -1,0 +1,16 @@
+# mqproxy server config — copy to /etc/mqproxy/<instance>.conf (chmod 0600).
+# CLI flags override values set here. Optional keys/sections omitted; see --help.
+[Interface]
+Listen   = 0.0.0.0:4433
+MaxConns = 64
+
+[TLS]
+Cert = /etc/mqproxy/tls/server.pem
+Key  = /etc/mqproxy/tls/server.key
+
+[Auth]
+Key = CHANGE_ME_shared_token
+
+[Multipath]
+CC        = bbr
+Scheduler = minrtt

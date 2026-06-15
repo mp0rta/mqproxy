@@ -1,0 +1,15 @@
+# mqproxy client config — copy and edit. CLI flags override file values.
+# At least one [Ingress] is required. Optional keys omitted; see --help.
+[Server]
+Address = your-server.example.com:4433
+
+[Auth]
+Key = CHANGE_ME_shared_token
+
+[Ingress]
+Socks5 = 127.0.0.1:1080
+
+[Multipath]
+CC        = bbr
+Scheduler = minrtt
+# Path = 10.0.0.1   # repeat per local source IP for multipath
