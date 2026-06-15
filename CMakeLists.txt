@@ -36,6 +36,7 @@ add_library(mqproxy STATIC
     src/proxy/mq_udp_session.c
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
+    src/ingress/mq_origdst.c
     src/ingress/mq_listener.c
     src/ingress/mq_udp_assoc.c
     src/gateway/mq_http1.c
@@ -128,6 +129,11 @@ add_test(NAME test_backoff COMMAND test_backoff)
 add_executable(test_gw_req_format tests/test_gw_req_format.c src/gateway/mq_gw_metrics.c)
 target_include_directories(test_gw_req_format PRIVATE tests src)  # tests → mqtest.h, src → gateway/mq_gw_metrics.h
 add_test(NAME test_gw_req_format COMMAND test_gw_req_format)
+
+add_executable(test_origdst tests/test_origdst.c)
+target_link_libraries(test_origdst mqproxy)
+target_include_directories(test_origdst PRIVATE tests)
+add_test(NAME test_origdst COMMAND test_origdst)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
