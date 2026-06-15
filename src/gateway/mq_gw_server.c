@@ -106,6 +106,7 @@ typedef struct mq_gw_req_s {
     /* H3 (transport) side */
     mq_h3_req_t *req; /* NULL once on_close fired (h3_dead) */
     int h3_dead;
+    int authed; /* request presented a valid x-mq-auth Bearer token */
 
     /* ORIGIN (curl) side */
     mq_origin_req_t *oreq; /* NULL once on_done fired OR we aborted (origin_dead) */
@@ -226,6 +227,7 @@ struct mq_gw_server_s {
     mq_gw_req_t *reqs; /* intrusive list of live per-request states */
 
     int request_metrics; /* emit mq.req per-request line (opt-in; default 0) */
+    int masquerade; /* return bare 404 to unauthenticated requests (opt-in; default 0) */
 
     /* In-memory origin response cache (opt-in via --cache-max-bytes; NULL when
      * disabled = default). Owned: freed in mq_gw_server_free. */
@@ -322,6 +324,23 @@ static void
 gw_send_error(mq_gw_req_t *r, const char *status, const char *xmq_error)
 {
     if (r->h3_dead || !r->req) return;
+    /* masquerade: an UNAUTHENTICATED peer gets a generic 404 with NO x-mq-*
+     * headers (indistinguishable from a vanilla H3 server returning 404 for an
+     * unknown path). authed==1 (post-auth rejects: bad-target, 502, ...) falls
+     * through to the diagnostic path below. Mirrors the send/reset/finish
+     * bookkeeping of the normal path; msh==0 (EAGAIN) is treated as sent. */
+    if (r->srv->masquerade && !r->authed) {
+        mq_h3_header_t m404[] = {{":status", "404"}, {"content-length", "0"}};
+        r->resp_status = 404;
+        long msh = mq_h3_req_send_headers(r->req, m404, 2, /*fin=*/1);
+        if (msh < 0) {
+            mq_h3_req_reset(r->req);
+            return;
+        }
+        r->resp_headers_sent = 1;
+        r->finished = 1;
+        return;
+    }
     /* :status is always 3 digits in practice; 32 keeps gcc's -Wformat-truncation
      * (which sizes this by the longest caller literal at -O2) satisfied. */
     char st[32];
@@ -1308,6 +1327,9 @@ gw_dispatch(mq_gw_req_t *r)
             return;
         }
     }
+    /* Past the auth gate: this request presented a valid token. Marks the
+     * boundary for masquerade — post-auth rejects keep x-mq-error diagnostics. */
+    r->authed = 1;
 
     /* x-mq-class: accept + log only (design: forward+log).
      * Sanitize before logging: the value is attacker-controlled (log-injection). */
@@ -1754,6 +1776,12 @@ void
 mq_gw_server_set_request_metrics(mq_gw_server_t *s, int on)
 {
     if (s) s->request_metrics = on ? 1 : 0;
+}
+
+void
+mq_gw_server_set_masquerade(mq_gw_server_t *s, int on)
+{
+    if (s) s->masquerade = on ? 1 : 0;
 }
 
 void

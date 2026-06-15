@@ -1284,6 +1284,60 @@ test_gws_403(void)
     gws_fixture_down(&f);
 }
 
+/* ── gw_server masquerade: unauth GET → bare 404, no x-mq-* ──────────────────*/
+static void
+test_gws_masq_unauth_404(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 64 * 1024) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    mq_gw_server_set_masquerade(f.gw, 1);
+
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    /* auth=NULL → no x-mq-auth header (unauthenticated probe). */
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "/x",
+                              NULL, NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 404);
+    MQ_CHECK(cli_find_hdr(&c, "x-mq-error") == NULL); /* no mqproxy tell */
+    gws_fixture_down(&f);
+}
+
+/* ── gw_server masquerade: authed + bad :path → 400 WITH x-mq-error ──────────*/
+static void
+test_gws_masq_authed_keeps_diag(void)
+{
+    gws_fixture_t f;
+    if (gws_fixture_up(&f, "sekrit", 64 * 1024) != 0) {
+        gws_fixture_down(&f);
+        MQ_CHECK(0);
+        return;
+    }
+    mq_gw_server_set_masquerade(f.gw, 1);
+
+    cli_req_t c;
+    memset(&c, 0, sizeof(c));
+    /* valid auth, but :path does not start with '/' → post-auth 400 bad-request. */
+    int rc = gws_send_request(&f, &c, "GET", "http", origin_authority(&f.origin), "bad",
+                              "Bearer sekrit", NULL, 0, 0, NULL);
+    MQ_CHECK_EQ_INT(rc, 0);
+    uint64_t deadline = now_ms() + 5000;
+    while (!c.closed && now_ms() < deadline)
+        event_base_loop(f.base, EVLOOP_NONBLOCK);
+
+    MQ_CHECK_EQ_INT(c.status, 400);
+    MQ_CHECK(cli_find_hdr(&c, "x-mq-error") != NULL); /* authed → diagnostics retained */
+    gws_fixture_down(&f);
+}
+
 /* ── gw_server Case 4: 400 on a missing :authority ──────────────────────────*/
 static void
 test_gws_400(void)
@@ -2266,6 +2320,8 @@ main(void)
     test_gws_req_metrics_off();
     test_gws_class();
     test_gws_403();
+    test_gws_masq_unauth_404();
+    test_gws_masq_authed_keeps_diag();
     test_gws_400();
     test_gws_bad_header();
     test_gws_502();

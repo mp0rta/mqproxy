@@ -122,6 +122,12 @@ unsigned mq_gw_server_live_reqs(const mq_gw_server_t *s);
  * Pass on=1 to enable, on=0 to disable. Safe on NULL (no-op). */
 void mq_gw_server_set_request_metrics(mq_gw_server_t *s, int on);
 
+/* When on, the gateway answers UNAUTHENTICATED requests with a bare 404 (no
+ * x-mq-* headers) instead of 403 auth-failed, so a probe sees a generic H3
+ * server. Authenticated requests keep full diagnostics. Opt-in; default off.
+ * Idempotent. Safe on NULL (no-op). */
+void mq_gw_server_set_masquerade(mq_gw_server_t *s, int on);
+
 /* Enable (or reconfigure) the in-memory origin response cache, bounded to
  * `max_bytes` total. max_bytes == 0 disables it (frees any existing cache, the
  * default). The per-object cap is min(max_bytes, 4 MiB) floored at one recv
