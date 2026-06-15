@@ -164,6 +164,10 @@ NOBODY_UID="$(id -u nobody)"
 
 # ── workspace + cleanup ───────────────────────────────────────────────────────
 WORK="$(mktemp -d /tmp/mqproxy_e2e_tproxy.XXXXXX)"
+# mktemp -d is 0700/root; the capture curl runs as `nobody` and must be able to
+# traverse WORK to write its -o output file. Make WORK traversable; the specific
+# output files are pre-created world-writable just before each `sudo -u nobody curl`.
+chmod 755 "${WORK}"
 ORIGIN_BODY="${WORK}/hello.txt"
 ORIGIN_PID=""
 SERVER_PID=""
@@ -360,11 +364,10 @@ start_client
 wait_tproxy_ready || exit 1
 note "Client + nft REDIRECT rules ready."
 
-# After rules are installed, wait a moment for the QUIC handshake to complete.
-# The handshake is asynchronous; without a gateway ping-probe (we have no
-# gateway ingress here) we cannot probe the tunnel directly.  A brief sleep
-# lets BBR/QUIC complete the 1-RTT handshake on loopback (typically <50ms).
-# NOTE: If a root run sees "connection refused" from curl, increase this sleep.
+# After rules are installed, wait for the QUIC handshake to complete. The
+# handshake is asynchronous and we have no gateway ping-probe here, so the capture
+# curl below is wrapped in a retry loop (up to ~10s) rather than relying on a
+# single fixed sleep — robust against slow/loaded CI without hanging.
 sleep 1
 
 # ── case 1: TLS opacity proof — byte-exact body + cert verification ───────────
@@ -388,14 +391,21 @@ sleep 1
 
 CURL_OUT="${WORK}/curl_out.txt"
 CURL_CODE="${WORK}/curl_code.txt"
+# Pre-create world-writable: `nobody` writes these inside root's WORK dir.
+: >"${CURL_OUT}"; : >"${CURL_CODE}"; chmod 666 "${CURL_OUT}" "${CURL_CODE}"
 
 note "case 1: running curl as nobody (uid ${NOBODY_UID}) to 127.0.0.1:443 ..."
-sudo -u nobody curl -s -o "${CURL_OUT}" -w '%{http_code}' \
-    --max-time 15 \
-    --cacert "${ORIGIN_CERT}" \
-    "https://127.0.0.1/" >"${CURL_CODE}" 2>/dev/null || true
-
-code1="$(cat "${CURL_CODE}" 2>/dev/null || echo 000)"
+code1="000"
+for attempt in $(seq 1 10); do
+    sudo -u nobody curl -s -o "${CURL_OUT}" -w '%{http_code}' \
+        --max-time 15 \
+        --cacert "${ORIGIN_CERT}" \
+        "https://127.0.0.1/" >"${CURL_CODE}" 2>/dev/null || true
+    code1="$(cat "${CURL_CODE}" 2>/dev/null || echo 000)"
+    [ "${code1}" = "200" ] && break
+    note "case 1: attempt ${attempt}/10 got HTTP ${code1}; tunnel may still be handshaking, retrying ..."
+    sleep 1
+done
 [ "${code1}" = "200" ] || fail "case 1: curl HTTP code = ${code1} (want 200); \
 check ${WORK}/client.log and ${WORK}/server.log for relay errors"
 
@@ -452,13 +462,19 @@ else
 
     CURL_OUT2="${WORK}/curl_out2.txt"
     CURL_CODE2="${WORK}/curl_code2.txt"
+    : >"${CURL_OUT2}"; : >"${CURL_CODE2}"; chmod 666 "${CURL_OUT2}" "${CURL_CODE2}"
     note "case 2: running 2-path curl as nobody ..."
-    sudo -u nobody curl -s -o "${CURL_OUT2}" -w '%{http_code}' \
-        --max-time 15 \
-        --cacert "${ORIGIN_CERT}" \
-        "https://127.0.0.1/" >"${CURL_CODE2}" 2>/dev/null || true
-
-    code2="$(cat "${CURL_CODE2}" 2>/dev/null || echo 000)"
+    code2="000"
+    for attempt in $(seq 1 10); do
+        sudo -u nobody curl -s -o "${CURL_OUT2}" -w '%{http_code}' \
+            --max-time 15 \
+            --cacert "${ORIGIN_CERT}" \
+            "https://127.0.0.1/" >"${CURL_CODE2}" 2>/dev/null || true
+        code2="$(cat "${CURL_CODE2}" 2>/dev/null || echo 000)"
+        [ "${code2}" = "200" ] && break
+        note "case 2: attempt ${attempt}/10 got HTTP ${code2}; retrying ..."
+        sleep 1
+    done
     [ "${code2}" = "200" ] || fail "case 2: 2-path curl HTTP code = ${code2} (want 200)"
 
     body2="$(cat "${CURL_OUT2}" 2>/dev/null)"
