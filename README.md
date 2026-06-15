@@ -2,7 +2,7 @@
 
 A **multipath application proxy/accelerator** built on [Multipath QUIC](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/), using a [fork of XQUIC](https://github.com/mp0rta/xquic). mqproxy maps application flows directly onto MPQUIC primitives — one TCP flow becomes one MPQUIC stream, one HTTP request becomes one H3 stream over MPQUIC, one UDP session becomes MPQUIC DATAGRAMs — so that applications get path diversity, seamless failover, and **bandwidth aggregation** without implementing MPQUIC themselves.
 
-> **Status: Phase 5 (Production Hardening) in progress.** Phase 1's TCP proxy (SOCKS5 / HTTP CONNECT → MPQUIC → origin, ~2× aggregation over two shaped paths), Phase 2's HTTP Request Execution Gateway (delegated `POST /_mqproxy/fetch` requests carried as H3 streams over MPQUIC, run against origins via libcurl with TLS verification always on), and Phase 3's UDP relay (SOCKS5 UDP ASSOCIATE → session-tagged MPQUIC DATAGRAMs → connected UDP socket, with fragmentation/reassembly and idle-timeout teardown) are all implemented and validated end-to-end including 2-path aggregation. Phase 5 is now underway: 5b (reconnect/keepalive), 5c (per-path `mq.path` metrics), and per-request `mq.req` metrics (`--request-metrics`) are done. Phases 6 and 7 are on the [roadmap](#roadmap).
+> **Status: production-hardening complete; TLS MITM (Phase 7) is the next milestone.** Phase 1's TCP proxy (SOCKS5 / HTTP CONNECT → MPQUIC → origin, ~2× aggregation over two shaped paths), Phase 2's HTTP Request Execution Gateway (delegated `POST /_mqproxy/fetch` requests carried as H3 streams over MPQUIC, run against origins via libcurl with TLS verification always on), and Phase 3's UDP relay (SOCKS5 UDP ASSOCIATE → session-tagged MPQUIC DATAGRAMs → connected UDP socket, with fragmentation/reassembly and idle-timeout teardown) are all implemented and validated end-to-end including 2-path aggregation. Phase 5 hardening is largely done — reconnect/keepalive, per-path `mq.path` + per-request `mq.req` metrics, congestion-control and multipath-scheduler selection, a pre-auth connection cap, masquerade mode, INI config files, and systemd packaging — and Phase 6's advanced gateway (origin-protocol selection, connection pooling, header filtering, download compression, response caching) is complete. The codebase is fuzzed (libFuzzer) and CodeQL-scanned in CI. Phase 7 (optional TLS MITM ingress) is on the [roadmap](#roadmap).
 
 mqproxy is the L4/L7 sibling of [mqvpn](https://github.com/mp0rta/mqvpn): where mqvpn is a standards-based L3 VPN that carries IP packets in QUIC DATAGRAMs (MASQUE CONNECT-IP), mqproxy works at the application-flow layer and is **MPQUIC-native**.
 
@@ -58,6 +58,8 @@ mqproxy-client ──────── HTTP/3 over MPQUIC (ALPN h3) ───�
 ```
 
 Instead of tunneling opaque bytes, the gateway **executes delegated HTTP requests**: the client validates `X-Mq-*` headers, maps the request onto a standard H3 request stream (QPACK, trailers and stream management come from the H3 stack — no custom HTTP framing on the wire), and the server authenticates each request (`X-Mq-Auth`, per-request), strips the `X-Mq-*` controls, and runs the request against the origin with full TLS verification. Errors map to HTTP statuses (DNS failure → 502, connect timeout → 504, bad token → 403, …) and responses carry an `X-Mq-Origin-Protocol` diagnostic header. Because each request is one MPQUIC stream, large downloads *and uploads* get within-stream multipath aggregation.
+
+Per-request `X-Mq-*` controls let a caller opt into gateway features without changing the API: `X-Mq-Origin-Protocol` pins the upstream HTTP version (`h1`/`h2`/`h3`), `X-Mq-Accept-Encoding` requests download compression, `X-Mq-Forward-Cookie` forwards the `Cookie` header upstream (otherwise withheld), and `X-Mq-Cache` opts the response into the in-memory origin cache (`--cache-max-bytes`). The server also pools and reuses origin connections across requests.
 
 ### UDP Relay
 
@@ -289,6 +291,9 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | `--listen <ip:port>` | **(required)** UDP address to accept MPQUIC connections on |
 | `--token <token>` | **(required)** Shared auth token clients must present |
 | `--cert <path>` / `--key <path>` | TLS cert/key (PEM); defaults to the bundled test cert |
+| `--max-conns <N>` | Cap on simultaneous QUIC connections (default 16; `0` = unlimited). Excess inbound connections are refused (`CONNECTION_REFUSED`) — a pre-auth DoS guard. |
+| `--cc <algo>` | Congestion control: `bbr` (default) \| `bbr2` \| `cubic` |
+| `--scheduler <s>` | Multipath scheduler: `minrtt` (default) \| `backup` \| `wlb` |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/server.qlog` |
 | `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s (must be > 0; omit to disable). Logs the most-recently-accepted TCP and gateway conn. |
 
@@ -300,6 +305,8 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | `--token <token>` | **(required)** Shared auth token |
 | `--path <local ip>` | Local IP to bind a path to — **repeat for multipath aggregation** (e.g. WiFi + LTE) |
 | `--client-id <id>` | Client identifier sent at auth |
+| `--cc <algo>` | Congestion control: `bbr` (default) \| `bbr2` \| `cubic` |
+| `--scheduler <s>` | Multipath scheduler: `minrtt` (default) \| `backup` \| `wlb` |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/client.qlog` |
 | `--reconnect` / `--no-reconnect` | Auto-reconnect on tunnel loss (default: enabled) |
 | `--reconnect-max-backoff <sec>` | Cap on exponential reconnect backoff in seconds (default 30; floored to 1) |
@@ -332,6 +339,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | `--no-gateway` | **Disables HTTP Gateway mode for this server** (it is enabled by default). The TCP-proxy core keeps running; only the gateway origin bridge is turned off, so a client's `--gateway` ingress has nothing to talk to. |
 | `--origin-ca <pem>` | Extra CA bundle for origin TLS verification (private CAs / tests); verification itself is always on |
 | `--request-metrics` | Emit one `mq.req` logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of `--metrics-interval`. |
+| `--cache-max-bytes <N>` | In-memory origin response cache bounded to `N` bytes (`0` = off = default; e.g. `67108864` = 64 MiB). Opt-in per request via `X-Mq-Cache`. |
 | `--masquerade` | Answer **unauthenticated** gateway requests with a bare `404` (no `X-Mq-*` headers), so probes/scanners see a generic HTTP/3 server instead of a fingerprintable `403 auth-failed`. Authenticated requests are unaffected. Gateway-only; off by default; recommended for internet-exposed servers. |
 
 **Client**
@@ -371,6 +379,8 @@ The unit/integration suite covers wire framing, the relay/flow state machine, in
 - `tests/integration/e2e_gateway.sh` — full gateway chain against a local TLS origin: 8 MB download/upload byte-exact, the whole error matrix (403/400/502/504), and a 2-path aggregation smoke (the 2-path case needs `NET_ADMIN`; the rest runs unprivileged).
 - `tests/integration/e2e_udp.sh` — UDP relay through SOCKS5 UDP ASSOCIATE against a local UDP echo (`udpsocks` + `udp_echo` helpers): byte-exact small + fragmented (3 KB) echo, concurrent sessions, idle-timeout re-OPEN, control-connection teardown, and a 2-path smoke (NET_ADMIN-gated; the rest runs unprivileged).
 
+The wire codecs and ingress parsers (the untrusted-input attack surface) also have a standalone [libFuzzer](fuzz/) harness suite, replayed against a seed corpus in CI; the C/C++ sources are scanned by CodeQL (`security-extended`) on every push to `main`.
+
 ## Observability
 
 Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts confirm that within-stream multipath is actually splitting a flow across paths — the key signal that aggregation is working. (xquic must be built with `XQC_ENABLE_EVENT_LOG=ON`, which `scripts/build-xquic.sh` does.)
@@ -383,8 +393,8 @@ Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts conf
 | **2. HTTP Request Execution Gateway** | ✅ `POST /_mqproxy/fetch` (header + raw body), H3-over-MPQUIC tunnel (ALPN `h3`), libcurl origin client (h2→h1, h3-ready), per-request auth, header policy, error mapping, up/download |
 | **3. UDP Relay** | ✅ SOCKS5 UDP ASSOCIATE ingress, per-session bidi signalling, MPQUIC DATAGRAM send/recv, fragmentation + LRU reassembly, idle timeout, DNS / non-QUIC UDP |
 | ~~4. Controlled Web App Integration~~ | **Dropped** — the SDK speaks native MPQUIC directly (no gateway hop needed); the gateway's per-request value is realized via Phase 7 MITM, not a browser/Web-App ingress |
-| 5. Production Hardening | TCP half-close, reconnect/keepalive ✅ (5b done), per-path metrics `mq.path` ✅ (5c done), per-request metrics `mq.req` ✅ (`--request-metrics`), masquerade mode, qlog, flow-control tuning, scheduler hints |
-| 6. Advanced HTTP Gateway | origin protocol selection, connection pooling, header filtering, cache integration |
+| **5. Production Hardening** | ✅ reconnect/keepalive, per-path `mq.path` + per-request `mq.req` metrics, CC/scheduler selection (`--cc`/`--scheduler`), pre-auth connection cap (`--max-conns`), masquerade mode, INI config files, systemd packaging, fuzzing + CodeQL. Remaining: TLS-error status mapping, flow-control/QoS tuning |
+| **6. Advanced HTTP Gateway** | ✅ origin protocol selection (`X-Mq-Origin-Protocol`), connection pooling, header filtering, download compression (`X-Mq-Accept-Encoding`), cache integration (`X-Mq-Cache` / `--cache-max-bytes`) |
 | 7. TLS MITM Ingress (optional) | managed-device CA, dynamic certs, H3 termination, Do-Not-Inspect policy |
 
 ## Security Model
