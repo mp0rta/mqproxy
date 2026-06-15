@@ -91,6 +91,91 @@ jobs:
       - name: Unit tests (ctest)
         run: ctest --test-dir build --output-on-failure
 
+  packaging:
+    # Static-link (xquic+BoringSSL) packaging build: verify the install layout +
+    # self-containment, then a REAL `systemctl start` of the hardened unit (the only
+    # check that exercises MemoryDenyWriteExecute / @system-service / RestrictAddressFamilies
+    # / ProtectHome against a live process — systemd-analyze cannot). Self-contained:
+    # rebuilds BoringSSL+xquic from the same caches as `build` (no artifact to depend on).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libevent-dev libcurl4-openssl-dev golang
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (gcc fPIC)
+        id: bssl-cache
+        uses: actions/cache@v5
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-gcc-fpic-v1
+      - name: Clone + build BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl
+          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j"$(nproc)" ssl crypto
+
+      - name: Cache xquic (gcc Release, EVENT_LOG)
+        id: xquic-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-9c95ec7-v1
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_EVENT_LOG=ON \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j"$(nproc)"
+
+      - name: Configure (static, prefix=/usr)
+        run: |
+          cmake -S . -B build-pkg -DCMAKE_BUILD_TYPE=Release \
+                -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build" \
+                -DMQPROXY_STATIC_XQUIC=ON -DCMAKE_INSTALL_PREFIX=/usr
+      - name: Build CLI
+        run: cmake --build build-pkg --target mqproxy_cli -j"$(nproc)"
+      - name: Verify packaging (layout + self-containment)
+        run: ctest --test-dir build-pkg -R packaging_install_static --output-on-failure
+      - name: Install + provision + live start smoke
+        run: |
+          sudo cmake --install build-pkg
+          sudo systemd-sysusers
+          sudo systemd-tmpfiles --create
+          sudo install -d -o mqproxy -g mqproxy -m 0750 /etc/mqproxy
+          # Cert/key MUST be readable by the hardened unit: the compiled-in default
+          # cert path is under /home (blocked by ProtectHome=yes), so copy the repo
+          # test cert into /etc/mqproxy (readable under ProtectSystem=strict).
+          sudo install -o mqproxy -g mqproxy -m 0644 tests/certs/test.crt /etc/mqproxy/test.crt
+          sudo install -o mqproxy -g mqproxy -m 0600 tests/certs/test.key /etc/mqproxy/test.key
+          printf '[Interface]\nListen = 127.0.0.1:4433\n[TLS]\nCert = /etc/mqproxy/test.crt\nKey = /etc/mqproxy/test.key\n[Auth]\nKey = citoken\n' \
+            | sudo tee /etc/mqproxy/test.conf >/dev/null
+          sudo chown mqproxy:mqproxy /etc/mqproxy/test.conf
+          sudo chmod 0600 /etc/mqproxy/test.conf
+          sudo systemctl daemon-reload
+          sudo systemctl start mqproxy-server@test
+          sleep 2
+          sudo journalctl -u mqproxy-server@test --no-pager | tail -30
+          sudo systemctl is-active mqproxy-server@test   # fails the job if the unit died
+          sudo systemctl stop mqproxy-server@test
+
   sanitizer:
     # ASan/UBSan build + unit suite (the configuration the proxy was developed
     # under). Same non-ASan Release xquic; only mqproxy gets the sanitizers.
