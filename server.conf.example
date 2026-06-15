@@ -1,7 +1,10 @@
 # mqproxy server config — copy to /etc/mqproxy/<instance>.conf (chmod 0600).
-# CLI flags override values set here. Optional keys/sections omitted; see --help.
+# CLI flags override values set here.
+# NOTE: comments must be on their OWN line — an inline "# ..." after a value is
+# read as part of the value, not stripped.
 [Interface]
-Listen   = 0.0.0.0:4433
+Listen = 0.0.0.0:4433
+# MaxConns: max simultaneous QUIC connections (default 16; 0 = unlimited)
 MaxConns = 64
 
 [TLS]
@@ -14,3 +17,28 @@ Key = CHANGE_ME_shared_token
 [Multipath]
 CC        = bbr
 Scheduler = minrtt
+
+# HTTP gateway is ENABLED by default. Uncomment Enabled to turn it off.
+[Gateway]
+# Enabled = false
+# OriginCA: CA bundle (PEM) used to verify origin TLS
+# OriginCA = /etc/ssl/certs/ca-certificates.crt
+# CacheMaxBytes: response cache size in bytes (0 = off)
+# CacheMaxBytes = 0
+
+# UDP relay is ENABLED by default. Uncomment Enabled to turn it off.
+[UDP]
+# Enabled = false
+# IdleTimeout in seconds (default 60)
+# IdleTimeout = 60
+
+# Metrics and qlog are OFF by default. Uncomment the keys you want.
+[Metrics]
+# Interval: log per-path stats every N seconds
+# Interval = 30
+# PerRequest: emit one mq.req line per gateway request
+# PerRequest = true
+
+[Log]
+# QLog: write xquic qlog to this dir
+# QLog = /var/log/mqproxy/edge1

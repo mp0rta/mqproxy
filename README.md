@@ -211,7 +211,7 @@ mqproxy server --config /etc/mqproxy/edge1.conf
 ```
 
 - **Precedence:** built-in defaults < config file < CLI flags. A flag passed alongside `--config` overrides the file, so you can pin steady state in the file and override transiently on the command line (e.g. add `--qlog /tmp/dbg` for one debug run).
-- **Format:** sectioned INI, CamelCase keys (case-insensitive), `#` and `;` comments, booleans are `true`/`yes`/`1`. `Path` may be repeated for multipath. Unknown keys and bad values warn and are skipped (the default stands); a missing `--config` file is a fatal error.
+- **Format:** sectioned INI, CamelCase keys (case-insensitive), `#` and `;` comments **on their own line** (an inline `# …` after a value is read as part of the value, not stripped), booleans are `true`/`yes`/`1`. `Path` may be repeated for multipath. Unknown keys and bad values warn and are skipped (the default stands); a missing `--config` file is a fatal error.
 - **Secrets:** the token lives in `[Auth] Key`. mqproxy warns at startup if the file is group/world-readable — `chmod 0600` it.
 
 **Key reference** — config keys map to the CLI flags in the [Options reference](#options-reference):
