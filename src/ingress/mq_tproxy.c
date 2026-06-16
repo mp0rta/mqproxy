@@ -121,6 +121,14 @@ on_accept(evutil_socket_t lfd, short what, void *user)
             continue;
         }
 
+        /* Log the recovered original destination — the key diagnostic for
+         * orig-dst issues. At DEBUG so it does not flood production logs with one
+         * line per captured connection (consistent with mq_listener.c, which does
+         * not INFO-log accepts); operators enable debug to inspect capture. */
+        char ipbuf[INET6_ADDRSTRLEN] = "?";
+        inet_ntop(atype == MQ_ADDR_IPV6 ? AF_INET6 : AF_INET, host, ipbuf, sizeof(ipbuf));
+        MQ_LOGD("mq_tproxy: captured connection -> %s:%u", ipbuf, (unsigned)port);
+
         /* Hand off to the core — from this point the CORE owns cfd.
          * Do NOT close cfd after this call (on success OR failure path). */
         l->open_fn(l->core, host, host_len, (mq_addr_type_t)atype, port, cfd, NULL, 0,
