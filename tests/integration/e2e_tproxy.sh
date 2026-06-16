@@ -183,6 +183,7 @@ CLIENT_PID=""
 TC_ON=0
 
 cleanup() {
+    rc=$?
     set +e
     # Kill client FIRST so it runs --setup-redirect teardown (nft delete table).
     # Give it up to 3s to exit cleanly so nft cleanup runs via atexit.
@@ -203,7 +204,17 @@ cleanup() {
     # Restore tc if case 2 (multipath) left shaping on lo.
     [ "${TC_ON}" -eq 1 ] && tc qdisc del dev lo root 2>/dev/null || true
     wait 2>/dev/null
-    rm -rf "${WORK}"
+    if [ "${rc}" -ne 0 ]; then
+        for lg in client server origin; do
+            if [ -s "${WORK}/${lg}.log" ]; then
+                note "──── ${lg}.log (tail) ────"
+                tail -n 40 "${WORK}/${lg}.log" | sed 's/^/  '"${lg}"'| /' >&2
+            fi
+        done
+        note "full logs preserved at ${WORK}"
+    else
+        rm -rf "${WORK}"
+    fi
 }
 trap cleanup EXIT INT TERM
 
