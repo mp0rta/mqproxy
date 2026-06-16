@@ -176,6 +176,20 @@ WORK="$(mktemp -d /tmp/mqproxy_e2e_tproxy.XXXXXX)"
 # traverse WORK to write its -o output file. Make WORK traversable; the specific
 # output files are pre-created world-writable just before each `sudo -u nobody curl`.
 chmod 755 "${WORK}"
+
+# Stage the origin CA where the UNPRIVILEGED capture curl (run as `nobody`) can
+# actually read it. The repo commonly lives under a 0700/0750 home dir (e.g.
+# /home/<user>) that `nobody` cannot traverse, so `curl --cacert <repo path>`
+# fails before the TLS handshake with "error setting certificate file" → HTTP
+# 000 (looks exactly like a relay failure but is purely a path-permission one).
+# WORK is under /tmp (world-traversable) and chmod 755, so a 0644 copy here is
+# reachable by nobody. The root-run origin readiness poll keeps the repo path.
+CACERT_PUB="${WORK}/origin_ca.crt"
+cp "${ORIGIN_CERT}" "${CACERT_PUB}" && chmod 644 "${CACERT_PUB}" || {
+    note "ERROR: could not stage origin CA into WORK for the unprivileged curl."
+    exit 1
+}
+
 ORIGIN_BODY="${WORK}/hello.txt"
 ORIGIN_PID=""
 SERVER_PID=""
@@ -403,11 +417,18 @@ sleep 1
 # test.crt (not trusted by origin.crt) → curl would exit with CURLE_SSL_PEER_CERTIFICATE.
 # A clean 200 + body match proves opaque relay.
 #
-# NOTE: sudo -u nobody inherits the environment; --cacert is a file path
-# accessible to root.  If the sandbox enforces strict sudoers, this may need
-# "sudo -u nobody env ..."; adjust if the root run sees "sudo: sorry, you
-# must have a tty" or similar.  The test cert is world-readable (0644) after
-# cmake generates it.
+# IMPORTANT: --cacert points at ${CACERT_PUB} (a copy staged in WORK under /tmp),
+# NOT the repo cert. The cert being world-readable (0644) is NOT enough: `nobody`
+# also needs EXECUTE on every directory of the path, and the repo usually sits
+# under a 0700/0750 home dir (/home/<user>) that `nobody` cannot traverse — so
+# `curl --cacert <repo path>` fails with "error setting certificate file" BEFORE
+# the TLS handshake, surfacing as HTTP 000 that mimics a relay bug. /tmp is
+# world-traversable, so the staged copy is reachable. (The root-run origin
+# readiness poll above still uses the repo path — root can traverse 0700.)
+#
+# NOTE: sudo -u nobody inherits the environment. If the sandbox enforces strict
+# sudoers, this may need "sudo -u nobody env ..."; adjust if the root run sees
+# "sudo: sorry, you must have a tty" or similar.
 
 CURL_OUT="${WORK}/curl_out.txt"
 CURL_CODE="${WORK}/curl_code.txt"
@@ -419,7 +440,7 @@ code1="000"
 for attempt in $(seq 1 10); do
     sudo -u nobody curl -s -o "${CURL_OUT}" -w '%{http_code}' \
         --max-time 15 \
-        --cacert "${ORIGIN_CERT}" \
+        --cacert "${CACERT_PUB}" \
         "https://127.0.0.1:${ORIGIN_PORT}/" >"${CURL_CODE}" 2>/dev/null || true
     code1="$(cat "${CURL_CODE}" 2>/dev/null || echo 000)"
     [ "${code1}" = "200" ] && break
@@ -488,7 +509,7 @@ else
     for attempt in $(seq 1 10); do
         sudo -u nobody curl -s -o "${CURL_OUT2}" -w '%{http_code}' \
             --max-time 15 \
-            --cacert "${ORIGIN_CERT}" \
+            --cacert "${CACERT_PUB}" \
             "https://127.0.0.1:${ORIGIN_PORT}/" >"${CURL_CODE2}" 2>/dev/null || true
         code2="$(cat "${CURL_CODE2}" 2>/dev/null || echo 000)"
         [ "${code2}" = "200" ] && break
