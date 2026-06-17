@@ -30,6 +30,21 @@
 #define MQ_MITM_LEAF_SERIAL_BITS  64   /* random leaf serial width */
 #define MQ_MITM_LEAF_BACKDATE_SEC 3600 /* notBefore clock-skew tolerance */
 
+#define MQ_MITM_CACHE_SKEW_SEC 30 /* treat a leaf within SKEW of not_after as stale */
+
+// One bounded-LRU cache entry: a forged leaf keyed by its normalized SNI.
+// REFCOUNT OWNERSHIP: the entry holds ONE X509 ref on `leaf` (taken via
+// X509_up_ref / inherited from forge_leaf at insert). cache_get_or_forge hands
+// the CALLER a SEPARATE ref. The cache's ref is released only by eviction or by
+// destroy (X509_free). MRU is the head of the doubly-linked list; LRU is the tail.
+typedef struct mq_cache_entry {
+    char norm_sni[256];          // normalized DNS name key
+    X509 *leaf;                  // cache-owned ref (one)
+    time_t not_after;            // expiry instant (forge-time now + leaf_ttl_sec)
+    struct mq_cache_entry *prev; // toward MRU/head
+    struct mq_cache_entry *next; // toward LRU/tail
+} mq_cache_entry_t;
+
 struct mq_mitm_core {
     X509 *ca_cert;
     EVP_PKEY *ca_key;
@@ -38,7 +53,12 @@ struct mq_mitm_core {
     int leaf_ttl_sec;
     time_t (*now_fn)(void);
     SSL_CTX *ssl_ctx; // created lazily in new_ssl (Task 6); NULL here
-    /* cache fields added in Task 5 */
+    // Bounded LRU leaf cache (Task 5). Intrusive doubly-linked list, MRU at head,
+    // LRU at tail; linear scan (cache_size <= 256, small — no hashing). `count`
+    // tracks current entries. All NULL/0 when cache_size == 0 (caching disabled).
+    mq_cache_entry_t *lru_head;
+    mq_cache_entry_t *lru_tail;
+    size_t cache_count;
 };
 
 static time_t
@@ -389,7 +409,124 @@ forge_leaf(mq_mitm_core_t *core, const char *norm_sni)
     return forge_leaf_ku(core, norm_sni, "critical,digitalSignature");
 }
 
+// --- Bounded LRU leaf cache (Task 5) ---
+
+// Unlink `e` from the intrusive list (does not free it).
+static void
+cache_unlink(mq_mitm_core_t *core, mq_cache_entry_t *e)
+{
+    if (e->prev)
+        e->prev->next = e->next;
+    else
+        core->lru_head = e->next;
+    if (e->next)
+        e->next->prev = e->prev;
+    else
+        core->lru_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+// Push `e` at the MRU (head) of the list.
+static void
+cache_push_front(mq_mitm_core_t *core, mq_cache_entry_t *e)
+{
+    e->prev = NULL;
+    e->next = core->lru_head;
+    if (core->lru_head) core->lru_head->prev = e;
+    core->lru_head = e;
+    if (!core->lru_tail) core->lru_tail = e;
+}
+
+// Free one entry: release its single cache-owned X509 ref + the node.
+static void
+cache_entry_free(mq_cache_entry_t *e)
+{
+    if (!e) return;
+    if (e->leaf) X509_free(e->leaf);
+    free(e);
+}
+
+// Drop and free the LRU (tail) entry. Caller ensures cache is non-empty.
+static void
+cache_evict_lru(mq_mitm_core_t *core)
+{
+    mq_cache_entry_t *victim = core->lru_tail;
+    if (!victim) return;
+    cache_unlink(core, victim);
+    cache_entry_free(victim);
+    core->cache_count--;
+}
+
+// Bounded LRU leaf cache keyed by normalized SNI, TTL-aware.
+//
+// REFCOUNT CONTRACT: returns a NEW X509 ref the CALLER owns and MUST X509_free.
+//  - HIT (fresh): X509_up_ref the cached leaf, move it to MRU, return that ref.
+//    The cache keeps its own ref.
+//  - HIT (expired / within SKEW of not_after): evict the stale entry, fall to MISS.
+//  - MISS: forge once (ref=1). If caching is enabled and we can store it, take a
+//    SECOND ref (X509_up_ref) for the cache and hand the ORIGINAL ref to the
+//    caller; otherwise (cache disabled, or storage allocation failed) hand the
+//    original ref straight to the caller and store nothing. Either way the caller
+//    gets exactly one ref and nothing leaks.
+static X509 *
+cache_get_or_forge(mq_mitm_core_t *core, const char *norm_sni)
+{
+    if (!core || !norm_sni) return NULL;
+
+    time_t now = core->now_fn();
+
+    // Caching disabled → always forge, never store. forge_leaf returns ref=1,
+    // which is exactly the caller's ref.
+    if (core->cache_size == 0) return forge_leaf(core, norm_sni);
+
+    // Linear scan for a hit.
+    for (mq_cache_entry_t *e = core->lru_head; e; e = e->next) {
+        if (strcmp(e->norm_sni, norm_sni) != 0) continue;
+        // Fresh only if comfortably before not_after.
+        if (now < e->not_after - MQ_MITM_CACHE_SKEW_SEC) {
+            cache_unlink(core, e); // move to MRU
+            cache_push_front(core, e);
+            X509_up_ref(e->leaf); // caller's ref; cache keeps its own
+            return e->leaf;
+        }
+        // Stale → evict and fall through to a fresh forge.
+        cache_unlink(core, e);
+        cache_entry_free(e);
+        core->cache_count--;
+        break;
+    }
+
+    // MISS → forge (ref=1, the caller's ref).
+    X509 *leaf = forge_leaf(core, norm_sni);
+    if (!leaf) return NULL;
+
+    // Try to store a SECOND ref. On any allocation failure, skip caching and
+    // still return the caller's ref (degrade gracefully, never leak/double-free).
+    mq_cache_entry_t *e = calloc(1, sizeof *e);
+    if (e) {
+        size_t n = strlen(norm_sni);
+        if (n < sizeof e->norm_sni) {
+            memcpy(e->norm_sni, norm_sni, n + 1);
+            e->leaf = leaf;
+            X509_up_ref(e->leaf); // cache-owned ref (caller keeps the original)
+            e->not_after = now + core->leaf_ttl_sec;
+            if (core->cache_count >= core->cache_size) cache_evict_lru(core);
+            cache_push_front(core, e);
+            core->cache_count++;
+        } else {
+            free(e); // pathological key (can't happen: norm_sni <= 253); skip caching
+        }
+    }
+    return leaf;
+}
+
 // TEST-ONLY hooks (no header; forward-declared extern in the test).
+X509 *
+mq_mitm_cache_get_or_forge_for_test(mq_mitm_core_t *core, const char *norm_sni)
+{
+    return cache_get_or_forge(core, norm_sni);
+}
+
 X509 *
 mq_mitm_forge_for_test(mq_mitm_core_t *core, const char *norm_sni)
 {
@@ -413,9 +550,16 @@ void
 mq_mitm_core_destroy(mq_mitm_core_t *core)
 {
     if (!core) return;
-    // Order: SSL_CTX first, then cache (none yet), then keys/cert.
+    // Order: SSL_CTX first, then cache, then keys/cert. Each cache entry holds
+    // one X509 ref on its leaf; release them all before freeing the keys/cert.
     if (core->ssl_ctx) SSL_CTX_free(core->ssl_ctx);
-    /* cache freed here in Task 5 */
+    for (mq_cache_entry_t *e = core->lru_head; e;) {
+        mq_cache_entry_t *next = e->next;
+        cache_entry_free(e);
+        e = next;
+    }
+    core->lru_head = core->lru_tail = NULL;
+    core->cache_count = 0;
     if (core->leaf_key) EVP_PKEY_free(core->leaf_key);
     if (core->ca_key) EVP_PKEY_free(core->ca_key);
     if (core->ca_cert) X509_free(core->ca_cert);

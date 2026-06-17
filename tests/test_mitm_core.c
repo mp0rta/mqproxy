@@ -23,6 +23,11 @@ extern X509 *mq_mitm_forge_for_test(mq_mitm_core_t *core, const char *norm_sni);
 // to prove the SSL-server purpose gate (I1) is load-bearing.
 extern X509 *mq_mitm_forge_ku_for_test(mq_mitm_core_t *core, const char *norm_sni,
                                        const char *ku_str);
+// Task 5: bounded LRU leaf cache. Returns a NEW ref to the caller (X509_up_ref on
+// hit; on miss the freshly-forged leaf is up_ref'd into the cache and the caller
+// gets the original ref). Caller MUST X509_free the returned X509.
+extern X509 *mq_mitm_cache_get_or_forge_for_test(mq_mitm_core_t *core,
+                                                 const char *norm_sni);
 
 static void
 test_sni_norm(void)
@@ -279,7 +284,163 @@ test_forge_purpose_gate_is_load_bearing(void)
     mq_mitm_core_destroy(c);
 }
 
+// ---- Task 5: LRU leaf cache with TTL expiry ----
+
+// Return the leaf's serial as a heap BIGNUM (caller BN_free's). Serial equality
+// is the durable cache-identity invariant (NOT pointer identity, which a future
+// refactor could break by returning a duplicated cert).
+static BIGNUM *
+leaf_serial_bn(X509 *leaf)
+{
+    const ASN1_INTEGER *s = X509_get_serialNumber(leaf);
+    MQ_CHECK(s != NULL);
+    BIGNUM *bn = ASN1_INTEGER_to_BN(s, NULL);
+    MQ_CHECK(bn != NULL);
+    return bn;
+}
+
+// Controllable test clock (the cache + forge read time via core->now_fn).
+static time_t g_fake_now = 1000000000; // fixed base
+static time_t
+fake_now(void)
+{
+    return g_fake_now;
+}
+
+static void
+test_cache_hit_same_serial(void)
+{
+    mq_mitm_opts_t opts = {.cache_size = 8, .leaf_ttl_sec = 86400};
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, &opts);
+    MQ_CHECK(c != NULL);
+    g_fake_now = 1000000000;
+    mq_mitm_core_set_clock_for_test(c, fake_now);
+
+    X509 *a = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+    X509 *b = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+    MQ_CHECK(a != NULL && b != NULL);
+
+    BIGNUM *sa = leaf_serial_bn(a), *sb = leaf_serial_bn(b);
+    MQ_CHECK(BN_cmp(sa, sb) == 0); // cache hit → same serial → one forge
+    BN_free(sa);
+    BN_free(sb);
+
+    X509_free(a);
+    X509_free(b);
+    mq_mitm_core_destroy(c);
+}
+
+static void
+test_cache_distinct_sni_distinct_serial(void)
+{
+    mq_mitm_opts_t opts = {.cache_size = 8, .leaf_ttl_sec = 86400};
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, &opts);
+    MQ_CHECK(c != NULL);
+    g_fake_now = 1000000000;
+    mq_mitm_core_set_clock_for_test(c, fake_now);
+
+    X509 *a = mq_mitm_cache_get_or_forge_for_test(c, "one.example.com");
+    X509 *b = mq_mitm_cache_get_or_forge_for_test(c, "two.example.com");
+    MQ_CHECK(a != NULL && b != NULL);
+
+    BIGNUM *sa = leaf_serial_bn(a), *sb = leaf_serial_bn(b);
+    MQ_CHECK(BN_cmp(sa, sb) != 0); // distinct SNI → distinct serial
+    BN_free(sa);
+    BN_free(sb);
+
+    X509_free(a);
+    X509_free(b);
+    mq_mitm_core_destroy(c);
+}
+
+static void
+test_cache_lru_eviction(void)
+{
+    // cache_size=2: insert 3 distinct SNIs; the first is LRU and gets evicted.
+    // Re-requesting it → miss → reforge → new serial.
+    mq_mitm_opts_t opts = {.cache_size = 2, .leaf_ttl_sec = 86400};
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, &opts);
+    MQ_CHECK(c != NULL);
+    g_fake_now = 1000000000;
+    mq_mitm_core_set_clock_for_test(c, fake_now);
+
+    X509 *first1 = mq_mitm_cache_get_or_forge_for_test(c, "a.example.com");
+    BIGNUM *s_first1 = leaf_serial_bn(first1);
+
+    X509 *bb = mq_mitm_cache_get_or_forge_for_test(c, "b.example.com"); // fill
+    X509 *cc = mq_mitm_cache_get_or_forge_for_test(c, "c.example.com"); // evicts "a"
+
+    X509 *first2 =
+        mq_mitm_cache_get_or_forge_for_test(c, "a.example.com"); // miss → reforge
+    BIGNUM *s_first2 = leaf_serial_bn(first2);
+
+    MQ_CHECK(BN_cmp(s_first1, s_first2) != 0); // evicted → new serial
+
+    BN_free(s_first1);
+    BN_free(s_first2);
+    X509_free(first1);
+    X509_free(bb);
+    X509_free(cc);
+    X509_free(first2);
+    mq_mitm_core_destroy(c);
+}
+
+static void
+test_cache_disabled(void)
+{
+    // cache_size=0 → caching disabled: two requests for the same SNI always forge.
+    mq_mitm_opts_t opts = {.cache_size = 0, .leaf_ttl_sec = 86400};
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, &opts);
+    MQ_CHECK(c != NULL);
+    g_fake_now = 1000000000;
+    mq_mitm_core_set_clock_for_test(c, fake_now);
+
+    X509 *a = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+    X509 *b = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+    MQ_CHECK(a != NULL && b != NULL);
+
+    BIGNUM *sa = leaf_serial_bn(a), *sb = leaf_serial_bn(b);
+    MQ_CHECK(BN_cmp(sa, sb) != 0); // no caching → distinct serials
+    BN_free(sa);
+    BN_free(sb);
+
+    X509_free(a);
+    X509_free(b);
+    mq_mitm_core_destroy(c);
+}
+
+static void
+test_cache_ttl_expiry(void)
+{
+    // Forge at t0; advance the clock past not_after; the same SNI must reforge.
+    mq_mitm_opts_t opts = {.cache_size = 8, .leaf_ttl_sec = 60}; // clamped min TTL
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, &opts);
+    MQ_CHECK(c != NULL);
+    g_fake_now = 1000000000;
+    mq_mitm_core_set_clock_for_test(c, fake_now);
+
+    X509 *a = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+    BIGNUM *sa = leaf_serial_bn(a);
+
+    // Advance well past not_after (now + 60). Even with the near-expiry SKEW this
+    // is unambiguously expired.
+    g_fake_now += 600;
+
+    X509 *b = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+    BIGNUM *sb = leaf_serial_bn(b);
+
+    MQ_CHECK(BN_cmp(sa, sb) != 0); // expired → reforged → new serial
+
+    BN_free(sa);
+    BN_free(sb);
+    X509_free(a);
+    X509_free(b);
+    mq_mitm_core_destroy(c);
+}
+
 MQ_TEST_MAIN(test_sni_norm(); test_create_valid(); test_reject_non_ca();
              test_reject_key_mismatch(); test_reject_encrypted_key();
              test_reject_symlink_key(); test_reject_world_readable_key();
-             test_forge_chains_to_ca(); test_forge_purpose_gate_is_load_bearing();)
+             test_forge_chains_to_ca(); test_forge_purpose_gate_is_load_bearing();
+             test_cache_hit_same_serial(); test_cache_distinct_sni_distinct_serial();
+             test_cache_lru_eviction(); test_cache_disabled(); test_cache_ttl_expiry();)
