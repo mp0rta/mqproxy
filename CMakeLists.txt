@@ -156,6 +156,23 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         target_include_directories(test_mitm_core PRIVATE tests src
             ${MQPROXY_BORINGSSL_INCLUDE_DIR})
         add_test(NAME test_mitm_core COMMAND test_mitm_core)
+
+        # ---- Task 8: openssl s_client cross-implementation smoke ----
+        # The single-shot helper terminates a real loopback TLS handshake via
+        # mq_mitm_core; the shell driver runs `openssl s_client` against it and
+        # asserts ALPN=h2 + chain-verify. Links the SAME way as test_mitm_core
+        # (mqproxy + BoringSSL archives, NO xquic — the MITM core is xquic-free).
+        add_executable(mitm_smoke_server tests/integration/mitm_smoke_server.c)
+        target_link_libraries(mitm_smoke_server
+            mqproxy
+            "${MQPROXY_BORINGSSL_DIR}/libssl.a"
+            "${MQPROXY_BORINGSSL_DIR}/libcrypto.a"
+            pthread dl m stdc++)
+        target_include_directories(mitm_smoke_server PRIVATE src
+            ${MQPROXY_BORINGSSL_INCLUDE_DIR})
+        # NOTE: add_test for e2e_mitm_smoke is registered below, after the MITM CA
+        # fixture paths (MQ_MITM_CA_*) are defined — same pattern as the
+        # test_mitm_core compile_definitions block.
     else()
         message(STATUS "BoringSSL archives absent — test_mitm_core not built "
                        "(run scripts/build-xquic.sh).")
@@ -327,6 +344,15 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MITM_CA_ENC_KEY="${MQ_MITM_CA_ENC_KEY}"
             MITM_LEAF_CRT="${MQ_MITM_LEAF_CRT}"   # CA:FALSE matched pair → non-CA negative
             MITM_LEAF_KEY="${MQ_MITM_LEAF_KEY}")  # P-256 ≠ CA key → mismatch negative
+
+        # Task 8 smoke (mitm_smoke_server target created above): register here so
+        # the MQ_MITM_CA_* fixture paths are populated. SKIP (77) iff openssl absent.
+        add_test(NAME e2e_mitm_smoke
+            COMMAND ${CMAKE_COMMAND} -E env
+                MITM_SERVER_BIN=$<TARGET_FILE:mitm_smoke_server>
+                MITM_CA_CRT=${MQ_MITM_CA_CRT} MITM_CA_KEY=${MQ_MITM_CA_KEY}
+                bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_mitm_smoke.sh)
+        set_tests_properties(e2e_mitm_smoke PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     add_executable(test_conn_handshake tests/integration/test_conn_handshake.c)
