@@ -69,7 +69,11 @@ target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLU
 # pulls NO MITM source and the whole tree (library + mqproxy_cli) builds/links
 # cleanly; `--mitm` then errors at startup via the MQ_MITM_AVAILABLE=0 guard.
 if(MQPROXY_MITM)
-    target_sources(mqproxy PRIVATE src/mitm/mq_mitm_core.c)
+    # mq_mitm_core.c #includes BoringSSL headers; mq_mitm_conn.c (live orchestrator,
+    # Task 10) references mq_mitm_core types. Both compile into the lib only under
+    # MQPROXY_MITM. The CLI links the lib, so adding mq_mitm_conn here (not to
+    # mqproxy_cli) also satisfies the test_mitm_conn target, which links `mqproxy`.
+    target_sources(mqproxy PRIVATE src/mitm/mq_mitm_core.c src/mitm/mq_mitm_conn.c)
     target_include_directories(mqproxy PUBLIC ${MQPROXY_BORINGSSL_INCLUDE_DIR})
 endif()
 
@@ -208,6 +212,16 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         target_link_libraries(test_mitm_core mqproxy mq_boringssl)
         target_include_directories(test_mitm_core PRIVATE tests src)
         add_test(NAME test_mitm_core COMMAND test_mitm_core)
+
+        # ---- Task 10: live MITM conn orchestrator decision-seam unit ----
+        # Exercises the drain→decide routing (ignore-hosts hit→opaque vs miss→MITM)
+        # via the socketless decision seam. Links mqproxy + mq_boringssl (touches
+        # mq_mitm_core types via the orchestrator) + libevent (the orchestrator
+        # creates events; the seam itself uses none).
+        add_executable(test_mitm_conn tests/test_mitm_conn.c)
+        target_link_libraries(test_mitm_conn mqproxy mq_boringssl ${EVENT_CORE_LIB})
+        target_include_directories(test_mitm_conn PRIVATE tests src)
+        add_test(NAME test_mitm_conn COMMAND test_mitm_conn)
 
         # ---- Task 8: openssl s_client cross-implementation smoke ----
         # The single-shot helper terminates a real loopback TLS handshake via
@@ -796,10 +810,10 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # path is compiled in; MQ_MITM_AVAILABLE is the matching C compile-definition.
     if(MQPROXY_MITM)
         target_compile_definitions(mqproxy_cli PRIVATE MQ_MITM_AVAILABLE=1)
-        # Task 10/13: add src/mitm/mq_mitm_conn.c to mqproxy_cli sources here (this
-        # block is already gated on MQPROXY_MITM; the file does not exist yet —
-        # Task 10 creates it):
-        #   target_sources(mqproxy_cli PRIVATE src/mitm/mq_mitm_conn.c)
+        # Task 10: src/mitm/mq_mitm_conn.c (live orchestrator) is compiled into the
+        # mqproxy LIB under MQPROXY_MITM (see ~line 71), which mqproxy_cli links —
+        # no per-cli target_sources needed. Task 13 wires it into cli/main.c under
+        # `#if MQ_MITM_AVAILABLE`.
         #
         # Isolate the BoringSSL the MITM core links against so its SSL_*/X509_*/EVP_*
         # cannot interpose libcurl's system OpenSSL (libssl.so) at runtime. Both the
