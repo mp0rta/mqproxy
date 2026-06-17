@@ -175,6 +175,8 @@ verify_leaf_with_ca(X509 *leaf, int *err)
 
 // Extract the single SAN DNS name from `leaf` into out (NUL-terminated). Returns
 // 0 on success, -1 if no SAN DNS entry present.
+// NOTE: returns only the FIRST DNS SAN — sufficient because the forge emits
+// exactly one SAN.
 static int
 leaf_san_dns(X509 *leaf, char *out, size_t outsz)
 {
@@ -553,10 +555,14 @@ make_client_ctx(void)
 // drives BOTH sides unconditionally; the bio-pair coupling moves bytes; only a
 // non-WANT_READ/WANT_WRITE error is fatal; a hard iteration cap fails (not hangs)
 // the test on a stall.
+// `out_peer` (optional): on a successful handshake, receives a NEW ref to the
+// server-presented leaf (caller MUST X509_free). NULL = don't capture; not set
+// when out_peer is NULL or the handshake failed.
 static hs_result_t
 do_handshake(mq_mitm_core_t *core, const unsigned char *client_alpn,
-             size_t client_alpn_len, const char *sni)
+             size_t client_alpn_len, const char *sni, X509 **out_peer)
 {
+    static const int K_MAX_HS_ITERS = 64;
     hs_result_t res = {0, "", 0};
 
     SSL *server = mq_mitm_core_new_ssl(core);
@@ -590,7 +596,7 @@ do_handshake(mq_mitm_core_t *core, const unsigned char *client_alpn,
 
     int client_done = 0, server_done = 0, fatal = 0;
     int iters = 0;
-    for (; iters < 64 && !(client_done && server_done) && !fatal; iters++) {
+    for (; iters < K_MAX_HS_ITERS && !(client_done && server_done) && !fatal; iters++) {
         if (!client_done) {
             int r = SSL_do_handshake(client);
             if (r == 1) {
@@ -610,7 +616,7 @@ do_handshake(mq_mitm_core_t *core, const unsigned char *client_alpn,
             }
         }
     }
-    MQ_CHECK(iters < 64); // a stall FAILS the test instead of hanging CI
+    MQ_CHECK(iters < K_MAX_HS_ITERS); // a stall FAILS the test instead of hanging CI
 
     if (client_done && server_done) {
         res.ok = 1;
@@ -622,6 +628,7 @@ do_handshake(mq_mitm_core_t *core, const unsigned char *client_alpn,
             memcpy(res.alpn, p, plen);
             res.alpn[plen] = '\0';
         }
+        if (out_peer) *out_peer = SSL_get_peer_certificate(client); // NEW ref → X509_free
     }
 
     SSL_free(server); // frees BIO a
@@ -639,49 +646,23 @@ test_handshake_positive_h2(void)
     MQ_CHECK(c != NULL);
 
     static const unsigned char ALPN_H2[] = {2, 'h', '2'};
-    hs_result_t r = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "host.example.com");
+    X509 *peer = NULL;
+    hs_result_t r = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "host.example.com", &peer);
 
     MQ_CHECK(r.ok == 1);
     MQ_CHECK(r.verify_result == X509_V_OK);
     MQ_CHECK(strcmp(r.alpn, "h2") == 0);
 
     // The leaf the server presented must independently verify against the CA and
-    // carry SAN DNS == the requested SNI. Re-run a fresh handshake just to capture
-    // the peer cert (do_handshake frees the client SSL), via a direct client here.
-    {
-        SSL *server = mq_mitm_core_new_ssl(c);
-        MQ_CHECK(server != NULL);
-        SSL_CTX *cctx = make_client_ctx();
-        SSL *client = SSL_new(cctx);
-        MQ_CHECK(client != NULL);
-        SSL_set_connect_state(client);
-        static const unsigned char A2[] = {2, 'h', '2'};
-        MQ_CHECK(SSL_set_alpn_protos(client, A2, sizeof A2) == 0);
-        MQ_CHECK(SSL_set_tlsext_host_name(client, "host.example.com") == 1);
-        BIO *a = NULL, *bb = NULL;
-        MQ_CHECK(BIO_new_bio_pair(&a, 65536, &bb, 65536) == 1);
-        SSL_set_bio(server, a, a);
-        SSL_set_bio(client, bb, bb);
-        int cd = 0, sd = 0, it = 0;
-        for (; it < 64 && !(cd && sd); it++) {
-            if (!cd && SSL_do_handshake(client) == 1) cd = 1;
-            if (!sd && SSL_do_handshake(server) == 1) sd = 1;
-        }
-        MQ_CHECK(cd && sd);
-
-        X509 *peer = SSL_get_peer_certificate(client); // NEW ref → X509_free
-        MQ_CHECK(peer != NULL);
-        int err = 0;
-        MQ_CHECK(verify_leaf_with_ca(peer, &err) == 1);
-        char san[256];
-        MQ_CHECK(leaf_san_dns(peer, san, sizeof san) == 0);
-        MQ_CHECK(strcmp(san, "host.example.com") == 0);
-        X509_free(peer);
-
-        SSL_free(server);
-        SSL_free(client);
-        SSL_CTX_free(cctx);
-    }
+    // carry SAN DNS == the requested SNI (peer cert captured via do_handshake's
+    // out-param — a NEW ref we must free).
+    MQ_CHECK(peer != NULL);
+    int err = 0;
+    MQ_CHECK(verify_leaf_with_ca(peer, &err) == 1);
+    char san[256];
+    MQ_CHECK(leaf_san_dns(peer, san, sizeof san) == 0);
+    MQ_CHECK(strcmp(san, "host.example.com") == 0);
+    X509_free(peer);
 
     mq_mitm_core_destroy(c);
 }
@@ -695,10 +676,11 @@ test_handshake_alpn_negatives(void)
     MQ_CHECK(c != NULL);
 
     static const unsigned char ALPN_H1[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-    hs_result_t only_h1 = do_handshake(c, ALPN_H1, sizeof ALPN_H1, "host.example.com");
+    hs_result_t only_h1 =
+        do_handshake(c, ALPN_H1, sizeof ALPN_H1, "host.example.com", NULL);
     MQ_CHECK(only_h1.ok == 0); // no h2 overlap → ALPN alert fatal
 
-    hs_result_t no_alpn = do_handshake(c, NULL, 0, "host.example.com");
+    hs_result_t no_alpn = do_handshake(c, NULL, 0, "host.example.com", NULL);
     MQ_CHECK(no_alpn.ok == 0); // no-ALPN guard → select_cert_error
 
     mq_mitm_core_destroy(c);
@@ -715,16 +697,17 @@ test_handshake_sni_negatives(void)
 
     static const unsigned char ALPN_H2[] = {2, 'h', '2'};
 
-    hs_result_t no_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, NULL);
+    hs_result_t no_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, NULL, NULL);
     MQ_CHECK(no_sni.ok == 0); // no SNI → normalize fails
 
-    hs_result_t ip_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "203.0.113.5");
+    hs_result_t ip_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "203.0.113.5", NULL);
     MQ_CHECK(ip_sni.ok == 0); // IP literal rejected
 
-    hs_result_t wild_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "*.example.com");
+    hs_result_t wild_sni =
+        do_handshake(c, ALPN_H2, sizeof ALPN_H2, "*.example.com", NULL);
     MQ_CHECK(wild_sni.ok == 0); // wildcard rejected
 
-    hs_result_t ctrl_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "a\tb.com");
+    hs_result_t ctrl_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "a\tb.com", NULL);
     MQ_CHECK(ctrl_sni.ok == 0); // control char rejected
 
     mq_mitm_core_destroy(c);
