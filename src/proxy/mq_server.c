@@ -45,6 +45,13 @@
 #define MQ_SERVER_ALPN "mqproxy-tcp/1"
 #define MQ_SERVER_ID   "mqproxy-server"
 
+/* Origin connect deadline. A non-blocking connect to a blackholed target would
+ * otherwise pin an fd + QUIC stream + data node until the kernel TCP timeout
+ * (~2 min). Cap it so a captured client cannot exhaust resources by dialing dead
+ * hosts. Internal backstop (not operator-tuned); 15 s is well under the kernel
+ * default and above any healthy origin's connect latency. */
+#define MQ_SRV_CONNECT_TIMEOUT_MS 15000
+
 /* The buffered AUTH_REQUEST / CONNECT_TCP_REQUEST is bounded by MQ_FRAMEBUF_CAP
  * (512): the full frame is at most version + client_id(<=64) + auth_token(<=256)
  * + host/port + small fields, comfortably under that. Exceeding the bound without
@@ -365,13 +372,21 @@ srv_data_begin_relay(mq_srv_data_t *d)
 static void
 srv_connect_done_cb(evutil_socket_t fd, short what, void *arg)
 {
-    (void)what;
     mq_srv_data_t *d = (mq_srv_data_t *)arg;
 
     /* The one-shot connect_ev has fired; it is no longer pending. */
     if (d->connect_ev) {
         event_free(d->connect_ev);
         d->connect_ev = NULL;
+    }
+
+    /* Deadline hit before the connect completed: fail the open with TIMEOUT so
+     * the origin fd + stream + node are released instead of pinned until the
+     * kernel TCP timeout. */
+    if (what & EV_TIMEOUT) {
+        MQ_LOGW("mq_server: origin connect timed out");
+        srv_data_fail(d, MQ_TCP_TIMEOUT);
+        return;
     }
 
     int soerr = 0;
@@ -496,7 +511,10 @@ srv_data_dial(mq_srv_data_t *d, const mq_connect_tcp_req_t *req)
         srv_data_fail(d, MQ_TCP_CONN_REFUSED);
         return;
     }
-    event_add(d->connect_ev, NULL);
+    /* Arm with a deadline: fires on writable (connect done) OR timeout, once. */
+    struct timeval tv = {.tv_sec = MQ_SRV_CONNECT_TIMEOUT_MS / 1000,
+                         .tv_usec = (MQ_SRV_CONNECT_TIMEOUT_MS % 1000) * 1000};
+    event_add(d->connect_ev, &tv);
 }
 
 /* Data stream readable while still buffering the CONNECT_TCP_REQUEST header.
