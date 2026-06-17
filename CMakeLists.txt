@@ -56,7 +56,9 @@ add_library(mqproxy STATIC
     src/transport/mq_stream.c
     src/transport/mq_transport.c
     src/runtime/mq_runtime_libevent.c
+    src/gateway/mq_gw_h2_adapter.c
     src/mitm/mq_ignore_hosts.c)
+target_include_directories(mqproxy PUBLIC ${NGHTTP2_INCLUDE_DIRS})
 target_link_libraries(mqproxy PUBLIC CURL::libcurl)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
@@ -177,6 +179,15 @@ else()
     target_link_libraries(nghttp2_link_probe ${NGHTTP2_LIBRARIES})
 endif()
 add_test(NAME nghttp2_link_probe COMMAND nghttp2_link_probe)
+
+# nghttp2 H2 server adapter unit suite (Slice 3 Task 5). Pure H2 framing — drives
+# a real nghttp2 CLIENT through an in-test memory pipe against the adapter SERVER
+# session; no xquic/BoringSSL needed (the adapter .o is pulled out of the base
+# mqproxy lib, which references only nghttp2). Lives in the unconditional section.
+add_executable(test_gw_h2_adapter tests/test_gw_h2_adapter.c)
+target_link_libraries(test_gw_h2_adapter mqproxy ${NGHTTP2_LIBRARIES})
+target_include_directories(test_gw_h2_adapter PRIVATE tests src ${NGHTTP2_INCLUDE_DIRS})
+add_test(NAME test_gw_h2_adapter COMMAND test_gw_h2_adapter)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
