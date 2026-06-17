@@ -1340,6 +1340,13 @@ mq_gw_client_new(mq_transport_t *t, mq_runtime_t *rt, mq_h3_t *h3, const char *s
     return c;
 }
 
+const char *
+mq_gw_client_token(const mq_gw_client_t *c)
+{
+    if (!c) return NULL;
+    return c->token;
+}
+
 void
 mq_gw_client_dump_stats(mq_gw_client_t *c)
 {
