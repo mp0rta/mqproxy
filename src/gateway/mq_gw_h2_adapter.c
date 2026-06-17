@@ -579,7 +579,17 @@ static void
 mq_h2_resp_finish(void *u)
 {
     mq_h2_stream_t *s = (mq_h2_stream_t *)u;
-    if (!s || s->rejected) return;
+    if (!s) return;
+    /* Even on the rejected early-return path we MUST drop the borrowed xreq: the
+     * core has signalled completion and may free it regardless of whether the
+     * stream was already RST'd, so resp_finish must symmetrically NULL it (mirror
+     * resp_abort, which NULLs unconditionally). Otherwise a rejected-then-finished
+     * stream lingering in a->streams would call req_aborted on freed memory at
+     * teardown (UAF). The END_STREAM-emit below is gated on !rejected. */
+    if (s->rejected) {
+        s->xreq = NULL;
+        return;
+    }
     s->resp_eof = 1;
     /* Resume in case the provider had deferred on an empty queue: now it can emit
      * the (possibly empty) END_STREAM DATA frame. */

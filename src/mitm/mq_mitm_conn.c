@@ -33,7 +33,10 @@
 // ── TEARDOWN ORDER (§5.1, codex H8) ──────────────────────────────────────────
 //   drive req_aborted per in-flight stream  (via mq_gw_h2_adapter_free, which
 //        already iterates its live-stream list and calls submit->req_aborted on
-//        each xreq — the adapter→core "local gone" signal, NO sink callback) →
+//        each xreq — the adapter→core "local gone" signal, NO sink callback;
+//        streams that already completed cleanly are EXEMPT: resp_finish (and
+//        resp_abort) NULL the borrowed xreq, so only genuinely in-flight streams
+//        are aborted — a finished stream is never req_aborted'd) →
 //   free the H2 adapter (nghttp2 session) →
 //   SSL_free(ssl) (frees ssl_bio) → BIO_free(app_bio) →
 //   close(local_fd) → unlink from registry → free conn ctx → free submit wrapper.

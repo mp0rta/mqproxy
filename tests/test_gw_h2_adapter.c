@@ -170,6 +170,12 @@ typedef struct {
     size_t pause_after;
     int paused_once; /* the single pause has fired (no further pausing) */
     int req_body_calls;
+
+    /* UAF-hardening regression (Slice 3): how many times the adapter called
+     * req_aborted (on_stream_close / adapter_free "local gone" signal). A stream
+     * that completed cleanly (resp_finish ran → the adapter NULLed its borrowed
+     * xreq) MUST NOT be aborted at teardown — this counter asserts that. */
+    int req_aborted_calls;
 } cap_state_t;
 
 static int
@@ -280,7 +286,11 @@ cap_req_drained(mq_gw_xreq_t *r)
 static void
 cap_req_aborted(mq_gw_xreq_t *r)
 {
-    (void)r;
+    /* The adapter passes back the xreq sentinel == the cap_state_t*. Count the
+     * abort so the UAF-hardening test can assert a cleanly-finished stream is
+     * NEVER aborted (its xreq was NULLed by resp_finish). */
+    cap_state_t *st = (cap_state_t *)r;
+    if (st) st->req_aborted_calls++;
 }
 static const char *
 cap_auth_token(void *u)
@@ -939,6 +949,101 @@ test_response_path_and_backpressure(void)
     nghttp2_session_del(cli2);
 }
 
+/* ── Slice 3 UAF-hardening: req_aborted accounting at adapter teardown ─────────
+ *
+ * The adapter borrows s->xreq (the gwc owns it). The terminal sink ops
+ * resp_finish / resp_abort NULL s->xreq so on_stream_close / adapter_free do NOT
+ * call req_aborted on a freed xreq (UAF). These two cases lock that contract in:
+ *
+ *   (a) CLEAN finish: materialize a stream, drive resp_head+resp_finish, then
+ *       free the adapter while the stream is still on its live list → req_aborted
+ *       must fire ZERO times (resp_finish NULLed the borrowed handle). This is
+ *       non-vacuous: it FAILS if resp_finish stops NULLing s->xreq.
+ *   (b) IN-FLIGHT: materialize a stream and free the adapter WITHOUT finishing →
+ *       req_aborted must fire exactly once (genuinely in-flight stream aborted).
+ *
+ * Helper: drive a fresh request to materialization and return the adapter + the
+ * captured sink (via st) with the stream still open (no client END_STREAM body,
+ * so the stream stays on a->streams until adapter_free). */
+static mq_gw_h2_adapter_t *
+materialize_open_stream(cap_state_t *st, nghttp2_session **out_cli, sink_buf_t *srv_out)
+{
+    st->prevalidate_verdict = MQ_GW_OK;
+    resp_cli_t rc = {0}; /* local sink for the client's outbound bytes */
+
+    mq_gw_h2_adapter_t *a = mq_gw_h2_adapter_new(&g_cap_ops, st, adapter_send, srv_out);
+    MQ_CHECK(a != NULL);
+    if (!a) return NULL;
+
+    nghttp2_session_callbacks *cbs = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_callbacks_new(&cbs), 0);
+    nghttp2_session_callbacks_set_send_callback(cbs, client_send);
+    nghttp2_session *cli = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_client_new(&cli, cbs, &rc), 0);
+    nghttp2_session_callbacks_del(cbs);
+
+    nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+    MQ_CHECK_EQ_INT(nghttp2_submit_settings(cli, NGHTTP2_FLAG_NONE, iv, 1), 0);
+
+    /* GET with NO body → END_STREAM rides the HEADERS, the request materializes,
+     * but the server-side stream stays OPEN (we never send a response that closes
+     * it) so it is still on a->streams at adapter_free. */
+    const nghttp2_nv nva[] = {
+        {(uint8_t *)":method", (uint8_t *)"GET", 7, 3, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":path", (uint8_t *)"/", 5, 1, NGHTTP2_NV_FLAG_NONE},
+    };
+    int sid = nghttp2_submit_request(cli, NULL, nva, 4, NULL, NULL);
+    MQ_CHECK(sid > 0);
+    shuttle(a, cli, &rc, srv_out);
+
+    MQ_CHECK_EQ_INT(st->req_begin_calls, 1);
+    MQ_CHECK(st->sink != NULL && st->sink_user != NULL);
+    *out_cli = cli;
+    return a;
+}
+
+static void
+test_teardown_clean_finish_no_abort(void)
+{
+    /* (a) clean finish → ZERO aborts at adapter teardown. */
+    cap_state_t st = {0};
+    sink_buf_t srv_out = {0};
+    nghttp2_session *cli = NULL;
+    mq_gw_h2_adapter_t *a = materialize_open_stream(&st, &cli, &srv_out);
+    if (!a) return;
+
+    const mq_h3_header_t rhdrs[] = {{"content-type", "text/plain"}};
+    int hr = st.sink->resp_head(st.sink_user, 200, rhdrs, 1, MQ_GW_BODY_STREAM);
+    MQ_CHECK(hr >= 0);
+    st.sink->resp_finish(st.sink_user); /* clean completion → adapter NULLs s->xreq */
+
+    /* Tear the adapter down with the stream still on its live list. Because
+     * resp_finish NULLed the borrowed xreq, adapter_free must NOT call req_aborted.
+     * (Non-vacuous: removing s->xreq=NULL from resp_finish flips this to 1.) */
+    mq_gw_h2_adapter_free(a);
+    MQ_CHECK_EQ_INT(st.req_aborted_calls, 0);
+
+    nghttp2_session_del(cli);
+
+    /* (b) in-flight → exactly ONE abort: a genuinely live stream IS aborted. */
+    cap_state_t st2 = {0};
+    sink_buf_t srv_out2 = {0};
+    nghttp2_session *cli2 = NULL;
+    mq_gw_h2_adapter_t *a2 = materialize_open_stream(&st2, &cli2, &srv_out2);
+    if (!a2) {
+        nghttp2_session_del(cli2);
+        return;
+    }
+    /* No resp_finish/resp_abort — xreq still borrowed → teardown must abort it. */
+    mq_gw_h2_adapter_free(a2);
+    MQ_CHECK_EQ_INT(st2.req_aborted_calls, 1);
+
+    nghttp2_session_del(cli2);
+}
+
 /* ── Task 8: request-body UPLOAD + backpressure + reject→error mapping ───────── */
 
 /* Client-side upload data provider: streams a fixed buffer as the request body,
@@ -1149,5 +1254,6 @@ test_reject_error_mapping(void)
 MQ_TEST_MAIN(test_settings_handshake(); test_demux_header_policy();
              test_demux_embedded_nul_rejected(); test_demux_header_bomb_rejected();
              test_demux_prevalidate_reject(); test_demux_auth_bearer_dedup();
-             test_response_path_and_backpressure(); test_upload_body_delivered();
-             test_upload_backpressure_no_loss(); test_reject_error_mapping();)
+             test_response_path_and_backpressure(); test_teardown_clean_finish_no_abort();
+             test_upload_body_delivered(); test_upload_backpressure_no_loss();
+             test_reject_error_mapping();)
