@@ -1321,7 +1321,7 @@ cmd_client(int argc, char **argv)
              * to this listener; no in-band protocol is spoken toward the client.
              * open_fn/open_core are the same TCP-proxy boundary used for
              * SOCKS5 / HTTP CONNECT above. */
-            tproxy_l = mq_tproxy_listener_new(mq_runtime_base(rt), tproxy_ip, tproxy_port,
+            tproxy_l = mq_tproxy_listener_new(base, tproxy_ip, tproxy_port,
                                               tproxy_capture_mode, open_fn, open_core);
             if (!tproxy_l) {
                 MQ_LOGE("failed to bind tproxy listener on %s:%u", tproxy_ip,
