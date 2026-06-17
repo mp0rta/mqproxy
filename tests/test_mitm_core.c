@@ -438,9 +438,74 @@ test_cache_ttl_expiry(void)
     mq_mitm_core_destroy(c);
 }
 
+// Lock the SKEW freshness boundary (off-by-one). Freshness is the STRICT test
+// `now < not_after - SKEW` (SKEW = MQ_MITM_CACHE_SKEW_SEC = 30s). With ttl=120
+// (> 2*SKEW so the boundary is unambiguous), not_after = t0+120 and the boundary
+// instant is t0+90. At EXACTLY the boundary (t0+90) the entry is NOT fresh → must
+// REFORGE; one second earlier (t0+89) it is still fresh → cache HIT.
+static void
+test_cache_skew_boundary(void)
+{
+    const int SKEW = 30; // == MQ_MITM_CACHE_SKEW_SEC in mq_mitm_core.c
+    const int TTL = 120; // > 2*SKEW so not_after-SKEW is unambiguous
+
+    // --- At exactly not_after - SKEW (t0+90): boundary is NOT fresh → reforge. ---
+    {
+        mq_mitm_opts_t opts = {.cache_size = 8, .leaf_ttl_sec = TTL};
+        mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, &opts);
+        MQ_CHECK(c != NULL);
+        g_fake_now = 1000000000;
+        mq_mitm_core_set_clock_for_test(c, fake_now);
+
+        X509 *a = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+        BIGNUM *sa = leaf_serial_bn(a);
+
+        // Advance to EXACTLY not_after - SKEW (= t0 + TTL - SKEW = t0 + 90).
+        g_fake_now += TTL - SKEW;
+
+        X509 *b = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+        BIGNUM *sb = leaf_serial_bn(b);
+
+        MQ_CHECK(BN_cmp(sa, sb) != 0); // boundary not fresh → reforged → new serial
+
+        BN_free(sa);
+        BN_free(sb);
+        X509_free(a);
+        X509_free(b);
+        mq_mitm_core_destroy(c);
+    }
+
+    // --- One second before the boundary (t0+89): still fresh → cache HIT. ---
+    {
+        mq_mitm_opts_t opts = {.cache_size = 8, .leaf_ttl_sec = TTL};
+        mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, &opts);
+        MQ_CHECK(c != NULL);
+        g_fake_now = 1000000000;
+        mq_mitm_core_set_clock_for_test(c, fake_now);
+
+        X509 *a = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+        BIGNUM *sa = leaf_serial_bn(a);
+
+        // Advance to one second BEFORE the boundary (t0 + 89).
+        g_fake_now += TTL - SKEW - 1;
+
+        X509 *b = mq_mitm_cache_get_or_forge_for_test(c, "host.example.com");
+        BIGNUM *sb = leaf_serial_bn(b);
+
+        MQ_CHECK(BN_cmp(sa, sb) == 0); // still fresh → cache hit → same serial
+
+        BN_free(sa);
+        BN_free(sb);
+        X509_free(a);
+        X509_free(b);
+        mq_mitm_core_destroy(c);
+    }
+}
+
 MQ_TEST_MAIN(test_sni_norm(); test_create_valid(); test_reject_non_ca();
              test_reject_key_mismatch(); test_reject_encrypted_key();
              test_reject_symlink_key(); test_reject_world_readable_key();
              test_forge_chains_to_ca(); test_forge_purpose_gate_is_load_bearing();
              test_cache_hit_same_serial(); test_cache_distinct_sni_distinct_serial();
-             test_cache_lru_eviction(); test_cache_disabled(); test_cache_ttl_expiry();)
+             test_cache_lru_eviction(); test_cache_disabled(); test_cache_ttl_expiry();
+             test_cache_skew_boundary();)

@@ -272,6 +272,7 @@ mq_mitm_core_create(const char *ca_cert_pem_path, const char *ca_key_pem_path,
         leaf_ttl_sec = 60;
     else if (leaf_ttl_sec > 86400 * 30)
         leaf_ttl_sec = 86400 * 30;
+    if (cache_size > 256) cache_size = 256;
     core->cache_size = cache_size;
     core->leaf_ttl_sec = leaf_ttl_sec;
 
@@ -486,7 +487,8 @@ cache_get_or_forge(mq_mitm_core_t *core, const char *norm_sni)
         if (now < e->not_after - MQ_MITM_CACHE_SKEW_SEC) {
             cache_unlink(core, e); // move to MRU
             cache_push_front(core, e);
-            X509_up_ref(e->leaf); // caller's ref; cache keeps its own
+            (void)X509_up_ref(e->leaf); // caller's ref; cache keeps its own
+                                        // (never fails in practice — internal lock)
             return e->leaf;
         }
         // Stale → evict and fall through to a fresh forge.
@@ -508,7 +510,8 @@ cache_get_or_forge(mq_mitm_core_t *core, const char *norm_sni)
         if (n < sizeof e->norm_sni) {
             memcpy(e->norm_sni, norm_sni, n + 1);
             e->leaf = leaf;
-            X509_up_ref(e->leaf); // cache-owned ref (caller keeps the original)
+            (void)X509_up_ref(e->leaf); // cache-owned ref (caller keeps the original)
+                                        // (never fails in practice — internal lock)
             e->not_after = now + core->leaf_ttl_sec;
             if (core->cache_count >= core->cache_size) cache_evict_lru(core);
             cache_push_front(core, e);
