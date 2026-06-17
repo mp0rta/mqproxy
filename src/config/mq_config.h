@@ -10,6 +10,8 @@
 #include <stdint.h>
 
 #define MQ_CONFIG_MAX_PATHS 8 /* must equal MQ_MAX_EXTRA_PATHS (cli/main.c) */
+/* must equal MQ_IGNORE_HOSTS_MAX (mitm/mq_ignore_hosts.h); kept in sync */
+#define MQ_CONFIG_MAX_IGNORE_HOSTS 256
 
 typedef struct mq_file_config_t {
     /* shared */
@@ -50,6 +52,15 @@ typedef struct mq_file_config_t {
     long tproxy_dport;    /* [Ingress] Dport — captured TCP dport (default 443) */
     int setup_redirect;   /* [Ingress] SetupRedirect (default false) */
     long tproxy_skip_uid; /* [Ingress] SkipUid (default -1 = geteuid()) */
+
+    /* client — MITM (Phase 7 Slice 3) */
+    int mitm_enabled;  /* [Mitm] Enabled */
+    char ca_cert[256]; /* [Mitm] CACert */
+    char ca_key[256];  /* [Mitm] CAKey */
+    /* [Mitm] IgnoreHosts (repeatable); 256-wide holds a normalized host,
+     * mq_ignore_hosts re-normalizes on add. */
+    char ignore_hosts[MQ_CONFIG_MAX_IGNORE_HOSTS][256];
+    int n_ignore_hosts;
 } mq_file_config_t;
 
 /* Fill cfg with the same defaults as the CLI locals. */
