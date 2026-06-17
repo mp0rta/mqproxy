@@ -522,10 +522,220 @@ test_new_ssl_is_server(void)
     mq_mitm_core_destroy(c);
 }
 
+// ---- Task 7: in-process memory-BIO handshake proof (the headline deliverable)
+// ----
+
+// Result of one in-process handshake attempt. `ok` is 1 iff BOTH sides completed
+// SSL_do_handshake; on success `alpn` holds the client-selected protocol (or "")
+// and `verify_result` is the client's SSL_get_verify_result.
+typedef struct {
+    int ok;
+    char alpn[16];
+    long verify_result;
+} hs_result_t;
+
+// Build a client SSL_CTX trusting the test CA (out-of-band, per spec — NOT relying
+// on a server-sent chain). Caller SSL_CTX_free's it.
+static SSL_CTX *
+make_client_ctx(void)
+{
+    SSL_CTX *cctx = SSL_CTX_new(TLS_client_method());
+    MQ_CHECK(cctx != NULL);
+    MQ_CHECK(SSL_CTX_load_verify_locations(cctx, MITM_CA_CRT, NULL) == 1);
+    SSL_CTX_set_verify(cctx, SSL_VERIFY_PEER, NULL);
+    return cctx;
+}
+
+// Drive a full TLS handshake with NO sockets between the module-under-test server
+// SSL (mq_mitm_core_new_ssl) and a local client SSL. `client_alpn` is the wire
+// protocol list to offer (e.g. "\x02h2"), or NULL for no ALPN extension. `sni` is
+// the host to send via SNI, or NULL for no SNI. DEADLOCK-PROOF (I3): each iteration
+// drives BOTH sides unconditionally; the bio-pair coupling moves bytes; only a
+// non-WANT_READ/WANT_WRITE error is fatal; a hard iteration cap fails (not hangs)
+// the test on a stall.
+static hs_result_t
+do_handshake(mq_mitm_core_t *core, const unsigned char *client_alpn,
+             size_t client_alpn_len, const char *sni)
+{
+    hs_result_t res = {0, "", 0};
+
+    SSL *server = mq_mitm_core_new_ssl(core);
+    MQ_CHECK(server != NULL);
+
+    SSL_CTX *cctx = make_client_ctx();
+    SSL *client = SSL_new(cctx);
+    MQ_CHECK(client != NULL);
+    SSL_set_connect_state(client);
+
+    if (client_alpn)
+        MQ_CHECK(SSL_set_alpn_protos(client, client_alpn, (unsigned)client_alpn_len) ==
+                 0);
+    if (sni) MQ_CHECK(SSL_set_tlsext_host_name(client, sni) == 1);
+
+    // Memory BIO pair: ownership of `a`/`b` transfers to each SSL on SSL_set_bio,
+    // so they are freed by SSL_free — do NOT free them separately.
+    BIO *a = NULL, *b = NULL;
+    if (BIO_new_bio_pair(&a, 65536, &b, 65536) != 1) {
+        // Allocation failed before any ownership transfer — free what we made.
+        if (a) BIO_free(a);
+        if (b) BIO_free(b);
+        SSL_free(server);
+        SSL_free(client);
+        SSL_CTX_free(cctx);
+        MQ_CHECK(0 && "BIO_new_bio_pair failed");
+        return res;
+    }
+    SSL_set_bio(server, a, a);
+    SSL_set_bio(client, b, b);
+
+    int client_done = 0, server_done = 0, fatal = 0;
+    int iters = 0;
+    for (; iters < 64 && !(client_done && server_done) && !fatal; iters++) {
+        if (!client_done) {
+            int r = SSL_do_handshake(client);
+            if (r == 1) {
+                client_done = 1;
+            } else {
+                int e = SSL_get_error(client, r);
+                if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) fatal = 1;
+            }
+        }
+        if (!server_done) {
+            int r = SSL_do_handshake(server);
+            if (r == 1) {
+                server_done = 1;
+            } else {
+                int e = SSL_get_error(server, r);
+                if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) fatal = 1;
+            }
+        }
+    }
+    MQ_CHECK(iters < 64); // a stall FAILS the test instead of hanging CI
+
+    if (client_done && server_done) {
+        res.ok = 1;
+        res.verify_result = SSL_get_verify_result(client);
+        const unsigned char *p = NULL;
+        unsigned plen = 0;
+        SSL_get0_alpn_selected(client, &p, &plen); // non-owning
+        if (p && plen > 0 && plen < sizeof res.alpn) {
+            memcpy(res.alpn, p, plen);
+            res.alpn[plen] = '\0';
+        }
+    }
+
+    SSL_free(server); // frees BIO a
+    SSL_free(client); // frees BIO b
+    SSL_CTX_free(cctx);
+    return res;
+}
+
+// Positive case: client offers h2 + valid SNI → handshake completes, verify ok,
+// ALPN == "h2", and the presented leaf chains to the CA with SAN == the SNI.
+static void
+test_handshake_positive_h2(void)
+{
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, NULL);
+    MQ_CHECK(c != NULL);
+
+    static const unsigned char ALPN_H2[] = {2, 'h', '2'};
+    hs_result_t r = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "host.example.com");
+
+    MQ_CHECK(r.ok == 1);
+    MQ_CHECK(r.verify_result == X509_V_OK);
+    MQ_CHECK(strcmp(r.alpn, "h2") == 0);
+
+    // The leaf the server presented must independently verify against the CA and
+    // carry SAN DNS == the requested SNI. Re-run a fresh handshake just to capture
+    // the peer cert (do_handshake frees the client SSL), via a direct client here.
+    {
+        SSL *server = mq_mitm_core_new_ssl(c);
+        MQ_CHECK(server != NULL);
+        SSL_CTX *cctx = make_client_ctx();
+        SSL *client = SSL_new(cctx);
+        MQ_CHECK(client != NULL);
+        SSL_set_connect_state(client);
+        static const unsigned char A2[] = {2, 'h', '2'};
+        MQ_CHECK(SSL_set_alpn_protos(client, A2, sizeof A2) == 0);
+        MQ_CHECK(SSL_set_tlsext_host_name(client, "host.example.com") == 1);
+        BIO *a = NULL, *bb = NULL;
+        MQ_CHECK(BIO_new_bio_pair(&a, 65536, &bb, 65536) == 1);
+        SSL_set_bio(server, a, a);
+        SSL_set_bio(client, bb, bb);
+        int cd = 0, sd = 0, it = 0;
+        for (; it < 64 && !(cd && sd); it++) {
+            if (!cd && SSL_do_handshake(client) == 1) cd = 1;
+            if (!sd && SSL_do_handshake(server) == 1) sd = 1;
+        }
+        MQ_CHECK(cd && sd);
+
+        X509 *peer = SSL_get_peer_certificate(client); // NEW ref → X509_free
+        MQ_CHECK(peer != NULL);
+        int err = 0;
+        MQ_CHECK(verify_leaf_with_ca(peer, &err) == 1);
+        char san[256];
+        MQ_CHECK(leaf_san_dns(peer, san, sizeof san) == 0);
+        MQ_CHECK(strcmp(san, "host.example.com") == 0);
+        X509_free(peer);
+
+        SSL_free(server);
+        SSL_free(client);
+        SSL_CTX_free(cctx);
+    }
+
+    mq_mitm_core_destroy(c);
+}
+
+// ALPN negatives: client offering ONLY http/1.1, or NO ALPN at all → the server's
+// no-ALPN guard / h2-only selector rejects → handshake FAILS.
+static void
+test_handshake_alpn_negatives(void)
+{
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, NULL);
+    MQ_CHECK(c != NULL);
+
+    static const unsigned char ALPN_H1[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    hs_result_t only_h1 = do_handshake(c, ALPN_H1, sizeof ALPN_H1, "host.example.com");
+    MQ_CHECK(only_h1.ok == 0); // no h2 overlap → ALPN alert fatal
+
+    hs_result_t no_alpn = do_handshake(c, NULL, 0, "host.example.com");
+    MQ_CHECK(no_alpn.ok == 0); // no-ALPN guard → select_cert_error
+
+    mq_mitm_core_destroy(c);
+}
+
+// SNI negatives (M5 — exercised THROUGH the live select_cert callback, not just the
+// Task 3 pure fn): no SNI, IP-literal, wildcard, control-char → all rejected by the
+// normalizer inside select_cb → handshake FAILS.
+static void
+test_handshake_sni_negatives(void)
+{
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, NULL);
+    MQ_CHECK(c != NULL);
+
+    static const unsigned char ALPN_H2[] = {2, 'h', '2'};
+
+    hs_result_t no_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, NULL);
+    MQ_CHECK(no_sni.ok == 0); // no SNI → normalize fails
+
+    hs_result_t ip_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "203.0.113.5");
+    MQ_CHECK(ip_sni.ok == 0); // IP literal rejected
+
+    hs_result_t wild_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "*.example.com");
+    MQ_CHECK(wild_sni.ok == 0); // wildcard rejected
+
+    hs_result_t ctrl_sni = do_handshake(c, ALPN_H2, sizeof ALPN_H2, "a\tb.com");
+    MQ_CHECK(ctrl_sni.ok == 0); // control char rejected
+
+    mq_mitm_core_destroy(c);
+}
+
 MQ_TEST_MAIN(test_sni_norm(); test_create_valid(); test_reject_non_ca();
              test_reject_key_mismatch(); test_reject_encrypted_key();
              test_reject_symlink_key(); test_reject_world_readable_key();
              test_forge_chains_to_ca(); test_forge_purpose_gate_is_load_bearing();
              test_cache_hit_same_serial(); test_cache_distinct_sni_distinct_serial();
              test_cache_lru_eviction(); test_cache_disabled(); test_cache_ttl_expiry();
-             test_cache_skew_boundary(); test_new_ssl_is_server();)
+             test_cache_skew_boundary(); test_new_ssl_is_server();
+             test_handshake_positive_h2(); test_handshake_alpn_negatives();
+             test_handshake_sni_negatives();)
