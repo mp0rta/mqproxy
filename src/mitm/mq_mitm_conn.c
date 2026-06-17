@@ -9,6 +9,22 @@
 //      8 KiB buffer, parse as a TLS ClientHello (mq_clienthello), under a
 //      complete-ClientHello deadline. Any malformed/oversized/slow input
 //      HARD-FAILS closed. (Task 10.)
+//
+// ── deadline_ev LIFECYCLE (M-5 / codex-3) ────────────────────────────────────
+// One reusable one-shot timer field (deadline_ev) bounds the two pre-LIVE phases,
+// each with its OWN fresh budget so a slow drain cannot eat the handshake's clock:
+//   (a) DRAIN deadline   : armed at accept (mq_mitm_conn_open), bounds the
+//                          ClientHello drain. Fires → conn_close.
+//   (b) HANDSHAKE deadline: RE-ARMED FRESH at the drain→handshake bridge
+//                          (mitm_handshake_begin), bounds the MITM TLS handshake.
+//                          A genuinely slow drain (e.g. 4 s) MUST NOT subtract from
+//                          the handshake budget, so the timer is re-armed from zero
+//                          rather than left running. Both (a) and (b) are HARD
+//                          deadlines: NOT reset on I/O progress (that would let a
+//                          dribbling slow-loris handshake stay alive forever).
+//   then LIVE idle timer : on handshake SUCCESS deadline_ev is cancelled and the
+//                          SEPARATE idle_ev (re-armed on activity) takes over.
+// deadline_ev is freed in conn_free_events on EVERY teardown path (UAF safety).
 //   2. DECIDE: normalize the SNI, ask mq_ignore_hosts.
 //        HIT  → OPAQUE: hand the drained bytes + ORIGINAL orig-dst to the relay.
 //        MISS → MITM: terminate TLS with a forged per-SNI leaf, bridge H2 onto
@@ -80,10 +96,14 @@
 // itself reports MQ_CH_INVALID past 8 KiB, so this is the hard ceiling.
 #define MQ_MITM_CH_BUF_MAX 8192
 
-// Complete-ClientHello deadline. A genuine ClientHello arrives within one
-// round-trip of the TCP handshake; 5s is generous for high-latency/lossy links
-// yet bounds a slow-loris that dribbles bytes (or sends none) to keep the fd +
-// its event/timer pinned forever.
+// Pre-LIVE HARD deadline (seconds). Used TWICE, each time with a fresh budget
+// (see the deadline_ev lifecycle note in the file header): once for the DRAIN
+// (complete-ClientHello) phase, then re-armed for the MITM TLS HANDSHAKE phase.
+// A genuine ClientHello arrives within one round-trip; the handshake is one more
+// flight. 5s per phase is generous for high-latency/lossy links yet bounds a
+// slow-loris that dribbles bytes (or sends none) to keep the fd + its event/timer
+// pinned forever. Re-arming (not sharing one clock) means a slow drain cannot kill
+// an otherwise-valid handshake mid-flight.
 #define MQ_MITM_CH_DEADLINE_SEC 5
 
 // LIVE-phase idle timeout (H-1). Once the (cheap) h2 handshake completes the
@@ -147,7 +167,8 @@ struct mq_mitm_conn {
     int local_fd;              // OWNED (closed on teardown)
     struct event *read_ev;     // EV_READ|EV_PERSIST on local_fd
     struct event *write_ev;    // EV_WRITE (one-shot, re-armed when send() blocks)
-    struct event *deadline_ev; // one-shot complete-ClientHello (DRAIN) timer
+    struct event *deadline_ev; // one-shot HARD deadline: bounds DRAIN, then
+                               // RE-ARMED FRESH to bound the HANDSHAKE (M-5/codex-3)
     struct event *idle_ev;     // LIVE-phase idle timer (H-1; re-armed on I/O)
 
     // Original recovered orig-dst params (forwarded UNCHANGED on the opaque path).
@@ -426,7 +447,9 @@ drive_handshake(struct mq_mitm_conn *c)
         return -1;
     }
 
-    // Cancel the ClientHello deadline (M-5): the handshake is done.
+    // Cancel the (re-armed handshake) deadline (M-5): the handshake is done. The
+    // LIVE idle timer (idle_ev) takes over below. See the deadline_ev lifecycle
+    // note in the file header.
     if (c->deadline_ev) {
         event_free(c->deadline_ev);
         c->deadline_ev = NULL;
@@ -691,6 +714,23 @@ mitm_handshake_begin(struct mq_mitm_conn *c)
     }
 
     c->phase = MQ_MITM_PHASE_HANDSHAKE;
+
+    // RE-ARM the deadline FRESH for the handshake phase (M-5 / codex-3). The same
+    // deadline_ev bounded the DRAIN; evtimer_add on a pending one-shot RESETS its
+    // expiry, so the handshake gets a full MQ_MITM_CH_DEADLINE_SEC budget that does
+    // NOT inherit however long the drain already burned. Still a HARD deadline: it
+    // is deliberately NOT re-armed on handshake I/O progress (that would let a
+    // dribbling slow-loris handshake live forever) — unlike the LIVE idle timer.
+    // On handshake SUCCESS drive_handshake cancels this and arms idle_ev instead.
+    // deadline_ev stays freed by conn_free_events on every teardown path (UAF safe).
+    if (c->deadline_ev) {
+        struct timeval dl = {.tv_sec = MQ_MITM_CH_DEADLINE_SEC, .tv_usec = 0};
+        if (evtimer_add(c->deadline_ev, &dl) != 0) {
+            MQ_LOGW("mq_mitm_conn: failed to re-arm handshake deadline — hard-fail");
+            return -1;
+        }
+    }
+
     return drive_handshake(c);
 }
 

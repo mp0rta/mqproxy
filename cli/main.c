@@ -1516,8 +1516,10 @@ cmd_client(int argc, char **argv)
                     MQ_LOGW("mitm: skipping invalid/rejected ignore-host entry '%s'",
                             cli_ignore_hosts[i]);
             }
-            mq_mitm_opts_t opts = {.cache_size = 256, .leaf_ttl_sec = 86400};
-            core = mq_mitm_core_create(ca_cert, ca_key, &opts);
+            /* NULL opts → the core applies (and clamps) its documented defaults
+             * (cache_size=256, leaf_ttl_sec=86400). Single source of truth — do
+             * not duplicate those constants here (F-1). */
+            core = mq_mitm_core_create(ca_cert, ca_key, NULL);
             if (!core) {
                 MQ_LOGE("mitm: failed to load CA from --ca-cert/--ca-key");
                 goto out;
