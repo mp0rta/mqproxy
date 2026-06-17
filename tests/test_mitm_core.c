@@ -3,13 +3,82 @@
 #include "mqtest.h"
 #include "mitm/mq_mitm_core.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 static void
-test_spike_links(void)
+test_create_valid(void)
 {
-    // create() returns NULL in the skeleton; this only proves the module + the
-    // BoringSSL archives link. Real behavior is asserted in later tasks.
-    mq_mitm_core_t *c = mq_mitm_core_create("/nonexistent.crt", "/nonexistent.key", NULL);
-    MQ_CHECK(c == NULL);
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, NULL);
+    MQ_CHECK(c != NULL);
+    mq_mitm_core_destroy(c);
 }
 
-MQ_TEST_MAIN(test_spike_links();)
+static void
+test_reject_non_ca(void)
+{
+    // matched CA:FALSE leaf pair → rejected for exactly one reason: not a CA
+    MQ_CHECK(mq_mitm_core_create(MITM_LEAF_CRT, MITM_LEAF_KEY, NULL) == NULL);
+}
+
+static void
+test_reject_key_mismatch(void)
+{
+    // valid P-256 CA cert + a DIFFERENT same-curve (P-256) key → exercises the
+    // real X509_check_private_key mismatch path (not an algorithm shortcut).
+    // chmod 0600 defensively (MINOR-2) so the perms gate doesn't pre-empt the
+    // mismatch path and falsely green this case.
+    chmod(MITM_LEAF_KEY, 0600);
+    MQ_CHECK(mq_mitm_core_create(MITM_CA_CRT, MITM_LEAF_KEY, NULL) == NULL);
+}
+
+static void
+test_reject_encrypted_key(void)
+{
+    // MINOR-2: the perms gate rejects group/other access BEFORE PEM parsing, so the
+    // encrypted-PEM path only gets exercised when the fixture is owner-only. openssl
+    // emits key files 0600 regardless of umask, but chmod defensively so a future
+    // umask/tooling change can't silently turn this into a perms-rejection false pass.
+    chmod(MITM_CA_ENC_KEY, 0600);
+    MQ_CHECK(mq_mitm_core_create(MITM_CA_CRT, MITM_CA_ENC_KEY, NULL) == NULL);
+}
+
+static void
+test_reject_symlink_key(void)
+{
+    char link[] = "/tmp/mq_mitm_link_XXXXXX";
+    int fd = mkstemp(link);
+    MQ_CHECK(fd >= 0);
+    close(fd);
+    unlink(link);
+    MQ_CHECK(symlink(MITM_CA_KEY, link) == 0);
+    MQ_CHECK(mq_mitm_core_create(MITM_CA_CRT, link, NULL) == NULL); // O_NOFOLLOW rejects
+    unlink(link);
+}
+
+static void
+test_reject_world_readable_key(void)
+{
+    // copy CA key to a 0644 temp file → fstat perms check must reject
+    char path[] = "/tmp/mq_mitm_key_XXXXXX";
+    int fd = mkstemp(path);
+    MQ_CHECK(fd >= 0);
+    FILE *src = fopen(MITM_CA_KEY, "rb");
+    MQ_CHECK(src != NULL);
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, src)) > 0)
+        MQ_CHECK(write(fd, buf, n) == (ssize_t)n);
+    fclose(src);
+    close(fd);
+    MQ_CHECK(chmod(path, 0644) == 0);
+    MQ_CHECK(mq_mitm_core_create(MITM_CA_CRT, path, NULL) == NULL);
+    unlink(path);
+}
+
+MQ_TEST_MAIN(test_create_valid(); test_reject_non_ca(); test_reject_key_mismatch();
+             test_reject_encrypted_key(); test_reject_symlink_key();
+             test_reject_world_readable_key();)

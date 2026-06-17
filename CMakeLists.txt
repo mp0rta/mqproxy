@@ -273,6 +273,62 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         endif()
     endif()
 
+    # MITM CA + negative fixtures (test-only; regenerated if missing).
+    # NOTE (rev2/C1): do NOT reuse tests/certs/test.crt as the non-CA negative —
+    # it is actually CA:TRUE. We mint a dedicated CA:FALSE leaf below.
+    set(MQ_MITM_CA_CRT     "${MQ_CERT_DIR}/mitm-ca.crt")
+    set(MQ_MITM_CA_KEY     "${MQ_CERT_DIR}/mitm-ca.key")
+    set(MQ_MITM_CA_ENC_KEY "${MQ_CERT_DIR}/mitm-ca.enc.key") # encrypted (must be rejected)
+    set(MQ_MITM_LEAF_CRT   "${MQ_CERT_DIR}/mitm-leaf.crt")   # CA:FALSE → non-CA negative
+    set(MQ_MITM_LEAF_KEY   "${MQ_CERT_DIR}/mitm-leaf.key")   # P-256, ≠ CA key → mismatch negative
+    if(NOT EXISTS "${MQ_MITM_CA_CRT}" OR NOT EXISTS "${MQ_MITM_CA_KEY}"
+       OR NOT EXISTS "${MQ_MITM_CA_ENC_KEY}"
+       OR NOT EXISTS "${MQ_MITM_LEAF_CRT}" OR NOT EXISTS "${MQ_MITM_LEAF_KEY}")
+        find_program(OPENSSL_BIN openssl REQUIRED)
+        file(MAKE_DIRECTORY "${MQ_CERT_DIR}")
+        message(STATUS "Generating MITM CA/leaf fixtures in ${MQ_CERT_DIR}")
+        # P-256 CA with basicConstraints CA:TRUE + keyUsage keyCertSign.
+        execute_process(
+            COMMAND ${OPENSSL_BIN} ecparam -name prime256v1 -genkey -noout -out "${MQ_MITM_CA_KEY}"
+            RESULT_VARIABLE _rc1 OUTPUT_QUIET ERROR_QUIET)
+        execute_process(
+            COMMAND ${OPENSSL_BIN} req -x509 -new -key "${MQ_MITM_CA_KEY}"
+                    -out "${MQ_MITM_CA_CRT}" -days 3650 -subj "/CN=mqproxy-mitm-test-ca"
+                    -addext "basicConstraints=critical,CA:TRUE"
+                    -addext "keyUsage=critical,keyCertSign,cRLSign"
+            RESULT_VARIABLE _rc2 OUTPUT_QUIET ERROR_QUIET)
+        # Encrypted copy of the CA key (passphrase "x") — create() must reject it.
+        execute_process(
+            COMMAND ${OPENSSL_BIN} ec -in "${MQ_MITM_CA_KEY}" -aes256 -passout pass:x
+                    -out "${MQ_MITM_CA_ENC_KEY}"
+            RESULT_VARIABLE _rc3 OUTPUT_QUIET ERROR_QUIET)
+        # P-256 leaf with CA:FALSE (matched key) — the ONLY rejection reason is CA:FALSE.
+        execute_process(
+            COMMAND ${OPENSSL_BIN} ecparam -name prime256v1 -genkey -noout -out "${MQ_MITM_LEAF_KEY}"
+            RESULT_VARIABLE _rc4 OUTPUT_QUIET ERROR_QUIET)
+        execute_process(
+            COMMAND ${OPENSSL_BIN} req -x509 -new -key "${MQ_MITM_LEAF_KEY}"
+                    -out "${MQ_MITM_LEAF_CRT}" -days 3650 -subj "/CN=mqproxy-mitm-test-leaf"
+                    -addext "basicConstraints=critical,CA:FALSE"
+            RESULT_VARIABLE _rc5 OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _rc1 EQUAL 0 OR NOT _rc2 EQUAL 0 OR NOT _rc3 EQUAL 0
+           OR NOT _rc4 EQUAL 0 OR NOT _rc5 EQUAL 0)
+            message(FATAL_ERROR "openssl failed generating MITM CA/leaf fixtures")
+        endif()
+    endif()
+
+    # Pass the fixture paths to the MITM unit suite (target created above, gated on
+    # the BoringSSL archives). The fixtures are defined here (after MQ_CERT_DIR), so
+    # we attach the compile defs here rather than at the target block.
+    if(MQ_HAVE_BORINGSSL_ARCHIVES)
+        target_compile_definitions(test_mitm_core PRIVATE
+            MITM_CA_CRT="${MQ_MITM_CA_CRT}"
+            MITM_CA_KEY="${MQ_MITM_CA_KEY}"
+            MITM_CA_ENC_KEY="${MQ_MITM_CA_ENC_KEY}"
+            MITM_LEAF_CRT="${MQ_MITM_LEAF_CRT}"   # CA:FALSE matched pair → non-CA negative
+            MITM_LEAF_KEY="${MQ_MITM_LEAF_KEY}")  # P-256 ≠ CA key → mismatch negative
+    endif()
+
     add_executable(test_conn_handshake tests/integration/test_conn_handshake.c)
     target_link_libraries(test_conn_handshake
         mqproxy
