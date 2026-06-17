@@ -298,8 +298,47 @@ test_long_sni_rejected(void)
     MQ_CHECK_EQ_INT(out.has_h2, 1);
 }
 
+static void
+test_len_over_cap_rejected(void)
+{
+    // Top-level DoS guard: any buffer larger than the 8 KiB cap is rejected
+    // outright (INVALID), before any record parsing — len == 8193 is one over.
+    // The record header declares a fragment far larger than the buffer, so
+    // WITHOUT the top-level cap this would parse to NEED_MORE; the cap must
+    // turn it into INVALID. First byte is a valid handshake type (not NOT_TLS).
+    static uint8_t big[8193];
+    memset(big, 0x00, sizeof(big));
+    big[0] = 0x16; // handshake content type
+    big[1] = 0x03; // legacy_version high
+    big[2] = 0x01; // legacy_version low
+    big[3] = 0xff; // fragment length high (0xffff >> len)
+    big[4] = 0xff; // fragment length low
+    mq_clienthello_t out;
+    mq_ch_result_t r = mq_clienthello_parse(big, sizeof(big), &out);
+    MQ_CHECK_EQ_INT(r, MQ_CH_INVALID);
+}
+
+static void
+test_record_frag_over_cap_rejected(void)
+{
+    // A valid 5-byte record header whose declared fragment length makes
+    // 5 + frag_len > 8192, with only the header actually present. The cap
+    // rejects (INVALID) BEFORE reassembly — it must NOT degrade to NEED_MORE.
+    // frag_len = 8188 → 5 + 8188 = 8193 > 8192.
+    uint8_t hdr[5];
+    hdr[0] = 0x16;                   // handshake
+    hdr[1] = 0x03;                   // legacy_version high
+    hdr[2] = 0x01;                   // legacy_version low
+    hdr[3] = (uint8_t)(8188 >> 8);   // frag_len high
+    hdr[4] = (uint8_t)(8188 & 0xff); // frag_len low
+    mq_clienthello_t out;
+    mq_ch_result_t r = mq_clienthello_parse(hdr, sizeof(hdr), &out);
+    MQ_CHECK_EQ_INT(r, MQ_CH_INVALID);
+}
+
 MQ_TEST_MAIN(test_good_sni_and_h2(); test_alpn_without_h2(); test_sni_absent();
              test_no_alpn(); test_truncated_prefix(); test_empty(); test_not_tls();
              test_sslv2_garbage(); test_handshake_not_clienthello();
              test_ext_length_overflow(); test_inner_ext_overruns_complete_block();
-             test_long_sni_rejected();)
+             test_long_sni_rejected(); test_len_over_cap_rejected();
+             test_record_frag_over_cap_rejected();)

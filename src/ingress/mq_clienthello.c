@@ -197,7 +197,12 @@ mq_clienthello_parse(const uint8_t *buf, size_t len, mq_clienthello_t *out)
                 size_t list_end = e.pos + list_len;
                 if (list_end <= ext_end) {
                     e.limit = list_end;
-                    /* Take the first host_name (type 0) entry. */
+                    /* Take the first host_name (type 0) entry. Inner
+                     * malformations here are NON-FATAL: the enclosing
+                     * server_name extension framing is already length-validated
+                     * (ext_len / list_end bounded above), so a truncated sub-
+                     * field degrades to empty-SNI rather than rejecting the
+                     * whole flow. Hence `break` (leave sni empty), not return. */
                     while (e.pos < e.limit) {
                         if (!cur_have(&e, 1)) {
                             break;
@@ -232,6 +237,10 @@ mq_clienthello_parse(const uint8_t *buf, size_t len, mq_clienthello_t *out)
                 size_t list_end = e.pos + list_len;
                 if (list_end <= ext_end) {
                     e.limit = list_end;
+                    /* As with SNI above, inner malformations are NON-FATAL: the
+                     * ALPN extension framing is already length-validated, so a
+                     * truncated protocol-name sub-field degrades to no-h2 rather
+                     * than rejecting the whole flow. Hence `break`, not return. */
                     while (e.pos < e.limit) {
                         if (!cur_have(&e, 1)) {
                             break;
