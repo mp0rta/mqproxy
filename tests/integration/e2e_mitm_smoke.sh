@@ -131,7 +131,6 @@ fi
 # -alpn h2          offer only h2 (the helper's selector must pick it)
 # -servername       SNI → the helper forges a leaf with this in the SAN
 # -CAfile           trust the MITM CA → "Verify return code: 0 (ok)" iff chain OK
-# -verify_return_error makes a chain failure show in the exit too (defensive)
 # Bounded by `timeout` so a hung handshake fails fast instead of hanging CI.
 SCLIENT_OUT="${WORK}/sclient.out"
 note "running openssl s_client to 127.0.0.1:${PORT} (SNI=host.example.com, alpn=h2) ..."

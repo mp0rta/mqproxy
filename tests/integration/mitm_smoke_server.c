@@ -97,7 +97,7 @@ main(int argc, char **argv)
         fprintf(stderr, "mitm_smoke_server: SSL_set_fd failed\n");
         goto out;
     }
-    cfd = -1; /* the SSL's BIO now owns the fd and will close it on SSL_free */
+    /* BoringSSL SSL_set_fd uses BIO_NOCLOSE: caller retains fd ownership. */
 
     if (SSL_accept(ssl) != 1) {
         fprintf(stderr, "mitm_smoke_server: SSL_accept failed\n");
@@ -115,8 +115,8 @@ main(int argc, char **argv)
     rc = 0; /* success */
 
 out:
-    if (ssl) SSL_free(ssl);   /* frees the BIO and closes the fd it owns */
-    if (cfd >= 0) close(cfd); /* only set when the fd was never handed to SSL */
+    if (ssl) SSL_free(ssl);   /* BIO_NOCLOSE: does NOT close the accepted fd */
+    if (cfd >= 0) close(cfd); /* sole owner of the accepted fd: close exactly once */
     if (lfd >= 0) close(lfd);
     mq_mitm_core_destroy(core);
     return rc;
