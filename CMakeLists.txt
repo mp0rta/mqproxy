@@ -56,11 +56,20 @@ add_library(mqproxy STATIC
     src/transport/mq_stream.c
     src/transport/mq_transport.c
     src/runtime/mq_runtime_libevent.c
-    src/mitm/mq_mitm_core.c
     src/mitm/mq_ignore_hosts.c)
 target_link_libraries(mqproxy PUBLIC CURL::libcurl)
-target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR}
-    ${MQPROXY_BORINGSSL_INCLUDE_DIR})
+target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+
+# Fail-closed MITM gate (Slice 3 Task 3, codex H7): mq_mitm_core.c #includes
+# BoringSSL headers (openssl/bytestring.h etc.) that exist only with the static
+# archives. Compile it — and its BoringSSL include dir — into the library ONLY
+# when the archives are present (MQPROXY_MITM). A no-archive build therefore
+# pulls NO MITM source and the whole tree (library + mqproxy_cli) builds/links
+# cleanly; `--mitm` then errors at startup via the MQ_MITM_AVAILABLE=0 guard.
+if(MQPROXY_MITM)
+    target_sources(mqproxy PRIVATE src/mitm/mq_mitm_core.c)
+    target_include_directories(mqproxy PUBLIC ${MQPROXY_BORINGSSL_INCLUDE_DIR})
+endif()
 
 enable_testing()
 add_executable(test_smoke tests/test_smoke.c)
@@ -155,20 +164,9 @@ add_test(NAME test_ignore_hosts COMMAND test_ignore_hosts)
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # ---- Phase 7 Slice 2: MITM crypto core unit suite ----
     # Needs the BoringSSL static archives libxquic was built against (SSL_*/X509_*).
+    # The mq_boringssl INTERFACE target is defined in cmake/BuildSetup.cmake
+    # (hoisted out of this test-only block so mqproxy_cli can also consume it).
     if(MQ_HAVE_BORINGSSL_ARCHIVES)
-        # Single source of truth for the BoringSSL static-link recipe (archive
-        # ORDER matters: libssl.a before libcrypto.a) + the matching include dir.
-        # Both MITM test targets link mqproxy + this — NO xquic: the MITM core is
-        # sans-io / BoringSSL-only and references no xqc_* symbols, so the static
-        # archive pulls no xquic-dependent objects. Keep it xquic-free.
-        add_library(mq_boringssl INTERFACE)
-        target_link_libraries(mq_boringssl INTERFACE
-            "${MQPROXY_BORINGSSL_DIR}/libssl.a"
-            "${MQPROXY_BORINGSSL_DIR}/libcrypto.a"
-            pthread dl m stdc++)
-        target_include_directories(mq_boringssl INTERFACE
-            ${MQPROXY_BORINGSSL_INCLUDE_DIR})
-
         add_executable(test_mitm_core tests/test_mitm_core.c)
         target_link_libraries(test_mitm_core mqproxy mq_boringssl)
         target_include_directories(test_mitm_core PRIVATE tests src)
@@ -703,6 +701,10 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
                 "via scripts/build-xquic.sh or set -DMQPROXY_BORINGSSL_DIR=<dir>.")
         endif()
         # Link order: xquic-static references BoringSSL symbols, so the archives follow it.
+        # NOTE: the raw archives (not mq_boringssl) are linked here because they must
+        # appear AFTER xquic-static to satisfy its undefined BoringSSL QUIC symbols;
+        # the MITM core's SSL_*/X509_* resolve against the very same objects. Symbol
+        # isolation (--exclude-libs) is applied below for both branches.
         target_link_libraries(mqproxy_cli
             mqproxy
             xquic-static
@@ -711,13 +713,51 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             ${EVENT_EXTRA_LIB}
             pthread dl m stdc++)
     else()
+        # Dynamic build: libxquic.so bakes its BoringSSL in internally, so the exe
+        # has no BoringSSL objects today. Link mq_boringssl so the MITM core's
+        # SSL_*/X509_* can resolve once a caller references them (Task 13). When the
+        # archives are absent, mq_boringssl does not exist and MITM is compiled out
+        # (MQ_MITM_AVAILABLE=0 below), so nothing references BoringSSL → clean link.
         target_link_libraries(mqproxy_cli
             mqproxy
             xquic
             ${EVENT_CORE_LIB}
             ${EVENT_EXTRA_LIB}
             pthread dl m stdc++)
+        if(MQ_HAVE_BORINGSSL_ARCHIVES)
+            target_link_libraries(mqproxy_cli mq_boringssl)
+        endif()
         set_target_properties(mqproxy_cli PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    endif()
+
+    # ---- MITM availability + BoringSSL symbol isolation (Slice 3 Task 3) -------
+    # MQ_MITM_AVAILABLE is the fail-closed gate: the live MITM path is compiled in
+    # ONLY when the BoringSSL archives are present. All MITM references in cli/main.c
+    # must be wrapped in `#if MQ_MITM_AVAILABLE` (added in Task 13) so a no-archive
+    # build pulls NO MITM symbols and therefore LINKS — a runtime branch alone would
+    # fail at link time. When unavailable, `--mitm` errors at startup and exits != 0.
+    # MQPROXY_MITM (CMake var, set in BuildSetup.cmake) gates whether the live MITM
+    # path is compiled in; MQ_MITM_AVAILABLE is the matching C compile-definition.
+    if(MQPROXY_MITM)
+        target_compile_definitions(mqproxy_cli PRIVATE MQ_MITM_AVAILABLE=1)
+        # Task 10/13: add src/mitm/mq_mitm_conn.c to mqproxy_cli sources here (this
+        # block is already gated on MQPROXY_MITM; the file does not exist yet —
+        # Task 10 creates it):
+        #   target_sources(mqproxy_cli PRIVATE src/mitm/mq_mitm_conn.c)
+        #
+        # Isolate the BoringSSL the MITM core links against so its SSL_*/X509_*/EVP_*
+        # cannot interpose libcurl's system OpenSSL (libssl.so) at runtime. Both the
+        # static branch (raw archives) and the dynamic branch (mq_boringssl) pull
+        # libssl.a/libcrypto.a by name, so --exclude-libs by archive base-name hides
+        # all their global symbols (makes them link-local). GNU ld + lld (Linux) only;
+        # applied to mqproxy_cli ONLY — the test targets MAY export (they link
+        # mq_boringssl directly without this flag). Verified by ctest
+        # check_boringssl_isolation.
+        target_link_options(mqproxy_cli PRIVATE
+            -Wl,--exclude-libs,libssl.a
+            -Wl,--exclude-libs,libcrypto.a)
+    else()
+        target_compile_definitions(mqproxy_cli PRIVATE MQ_MITM_AVAILABLE=0)
     endif()
     target_include_directories(mqproxy_cli PRIVATE src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
@@ -732,6 +772,18 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     add_test(NAME test_cli_help
         COMMAND ${CMAKE_COMMAND} -E env
             sh ${CMAKE_SOURCE_DIR}/tests/test_cli_help.sh $<TARGET_FILE:mqproxy_cli>)
+
+    # ---- BoringSSL symbol-isolation gate (Slice 3 Task 3) ----
+    # Asserts the BoringSSL the MITM core links against is NOT exported from the
+    # mqproxy exe (cannot interpose libcurl's system OpenSSL), no undefined SSL_*
+    # remains, and libcurl still dynamically needs libssl.so. Gated on the archives
+    # since --exclude-libs / the MITM link only apply then. See the script header
+    # for why the checks tolerate symbol ABSENCE (static vs dynamic build).
+    if(MQ_HAVE_BORINGSSL_ARCHIVES)
+        add_test(NAME check_boringssl_isolation
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tests/integration/check_boringssl_isolation.sh
+                $<TARGET_FILE:mqproxy_cli>)
+    endif()
 
     # ---- 1-B multipath aggregation benchmark (design §9.2) ----
     # Self-contained bash benchmark the USER runs with sudo: it shapes two

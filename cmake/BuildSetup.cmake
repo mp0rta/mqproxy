@@ -80,6 +80,29 @@ if(EXISTS "${MQPROXY_BORINGSSL_DIR}/libssl.a" AND
     set(MQ_HAVE_BORINGSSL_ARCHIVES ON)
 endif()
 
+# Derived MITM availability flag: the live MITM L7 path (Phase 7 Slice 3) needs
+# the BoringSSL static archives the MITM core links against. Kept as its own
+# name so call sites read intent ("is MITM compiled in?") rather than re-deriving
+# the archive predicate, and so a future decoupling has one place to change.
+set(MQPROXY_MITM ${MQ_HAVE_BORINGSSL_ARCHIVES})
+
+# ---- mq_boringssl: single source of truth for the BoringSSL static-link recipe.
+# Hoisted here (out of the test-only block in CMakeLists.txt) so it exists
+# whenever the archives are present, independent of which targets consume it:
+# the MITM unit/smoke test targets AND mqproxy_cli (the live MITM path) all link
+# it. Archive ORDER matters (libssl.a before libcrypto.a). NO xquic here: the
+# MITM core is sans-io / BoringSSL-only and references no xqc_* symbols, so the
+# static archive pulls no xquic-dependent objects — keep it xquic-free.
+if(MQ_HAVE_BORINGSSL_ARCHIVES AND NOT TARGET mq_boringssl)
+    add_library(mq_boringssl INTERFACE)
+    target_link_libraries(mq_boringssl INTERFACE
+        "${MQPROXY_BORINGSSL_DIR}/libssl.a"
+        "${MQPROXY_BORINGSSL_DIR}/libcrypto.a"
+        pthread dl m stdc++)
+    target_include_directories(mq_boringssl INTERFACE
+        ${MQPROXY_BORINGSSL_INCLUDE_DIR})
+endif()
+
 # ---------- libevent ----------
 find_path(EVENT_INCLUDE_DIR event2/event.h)
 find_library(EVENT_CORE_LIB event_core)
