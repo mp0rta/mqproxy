@@ -159,6 +159,17 @@ typedef struct {
     void *sink_user;
     mq_gw_xreq_t *xreq;    /* the sentinel we returned from req_begin */
     int req_drained_calls; /* how many times the adapter called req_drained */
+
+    /* Task 8: request-body upload capture + injectable pause. */
+    uint8_t up_body[256 * 1024]; /* uploaded bytes, in delivery order */
+    size_t up_len;
+    int req_body_done_calls; /* req_body_done fired (stream end) */
+    /* When >0, req_body returns -1 (pause) ONCE after up_len reaches/exceeds this
+     * many bytes, then clears the trip so the resumed feed is accepted. Models a
+     * stalled tunnel that backpressures the browser, then drains. */
+    size_t pause_after;
+    int paused_once; /* the single pause has fired (no further pausing) */
+    int req_body_calls;
 } cap_state_t;
 
 static int
@@ -235,15 +246,27 @@ cap_req_begin(void *u, const mq_gw_req_head_t *head, const mq_gw_sink_ops_t *sin
 static int
 cap_req_body(mq_gw_xreq_t *r, const uint8_t *p, size_t len)
 {
-    (void)r;
-    (void)p;
-    (void)len;
-    return 0;
+    cap_state_t *st = (cap_state_t *)r; /* xreq sentinel == cap_state_t* */
+    st->req_body_calls++;
+    /* Capture the bytes IN ORDER (the contract: bytes are consumed even when we
+     * return -1/pause, so we always record them — never re-deliver). */
+    if (st->up_len + len <= sizeof(st->up_body)) {
+        memcpy(st->up_body + st->up_len, p, len);
+        st->up_len += len;
+    }
+    /* Injectable single pause: once the upload reaches pause_after bytes, return
+     * -1 (pause) EXACTLY once. The resumed feed must then be accepted (0). */
+    if (st->pause_after > 0 && !st->paused_once && st->up_len >= st->pause_after) {
+        st->paused_once = 1;
+        return -1; /* pause: stop feeding more body until resume_read */
+    }
+    return 0; /* accepted; keep reading */
 }
 static void
 cap_req_body_done(mq_gw_xreq_t *r)
 {
-    (void)r;
+    cap_state_t *st = (cap_state_t *)r;
+    st->req_body_done_calls++;
 }
 static void
 cap_req_drained(mq_gw_xreq_t *r)
@@ -916,7 +939,215 @@ test_response_path_and_backpressure(void)
     nghttp2_session_del(cli2);
 }
 
+/* ── Task 8: request-body UPLOAD + backpressure + reject→error mapping ───────── */
+
+/* Client-side upload data provider: streams a fixed buffer as the request body,
+ * setting END_STREAM (DATA_FLAG_EOF) on the final frame. */
+typedef struct {
+    const uint8_t *data;
+    size_t len;
+    size_t off;
+} up_src_t;
+
+static ssize_t
+up_read_cb(nghttp2_session *s, int32_t sid, uint8_t *buf, size_t length,
+           uint32_t *data_flags, nghttp2_data_source *source, void *user_data)
+{
+    (void)s;
+    (void)sid;
+    (void)user_data;
+    up_src_t *us = (up_src_t *)source->ptr;
+    size_t rem = us->len - us->off;
+    size_t n = rem < length ? rem : length;
+    memcpy(buf, us->data + us->off, n);
+    us->off += n;
+    if (us->off >= us->len) *data_flags |= NGHTTP2_DATA_FLAG_EOF; /* → END_STREAM */
+    return (ssize_t)n;
+}
+
+/* Upload happy-path: a POST with a body → the stub req_body receives the exact
+ * bytes in order, and req_body_done fires at stream end. */
+static void
+test_upload_body_delivered(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_OK;
+    resp_cli_t rc = {0};
+
+    sink_buf_t srv_out = {0};
+    mq_gw_h2_adapter_t *a = mq_gw_h2_adapter_new(&g_cap_ops, &st, adapter_send, &srv_out);
+    MQ_CHECK(a != NULL);
+    if (!a) return;
+
+    nghttp2_session_callbacks *cbs = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_callbacks_new(&cbs), 0);
+    nghttp2_session_callbacks_set_send_callback(cbs, client_send);
+    nghttp2_session *cli = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_client_new(&cli, cbs, &rc), 0);
+    nghttp2_session_callbacks_del(cbs);
+
+    nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+    MQ_CHECK_EQ_INT(nghttp2_submit_settings(cli, NGHTTP2_FLAG_NONE, iv, 1), 0);
+
+    /* A body that spans multiple DATA frames (3 * 16 KiB + a tail). */
+    static uint8_t body[3 * 16384 + 777];
+    for (size_t i = 0; i < sizeof(body); i++)
+        body[i] = (uint8_t)((i * 31u + 7u) & 0xff);
+    up_src_t us = {body, sizeof(body), 0};
+    nghttp2_data_provider prd = {.source.ptr = &us, .read_callback = up_read_cb};
+
+    const nghttp2_nv nva[] = {
+        {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":path", (uint8_t *)"/upload", 5, 7, NGHTTP2_NV_FLAG_NONE},
+    };
+    int sid = nghttp2_submit_request(cli, NULL, nva, 4, &prd, NULL);
+    MQ_CHECK(sid > 0);
+
+    shuttle(a, cli, &rc, &srv_out);
+
+    MQ_CHECK_EQ_INT(st.req_begin_calls, 1);
+    /* Exact bytes, in order. */
+    MQ_CHECK_EQ_INT((int)st.up_len, (int)sizeof(body));
+    MQ_CHECK(memcmp(st.up_body, body, sizeof(body)) == 0);
+    /* Stream end → req_body_done fired exactly once. */
+    MQ_CHECK_EQ_INT(st.req_body_done_calls, 1);
+
+    mq_gw_h2_adapter_free(a);
+    nghttp2_session_del(cli);
+}
+
+/* Upload backpressure (codex H — -1 = pause): the stub req_body returns -1 after
+ * the first chunk → the adapter pauses the inbound read (no more body delivered)
+ * and throttles the browser. The test then drives resume_read; the remaining
+ * bytes MUST be delivered and NONE lost (total received == total sent, in
+ * order). */
+static void
+test_upload_backpressure_no_loss(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_OK;
+    st.pause_after = 1; /* pause as soon as the first body byte arrives */
+    resp_cli_t rc = {0};
+
+    sink_buf_t srv_out = {0};
+    mq_gw_h2_adapter_t *a = mq_gw_h2_adapter_new(&g_cap_ops, &st, adapter_send, &srv_out);
+    MQ_CHECK(a != NULL);
+    if (!a) return;
+
+    nghttp2_session_callbacks *cbs = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_callbacks_new(&cbs), 0);
+    nghttp2_session_callbacks_set_send_callback(cbs, client_send);
+    nghttp2_session *cli = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_client_new(&cli, cbs, &rc), 0);
+    nghttp2_session_callbacks_del(cbs);
+
+    nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+    MQ_CHECK_EQ_INT(nghttp2_submit_settings(cli, NGHTTP2_FLAG_NONE, iv, 1), 0);
+
+    static uint8_t body[5 * 16384 + 123]; /* spans several DATA frames */
+    for (size_t i = 0; i < sizeof(body); i++)
+        body[i] = (uint8_t)((i * 17u + 3u) & 0xff);
+    up_src_t us = {body, sizeof(body), 0};
+    nghttp2_data_provider prd = {.source.ptr = &us, .read_callback = up_read_cb};
+
+    const nghttp2_nv nva[] = {
+        {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":path", (uint8_t *)"/upload", 5, 7, NGHTTP2_NV_FLAG_NONE},
+    };
+    int sid = nghttp2_submit_request(cli, NULL, nva, 4, &prd, NULL);
+    MQ_CHECK(sid > 0);
+
+    /* Drive until the adapter pauses. The pause stops the inbound read; the
+     * client's remaining body is held by H2 flow control. After shuttle the stub
+     * has been paused (paused_once) and req_body_done has NOT yet fired (more
+     * body outstanding). */
+    shuttle(a, cli, &rc, &srv_out);
+    MQ_CHECK_EQ_INT(st.req_begin_calls, 1);
+    MQ_CHECK_EQ_INT(st.paused_once, 1);
+    MQ_CHECK_EQ_INT(st.req_body_done_calls, 0); /* not done yet — throttled */
+    MQ_CHECK(st.up_len < sizeof(body));         /* did NOT receive it all yet */
+    size_t at_pause = st.up_len;
+
+    /* Core resumes the upload read. */
+    MQ_CHECK(st.sink != NULL);
+    st.sink->resume_read(st.sink_user);
+
+    /* Pump again: the buffered tail + the rest of the browser's body must now
+     * flow through to req_body, lossless and in order. */
+    shuttle(a, cli, &rc, &srv_out);
+
+    MQ_CHECK(st.up_len > at_pause); /* the resume actually delivered more */
+    MQ_CHECK_EQ_INT((int)st.up_len, (int)sizeof(body));    /* ALL bytes, none lost */
+    MQ_CHECK(memcmp(st.up_body, body, sizeof(body)) == 0); /* in order */
+    MQ_CHECK_EQ_INT(st.req_body_done_calls, 1);            /* stream end */
+
+    mq_gw_h2_adapter_free(a);
+    nghttp2_session_del(cli);
+}
+
+/* Reject → X-Mq-Error mapping (§5/§5.2): force MQ_GW_REJ_HEADER_TOO_LONG via the
+ * stub prevalidate → the H2 client receives a response whose x-mq-error value is
+ * byte-for-byte "header-too-long" (the adapter renders the error response). */
+static void
+test_reject_error_mapping(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_REJ_HEADER_TOO_LONG;
+    st.prevalidate_status = 400;
+    resp_cli_t rc = {0};
+
+    sink_buf_t srv_out = {0};
+    mq_gw_h2_adapter_t *a = mq_gw_h2_adapter_new(&g_cap_ops, &st, adapter_send, &srv_out);
+    MQ_CHECK(a != NULL);
+    if (!a) return;
+
+    nghttp2_session_callbacks *cbs = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_callbacks_new(&cbs), 0);
+    nghttp2_session_callbacks_set_send_callback(cbs, client_send);
+    nghttp2_session_callbacks_set_on_header_callback(cbs, resp_cli_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs,
+                                                              resp_cli_on_data_chunk);
+    nghttp2_session_callbacks_set_on_stream_close_callback(cbs, resp_cli_on_stream_close);
+    nghttp2_session *cli = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_client_new(&cli, cbs, &rc), 0);
+    nghttp2_session_callbacks_del(cbs);
+
+    nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+    MQ_CHECK_EQ_INT(nghttp2_submit_settings(cli, NGHTTP2_FLAG_NONE, iv, 1), 0);
+
+    const nghttp2_nv nva[] = {
+        {(uint8_t *)":method", (uint8_t *)"GET", 7, 3, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":path", (uint8_t *)"/", 5, 1, NGHTTP2_NV_FLAG_NONE},
+    };
+    int sid = nghttp2_submit_request(cli, NULL, nva, 4, NULL, NULL);
+    MQ_CHECK(sid > 0);
+
+    shuttle(a, cli, &rc, &srv_out);
+
+    /* prevalidate rejected → no req_begin; the adapter rendered an error
+     * RESPONSE (not a bare RST), carrying x-mq-error: header-too-long. */
+    MQ_CHECK_EQ_INT(st.req_begin_calls, 0);
+    MQ_CHECK_EQ_INT(rc.status, 400);
+    const char *xerr = resp_cli_find(&rc, "x-mq-error");
+    MQ_CHECK(xerr != NULL);
+    MQ_CHECK(xerr && strcmp(xerr, "header-too-long") == 0); /* byte-for-byte */
+    MQ_CHECK(rc.stream_closed);
+
+    mq_gw_h2_adapter_free(a);
+    nghttp2_session_del(cli);
+}
+
 MQ_TEST_MAIN(test_settings_handshake(); test_demux_header_policy();
              test_demux_embedded_nul_rejected(); test_demux_header_bomb_rejected();
              test_demux_prevalidate_reject(); test_demux_auth_bearer_dedup();
-             test_response_path_and_backpressure();)
+             test_response_path_and_backpressure(); test_upload_body_delivered();
+             test_upload_backpressure_no_loss(); test_reject_error_mapping();)

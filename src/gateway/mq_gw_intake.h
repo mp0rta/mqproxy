@@ -53,4 +53,12 @@ typedef enum {
     MQ_GW_REJ_INTERNAL,         /* 502 "internal-error" */
 } mq_gw_reject_reason_t;
 
+/* Map a reject reason → its X-Mq-Error string (byte-identical across adapters;
+ * tests/e2e assert these verbatim). Returns a borrowed, NUL-terminated literal
+ * (never NULL — an unknown reason maps to "internal-error"). Shared by every
+ * gateway adapter (H1 fetch + H2 MITM) so the rendered error strings cannot
+ * drift between protocols. Implemented in mq_gw_client.c (the enum's producer,
+ * already a compiled gateway TU). */
+const char *mq_gw_reject_xmq(mq_gw_reject_reason_t reason);
+
 #endif /* MQ_GW_INTAKE_H */

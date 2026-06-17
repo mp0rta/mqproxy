@@ -67,6 +67,17 @@
  * bound as the request side; the core's response heads are small. */
 #define MQ_H2_MAX_RESP_HDRS 256
 
+/* §5.2 inbound (upload) backpressure buffer cap. When a stream's submit->req_body
+ * returns -1 (pause), the adapter STOPS feeding nghttp2 and parks the not-yet-
+ * processed input bytes here until the core releases the pause via
+ * sink->resume_read. See the UPLOAD BACKPRESSURE block below for the full design;
+ * 256 KiB comfortably exceeds the H2 connection flow-control window (nghttp2's
+ * default 64 KiB), so under a well-behaved peer the buffer never approaches the
+ * cap before HTTP/2 flow control throttles the browser. Overflow (a peer that
+ * floods past its window) is a fatal protocol/DoS condition → tear the
+ * connection down (return -1 from recv) rather than grow memory unbounded. */
+#define MQ_H2_UPLOAD_PAUSE_CAP (256u * 1024u)
+
 /* ── adapter struct ─────────────────────────────────────────────────────────── */
 
 struct mq_h2_stream_s; /* fwd */
@@ -87,6 +98,39 @@ struct mq_gw_h2_adapter {
      * invoke on_stream_close for streams still open at teardown, so the adapter
      * tracks them and frees any survivors in mq_gw_h2_adapter_free. */
     struct mq_h2_stream_s *streams;
+
+    /* ── UPLOAD BACKPRESSURE (Task 8) — adapter-level input gate ───────────────
+     *
+     * DESIGN (approach A: nghttp2 input pause + bounded re-feed buffer):
+     *
+     * When on_data_chunk_recv hands a chunk to submit->req_body and the core
+     * returns -1 (PAUSE — the chunk IS consumed by the core; -1 only means "stop
+     * feeding me more", per the mq_gw_intake.h req_body contract), the callback
+     * returns NGHTTP2_ERR_PAUSE. nghttp2_session_mem_recv then stops and returns
+     * the byte count it consumed SO FAR (a positive value that may be < n). The
+     * unconsumed tail [r, n) is NOT lost: mq_gw_h2_adapter_recv parks it in
+     * `pending_in` and sets `input_paused`. While paused, recv parks any further
+     * input into the same bounded buffer (and does NOT feed nghttp2 — so nghttp2
+     * sends no WINDOW_UPDATE and the browser is throttled by H2 flow control).
+     *
+     * sink->resume_read clears `input_paused` and RE-FEEDS the parked bytes
+     * through nghttp2_session_mem_recv (which re-drives on_data_chunk_recv for the
+     * buffered DATA), looping until the buffer drains or it pauses again.
+     *
+     * INVARIANT: no upload body byte is ever lost (every byte either reaches
+     * req_body or sits in pending_in awaiting re-feed), and a stalled tunnel
+     * (req_body=-1) throttles the browser without unbounded growth (the buffer is
+     * bounded by MQ_H2_UPLOAD_PAUSE_CAP; H2 flow control keeps a well-behaved peer
+     * far below it).
+     *
+     * NOTE: nghttp2_session_resume_data() is the OUTBOUND deferred-data-provider
+     * resume; it is NOT used for inbound upload resume (re-feed is the correct
+     * mechanism). The pause is connection-wide (one in-flight request per MITM
+     * conn per the deployment model), which is simpler and sufficient. */
+    uint8_t pending_in[MQ_H2_UPLOAD_PAUSE_CAP];
+    size_t pending_len;
+    int input_paused; /* a req_body returned -1; do not feed nghttp2 until resumed */
+    int input_fatal;  /* pending_in overflowed (peer flooded past its window) */
 };
 
 /* ── per-stream demux context (Task 6) ──────────────────────────────────────
@@ -135,6 +179,7 @@ typedef struct mq_h2_stream_s {
 
     int32_t stream_id;
     int materialized; /* req_begin already driven (guards re-entry) */
+    int upload_done;  /* req_body_done already fired (END_STREAM seen; guards re-entry) */
 
     /* ── response (download) path (Task 7) ──────────────────────────────────
      *
@@ -173,6 +218,9 @@ arena_dup(mq_h2_stream_t *s, const uint8_t *p, size_t len)
     return dst;
 }
 
+/* fwd (defined in the recv section) — used by the resume_read re-feed loop. */
+static int park_pending(mq_gw_h2_adapter_t *a, const uint8_t *p, size_t len);
+
 /* Case-insensitive ASCII prefix test: does `name` (len nl) start with "x-mq-"? */
 static int
 name_has_xmq_prefix(const uint8_t *name, size_t nl)
@@ -206,6 +254,50 @@ stream_reject(mq_h2_stream_t *s, uint32_t error_code)
     if (s->rejected) return;
     s->rejected = 1;
     nghttp2_submit_rst_stream(s->a->session, NGHTTP2_FLAG_NONE, s->stream_id, error_code);
+}
+
+/* Render an H2 ERROR RESPONSE for a reject *reason* known after END_HEADERS
+ * (prevalidate / req_begin verdicts). Unlike stream_reject (a bare RST used for
+ * mid-header-block failures where no response can be framed), this submits a
+ * complete header-only response: :status + x-mq-error: <reason text> with
+ * END_STREAM, so the browser sees the same diagnostic the H1 fetch adapter
+ * renders (§5/§5.2; strings byte-identical via the shared mq_gw_reject_xmq). The
+ * stream is then marked rejected so no further demux/body touches it.
+ *
+ * `status` is the verdict's HTTP status (the boundary fills it; 0 → default 400
+ * for the 4xx reasons / nothing reasonable, so we floor to 400). */
+static void
+stream_reject_response(mq_h2_stream_t *s, int status, mq_gw_reject_reason_t reason)
+{
+    if (s->rejected) return;
+    s->rejected = 1;
+
+    if (status < 100 || status > 999) status = 400; /* defensive floor */
+    char status_str[4];
+    status_str[0] = (char)('0' + (status / 100) % 10);
+    status_str[1] = (char)('0' + (status / 10) % 10);
+    status_str[2] = (char)('0' + status % 10);
+    status_str[3] = '\0';
+
+    const char *xmq = mq_gw_reject_xmq(reason); /* shared, byte-identical literal */
+
+    nghttp2_nv nva[2];
+    nva[0].name = (uint8_t *)":status";
+    nva[0].namelen = 7;
+    nva[0].value = (uint8_t *)status_str;
+    nva[0].valuelen = 3;
+    nva[0].flags = NGHTTP2_NV_FLAG_NONE;
+    nva[1].name = (uint8_t *)"x-mq-error";
+    nva[1].namelen = 10;
+    nva[1].value = (uint8_t *)xmq;
+    nva[1].valuelen = strlen(xmq);
+    nva[1].flags = NGHTTP2_NV_FLAG_NONE;
+
+    /* No data provider → nghttp2 sets END_STREAM on the HEADERS frame. If submit
+     * fails (OOM), fall back to a RST so the browser still sees a clean failure. */
+    if (nghttp2_submit_response(s->a->session, s->stream_id, nva, 2, NULL) != 0)
+        nghttp2_submit_rst_stream(s->a->session, NGHTTP2_FLAG_NONE, s->stream_id,
+                                  NGHTTP2_INTERNAL_ERROR);
 }
 
 static int
@@ -487,13 +579,47 @@ mq_h2_resp_abort(void *u)
     }
 }
 
-/* sink->resume_read: UPLOAD backpressure release (browser→origin). Wired in
- * Task 8 when the adapter buffers request-body bytes; until then there is no
- * upload buffer to un-pause, so this is intentionally a no-op. */
+/* sink->resume_read: UPLOAD backpressure release (browser→origin). The core has
+ * room again; clear the pause and re-feed the parked input bytes through nghttp2
+ * (which re-drives on_data_chunk_recv → req_body). If req_body pauses again
+ * mid-drain, mem_recv stops on the prefix and we re-park the unconsumed tail and
+ * stay paused — bytes are never lost or re-delivered. Loops until the buffer
+ * drains or the upload re-pauses. */
 static void
 mq_h2_resume_read(void *u)
 {
-    (void)u; /* Task 8: resume the paused inbound (upload) read path. */
+    mq_h2_stream_t *s = (mq_h2_stream_t *)u;
+    if (!s) return;
+    mq_gw_h2_adapter_t *a = s->a;
+    if (a->input_fatal) return;
+
+    a->input_paused = 0;
+
+    /* Drain the parked buffer. Each pass feeds the whole current buffer; a pause
+     * re-arms input_paused and reports a short consume, so we snapshot, clear,
+     * feed, then re-park the unconsumed tail (plus anything req_body→recv may
+     * have parked re-entrantly — but recv is not called during a feed here). */
+    while (a->pending_len > 0 && !a->input_paused && !a->input_fatal) {
+        /* Move the parked bytes out so a re-park (on pause) appends cleanly. */
+        static uint8_t scratch[MQ_H2_UPLOAD_PAUSE_CAP];
+        size_t plen = a->pending_len;
+        memcpy(scratch, a->pending_in, plen);
+        a->pending_len = 0;
+
+        ssize_t r = nghttp2_session_mem_recv(a->session, scratch, plen);
+        if (r < 0) {
+            a->input_fatal = 1; /* fatal parse error — surfaced by next recv */
+            return;
+        }
+        if ((size_t)r != plen) {
+            /* Paused (or unexpected shortfall) mid-drain: re-park the tail. */
+            if (!a->input_paused) {
+                a->input_fatal = 1;
+                return;
+            }
+            if (park_pending(a, scratch + (size_t)r, plen - (size_t)r) != 0) return;
+        }
+    }
 }
 
 static const mq_gw_sink_ops_t mq_h2_sink = {
@@ -569,7 +695,7 @@ materialize_request(mq_h2_stream_t *s)
     mq_gw_reject_reason_t reason =
         a->submit->prevalidate(a->submit_user, final, nf, &status);
     if (reason != MQ_GW_OK) {
-        stream_reject(s, NGHTTP2_INTERNAL_ERROR); /* Task 8: render X-Mq-Error body */
+        stream_reject_response(s, status, reason); /* :status + x-mq-error response */
         return;
     }
 
@@ -591,7 +717,7 @@ materialize_request(mq_h2_stream_t *s)
     mq_gw_xreq_t *xreq =
         a->submit->req_begin(a->submit_user, &head, &mq_h2_sink, s, &err_status, &reason);
     if (!xreq) {
-        stream_reject(s, NGHTTP2_INTERNAL_ERROR); /* Task 8: render X-Mq-Error body */
+        stream_reject_response(s, err_status, reason); /* :status + x-mq-error response */
         return;
     }
     s->xreq = xreq;
@@ -599,10 +725,65 @@ materialize_request(mq_h2_stream_t *s)
      * it (s->xreq). Task 7 wires the response sink to find s (and s->xreq). */
 }
 
+/* Signal the core that the upload body is complete (END_STREAM seen). Fired once
+ * per stream, only if the request actually materialized (has an xreq). */
+static void
+finish_upload(mq_h2_stream_t *s)
+{
+    if (s->upload_done) return;
+    s->upload_done = 1;
+    if (s->xreq && s->a->submit->req_body_done) s->a->submit->req_body_done(s->xreq);
+}
+
+/* on_data_chunk_recv: forward request-body bytes to the core (upload path).
+ *
+ * Contract (mq_gw_intake.h req_body): the bytes are ALWAYS consumed by the core;
+ * 0 = accepted (keep reading), -1 = pause (consumed, but stop feeding more). On
+ * -1 we return NGHTTP2_ERR_PAUSE so nghttp2_session_mem_recv stops and reports
+ * how much it consumed — the recv wrapper parks the unconsumed tail and the
+ * adapter stays paused until sink->resume_read re-feeds it (see the UPLOAD
+ * BACKPRESSURE block on the adapter struct). */
+static int
+on_data_chunk_recv(nghttp2_session *session, uint8_t flags, int32_t stream_id,
+                   const uint8_t *data, size_t len, void *user_data)
+{
+    (void)flags;
+    (void)user_data;
+    mq_h2_stream_t *s =
+        (mq_h2_stream_t *)nghttp2_session_get_stream_user_data(session, stream_id);
+    if (!s) return 0;          /* no context — ignore */
+    if (s->rejected) return 0; /* stream already RST'd — drop the body */
+    if (!s->xreq) return 0;    /* not materialized (e.g. reject pending) — drop */
+    if (len == 0) return 0;
+
+    if (s->a->submit->req_body) {
+        int rc = s->a->submit->req_body(s->xreq, data, len);
+        if (rc < 0) {
+            /* PAUSE: the core consumed these bytes but wants no more for now.
+             * Stop nghttp2 here; mem_recv returns the consumed prefix and the
+             * recv wrapper parks the tail. resume_read re-feeds. */
+            s->a->input_paused = 1;
+            return NGHTTP2_ERR_PAUSE;
+        }
+    }
+    return 0;
+}
+
 static int
 on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame, void *user_data)
 {
     (void)user_data;
+
+    /* DATA frame with END_STREAM → upload body complete. */
+    if (frame->hd.type == NGHTTP2_DATA) {
+        if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+            mq_h2_stream_t *s = (mq_h2_stream_t *)nghttp2_session_get_stream_user_data(
+                session, frame->hd.stream_id);
+            if (s && !s->rejected) finish_upload(s);
+        }
+        return 0;
+    }
+
     if (frame->hd.type != NGHTTP2_HEADERS) return 0;
     if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) return 0;
     if (!(frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) return 0;
@@ -613,6 +794,12 @@ on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame, void *user_d
     if (s->rejected) return 0; /* already RST'd (bomb / NUL) — do not materialize */
 
     materialize_request(s);
+
+    /* Body-less request (END_STREAM on HEADERS): the upload is already complete.
+     * Fire req_body_done so the core sends fin and proceeds. Only if it actually
+     * materialized (materialize_request may have rejected it). */
+    if ((frame->hd.flags & NGHTTP2_FLAG_END_STREAM) && !s->rejected && s->xreq)
+        finish_upload(s);
     return 0;
 }
 
@@ -660,6 +847,7 @@ mq_gw_h2_adapter_new(const mq_gw_submit_ops_t *submit, void *submit_user,
     nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, on_begin_headers);
     nghttp2_session_callbacks_set_on_header_callback(cbs, on_header);
     nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, on_frame_recv);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, on_data_chunk_recv);
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, on_stream_close);
 
     int rc = nghttp2_session_server_new(&a->session, cbs, a);
@@ -688,16 +876,45 @@ mq_gw_h2_adapter_new(const mq_gw_submit_ops_t *submit, void *submit_user,
     return a;
 }
 
+/* Park `len` bytes from `p` into the bounded upload-pause buffer. Returns 0 on
+ * success, -1 if it would overflow the cap (fatal — the peer flooded past its H2
+ * flow-control window). */
+static int
+park_pending(mq_gw_h2_adapter_t *a, const uint8_t *p, size_t len)
+{
+    if (len == 0) return 0;
+    if (a->pending_len + len > sizeof(a->pending_in)) {
+        a->input_fatal = 1;
+        return -1;
+    }
+    memcpy(a->pending_in + a->pending_len, p, len);
+    a->pending_len += len;
+    return 0;
+}
+
 int
 mq_gw_h2_adapter_recv(mq_gw_h2_adapter_t *a, const uint8_t *p, size_t n)
 {
-    if (!a) return -1;
+    if (!a || a->input_fatal) return -1;
+
+    /* While the upload is paused (a stream's req_body returned -1), do NOT feed
+     * nghttp2 — park the new bytes so the browser is throttled by H2 flow control
+     * (nghttp2 emits no WINDOW_UPDATE while we hold input). resume_read re-feeds
+     * the parked bytes. Bounded: overflow → fatal (see MQ_H2_UPLOAD_PAUSE_CAP). */
+    if (a->input_paused) return park_pending(a, p, n) == 0 ? 0 : -1;
+
     ssize_t r = nghttp2_session_mem_recv(a->session, p, n);
     if (r < 0) return -1;
-    /* nghttp2 consumes the whole buffer or signals a fatal error; a partial
-     * positive return is not expected from mem_recv, but treat any shortfall as
-     * fatal to be safe. */
-    if ((size_t)r != n) return -1;
+
+    /* A short positive return means on_data_chunk_recv returned NGHTTP2_ERR_PAUSE
+     * (upload backpressure): nghttp2 consumed [0, r) and stopped. The unconsumed
+     * tail [r, n) is NOT lost — park it for re-feed on resume_read. (Absent a
+     * pause, mem_recv consumes the whole buffer, so r == n and nothing is
+     * parked.) */
+    if ((size_t)r != n) {
+        if (!a->input_paused) return -1; /* shortfall without a pause → fatal */
+        if (park_pending(a, p + (size_t)r, n - (size_t)r) != 0) return -1;
+    }
     return 0;
 }
 

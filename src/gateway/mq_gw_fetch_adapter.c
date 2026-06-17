@@ -85,24 +85,10 @@ gw_reject_write(void *handle, int code, const char *reason, const char *xmq_erro
     if (n) mq_fetch_conn_write(handle, buf, n);
 }
 
-/* Map mq_gw_reject_reason_t → X-Mq-Error string (moved from mq_gw_client.c). */
-static const char *
-gw_reason_xmq(mq_gw_reject_reason_t reason)
-{
-    switch (reason) {
-    case MQ_GW_REJ_DUP_CONTROL: return "duplicate-control-header";
-    case MQ_GW_REJ_MISSING_AUTH: return "missing-auth";
-    case MQ_GW_REJ_BAD_AUTH: return "bad-auth-format";
-    case MQ_GW_REJ_BAD_TARGET: return "bad-target";
-    case MQ_GW_REJ_BAD_METHOD: return "bad-method";
-    case MQ_GW_REJ_BAD_ORIGIN_PROTO: return "bad-origin-protocol";
-    case MQ_GW_REJ_BAD_CACHE_TTL: return "bad-cache-ttl";
-    case MQ_GW_REJ_HEADER_TOO_LONG: return "header-too-long";
-    case MQ_GW_REJ_TUNNEL_UNAVAIL: return "tunnel-unavailable";
-    case MQ_GW_REJ_INTERNAL: return "internal-error";
-    default: return "internal-error";
-    }
-}
+/* Map mq_gw_reject_reason_t → X-Mq-Error string: now the SHARED helper
+ * mq_gw_reject_xmq (mq_gw_intake.h, implemented in mq_gw_client.c) so the H1 and
+ * H2 adapters render byte-identical strings. The former static gw_reason_xmq was
+ * extracted there (Slice 3 Task 8). */
 
 /* H1 reason → status-line reason phrase (moved from mq_gw_client.c). */
 static const char *
@@ -325,7 +311,7 @@ adp_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_c
     /* Phase 1 (header-only): dup-control-header, X-Mq-Auth. */
     mq_gw_reject_reason_t pre = mq_gw_client_prevalidate(a->core, H, hn, &status);
     if (pre != MQ_GW_OK) {
-        gw_reject_write(handle, status, gw_status_phrase(status), gw_reason_xmq(pre));
+        gw_reject_write(handle, status, gw_status_phrase(status), mq_gw_reject_xmq(pre));
         free(H);
         free(namearena);
         free(valarena);
@@ -394,7 +380,7 @@ adp_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_c
     if (!r) {
         free(ar);
         gw_reject_write(handle, err_status, gw_status_phrase(err_status),
-                        gw_reason_xmq(reason));
+                        mq_gw_reject_xmq(reason));
         return -1;
     }
 
