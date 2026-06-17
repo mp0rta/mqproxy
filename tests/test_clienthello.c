@@ -79,12 +79,12 @@ build_extensions(chb_t *ext, int want_sni, const char *host, int alpn_mode)
     }
 }
 
-// Build a full record+handshake ClientHello. Returns it in `out`.
+// Build the raw handshake message (4-byte handshake header + ClientHello body)
+// into `hs`, WITHOUT the surrounding TLS record. Used by both the single-record
+// builder and the multi-record (fragmented) builders below.
 static void
-build_clienthello(chb_t *out, int want_sni, const char *host, int alpn_mode)
+build_handshake(chb_t *hs, int want_sni, const char *host, int alpn_mode)
 {
-    // First build the ClientHello body (everything after the 4-byte handshake
-    // header: legacy_version .. extensions).
     chb_t body;
     body.len = 0;
     chb_u16(&body, 0x0303); // legacy_version TLS 1.2
@@ -102,21 +102,34 @@ build_clienthello(chb_t *out, int want_sni, const char *host, int alpn_mode)
     chb_u16(&body, (uint16_t)ext.len); // extensions length
     chb_bytes(&body, ext.buf, ext.len);
 
-    // Handshake header: msg_type(1)=ClientHello + 24-bit length.
-    chb_t hs;
-    hs.len = 0;
-    chb_u8(&hs, 0x01);
-    chb_u8(&hs, (uint8_t)((body.len >> 16) & 0xff));
-    chb_u8(&hs, (uint8_t)((body.len >> 8) & 0xff));
-    chb_u8(&hs, (uint8_t)(body.len & 0xff));
-    chb_bytes(&hs, body.buf, body.len);
+    hs->len = 0;
+    chb_u8(hs, 0x01); // msg_type = ClientHello
+    chb_u8(hs, (uint8_t)((body.len >> 16) & 0xff));
+    chb_u8(hs, (uint8_t)((body.len >> 8) & 0xff));
+    chb_u8(hs, (uint8_t)(body.len & 0xff));
+    chb_bytes(hs, body.buf, body.len);
+}
 
-    // Record header: content_type(22) + legacy_version + fragment_length(u16).
+// Wrap a raw byte slice into a single TLS record of the given content_type and
+// append it to `out`.
+static void
+append_record(chb_t *out, uint8_t content_type, const uint8_t *p, size_t n)
+{
+    chb_u8(out, content_type);
+    chb_u16(out, 0x0301); // legacy record version
+    chb_u16(out, (uint16_t)n);
+    chb_bytes(out, p, n);
+}
+
+// Build a full record+handshake ClientHello. Returns it in `out`.
+static void
+build_clienthello(chb_t *out, int want_sni, const char *host, int alpn_mode)
+{
+    chb_t hs;
+    build_handshake(&hs, want_sni, host, alpn_mode);
+    // Single TLS handshake record carrying the whole ClientHello.
     out->len = 0;
-    chb_u8(out, 0x16);
-    chb_u16(out, 0x0301);
-    chb_u16(out, (uint16_t)hs.len);
-    chb_bytes(out, hs.buf, hs.len);
+    append_record(out, 0x16, hs.buf, hs.len);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,30 +268,25 @@ test_ext_length_overflow(void)
 static void
 test_inner_ext_overruns_complete_block(void)
 {
-    // A COMPLETE record whose inner extensions-length field overruns the
-    // enclosing handshake body → structurally impossible → INVALID (no OOB).
+    // A FULLY-PRESENT, single-record ClientHello whose inner extensions-block
+    // length field overruns the (complete) handshake body → structurally
+    // impossible → INVALID (no OOB). This is an overrun WITHIN a complete
+    // enclosing field, which reassembly does not turn into NEED_MORE: there are
+    // no missing bytes, the framing is self-contradictory.
     chb_t b;
     build_clienthello(&b, 1, "example.com", 1);
-    // The extensions length u16 sits right after compression. Find it by
-    // re-deriving offsets is fragile; instead just flip the last two bytes of
-    // a server_name length-ish region is also fragile. Simpler: corrupt the
-    // 24-bit handshake length to be larger than the fragment, with a complete
-    // record fragment. We achieve "complete enclosing field, inner overrun" by
-    // shrinking the record fragment length to less than the handshake claims is
-    // covered — but keeping the buffer fully present. Use a hand-built minimal.
-    b.len = 0;
-    chb_u8(&b, 0x16);
-    chb_u16(&b, 0x0301);
-    chb_u16(&b, 0x0006); // fragment length = 6 (complete, present)
-    chb_u8(&b, 0x01);    // ClientHello
-    chb_u8(&b, 0x00);
-    chb_u8(&b, 0xff);
-    chb_u8(&b, 0xfe);    // 24-bit handshake length = 0xfffe >> fragment
-    chb_u16(&b, 0x0303); // start of body (only 2 bytes present)
+    // Compute the extensions-block u16 length offset exactly. Within the body the
+    // fixed prefix is legacy_version(2) + random(32) + sid_len(1) + cs_len(2) +
+    // cs(2) + cm_len(1) + cm(1) = 41 bytes, then the extensions-block u16 length.
+    // The body itself starts at record_hdr(5) + handshake_hdr(4) = 9.
+    const size_t ext_total_off = 9 + 41;
+    MQ_CHECK(ext_total_off + 1 < b.len);
+    // Inflate it so it claims far more than the handshake body can hold — but keep
+    // every byte of the buffer present (record + handshake fully complete).
+    b.buf[ext_total_off] = 0xff;
+    b.buf[ext_total_off + 1] = 0xff;
     mq_clienthello_t out;
     mq_ch_result_t r = mq_clienthello_parse(b.buf, b.len, &out);
-    // Handshake claims 0xfffe bytes but the record fragment (the complete
-    // enclosing field) only carries 2 → INVALID.
     MQ_CHECK_EQ_INT(r, MQ_CH_INVALID);
 }
 
@@ -336,9 +344,93 @@ test_record_frag_over_cap_rejected(void)
     MQ_CHECK_EQ_INT(r, MQ_CH_INVALID);
 }
 
+static void
+test_split_record_first_half_need_more(void)
+{
+    // RFC 8446 §5.1: a handshake message MAY be fragmented across multiple TLS
+    // handshake records. Build the ClientHello, then carry only its FIRST half in
+    // record 1. The 24-bit handshake length declares more than record 1 carries,
+    // so the parser must ask for more — NOT reject as INVALID.
+    chb_t hs;
+    build_handshake(&hs, 1, "split.example.com", 1);
+    size_t half = hs.len / 2;
+    MQ_CHECK(half > 4 && half < hs.len); // ensure a real boundary mid-body
+    chb_t b;
+    b.len = 0;
+    append_record(&b, 0x16, hs.buf, half);
+    mq_clienthello_t out;
+    mq_ch_result_t r = mq_clienthello_parse(b.buf, b.len, &out);
+    MQ_CHECK_EQ_INT(r, MQ_CH_NEED_MORE);
+}
+
+static void
+test_split_record_both_halves_ok(void)
+{
+    // Same fragmented ClientHello, now both records present (handshake split
+    // across a record boundary). The parser must reassemble across the boundary
+    // and extract SNI + has_h2 correctly. The split point lands mid-body so the
+    // extensions (and thus SNI/ALPN) straddle the two records.
+    chb_t hs;
+    build_handshake(&hs, 1, "split.example.com", 1);
+    size_t half = hs.len / 2;
+    chb_t b;
+    b.len = 0;
+    append_record(&b, 0x16, hs.buf, half);                 // record 1
+    append_record(&b, 0x16, hs.buf + half, hs.len - half); // record 2
+    mq_clienthello_t out;
+    memset(&out, 0xff, sizeof(out));
+    mq_ch_result_t r = mq_clienthello_parse(b.buf, b.len, &out);
+    MQ_CHECK_EQ_INT(r, MQ_CH_OK);
+    MQ_CHECK(strcmp(out.sni, "split.example.com") == 0);
+    MQ_CHECK_EQ_INT(out.has_alpn, 1);
+    MQ_CHECK_EQ_INT(out.has_h2, 1);
+}
+
+static void
+test_split_record_many_fragments_ok(void)
+{
+    // Pathological-but-legal fragmentation: chop the handshake into 1-byte
+    // records. Reassembly must still recover the complete ClientHello.
+    chb_t hs;
+    build_handshake(&hs, 1, "tiny.example.com", 1);
+    chb_t b;
+    b.len = 0;
+    for (size_t i = 0; i < hs.len; i++) {
+        append_record(&b, 0x16, hs.buf + i, 1);
+    }
+    mq_clienthello_t out;
+    mq_ch_result_t r = mq_clienthello_parse(b.buf, b.len, &out);
+    MQ_CHECK_EQ_INT(r, MQ_CH_OK);
+    MQ_CHECK(strcmp(out.sni, "tiny.example.com") == 0);
+    MQ_CHECK_EQ_INT(out.has_h2, 1);
+}
+
+static void
+test_interleaved_non_handshake_record_invalid(void)
+{
+    // A non-handshake record (content_type 23 = application_data) interleaved
+    // BETWEEN handshake records while the ClientHello is still incomplete is a
+    // protocol violation → INVALID (never NEED_MORE, never an OOB read).
+    chb_t hs;
+    build_handshake(&hs, 1, "evil.example.com", 1);
+    size_t half = hs.len / 2;
+    chb_t b;
+    b.len = 0;
+    append_record(&b, 0x16, hs.buf, half); // handshake, partial
+    const uint8_t junk[4] = {0xde, 0xad, 0xbe, 0xef};
+    append_record(&b, 0x17, junk, sizeof(junk)); // application_data mid-handshake
+    append_record(&b, 0x16, hs.buf + half, hs.len - half); // continuation
+    mq_clienthello_t out;
+    mq_ch_result_t r = mq_clienthello_parse(b.buf, b.len, &out);
+    MQ_CHECK_EQ_INT(r, MQ_CH_INVALID);
+}
+
 MQ_TEST_MAIN(test_good_sni_and_h2(); test_alpn_without_h2(); test_sni_absent();
              test_no_alpn(); test_truncated_prefix(); test_empty(); test_not_tls();
              test_sslv2_garbage(); test_handshake_not_clienthello();
              test_ext_length_overflow(); test_inner_ext_overruns_complete_block();
              test_long_sni_rejected(); test_len_over_cap_rejected();
-             test_record_frag_over_cap_rejected();)
+             test_record_frag_over_cap_rejected();
+             test_split_record_first_half_need_more(); test_split_record_both_halves_ok();
+             test_split_record_many_fragments_ok();
+             test_interleaved_non_handshake_record_invalid();)
