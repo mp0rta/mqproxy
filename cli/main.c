@@ -257,6 +257,18 @@ usage_client(FILE *out)
         "                             CAP_NET_ADMIN; off by default).\n"
         "  --tproxy-uid <uid>         UID whose outbound traffic is NOT redirected\n"
         "                             (default: geteuid() of the process).\n"
+        "  --mitm                     Terminate TLS on captured flows (HTTPS MITM) and\n"
+        "                             re-encrypt to the origin. Requires --tproxy and\n"
+        "                             --ca-cert/--ca-key. Off by default.\n"
+        "  --ca-cert      <pem>       Signing CA certificate (PEM) used to forge\n"
+        "                             per-host leaf certs (required with --mitm).\n"
+        "  --ca-key       <pem>       Signing CA private key (PEM) (required with\n"
+        "                             --mitm).\n"
+        "  --ignore-host  <pattern>   Leave the named host OPAQUE (no MITM; pass TLS\n"
+        "                             through). Repeatable. Leading-dot suffix matches\n"
+        "                             subdomains (e.g. .example.com).\n"
+        "  --ignore-hosts <a,b,c>     Comma-separated form of --ignore-host (union with\n"
+        "                             repeated --ignore-host and [Mitm] IgnoreHosts).\n"
         "  --config <path>            Load settings from an INI file (CLI flags\n"
         "                             override file values).\n"
         "  -h, --help                 Show this help and exit.\n");
@@ -888,6 +900,19 @@ cmd_client(int argc, char **argv)
     const char *ca_cert = NULL; /* --ca-cert <pem> (MITM signing CA) */
     const char *ca_key = NULL;  /* --ca-key <pem> (MITM signing CA key) */
 
+    /* MITM ignore-hosts collection. CLI --ignore-host(s) + [Mitm] IgnoreHosts
+     * entries accumulate here (union), then feed the mq_ignore_hosts list built
+     * in the MITM block below. Entries point into argv (optarg, alive for the
+     * whole main()) or into ig_buf (comma-split tokens, also function-scoped);
+     * mq_ignore_hosts_add COPIES the pattern, so all pointers are add()-safe. */
+    const char *cli_ignore_hosts[MQ_CONFIG_MAX_IGNORE_HOSTS];
+    int n_cli_ignore = 0;
+    /* Backing storage for --ignore-hosts comma-split tokens (one NUL-terminated
+     * copy of each optarg; tokens point into it). 256 bytes/entry matches the
+     * config-side cap; over-long inputs are truncated by snprintf below. */
+    static char ig_buf[MQ_CONFIG_MAX_IGNORE_HOSTS][256];
+    int n_ig_buf = 0;
+
     /* Seed from --config before getopt (defaults < file < CLI). fcfg is
      * function-scoped so the const char* aliases stay valid for the function. */
     mq_file_config_t fcfg;
@@ -924,6 +949,14 @@ cmd_client(int argc, char **argv)
         tproxy_dport = fcfg.tproxy_dport;
         setup_redirect = fcfg.setup_redirect;
         tproxy_uid = fcfg.tproxy_skip_uid;
+        /* MITM ([Mitm] section). Scalars follow seed-then-override (CLI switch
+         * below wins); ignore-hosts accumulate (config + CLI union). */
+        if (fcfg.mitm_enabled) mitm_enabled = 1;
+        if (fcfg.ca_cert[0]) ca_cert = fcfg.ca_cert;
+        if (fcfg.ca_key[0]) ca_key = fcfg.ca_key;
+        for (int i = 0;
+             i < fcfg.n_ignore_hosts && n_cli_ignore < MQ_CONFIG_MAX_IGNORE_HOSTS; i++)
+            cli_ignore_hosts[n_cli_ignore++] = fcfg.ignore_hosts[i];
     }
 
     enum {
@@ -950,6 +983,11 @@ cmd_client(int argc, char **argv)
         OPT_TPROXY_DPORT,
         OPT_SETUP_REDIRECT,
         OPT_TPROXY_UID,
+        OPT_MITM,
+        OPT_CA_CERT,
+        OPT_CA_KEY,
+        OPT_IGNORE_HOST,
+        OPT_IGNORE_HOSTS,
     };
     static const struct option longopts[] = {
         {"server", required_argument, NULL, OPT_SERVER},
@@ -975,6 +1013,11 @@ cmd_client(int argc, char **argv)
         {"tproxy-dport", required_argument, NULL, OPT_TPROXY_DPORT},
         {"setup-redirect", no_argument, NULL, OPT_SETUP_REDIRECT},
         {"tproxy-uid", required_argument, NULL, OPT_TPROXY_UID},
+        {"mitm", no_argument, NULL, OPT_MITM},
+        {"ca-cert", required_argument, NULL, OPT_CA_CERT},
+        {"ca-key", required_argument, NULL, OPT_CA_KEY},
+        {"ignore-host", required_argument, NULL, OPT_IGNORE_HOST},
+        {"ignore-hosts", required_argument, NULL, OPT_IGNORE_HOSTS},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -1111,6 +1154,40 @@ cmd_client(int argc, char **argv)
             tproxy_uid = v;
             break;
         }
+        case OPT_MITM: mitm_enabled = 1; break;
+        case OPT_CA_CERT: ca_cert = optarg; break;
+        case OPT_CA_KEY: ca_key = optarg; break;
+        case OPT_IGNORE_HOST:
+            if (n_cli_ignore < MQ_CONFIG_MAX_IGNORE_HOSTS) {
+                cli_ignore_hosts[n_cli_ignore++] = optarg;
+            } else {
+                MQ_LOGW("too many ignore-host entries (max %d); ignoring %s",
+                        MQ_CONFIG_MAX_IGNORE_HOSTS, optarg);
+            }
+            break;
+        case OPT_IGNORE_HOSTS: {
+            /* Comma-split into a function-scoped backing buffer so the tokens
+             * outlive this switch (mq_ignore_hosts_add copies them later). */
+            if (n_ig_buf >= MQ_CONFIG_MAX_IGNORE_HOSTS) {
+                MQ_LOGW("too many --ignore-hosts buffers (max %d); ignoring %s",
+                        MQ_CONFIG_MAX_IGNORE_HOSTS, optarg);
+                break;
+            }
+            snprintf(ig_buf[n_ig_buf], sizeof(ig_buf[n_ig_buf]), "%s", optarg);
+            char *save = NULL;
+            for (char *tok = strtok_r(ig_buf[n_ig_buf], ",", &save); tok;
+                 tok = strtok_r(NULL, ",", &save)) {
+                if (*tok == '\0') continue; /* skip empty (e.g. "a,,b") */
+                if (n_cli_ignore < MQ_CONFIG_MAX_IGNORE_HOSTS) {
+                    cli_ignore_hosts[n_cli_ignore++] = tok;
+                } else {
+                    MQ_LOGW("too many ignore-host entries (max %d); ignoring %s",
+                            MQ_CONFIG_MAX_IGNORE_HOSTS, tok);
+                }
+            }
+            n_ig_buf++;
+            break;
+        }
         case 'h': usage_client(stdout); return 0;
         default: usage_client(stderr); return 2;
         }
@@ -1170,6 +1247,31 @@ cmd_client(int argc, char **argv)
                         "(--socks5, --http-connect, --gateway, or --tproxy)\n\n");
         usage_client(stderr);
         return 2;
+    }
+
+    /* MITM fail-closed validation. --mitm rides the transparent-capture ingress
+     * and forges leaf certs from a signing CA, so it REQUIRES --tproxy and both
+     * --ca-cert/--ca-key. A no-archive build (built without BoringSSL) cannot
+     * terminate TLS at all → hard error so MITM never silently no-ops. */
+    if (mitm_enabled) {
+#if !MQ_MITM_AVAILABLE
+        fprintf(stderr, "mqproxy client: --mitm unavailable: built without BoringSSL "
+                        "archives — run scripts/build-xquic.sh\n");
+        return 2;
+#else
+        if (!tproxy_addr) {
+            fprintf(stderr, "mqproxy client: --mitm requires --tproxy (MITM rides the "
+                            "transparent-capture ingress)\n\n");
+            usage_client(stderr);
+            return 2;
+        }
+        if (!ca_cert || !ca_key) {
+            fprintf(stderr, "mqproxy client: --mitm requires --ca-cert and --ca-key (the "
+                            "signing CA used to forge per-host leaf certificates)\n\n");
+            usage_client(stderr);
+            return 2;
+        }
+#endif
     }
 
     char server_ip[INET6_ADDRSTRLEN];
@@ -1388,19 +1490,31 @@ cmd_client(int argc, char **argv)
         mq_tcp_open_fn tproxy_open_fn = open_fn;
         void *tproxy_open_core = open_core;
 #if !MQ_MITM_AVAILABLE
-        /* ca_cert/ca_key are consumed only by the MITM block below; in a
-         * no-archive build that block is compiled out, so silence unused-var. */
+        /* ca_cert/ca_key + the ignore-hosts collection are consumed only by the
+         * MITM block below; in a no-archive build that block is compiled out, so
+         * silence unused-var. (--mitm itself hard-errors at validation here.) */
         (void)ca_cert;
         (void)ca_key;
+        (void)cli_ignore_hosts;
+        (void)n_cli_ignore;
+        (void)ig_buf;
+        (void)n_ig_buf;
 #endif
 #if MQ_MITM_AVAILABLE
         if (mitm_enabled) {
-            /* Build the (currently empty) ignore-hosts list — Task 15 will feed
-             * --ignore-hosts / [Mitm] entries into it. */
+            /* Build the ignore-hosts list and feed the accumulated CLI
+             * --ignore-host(s) + [Mitm] IgnoreHosts entries (union) into it.
+             * A malformed/over-full single entry warns + is skipped — it must
+             * not kill startup (the rest of the list is still useful). */
             ign = mq_ignore_hosts_new();
             if (!ign) {
                 MQ_LOGE("mitm: failed to allocate ignore-hosts list");
                 goto out;
+            }
+            for (int i = 0; i < n_cli_ignore; i++) {
+                if (mq_ignore_hosts_add(ign, cli_ignore_hosts[i]) != 0)
+                    MQ_LOGW("mitm: skipping invalid/rejected ignore-host entry '%s'",
+                            cli_ignore_hosts[i]);
             }
             mq_mitm_opts_t opts = {.cache_size = 256, .leaf_ttl_sec = 86400};
             core = mq_mitm_core_create(ca_cert, ca_key, &opts);
