@@ -82,6 +82,12 @@ run_cmd(const char *prog, const char *const argv[])
         return -1;
     }
     if (pid == 0) {
+        /* This runs privileged (root / CAP_NET_ADMIN) and resolves `nft`/`ip`
+         * via PATH. Pin a known-safe PATH so a polluted service environment
+         * cannot substitute an attacker-controlled `nft`/`ip` binary. Standard
+         * system sbin/bin dirs cover both Debian and split-/usr layouts without
+         * hardcoding a distro-specific absolute path. */
+        setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin", 1);
         execvp(prog, (char *const *)argv);
         /* execvp only returns on failure */
         _exit(127);

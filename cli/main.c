@@ -33,6 +33,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -1037,9 +1038,10 @@ cmd_client(int argc, char **argv)
             char *endp = NULL;
             errno = 0;
             long v = strtol(optarg, &endp, 10);
-            if (errno != 0 || endp == optarg || *endp != '\0' || v <= 0) {
+            if (errno != 0 || endp == optarg || *endp != '\0' || v <= 0 || v > INT_MAX) {
                 fprintf(stderr,
-                        "mqproxy client: invalid --tproxy-fwmark '%s' (must be > 0)\n\n",
+                        "mqproxy client: invalid --tproxy-fwmark '%s' (must be "
+                        "1..2147483647)\n\n",
                         optarg);
                 usage_client(stderr);
                 return 2;
@@ -1082,9 +1084,10 @@ cmd_client(int argc, char **argv)
             char *endp = NULL;
             errno = 0;
             long v = strtol(optarg, &endp, 10);
-            if (errno != 0 || endp == optarg || *endp != '\0' || v < 0) {
+            if (errno != 0 || endp == optarg || *endp != '\0' || v < 0 || v > INT_MAX) {
                 fprintf(stderr,
-                        "mqproxy client: invalid --tproxy-uid '%s' (must be >= 0)\n\n",
+                        "mqproxy client: invalid --tproxy-uid '%s' (must be "
+                        "0..2147483647)\n\n",
                         optarg);
                 usage_client(stderr);
                 return 2;

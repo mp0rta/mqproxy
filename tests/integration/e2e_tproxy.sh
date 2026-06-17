@@ -15,8 +15,10 @@
 #   passes through unmodified, with the origin's cert arriving intact.
 #
 # ARCHITECTURE OF THE TEST:
-#   - TLS origin (python3 ssl/http.server) on 127.0.0.1:443 (root can bind 443).
-#     dport=443 is hardcoded in --setup-redirect (mq_tproxy_setup.c).
+#   - TLS origin (python3 ssl/http.server) on 127.0.0.1:${ORIGIN_PORT}, a free
+#     ephemeral TCP port chosen at runtime (no longer the hardcoded :443 — that
+#     collided with anything already on :443). The client captures exactly that
+#     port via --tproxy-dport "${ORIGIN_PORT}".
 #   - mqproxy server: UDP on a free ephemeral port (127.0.0.1).
 #   - mqproxy client (running as root, uid 0):
 #       --tproxy 127.0.0.1:<ephemeral-tcp>   transparent-capture listener
@@ -26,11 +28,12 @@
 #     This means: connections from root are SKIPPED by the nft rule, so mqproxy
 #     itself and the origin server (both root) can talk to each other directly.
 #   - Test TLS check via curl running as nobody (uid 65534, typically):
-#       sudo -u nobody curl https://127.0.0.1/ --cacert origin.crt
-#     nobody's outbound TCP to 127.0.0.1:443 is caught by the nft REDIRECT rule,
-#     diverted to the tproxy listener port, tunneled over QUIC to the server, and
-#     the server relays it to 127.0.0.1:443 where the origin is actually listening.
-#     curl sees the origin's cert because the relay is OPAQUE.
+#       sudo -u nobody curl https://127.0.0.1:${ORIGIN_PORT}/ --cacert origin.crt
+#     nobody's outbound TCP to 127.0.0.1:${ORIGIN_PORT} is caught by the nft
+#     REDIRECT rule, diverted to the tproxy listener port, tunneled over QUIC to
+#     the server, and the server relays it to 127.0.0.1:${ORIGIN_PORT} where the
+#     origin is actually listening. curl sees the origin's cert because the
+#     relay is OPAQUE.
 #
 # UID STRATEGY:
 #   The whole test script runs as root.  mqproxy client also runs as root (uid 0)
@@ -141,7 +144,8 @@ for f in "${ORIGIN_CERT}" "${ORIGIN_KEY}" "${MQPROXY_CERT}" "${MQPROXY_KEY}"; do
 done
 
 # ── free-port selection (for the QUIC server and tproxy listener) ─────────────
-# The tproxy listener can use any ephemeral TCP port; nft redirects :443 to it.
+# The tproxy listener can use any ephemeral TCP port; nft redirects the captured
+# dport (ORIGIN_PORT) to it.
 # The QUIC server uses an ephemeral UDP port.
 free_port() {
     python3 - "$1" <<'PY'
@@ -232,10 +236,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── TLS origin (python3 http.server + wrap_socket on port 443) ───────────────
+# ── TLS origin (python3 http.server + wrap_socket on ${ORIGIN_PORT}) ─────────
 # Serves a fixed-body response (ORIGIN_MAGIC) for byte-exact checking.
 # Runs as root (both origin and mqproxy server are root → exempt from capture).
-# NOTE: binding port 443 requires root; that is satisfied by the skip gate above.
+# Binds a free ephemeral port (no privilege needed for the bind itself); the
+# test's root requirement comes from nft + IP_TRANSPARENT, not from this bind.
 ORIGIN_MAGIC="tproxy-e2e-origin-body-$(date +%s)"
 printf '%s\n' "${ORIGIN_MAGIC}" >"${ORIGIN_BODY}"
 
@@ -314,7 +319,7 @@ start_server() {
 # UID RATIONALE: the client runs as root (uid 0).  --tproxy-uid 0 installs the
 # nft "meta skuid 0 return" rule that EXEMPTS root's own traffic from capture.
 # This allows the mqproxy process itself (and the TLS origin server, also root)
-# to communicate on port 443 without being loop-captured.  curl runs as nobody
+# to communicate on the origin port without being loop-captured.  curl runs as nobody
 # (non-root), so its traffic IS captured.
 start_client() {
     local path_args=() ip
@@ -406,11 +411,11 @@ sleep 1
 
 # ── case 1: TLS opacity proof — byte-exact body + cert verification ───────────
 #
-# curl as nobody (uid ${NOBODY_UID}) connects to 127.0.0.1:443.  The nft rule:
+# curl as nobody (uid ${NOBODY_UID}) connects to 127.0.0.1:${ORIGIN_PORT}.  The nft rule:
 #   meta skuid 0 return           (root traffic exempt)
-#   tcp dport 443 redirect to :<TPROXY_PORT>  (everyone else captured)
+#   tcp dport ${ORIGIN_PORT} redirect to :<TPROXY_PORT>  (everyone else captured)
 # diverts nobody's connection to the tproxy listener, which tunnels it over
-# QUIC to the server, which relays it to 127.0.0.1:443 (the actual origin).
+# QUIC to the server, which relays it to 127.0.0.1:${ORIGIN_PORT} (the actual origin).
 #
 # --cacert uses the ORIGIN cert (not the mqproxy tunnel cert).  If the relay
 # were a TLS MITM (Slice 1 must NOT be), the server-side cert would be

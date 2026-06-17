@@ -18,13 +18,18 @@
  *     Transfer-Encoding: chunked / Connection: close, chunk framing) via the
  *     mq_fetch_conn_* handle ops — byte-identical to the former inline path.
  *
- * LIFETIME: mq_gw_fetch_adapter_t does NOT take ownership of the core; the
- * caller must free the adapter BEFORE freeing the fetch listener and the core.
- * Recommended teardown order:
+ * LIFETIME: mq_gw_fetch_adapter_t does NOT take ownership of the core, the
+ * fetch listener, or the H3 engine — it only borrows them. Per the SANCTIONED
+ * teardown order (see cli/main.c, where the rationale is spelled out), the core
+ * (mq_gw_client) is freed FIRST, while the H3 engine is still live, so a late
+ * gateway conn-close callback lands as a no-op into the dying gw_client instead
+ * of a use-after-free. The adapter does not dereference the core in
+ * mq_gw_fetch_adapter_free, so freeing it after the core is safe:
  *
+ *   mq_gw_client_free(core)            -- FIRST, while mq_h3 engine still live
  *   mq_fetch_listener_free(listener)
- *   mq_gw_fetch_adapter_free(adapter)
- *   mq_gw_client_free(core)   -- must still be BEFORE mq_h3_free
+ *   mq_gw_fetch_adapter_free(adapter)  -- does not touch the freed core
+ *   mq_h3_free(engine)
  */
 #pragma once
 #include "gateway/mq_fetch_listener.h"

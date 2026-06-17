@@ -257,7 +257,8 @@ handle_kv(mq_file_config_t *cfg, int section, const char *key, const char *val,
         else if (strcasecmp(key, "Mode") == 0)
             CSTR(tproxy_mode);
         else if (strcasecmp(key, "Fwmark") == 0)
-            LONGV(tproxy_fwmark, 1, LONG_MAX);
+            /* capped at INT_MAX: applied as int (mq_tproxy_setup_t.fwmark). */
+            LONGV(tproxy_fwmark, 1, INT_MAX);
         else if (strcasecmp(key, "Table") == 0)
             LONGV(tproxy_table, 1, 65535);
         else if (strcasecmp(key, "Dport") == 0)
@@ -265,7 +266,9 @@ handle_kv(mq_file_config_t *cfg, int section, const char *key, const char *val,
         else if (strcasecmp(key, "SetupRedirect") == 0)
             cfg->setup_redirect = parse_bool(val);
         else if (strcasecmp(key, "SkipUid") == 0)
-            LONGV(tproxy_skip_uid, -1, LONG_MAX);
+            /* capped at INT_MAX: narrowed to uid_t at apply; reserves (uid_t)-1
+             * as the internal "use geteuid()" sentinel, not a user value. */
+            LONGV(tproxy_skip_uid, -1, INT_MAX);
         else
             MQ_LOGW("%s:%d: unknown key '%s' in [Ingress]", path, lineno, key);
         break;
