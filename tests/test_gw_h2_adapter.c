@@ -259,6 +259,26 @@ static const mq_gw_submit_ops_t g_cap_ops = {
     .auth_token = cap_auth_token,
 };
 
+/* Variant whose configured token is ALREADY "Bearer "-prefixed. The adapter must
+ * STRIP the leading "Bearer " before re-prefixing, so the injected x-mq-auth is
+ * EXACTLY "Bearer tok" — never "Bearer Bearer tok" (codex H3 dedup branch). */
+static const char *
+cap_auth_token_prefixed(void *u)
+{
+    (void)u;
+    return "Bearer tok";
+}
+
+static const mq_gw_submit_ops_t g_cap_ops_prefixed = {
+    .prevalidate = cap_prevalidate,
+    .req_begin = cap_req_begin,
+    .req_body = cap_req_body,
+    .req_body_done = cap_req_body_done,
+    .req_drained = cap_req_drained,
+    .req_aborted = cap_req_aborted,
+    .auth_token = cap_auth_token_prefixed,
+};
+
 /* Look up a captured final header by name (case-insensitive). Returns value or
  * NULL; *count receives how many times the name appears. */
 static const char *
@@ -599,6 +619,39 @@ test_demux_prevalidate_reject(void)
     MQ_CHECK_EQ_INT(st.req_begin_calls, 0);
 }
 
+/* §4.5 / codex H3: when the configured auth_token already carries a "Bearer "
+ * prefix, the adapter strips it before re-prefixing so the injected x-mq-auth is
+ * EXACTLY "Bearer tok" — NOT "Bearer Bearer tok" (which would corrupt the shared
+ * secret). A regression that dropped the strip would yield the doubled value and
+ * fail the strcmp below. */
+static void
+test_demux_auth_bearer_dedup(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_OK;
+    cli_ud_t cud = {0};
+
+    const nghttp2_nv nva[] = {
+        {(uint8_t *)":method", (uint8_t *)"GET", 7, 3, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":path", (uint8_t *)"/", 5, 1, NGHTTP2_NV_FLAG_NONE},
+    };
+    int sid = 0;
+    drive_request(&g_cap_ops_prefixed, &st, nva, sizeof(nva) / sizeof(nva[0]), &cud,
+                  &sid);
+
+    /* Request materialized once and the dedup branch ran. */
+    MQ_CHECK_EQ_INT(st.req_begin_calls, 1);
+    MQ_CHECK_EQ_INT(st.prevalidate_calls, 1);
+
+    int n_auth = 0;
+    const char *auth = cap_find(&st, "x-mq-auth", &n_auth);
+    MQ_CHECK_EQ_INT(n_auth, 1);
+    MQ_CHECK(auth && strcmp(auth, "Bearer tok") == 0);
+}
+
 MQ_TEST_MAIN(test_settings_handshake(); test_demux_header_policy();
              test_demux_embedded_nul_rejected(); test_demux_header_bomb_rejected();
-             test_demux_prevalidate_reject();)
+             test_demux_prevalidate_reject(); test_demux_auth_bearer_dedup();)
