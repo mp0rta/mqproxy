@@ -28,6 +28,7 @@
 #define EXP_MAX_CONCURRENT_STREAMS 128u
 #define EXP_MAX_FRAME_SIZE         16384u
 #define EXP_HEADER_TABLE_SIZE      4096u
+#define EXP_MAX_HEADER_LIST_SIZE   16384u
 
 /* ── adapter send_cb: capture the server's outbound plaintext ────────────────*/
 
@@ -197,10 +198,15 @@ test_settings_handshake(void)
         nghttp2_session_get_remote_settings(cli, NGHTTP2_SETTINGS_MAX_FRAME_SIZE);
     uint32_t hts =
         nghttp2_session_get_remote_settings(cli, NGHTTP2_SETTINGS_HEADER_TABLE_SIZE);
+    /* Non-vacuous: nghttp2's default MAX_HEADER_LIST_SIZE is unlimited/large, so
+     * ==16384 proves the server actually advertised the §5.2 limit. */
+    uint32_t mhls =
+        nghttp2_session_get_remote_settings(cli, NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE);
 
     MQ_CHECK_EQ_INT(mcs, EXP_MAX_CONCURRENT_STREAMS);
     MQ_CHECK_EQ_INT(mfs, EXP_MAX_FRAME_SIZE);
     MQ_CHECK_EQ_INT(hts, EXP_HEADER_TABLE_SIZE);
+    MQ_CHECK_EQ_INT(mhls, EXP_MAX_HEADER_LIST_SIZE);
     /* MAX_CONCURRENT_STREAMS must be bounded (<= 128 per §5.2). */
     MQ_CHECK(mcs <= EXP_MAX_CONCURRENT_STREAMS);
 

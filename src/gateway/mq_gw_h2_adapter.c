@@ -27,17 +27,18 @@
 /* Bound the HPACK dynamic table (4 KiB) so a decoder-state-bloat attack is
  * capped. */
 #define MQ_H2_HEADER_TABLE_SIZE 4096
-/* Reject a header bomb: cap the cumulative (name+value+per-field-overhead) size
- * of a single inbound header block (16 KiB). Advertised as
- * SETTINGS_MAX_HEADER_LIST_SIZE — nghttp2 BOTH sends it to the peer AND enforces
- * it locally while decoding, refusing (RST_STREAM) a header block that exceeds
- * it before the application materializes the headers.
+/* Cumulative (name+value+per-field-overhead) cap for a single inbound header
+ * block (16 KiB), advertised as SETTINGS_MAX_HEADER_LIST_SIZE.
  *
- * NOTE: the plan named nghttp2_option_set_max_header_list_size for this, but
- * that symbol is absent from the installed libnghttp2 1.59.0 (only declared in a
- * doc comment, not exported). SETTINGS_MAX_HEADER_LIST_SIZE is the portable,
- * standard mechanism with the same effect (it is the on-wire setting that
- * nghttp2 enforces on inbound), so we advertise it as a SETTINGS entry. */
+ * This SETTINGS entry is a COOPERATIVE HINT to the peer only: nghttp2 1.59.0
+ * does NOT auto-enforce it on inbound header blocks (the recv/HPACK-inflate path
+ * never compares decoded header-list size against local_settings; the inflater
+ * caps only the HPACK dynamic table). The symbol that would enforce it,
+ * nghttp2_option_set_max_header_list_size, is absent from 1.59.0.
+ *
+ * Therefore inbound header-bomb rejection is NOT provided by advertising this
+ * setting — it must be enforced by application-side cumulative header-size
+ * accounting in the on_header callback. That accounting is added in Task 6. */
 #define MQ_H2_MAX_HEADER_LIST_SIZE 16384
 
 /* ── adapter struct ─────────────────────────────────────────────────────────── */
