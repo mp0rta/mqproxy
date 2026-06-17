@@ -4,7 +4,7 @@
 
 ## 1. The question
 
-A multipath proxy that wants to *aggregate* the bandwidth of two WAN links has two
+A multipath proxy that wants to *aggregate* the bandwidth of two WAN links has three
 ways to handle a client's HTTP/3 traffic:
 
 - **block** — drop/block UDP 443 so the client falls back to HTTP/2 over TCP;
@@ -15,11 +15,19 @@ ways to handle a client's HTTP/3 traffic:
   **DATAGRAM** lane (CONNECT-UDP / SOCKS5 UDP ASSOCIATE style). The proxy never
   decrypts; the inner end-to-end QUIC owns reliability and congestion control and
   has no idea multipath exists underneath it.
+- **MITM** — terminate the client's QUIC itself (decrypt TLS), then carry each
+  inner H3 request as its **own MPQUIC STREAM**, the same per-stream aggregation
+  block gets — but *without* forcing a TCP fallback, so it works even on
+  un-block-able H3. This is the strongest option in principle, but it requires
+  intercepting TLS (a trusted cert on the client) and so **breaks transparency**;
+  it is also the most involved to build. **We defer it** and measure only the two
+  transparent, no-MITM approaches here.
 
-Folklore (and prior mqvpn experience) says the relay path underperforms because the
-inner QUIC misreads cross-path reordering as loss. We wanted that quantified: **where,
-in (RTT-skew × loss) space, does each approach win, and by how much — and does an
-improved scheduler change the verdict?**
+So the purpose of this report is a **block vs relay performance comparison**. Folklore
+(and prior mqvpn experience) says the relay path underperforms because the inner QUIC
+misreads cross-path reordering as loss. We wanted that quantified: **where, in
+(RTT-skew × loss) space, does each approach win, and by how much — and does an improved
+scheduler change the verdict?**
 
 This matters because QUIC fuses TLS into the transport. Unlike TCP — where a layer-4
 split proxy can terminate the transport while leaving the TLS bytestream end-to-end —
@@ -112,8 +120,7 @@ vs 23.2), because at 32 MB the setup time is negligible against the transfer. So
 two probes measure effectively the same quantity *at this transfer size*; for small
 transfers or extreme loss, where setup weighs more, prefer the wall-clock figure.
 
-**Build:** release mqproxy + release xquic (an AddressSanitizer build would crush
-goodput and make the numbers meaningless). `REPEAT=1` (see §5).
+**Build:** release mqproxy + release xquic. `REPEAT=1` (see §5).
 
 **Metrics per cell:** goodput (Mbps), per-path bytes (from `mq.path` teardown stats),
 inner-QUIC `packet_lost` event count (picoquic server qlog), and the netem drop delta.
