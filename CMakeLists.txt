@@ -54,9 +54,11 @@ add_library(mqproxy STATIC
     src/transport/mq_h3.c
     src/transport/mq_stream.c
     src/transport/mq_transport.c
-    src/runtime/mq_runtime_libevent.c)
+    src/runtime/mq_runtime_libevent.c
+    src/mitm/mq_mitm_core.c)
 target_link_libraries(mqproxy PUBLIC CURL::libcurl)
-target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR}
+    ${MQPROXY_BORINGSSL_INCLUDE_DIR})
 
 enable_testing()
 add_executable(test_smoke tests/test_smoke.c)
@@ -139,6 +141,42 @@ add_test(NAME test_origdst COMMAND test_origdst)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
+    # ---- Phase 7 Slice 2: MITM crypto core unit suite ----
+    # Needs the BoringSSL static archives libxquic was built against (SSL_*/X509_*).
+    if(MQ_HAVE_BORINGSSL_ARCHIVES)
+        # Single source of truth for the BoringSSL static-link recipe (archive
+        # ORDER matters: libssl.a before libcrypto.a) + the matching include dir.
+        # Both MITM test targets link mqproxy + this — NO xquic: the MITM core is
+        # sans-io / BoringSSL-only and references no xqc_* symbols, so the static
+        # archive pulls no xquic-dependent objects. Keep it xquic-free.
+        add_library(mq_boringssl INTERFACE)
+        target_link_libraries(mq_boringssl INTERFACE
+            "${MQPROXY_BORINGSSL_DIR}/libssl.a"
+            "${MQPROXY_BORINGSSL_DIR}/libcrypto.a"
+            pthread dl m stdc++)
+        target_include_directories(mq_boringssl INTERFACE
+            ${MQPROXY_BORINGSSL_INCLUDE_DIR})
+
+        add_executable(test_mitm_core tests/test_mitm_core.c)
+        target_link_libraries(test_mitm_core mqproxy mq_boringssl)
+        target_include_directories(test_mitm_core PRIVATE tests src)
+        add_test(NAME test_mitm_core COMMAND test_mitm_core)
+
+        # ---- Task 8: openssl s_client cross-implementation smoke ----
+        # The single-shot helper terminates a real loopback TLS handshake via
+        # mq_mitm_core; the shell driver runs `openssl s_client` against it and
+        # asserts ALPN=h2 + chain-verify.
+        add_executable(mitm_smoke_server tests/integration/mitm_smoke_server.c)
+        target_link_libraries(mitm_smoke_server mqproxy mq_boringssl)
+        target_include_directories(mitm_smoke_server PRIVATE src)
+        # NOTE: add_test for e2e_mitm_smoke is registered below, after the MITM CA
+        # fixture paths (MQ_MITM_CA_*) are defined — same pattern as the
+        # test_mitm_core compile_definitions block.
+    else()
+        message(STATUS "BoringSSL archives absent — test_mitm_core not built "
+                       "(run scripts/build-xquic.sh).")
+    endif()
+
     add_executable(test_engine_boot tests/integration/test_engine_boot.c)
     target_link_libraries(test_engine_boot
         mqproxy
@@ -249,6 +287,88 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         if(NOT _origin_cert_rc EQUAL 0)
             message(FATAL_ERROR "openssl failed to generate origin test cert")
         endif()
+    endif()
+
+    # MITM CA + negative fixtures (test-only; regenerated if missing).
+    # NOTE (rev2/C1): do NOT reuse tests/certs/test.crt as the non-CA negative —
+    # it is actually CA:TRUE. We mint a dedicated CA:FALSE leaf below.
+    set(MQ_MITM_CA_CRT     "${MQ_CERT_DIR}/mitm-ca.crt")
+    set(MQ_MITM_CA_KEY     "${MQ_CERT_DIR}/mitm-ca.key")
+    set(MQ_MITM_CA_ENC_KEY "${MQ_CERT_DIR}/mitm-ca.enc.key") # encrypted (must be rejected)
+    set(MQ_MITM_LEAF_CRT   "${MQ_CERT_DIR}/mitm-leaf.crt")   # CA:FALSE → non-CA negative
+    set(MQ_MITM_LEAF_KEY   "${MQ_CERT_DIR}/mitm-leaf.key")   # P-256, ≠ CA key → mismatch negative
+    set(MQ_MITM_V1_CA_CRT  "${MQ_CERT_DIR}/mitm-v1ca.crt")   # X509v1, NO extensions → must be rejected (no explicit basicConstraints)
+    if(NOT EXISTS "${MQ_MITM_CA_CRT}" OR NOT EXISTS "${MQ_MITM_CA_KEY}"
+       OR NOT EXISTS "${MQ_MITM_CA_ENC_KEY}"
+       OR NOT EXISTS "${MQ_MITM_LEAF_CRT}" OR NOT EXISTS "${MQ_MITM_LEAF_KEY}"
+       OR NOT EXISTS "${MQ_MITM_V1_CA_CRT}")
+        find_program(OPENSSL_BIN openssl REQUIRED)
+        file(MAKE_DIRECTORY "${MQ_CERT_DIR}")
+        message(STATUS "Generating MITM CA/leaf fixtures in ${MQ_CERT_DIR}")
+        # P-256 CA with basicConstraints CA:TRUE + keyUsage keyCertSign.
+        execute_process(
+            COMMAND ${OPENSSL_BIN} ecparam -name prime256v1 -genkey -noout -out "${MQ_MITM_CA_KEY}"
+            RESULT_VARIABLE _rc1 OUTPUT_QUIET ERROR_QUIET)
+        execute_process(
+            COMMAND ${OPENSSL_BIN} req -x509 -new -key "${MQ_MITM_CA_KEY}"
+                    -out "${MQ_MITM_CA_CRT}" -days 3650 -subj "/CN=mqproxy-mitm-test-ca"
+                    -addext "basicConstraints=critical,CA:TRUE"
+                    -addext "keyUsage=critical,keyCertSign,cRLSign"
+            RESULT_VARIABLE _rc2 OUTPUT_QUIET ERROR_QUIET)
+        # Encrypted copy of the CA key (passphrase "x") — create() must reject it.
+        execute_process(
+            COMMAND ${OPENSSL_BIN} ec -in "${MQ_MITM_CA_KEY}" -aes256 -passout pass:x
+                    -out "${MQ_MITM_CA_ENC_KEY}"
+            RESULT_VARIABLE _rc3 OUTPUT_QUIET ERROR_QUIET)
+        # P-256 leaf with CA:FALSE (matched key) — the ONLY rejection reason is CA:FALSE.
+        execute_process(
+            COMMAND ${OPENSSL_BIN} ecparam -name prime256v1 -genkey -noout -out "${MQ_MITM_LEAF_KEY}"
+            RESULT_VARIABLE _rc4 OUTPUT_QUIET ERROR_QUIET)
+        execute_process(
+            COMMAND ${OPENSSL_BIN} req -x509 -new -key "${MQ_MITM_LEAF_KEY}"
+                    -out "${MQ_MITM_LEAF_CRT}" -days 3650 -subj "/CN=mqproxy-mitm-test-leaf"
+                    -addext "basicConstraints=critical,CA:FALSE"
+            RESULT_VARIABLE _rc5 OUTPUT_QUIET ERROR_QUIET)
+        # X509v1 self-signed cert with NO extensions (CSR -> x509 -req with no
+        # -extfile keeps it v1). X509_check_ca() treats a v1 cert as CA-eligible,
+        # so this is the negative that proves the explicit-basicConstraints gate:
+        # it has no BCONS extension and MUST be rejected. Signed by the CA key so
+        # the ONLY rejection reason is the missing basicConstraints.
+        execute_process(
+            COMMAND ${OPENSSL_BIN} req -new -key "${MQ_MITM_CA_KEY}"
+                    -subj "/CN=mqproxy-mitm-test-v1ca" -out "${MQ_CERT_DIR}/mitm-v1ca.csr"
+            RESULT_VARIABLE _rc6 OUTPUT_QUIET ERROR_QUIET)
+        execute_process(
+            COMMAND ${OPENSSL_BIN} x509 -req -in "${MQ_CERT_DIR}/mitm-v1ca.csr"
+                    -signkey "${MQ_MITM_CA_KEY}" -days 3650 -out "${MQ_MITM_V1_CA_CRT}"
+            RESULT_VARIABLE _rc7 OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _rc1 EQUAL 0 OR NOT _rc2 EQUAL 0 OR NOT _rc3 EQUAL 0
+           OR NOT _rc4 EQUAL 0 OR NOT _rc5 EQUAL 0
+           OR NOT _rc6 EQUAL 0 OR NOT _rc7 EQUAL 0)
+            message(FATAL_ERROR "openssl failed generating MITM CA/leaf fixtures")
+        endif()
+    endif()
+
+    # Pass the fixture paths to the MITM unit suite (target created above, gated on
+    # the BoringSSL archives). The fixtures are defined here (after MQ_CERT_DIR), so
+    # we attach the compile defs here rather than at the target block.
+    if(MQ_HAVE_BORINGSSL_ARCHIVES)
+        target_compile_definitions(test_mitm_core PRIVATE
+            MITM_CA_CRT="${MQ_MITM_CA_CRT}"
+            MITM_CA_KEY="${MQ_MITM_CA_KEY}"
+            MITM_CA_ENC_KEY="${MQ_MITM_CA_ENC_KEY}"
+            MITM_LEAF_CRT="${MQ_MITM_LEAF_CRT}"   # CA:FALSE matched pair → non-CA negative
+            MITM_LEAF_KEY="${MQ_MITM_LEAF_KEY}"   # P-256 ≠ CA key → mismatch negative
+            MITM_V1_CA_CRT="${MQ_MITM_V1_CA_CRT}") # X509v1 no-extensions → missing-basicConstraints negative
+
+        # Task 8 smoke (mitm_smoke_server target created above): register here so
+        # the MQ_MITM_CA_* fixture paths are populated. SKIP (77) iff openssl absent.
+        add_test(NAME e2e_mitm_smoke
+            COMMAND ${CMAKE_COMMAND} -E env
+                MITM_SERVER_BIN=$<TARGET_FILE:mitm_smoke_server>
+                MITM_CA_CRT=${MQ_MITM_CA_CRT} MITM_CA_KEY=${MQ_MITM_CA_KEY}
+                bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_mitm_smoke.sh)
+        set_tests_properties(e2e_mitm_smoke PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     add_executable(test_conn_handshake tests/integration/test_conn_handshake.c)

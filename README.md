@@ -449,6 +449,10 @@ The unit/integration suite covers wire framing, the relay/flow state machine, in
 - `tests/integration/e2e_udp.sh` — UDP relay through SOCKS5 UDP ASSOCIATE against a local UDP echo (`udpsocks` + `udp_echo` helpers): byte-exact small + fragmented (3 KB) echo, concurrent sessions, idle-timeout re-OPEN, control-connection teardown, and a 2-path smoke (NET_ADMIN-gated; the rest runs unprivileged).
 - `tests/integration/e2e_tproxy.sh` — transparent capture end-to-end: self-installs nft redirect rules, verifies a connection is intercepted and relayed opaquely through the MPQUIC tunnel. **Requires root/`NET_ADMIN` and self-skips otherwise.**
 
+**TLS MITM core (Phase 7 Slice 2 — built but not yet wired).** The `mq_mitm_core` module (`src/mitm/`) implements the crypto foundation for TLS MITM ingress: it loads a provided CA, forges a per-SNI leaf certificate (LRU-cached, signed by the CA), and configures a browser-facing TLS server handshake that negotiates `ALPN=h2`. This slice is **tests-only and is NOT wired into the live capture path** — live wiring (the H2 adapter + tproxy MITM branch) is a later slice. The module is built only when the BoringSSL static archives are present, so run `scripts/build-xquic.sh` first; with no archives the targets are skipped. Two tests cover it:
+  - `test_mitm_core` — in-process unit suite (memory-BIO handshake proving the forged leaf chains to the CA, ALPN negotiates `h2`, and SAN matches the SNI; plus CA-validation, SNI-normalization, forge, LRU/TTL, and ALPN/SNI rejection negatives). Runs clean under ASan (`-DMQPROXY_SANITIZE=ON`).
+  - `e2e_mitm_smoke` — cross-implementation smoke: a real `openssl s_client` negotiates `h2` against the module and verifies the forged chain against the CA. **Self-skips (77) if `openssl` is absent.**
+
 The wire codecs and ingress parsers (the untrusted-input attack surface) also have a standalone [libFuzzer](fuzz/) harness suite, replayed against a seed corpus in CI; the C/C++ sources are scanned by CodeQL (`security-extended`) on every push to `main`.
 
 ## Observability
