@@ -166,7 +166,15 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # Needs the BoringSSL static archives libxquic was built against (SSL_*/X509_*).
     # The mq_boringssl INTERFACE target is defined in cmake/BuildSetup.cmake
     # (hoisted out of this test-only block so mqproxy_cli can also consume it).
-    if(MQ_HAVE_BORINGSSL_ARCHIVES)
+    # GATE: MQPROXY_MITM, NOT MQ_HAVE_BORINGSSL_ARCHIVES. These targets reference
+    # mq_mitm_core_* symbols, which are compiled into the mqproxy lib only under
+    # MQPROXY_MITM (see ~line 69). Gating them on the raw-archive predicate while
+    # the source compilation is gated on MQPROXY_MITM would let a hypothetical
+    # MQPROXY_MITM=OFF + archives-present build still emit these targets and then
+    # fail to LINK with undefined mq_mitm_core_* — a confusing failure far from the
+    # cause. MQPROXY_MITM is an alias of MQ_HAVE_BORINGSSL_ARCHIVES today, so this
+    # is behavior-preserving; it makes the documented decoupling actually safe.
+    if(MQPROXY_MITM)
         add_executable(test_mitm_core tests/test_mitm_core.c)
         target_link_libraries(test_mitm_core mqproxy mq_boringssl)
         target_include_directories(test_mitm_core PRIVATE tests src)
@@ -360,9 +368,11 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     endif()
 
     # Pass the fixture paths to the MITM unit suite (target created above, gated on
-    # the BoringSSL archives). The fixtures are defined here (after MQ_CERT_DIR), so
-    # we attach the compile defs here rather than at the target block.
-    if(MQ_HAVE_BORINGSSL_ARCHIVES)
+    # MQPROXY_MITM). The fixtures are defined here (after MQ_CERT_DIR), so we attach
+    # the compile defs here rather than at the target block. Gate MUST match the
+    # target-definition block above (MQPROXY_MITM) so the targets and their tests
+    # appear/disappear together.
+    if(MQPROXY_MITM)
         target_compile_definitions(test_mitm_core PRIVATE
             MITM_CA_CRT="${MQ_MITM_CA_CRT}"
             MITM_CA_KEY="${MQ_MITM_CA_KEY}"

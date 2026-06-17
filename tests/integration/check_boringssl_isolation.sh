@@ -4,6 +4,12 @@
 # Asserts the BoringSSL the MITM core links against is *isolated* inside the
 # mqproxy executable so it cannot interpose libcurl's system OpenSSL (libssl.so).
 #
+# SCOPE OF THE CANARIES: the three symbols below (SSL_new, SSL_CTX_new, X509_sign)
+# are *representative canaries* for the BoringSSL SSL_*/X509_* surface — NOT an
+# exhaustive enumeration. The actual isolation is enforced by --exclude-libs
+# covering the WHOLE libssl.a/libcrypto.a archives (plus BoringSSL's own hidden
+# visibility); the `nm` checks here only spot-validate non-export on these few.
+#
 # WHY THE THREE CHECKS LOOK ASYMMETRIC (symbol-presence ordering subtlety):
 #   A static archive only contributes object files that resolve some *referenced*
 #   undefined symbol. At THIS task nothing in cli/main.c references the MITM core
@@ -70,7 +76,7 @@ fi
 # up as a global 'T' or weak 'W' in the dynamic symbol table, it can interpose
 # libcurl's libssl.so at runtime — exactly what --exclude-libs must prevent.
 # Vacuously passes when the symbols are absent; meaningfully enforced when present.
-exported="$(nm -D "$EXE" 2>/dev/null | grep -E ' (T|W) (SSL_new|X509_sign|SSL_CTX_new)$' || true)"
+exported="$(nm -D "$EXE" 2>/dev/null | grep -E ' (T|W) (SSL_new|SSL_CTX_new|X509_sign)$' || true)"
 if [[ -n "$exported" ]]; then
     echo "FAIL (ii): BoringSSL symbols EXPORTED in dynamic symbol table (interposition risk):" >&2
     echo "$exported" >&2
