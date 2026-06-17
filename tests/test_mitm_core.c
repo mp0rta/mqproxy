@@ -3,6 +3,12 @@
 #include "mqtest.h"
 #include "mitm/mq_mitm_core.h"
 
+#include <openssl/asn1.h>
+#include <openssl/bn.h>
+#include <openssl/evp.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +17,12 @@
 
 // Internal (no header) — forward-declared for direct unit testing.
 extern int mq_mitm_normalize_sni(const char *, size_t, char[256]);
+extern X509 *mq_mitm_forge_for_test(mq_mitm_core_t *core, const char *norm_sni);
+// Forge with a caller-chosen keyUsage extension string (e.g. "critical,cRLSign")
+// — otherwise identical to the production profile. CA-signed. Test-only hook used
+// to prove the SSL-server purpose gate (I1) is load-bearing.
+extern X509 *mq_mitm_forge_ku_for_test(mq_mitm_core_t *core, const char *norm_sni,
+                                       const char *ku_str);
 
 static void
 test_sni_norm(void)
@@ -123,6 +135,151 @@ test_reject_world_readable_key(void)
     unlink(path);
 }
 
+// ---- Task 4: leaf forge ----
+
+// Build an X509_STORE trusting the test CA, then verify `leaf` against it under
+// the SSL-server purpose. Returns the X509_verify_cert result (1 == ok) and, on
+// failure, writes the verify-error code into *err (else 0).
+static int
+verify_leaf_with_ca(X509 *leaf, int *err)
+{
+    if (err) *err = 0;
+    FILE *fp = fopen(MITM_CA_CRT, "rb");
+    MQ_CHECK(fp != NULL);
+    X509 *ca = PEM_read_X509(fp, NULL, NULL, NULL);
+    fclose(fp);
+    MQ_CHECK(ca != NULL);
+
+    X509_STORE *store = X509_STORE_new();
+    MQ_CHECK(store != NULL);
+    MQ_CHECK(X509_STORE_add_cert(store, ca) == 1);
+
+    X509_STORE_CTX *ctx = X509_STORE_CTX_new();
+    MQ_CHECK(ctx != NULL);
+    MQ_CHECK(X509_STORE_CTX_init(ctx, store, leaf, NULL) == 1);
+    MQ_CHECK(X509_STORE_CTX_set_purpose(ctx, X509_PURPOSE_SSL_SERVER) == 1);
+
+    int rv = X509_verify_cert(ctx);
+    if (rv != 1 && err) *err = X509_STORE_CTX_get_error(ctx);
+
+    X509_STORE_CTX_free(ctx);
+    X509_STORE_free(store);
+    X509_free(ca);
+    return rv;
+}
+
+// Extract the single SAN DNS name from `leaf` into out (NUL-terminated). Returns
+// 0 on success, -1 if no SAN DNS entry present.
+static int
+leaf_san_dns(X509 *leaf, char *out, size_t outsz)
+{
+    GENERAL_NAMES *gens = X509_get_ext_d2i(leaf, NID_subject_alt_name, NULL, NULL);
+    if (!gens) return -1;
+    int rc = -1;
+    for (size_t i = 0; i < (size_t)sk_GENERAL_NAME_num(gens); i++) {
+        const GENERAL_NAME *gn = sk_GENERAL_NAME_value(gens, i);
+        int type = 0;
+        const ASN1_IA5STRING *ia5 = GENERAL_NAME_get0_value((GENERAL_NAME *)gn, &type);
+        if (type == GEN_DNS && ia5) {
+            int len = ASN1_STRING_length(ia5);
+            const unsigned char *data = ASN1_STRING_get0_data(ia5);
+            if (len >= 0 && (size_t)len < outsz) {
+                memcpy(out, data, (size_t)len);
+                out[len] = '\0';
+                rc = 0;
+            }
+            break;
+        }
+    }
+    GENERAL_NAMES_free(gens);
+    return rc;
+}
+
+// Read the leaf's subject CN into out. Returns 0 on success.
+static int
+leaf_cn(X509 *leaf, char *out, int outsz)
+{
+    X509_NAME *subj = X509_get_subject_name(leaf);
+    if (!subj) return -1;
+    int n = X509_NAME_get_text_by_NID(subj, NID_commonName, out, outsz);
+    return n >= 0 ? 0 : -1;
+}
+
+static void
+test_forge_chains_to_ca(void)
+{
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, NULL);
+    MQ_CHECK(c != NULL);
+
+    X509 *leaf = mq_mitm_forge_for_test(c, "host.example.com");
+    MQ_CHECK(leaf != NULL);
+
+    int err = 0;
+    MQ_CHECK(verify_leaf_with_ca(leaf, &err) == 1); // chains to CA, SSL-server purpose
+
+    // SAN DNS == the (already-normalized) name.
+    char san[256];
+    MQ_CHECK(leaf_san_dns(leaf, san, sizeof san) == 0);
+    MQ_CHECK(strcmp(san, "host.example.com") == 0);
+
+    // CA:FALSE and CN == "mqproxy-mitm".
+    MQ_CHECK(X509_check_ca(leaf) == 0);
+    char cn[64];
+    MQ_CHECK(leaf_cn(leaf, cn, (int)sizeof cn) == 0);
+    MQ_CHECK(strcmp(cn, "mqproxy-mitm") == 0);
+
+    X509_free(leaf);
+    mq_mitm_core_destroy(c);
+}
+
+// I1 — prove the SSL-server purpose gate is load-bearing (not vacuous). Forge a
+// leaf that is CA-signed and otherwise valid, but whose keyUsage omits ALL THREE
+// of digitalSignature/keyEncipherment/keyAgreement (here: cRLSign only). Per
+// BoringSSL v3_purp.cc, X509v3_KU_TLS accepts ANY of those three, so omitting
+// only digitalSignature would still PASS — all three must be absent. Such a leaf
+// must FAIL X509_verify_cert with X509_V_ERR_INVALID_PURPOSE.
+static void
+test_forge_purpose_gate_is_load_bearing(void)
+{
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, NULL);
+    MQ_CHECK(c != NULL);
+
+    // keyUsage omits ALL THREE TLS-server usages (cRLSign only) → otherwise valid,
+    // CA-signed leaf that must fail the SSL-server purpose check.
+    X509 *leaf = mq_mitm_forge_ku_for_test(c, "host.example.com", "critical,cRLSign");
+    MQ_CHECK(leaf != NULL);
+
+    // Sanity: it really does chain (signature/trust/time all fine) — so the only
+    // possible failure reason is the purpose gate, not a broken negative.
+    int err0 = 0;
+    {
+        FILE *fp = fopen(MITM_CA_CRT, "rb");
+        MQ_CHECK(fp != NULL);
+        X509 *ca = PEM_read_X509(fp, NULL, NULL, NULL);
+        fclose(fp);
+        MQ_CHECK(ca != NULL);
+        X509_STORE *store = X509_STORE_new();
+        MQ_CHECK(X509_STORE_add_cert(store, ca) == 1);
+        X509_STORE_CTX *ctx = X509_STORE_CTX_new();
+        MQ_CHECK(X509_STORE_CTX_init(ctx, store, leaf, NULL) == 1);
+        // No purpose set → trust/time/signature only → should pass.
+        MQ_CHECK(X509_verify_cert(ctx) == 1);
+        (void)err0;
+        X509_STORE_CTX_free(ctx);
+        X509_STORE_free(store);
+        X509_free(ca);
+    }
+
+    int err = 0;
+    int rv = verify_leaf_with_ca(leaf, &err);
+    MQ_CHECK(rv != 1);                           // must FAIL
+    MQ_CHECK(err == X509_V_ERR_INVALID_PURPOSE); // for the right reason
+
+    X509_free(leaf);
+    mq_mitm_core_destroy(c);
+}
+
 MQ_TEST_MAIN(test_sni_norm(); test_create_valid(); test_reject_non_ca();
              test_reject_key_mismatch(); test_reject_encrypted_key();
-             test_reject_symlink_key(); test_reject_world_readable_key();)
+             test_reject_symlink_key(); test_reject_world_readable_key();
+             test_forge_chains_to_ca(); test_forge_purpose_gate_is_load_bearing();)

@@ -6,6 +6,8 @@
 // land in later Slice 2 tasks). NOT wired into the live tproxy path (Slice 3).
 #include "mitm/mq_mitm_core.h"
 
+#include <openssl/asn1.h>
+#include <openssl/bn.h>
 #include <openssl/bytestring.h>
 #include <openssl/ec.h>
 #include <openssl/evp.h>
@@ -264,6 +266,135 @@ fail:
     if (cert_fp) fclose(cert_fp);
     if (key_bio) BIO_free(key_bio);
     return NULL;
+}
+
+// Add a v3 extension to `leaf` from a config string (e.g. "critical,CA:FALSE")
+// using the X509V3 config-string mechanism. Returns 0 on success, -1 on failure.
+static int
+add_ext_conf(X509 *leaf, int nid, const char *value)
+{
+    X509V3_CTX v3ctx;
+    X509V3_set_ctx_nodb(&v3ctx);
+    // issuer = leaf's own issuer (already set), subject = leaf — sufficient for
+    // basicConstraints / keyUsage / extendedKeyUsage which don't reference names.
+    X509V3_set_ctx(&v3ctx, leaf, leaf, NULL, NULL, 0);
+    // Use the nconf variant (conf=NULL): the thin X509V3_EXT_conf_nid wrapper is
+    // not present in the vendored BoringSSL static archive.
+    X509_EXTENSION *ext = X509V3_EXT_nconf_nid(NULL, &v3ctx, nid, (char *)value);
+    if (!ext) return -1;
+    int rc = X509_add_ext(leaf, ext, -1);
+    X509_EXTENSION_free(ext);
+    return rc == 1 ? 0 : -1;
+}
+
+// Build a per-SNI leaf per the spec §3 profile, signed by the CA. `ku_str` is the
+// keyUsage extension config string ("critical,digitalSignature" in production).
+// The forge_leaf production wrapper pins the spec keyUsage; the parameter exists
+// so the test suite can prove the SSL-server purpose gate is load-bearing.
+// Returns a new X509* owned by the caller, or NULL on failure (no leaks).
+static X509 *
+forge_leaf_ku(mq_mitm_core_t *core, const char *norm_sni, const char *ku_str)
+{
+    if (!core || !norm_sni) return NULL;
+
+    X509 *leaf = NULL;
+    GENERAL_NAME *gen = NULL;
+    GENERAL_NAMES *gens = NULL;
+    ASN1_IA5STRING *ia5 = NULL;
+    BIGNUM *bn = NULL;
+    ASN1_INTEGER *serial = NULL;
+    X509_NAME *subj = NULL;
+    int ok = 0;
+
+    leaf = X509_new();
+    if (!leaf) goto done;
+    if (X509_set_version(leaf, 2) != 1) goto done; // v3
+
+    // Issuer = CA subject name.
+    if (X509_set_issuer_name(leaf, X509_get_subject_name(core->ca_cert)) != 1) goto done;
+
+    // Subject CN = fixed literal (NOT the SNI — DNS names can exceed CN limit).
+    subj = X509_get_subject_name(leaf);
+    if (!subj) goto done;
+    if (X509_NAME_add_entry_by_NID(subj, NID_commonName, MBSTRING_ASC,
+                                   (const unsigned char *)"mqproxy-mitm", -1, -1, 0) != 1)
+        goto done;
+
+    // Public key = shared leaf key.
+    if (X509_set_pubkey(leaf, core->leaf_key) != 1) goto done;
+
+    // Serial = positive random (~64 bits).
+    bn = BN_new();
+    if (!bn) goto done;
+    if (BN_rand(bn, 64, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) != 1) goto done;
+    BN_set_negative(bn, 0); // ensure positive
+    serial = BN_to_ASN1_INTEGER(bn, NULL);
+    if (!serial) goto done;
+    if (X509_set_serialNumber(leaf, serial) != 1) goto done;
+
+    // Validity: notBefore = now-1h, notAfter = now + leaf_ttl_sec.
+    {
+        time_t now = core->now_fn();
+        if (!X509_time_adj_ex(X509_getm_notBefore(leaf), 0, -3600, &now)) goto done;
+        if (!X509_time_adj_ex(X509_getm_notAfter(leaf), 0, core->leaf_ttl_sec, &now))
+            goto done;
+    }
+
+    // SAN: DNS = normalized SNI, built via GENERAL_NAME/GEN_DNS (NOT a conf string).
+    gens = sk_GENERAL_NAME_new_null();
+    if (!gens) goto done;
+    gen = GENERAL_NAME_new();
+    if (!gen) goto done;
+    ia5 = ASN1_IA5STRING_new();
+    if (!ia5) goto done;
+    if (ASN1_STRING_set(ia5, norm_sni, -1) != 1) goto done;
+    GENERAL_NAME_set0_value(gen, GEN_DNS, ia5);
+    ia5 = NULL; // ownership transferred to gen
+    if (!sk_GENERAL_NAME_push(gens, gen)) goto done;
+    gen = NULL; // ownership transferred to gens
+    if (X509_add1_ext_i2d(leaf, NID_subject_alt_name, gens, 0, 0) != 1) goto done;
+
+    // basicConstraints / keyUsage / extendedKeyUsage.
+    if (add_ext_conf(leaf, NID_basic_constraints, "critical,CA:FALSE") != 0) goto done;
+    if (add_ext_conf(leaf, NID_key_usage, ku_str) != 0) goto done;
+    if (add_ext_conf(leaf, NID_ext_key_usage, "serverAuth") != 0) goto done;
+
+    // Sign with the CA key.
+    if (X509_sign(leaf, core->ca_key, EVP_sha256()) == 0) goto done;
+
+    ok = 1;
+
+done:
+    if (gens) GENERAL_NAMES_free(gens); // frees any remaining pushed GENERAL_NAMEs
+    if (gen) GENERAL_NAME_free(gen);    // only if not yet pushed
+    if (ia5) ASN1_IA5STRING_free(ia5);  // only if ownership not transferred
+    if (serial) ASN1_INTEGER_free(serial);
+    if (bn) BN_free(bn);
+    if (!ok && leaf) {
+        X509_free(leaf);
+        leaf = NULL;
+    }
+    return leaf;
+}
+
+// Production forge: spec §3 keyUsage = critical, digitalSignature.
+static X509 *
+forge_leaf(mq_mitm_core_t *core, const char *norm_sni)
+{
+    return forge_leaf_ku(core, norm_sni, "critical,digitalSignature");
+}
+
+// TEST-ONLY hooks (no header; forward-declared extern in the test).
+X509 *
+mq_mitm_forge_for_test(mq_mitm_core_t *core, const char *norm_sni)
+{
+    return forge_leaf(core, norm_sni);
+}
+
+X509 *
+mq_mitm_forge_ku_for_test(mq_mitm_core_t *core, const char *norm_sni, const char *ku_str)
+{
+    return forge_leaf_ku(core, norm_sni, ku_str);
 }
 
 SSL *
