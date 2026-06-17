@@ -16,7 +16,6 @@
 #include <openssl/x509v3.h>
 
 #include <arpa/inet.h>
-#include <assert.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -48,6 +47,14 @@ typedef struct mq_cache_entry {
 } mq_cache_entry_t;
 
 struct mq_mitm_core {
+    // Lifetime refcount. Starts at 1 (the create()/destroy() owner ref). Each SSL
+    // built by mq_mitm_core_new_ssl takes ANOTHER ref (stashed in SSL ex-data) and
+    // releases it from the SSL ex-data free callback on SSL_free. The core's
+    // resources are torn down only when the count reaches 0, so destroy() may run
+    // while SSLs are still alive without dangling the core pointer they hold.
+    // Non-atomic: the 1-client/process model means one owner thread (same
+    // assumption as the lazy SSL_CTX build below).
+    int refcount;
     X509 *ca_cert;
     EVP_PKEY *ca_key;
     EVP_PKEY *leaf_key; // shared across all forged leaves
@@ -111,9 +118,14 @@ mq_mitm_normalize_sni(const char *sni, size_t sni_len, char out[256])
         if (++label_len > MQ_DNS_LABEL_MAX) return -1; // label too long
         tmp[i] = c;
     }
-    // The loop's per-'.' empty-label guard plus the sni_len==0 checks above mean
-    // a non-empty trailing label is invariant here; assert rather than branch.
-    assert(label_len != 0);
+    // Reject a trailing empty label. The single-dot strip above only removes ONE
+    // root dot, so multi-dot suffixes ("example.com..") arrive here with the loop
+    // having reset label_len to 0 on the final '.'. This MUST be a runtime check,
+    // not an assert: SNI is attacker-controlled and reaches this on the live
+    // cert-selection path — an assert would abort the data plane (debug) or, under
+    // NDEBUG, let a trailing-dot name through as a forge key / SAN (normalization
+    // bypass → cache amplification).
+    if (label_len == 0) return -1;
     tmp[sni_len] = '\0';
 
     // Reject IP literals — they must not be treated as DNS names. inet_pton on
@@ -229,6 +241,14 @@ mq_mitm_core_create(const char *ca_cert_pem_path, const char *ca_key_pem_path,
         goto fail; // not a CA (CA:FALSE or no basicConstraints)
     uint32_t exflags = X509_get_extension_flags(ca_cert);
     if (exflags & EXFLAG_INVALID) goto fail; // malformed/contradictory extensions
+    // X509_check_ca() treats an X509v1 cert (which has NO extensions) as
+    // CA-eligible. Require a real basicConstraints extension so a v1 / no-BCONS
+    // cert can't be loaded as a signing CA — i.e. demand explicit CA:TRUE.
+    if (!(exflags & EXFLAG_BCONS)) goto fail;
+    // keyUsage stays CONDITIONAL on purpose: RFC 5280 §4.2.1.3 makes keyUsage
+    // OPTIONAL, and an absent keyUsage permits all usages (incl. cert signing).
+    // We reject only a PRESENT keyUsage that withholds keyCertSign — tightening
+    // this to "keyUsage mandatory" would wrongly reject conformant CAs that omit it.
     if (exflags & EXFLAG_KUSAGE) {
         if (!(X509_get_key_usage(ca_cert) & KU_KEY_CERT_SIGN))
             goto fail; // keyUsage present but cannot sign certs
@@ -258,6 +278,7 @@ mq_mitm_core_create(const char *ca_cert_pem_path, const char *ca_key_pem_path,
     // --- 6. Assemble the core ---
     core = calloc(1, sizeof *core);
     if (!core) goto fail;
+    core->refcount = 1; // owner ref, released by mq_mitm_core_destroy
     core->ca_cert = ca_cert;
     core->ca_key = ca_key;
     core->leaf_key = leaf_key;
@@ -552,10 +573,15 @@ mq_mitm_forge_ku_for_test(mq_mitm_core_t *core, const char *norm_sni, const char
 static int g_core_idx = -1;
 static pthread_once_t g_core_idx_once = PTHREAD_ONCE_INIT;
 
+// Defined below (near destroy); registered as the ex-data free callback so each
+// SSL releases its core ref on SSL_free.
+static void core_ssl_ex_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int index,
+                             long argl, void *argp);
+
 static void
 init_core_idx(void)
 {
-    g_core_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+    g_core_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, core_ssl_ex_free);
 }
 
 // Server-advertised ALPN protocol list (length-prefixed wire form): just "h2".
@@ -570,8 +596,13 @@ alpn_select_cb(SSL *ssl, const uint8_t **out, uint8_t *outlen, const uint8_t *in
 {
     (void)ssl;
     (void)arg;
-    int rc = SSL_select_next_proto((uint8_t **)out, outlen, k_alpn_h2,
-                                   (unsigned int)sizeof k_alpn_h2, in, inlen);
+    // Documented arg order: SSL_select_next_proto(out, out_len, peer, peer_len,
+    // supported, supported_len) selects from `supported` (OURS) the first entry
+    // the peer offered. Pass the client's list as `peer` and our h2-only list as
+    // `supported`. (Today our list is a single proto so the intersection is
+    // order-insensitive, but keep the positions correct for when it grows.)
+    int rc = SSL_select_next_proto((uint8_t **)out, outlen, in, inlen, k_alpn_h2,
+                                   (unsigned int)sizeof k_alpn_h2);
     if (rc == OPENSSL_NPN_NEGOTIATED) return SSL_TLSEXT_ERR_OK;
     return SSL_TLSEXT_ERR_ALERT_FATAL; // OPENSSL_NPN_NO_OVERLAP (no h2 offered)
 }
@@ -653,7 +684,11 @@ mq_mitm_core_new_ssl(mq_mitm_core_t *core)
 
     SSL *s = SSL_new(core->ssl_ctx);
     if (!s) return NULL;
+    // Hand this SSL its own core ref BEFORE stashing the pointer, so the ref the
+    // ex-data free callback will release on SSL_free is already accounted for.
+    core->refcount++;
     if (SSL_set_ex_data(s, g_core_idx, core) != 1) {
+        core->refcount--; // ex-data slot not set → callback won't fire for it
         SSL_free(s);
         return NULL;
     }
@@ -661,12 +696,16 @@ mq_mitm_core_new_ssl(mq_mitm_core_t *core)
     return s;
 }
 
-void
-mq_mitm_core_destroy(mq_mitm_core_t *core)
+// Drop one ref; tear down only when the last ref goes away. Shared by the public
+// destroy() (owner ref) and the SSL ex-data free callback (per-SSL ref).
+static void
+core_release(mq_mitm_core_t *core)
 {
-    if (!core) return;
+    if (--core->refcount > 0) return;
     // Order: SSL_CTX first, then cache, then keys/cert. Each cache entry holds
     // one X509 ref on its leaf; release them all before freeing the keys/cert.
+    // (SSL_CTX_free here only drops the core's own ctx ref — any SSL still alive
+    // holds its own ref, so the ctx outlives this call until that SSL is freed.)
     if (core->ssl_ctx) SSL_CTX_free(core->ssl_ctx);
     for (mq_cache_entry_t *e = core->lru_head; e;) {
         mq_cache_entry_t *next = e->next;
@@ -679,6 +718,29 @@ mq_mitm_core_destroy(mq_mitm_core_t *core)
     if (core->ca_key) EVP_PKEY_free(core->ca_key);
     if (core->ca_cert) X509_free(core->ca_cert);
     free(core);
+}
+
+// SSL ex-data free callback: releases the per-SSL core ref on SSL_free. `ptr` is
+// the stashed core (NULL if the slot was never set — see SSL_set_ex_data failure
+// path in mq_mitm_core_new_ssl). Per the BoringSSL contract, `parent`/`ad` are
+// NULL and must not be touched; `core` is a separate object and is safe to use.
+static void
+core_ssl_ex_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int index, long argl,
+                 void *argp)
+{
+    (void)parent;
+    (void)ad;
+    (void)index;
+    (void)argl;
+    (void)argp;
+    if (ptr) core_release((mq_mitm_core_t *)ptr);
+}
+
+void
+mq_mitm_core_destroy(mq_mitm_core_t *core)
+{
+    if (!core) return;
+    core_release(core); // drops the owner ref (actual teardown when refcount==0)
 }
 
 void

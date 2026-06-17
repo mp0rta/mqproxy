@@ -68,6 +68,15 @@ test_sni_norm(void)
     // Leading dot / double dot rejected (empty label).
     MQ_CHECK(mq_mitm_normalize_sni(".example.com", 12, out) == -1);
     MQ_CHECK(mq_mitm_normalize_sni("a..b.com", 8, out) == -1);
+    // Trailing EMPTY label: only ONE root dot is stripped, so a multi-dot suffix
+    // leaves a trailing '.' that must be rejected (not asserted/aborted, not let
+    // through as "example.com."). Regression guard for the SNI normalization
+    // bypass / debug-build abort.
+    MQ_CHECK(mq_mitm_normalize_sni("example.com..", 13, out) == -1);
+    MQ_CHECK(mq_mitm_normalize_sni("example.com...", 14, out) == -1);
+    MQ_CHECK(mq_mitm_normalize_sni(".", 1, out) == -1); // bare root → empty after strip
+    MQ_CHECK(mq_mitm_normalize_sni("..", 2, out) ==
+             -1); // strip one dot → ".", empty label
 }
 
 static void
@@ -83,6 +92,18 @@ test_reject_non_ca(void)
 {
     // matched CA:FALSE leaf pair → rejected for exactly one reason: not a CA
     MQ_CHECK(mq_mitm_core_create(MITM_LEAF_CRT, MITM_LEAF_KEY, NULL) == NULL);
+}
+
+static void
+test_reject_v1_ca(void)
+{
+    // X509v1 cert (no extensions). X509_check_ca() treats it as CA-eligible, so
+    // this exercises the explicit-basicConstraints gate specifically. Signed by
+    // the CA key (so the key-match check would pass) → the ONLY rejection reason
+    // is the missing basicConstraints extension. Defensively chmod 0600 so the
+    // perms gate on the key doesn't pre-empt the cert-eligibility path.
+    chmod(MITM_CA_KEY, 0600);
+    MQ_CHECK(mq_mitm_core_create(MITM_V1_CA_CRT, MITM_CA_KEY, NULL) == NULL);
 }
 
 static void
@@ -142,11 +163,13 @@ test_reject_world_readable_key(void)
 
 // ---- Task 4: leaf forge ----
 
-// Build an X509_STORE trusting the test CA, then verify `leaf` against it under
-// the SSL-server purpose. Returns the X509_verify_cert result (1 == ok) and, on
+// Build an X509_STORE trusting the test CA, then verify `leaf` against it.
+// When set_purpose != 0 the SSL-server purpose is enforced; when 0, only
+// trust/time/signature are checked (used to prove the purpose gate is the sole
+// reason a negative fails). Returns the X509_verify_cert result (1 == ok) and, on
 // failure, writes the verify-error code into *err (else 0).
 static int
-verify_leaf_with_ca(X509 *leaf, int *err)
+verify_leaf_with_ca(X509 *leaf, int set_purpose, int *err)
 {
     if (err) *err = 0;
     FILE *fp = fopen(MITM_CA_CRT, "rb");
@@ -162,7 +185,8 @@ verify_leaf_with_ca(X509 *leaf, int *err)
     X509_STORE_CTX *ctx = X509_STORE_CTX_new();
     MQ_CHECK(ctx != NULL);
     MQ_CHECK(X509_STORE_CTX_init(ctx, store, leaf, NULL) == 1);
-    MQ_CHECK(X509_STORE_CTX_set_purpose(ctx, X509_PURPOSE_SSL_SERVER) == 1);
+    if (set_purpose)
+        MQ_CHECK(X509_STORE_CTX_set_purpose(ctx, X509_PURPOSE_SSL_SERVER) == 1);
 
     int rv = X509_verify_cert(ctx);
     if (rv != 1 && err) *err = X509_STORE_CTX_get_error(ctx);
@@ -222,7 +246,7 @@ test_forge_chains_to_ca(void)
     MQ_CHECK(leaf != NULL);
 
     int err = 0;
-    MQ_CHECK(verify_leaf_with_ca(leaf, &err) == 1); // chains to CA, SSL-server purpose
+    MQ_CHECK(verify_leaf_with_ca(leaf, 1, &err) == 1); // chains to CA, SSL-server purpose
 
     // SAN DNS == the (already-normalized) name.
     char san[256];
@@ -256,29 +280,13 @@ test_forge_purpose_gate_is_load_bearing(void)
     X509 *leaf = mq_mitm_forge_ku_for_test(c, "host.example.com", "critical,cRLSign");
     MQ_CHECK(leaf != NULL);
 
-    // Sanity: it really does chain (signature/trust/time all fine) — so the only
-    // possible failure reason is the purpose gate, not a broken negative.
-    int err0 = 0;
-    {
-        FILE *fp = fopen(MITM_CA_CRT, "rb");
-        MQ_CHECK(fp != NULL);
-        X509 *ca = PEM_read_X509(fp, NULL, NULL, NULL);
-        fclose(fp);
-        MQ_CHECK(ca != NULL);
-        X509_STORE *store = X509_STORE_new();
-        MQ_CHECK(X509_STORE_add_cert(store, ca) == 1);
-        X509_STORE_CTX *ctx = X509_STORE_CTX_new();
-        MQ_CHECK(X509_STORE_CTX_init(ctx, store, leaf, NULL) == 1);
-        // No purpose set → trust/time/signature only → should pass.
-        MQ_CHECK(X509_verify_cert(ctx) == 1);
-        (void)err0;
-        X509_STORE_CTX_free(ctx);
-        X509_STORE_free(store);
-        X509_free(ca);
-    }
+    // Sanity: it really does chain (signature/trust/time all fine) with NO purpose
+    // set — so the only possible failure reason below is the purpose gate, not a
+    // broken negative.
+    MQ_CHECK(verify_leaf_with_ca(leaf, 0, NULL) == 1);
 
     int err = 0;
-    int rv = verify_leaf_with_ca(leaf, &err);
+    int rv = verify_leaf_with_ca(leaf, 1, &err); // now enforce the SSL-server purpose
     MQ_CHECK(rv != 1);                           // must FAIL
     MQ_CHECK(err == X509_V_ERR_INVALID_PURPOSE); // for the right reason
 
@@ -524,6 +532,25 @@ test_new_ssl_is_server(void)
     mq_mitm_core_destroy(c);
 }
 
+// Lifetime: destroying the core while an SSL it produced is STILL ALIVE must not
+// dangle the core pointer that SSL stashed in ex-data. The refcount keeps the
+// core alive until the last SSL_free, then frees it exactly once. Run under
+// ASan/LSan this proves no use-after-free (destroy-before-free) and no leak
+// (freed exactly once on the final SSL_free).
+static void
+test_core_outlives_live_ssl(void)
+{
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, NULL);
+    MQ_CHECK(c != NULL);
+
+    SSL *s = mq_mitm_core_new_ssl(c);
+    MQ_CHECK(s != NULL);
+
+    // Reverse the usual order: drop the owner ref FIRST, while s is still live.
+    mq_mitm_core_destroy(c); // core must survive (s still holds a ref)
+    SSL_free(s);             // last ref → core actually torn down here
+}
+
 // ---- Task 7: in-process memory-BIO handshake proof (the headline deliverable)
 // ----
 
@@ -658,7 +685,7 @@ test_handshake_positive_h2(void)
     // out-param — a NEW ref we must free).
     MQ_CHECK(peer != NULL);
     int err = 0;
-    MQ_CHECK(verify_leaf_with_ca(peer, &err) == 1);
+    MQ_CHECK(verify_leaf_with_ca(peer, 1, &err) == 1);
     char san[256];
     MQ_CHECK(leaf_san_dns(peer, san, sizeof san) == 0);
     MQ_CHECK(strcmp(san, "host.example.com") == 0);
@@ -714,11 +741,11 @@ test_handshake_sni_negatives(void)
 }
 
 MQ_TEST_MAIN(test_sni_norm(); test_create_valid(); test_reject_non_ca();
-             test_reject_key_mismatch(); test_reject_encrypted_key();
+             test_reject_v1_ca(); test_reject_key_mismatch(); test_reject_encrypted_key();
              test_reject_symlink_key(); test_reject_world_readable_key();
              test_forge_chains_to_ca(); test_forge_purpose_gate_is_load_bearing();
              test_cache_hit_same_serial(); test_cache_distinct_sni_distinct_serial();
              test_cache_lru_eviction(); test_cache_disabled(); test_cache_ttl_expiry();
              test_cache_skew_boundary(); test_new_ssl_is_server();
-             test_handshake_positive_h2(); test_handshake_alpn_negatives();
-             test_handshake_sni_negatives();)
+             test_core_outlives_live_ssl(); test_handshake_positive_h2();
+             test_handshake_alpn_negatives(); test_handshake_sni_negatives();)
