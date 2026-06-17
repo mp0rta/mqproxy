@@ -13,6 +13,7 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,62 @@ static time_t
 mq_default_now(void)
 {
     return time(NULL);
+}
+
+// Normalize an SNI host name for use as a forge key / SAN entry. On success
+// returns 0 and writes a NUL-terminated, lowercased DNS name (<= 253 chars)
+// into out. Returns -1 for: NULL/empty input, total length > 253, any label
+// > 63 bytes, empty label (e.g. "a..b" or leading dot), an IP literal
+// (IPv4/IPv6, via inet_pton), a wildcard (any '*'), or any byte outside
+// [A-Za-z0-9.-]. A single trailing dot is stripped before validation.
+int
+mq_mitm_normalize_sni(const char *sni, size_t sni_len, char out[256])
+{
+    if (!sni || sni_len == 0) return -1;
+
+    // Strip a single trailing dot (root label), then re-check for emptiness.
+    if (sni[sni_len - 1] == '.') sni_len--;
+    if (sni_len == 0) return -1;
+
+    // Total length cap (DNS presentation name, excluding the stripped dot).
+    if (sni_len > 253) return -1;
+
+    // Reject wildcards and any byte outside [A-Za-z0-9.-]; lowercase ASCII;
+    // enforce per-label length (1..63, no empty labels).
+    char tmp[254];
+    size_t label_len = 0;
+    for (size_t i = 0; i < sni_len; i++) {
+        unsigned char ch = (unsigned char)sni[i];
+        if (ch == '.') {
+            if (label_len == 0) return -1; // empty label (leading/double dot)
+            label_len = 0;
+            tmp[i] = '.';
+            continue;
+        }
+        if (ch == '*') return -1; // wildcard
+        char c;
+        if (ch >= 'A' && ch <= 'Z') {
+            c = (char)(ch - 'A' + 'a');
+        } else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-') {
+            c = (char)ch;
+        } else {
+            return -1; // any other byte (control chars, '_', etc.)
+        }
+        if (++label_len > 63) return -1; // label too long
+        tmp[i] = c;
+    }
+    if (label_len == 0) return -1; // trailing empty label (shouldn't happen)
+    tmp[sni_len] = '\0';
+
+    // Reject IP literals — they must not be treated as DNS names. inet_pton on
+    // the lowercased copy covers IPv4 (and IPv6, which the charset filter above
+    // already rejects via ':' but we check defensively).
+    unsigned char addr[16];
+    if (inet_pton(AF_INET, tmp, addr) == 1) return -1;
+    if (inet_pton(AF_INET6, tmp, addr) == 1) return -1;
+
+    memcpy(out, tmp, sni_len + 1);
+    return 0;
 }
 
 // Password callback that always declines: an encrypted PEM (which needs a

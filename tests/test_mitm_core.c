@@ -9,6 +9,23 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// Internal (no header) — forward-declared for direct unit testing.
+extern int mq_mitm_normalize_sni(const char *, size_t, char[256]);
+
+static void
+test_sni_norm(void)
+{
+    char out[256];
+    MQ_CHECK(mq_mitm_normalize_sni("Example.COM", 11, out) == 0);
+    MQ_CHECK(strcmp(out, "example.com") == 0);
+    MQ_CHECK(mq_mitm_normalize_sni("host.example.com.", 17, out) == 0); // trailing dot
+    MQ_CHECK(strcmp(out, "host.example.com") == 0);
+    MQ_CHECK(mq_mitm_normalize_sni("", 0, out) == -1);               // empty
+    MQ_CHECK(mq_mitm_normalize_sni("*.example.com", 13, out) == -1); // wildcard
+    MQ_CHECK(mq_mitm_normalize_sni("203.0.113.5", 11, out) == -1);   // IPv4 literal
+    MQ_CHECK(mq_mitm_normalize_sni("a\tb.com", 7, out) == -1);       // control char
+}
+
 static void
 test_create_valid(void)
 {
@@ -79,6 +96,6 @@ test_reject_world_readable_key(void)
     unlink(path);
 }
 
-MQ_TEST_MAIN(test_create_valid(); test_reject_non_ca(); test_reject_key_mismatch();
-             test_reject_encrypted_key(); test_reject_symlink_key();
-             test_reject_world_readable_key();)
+MQ_TEST_MAIN(test_sni_norm(); test_create_valid(); test_reject_non_ca();
+             test_reject_key_mismatch(); test_reject_encrypted_key();
+             test_reject_symlink_key(); test_reject_world_readable_key();)
