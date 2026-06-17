@@ -18,6 +18,8 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -542,11 +544,115 @@ mq_mitm_forge_ku_for_test(mq_mitm_core_t *core, const char *norm_sni, const char
     return forge_leaf_ku(core, norm_sni, ku_str);
 }
 
+// --- Task 6: server SSL_CTX + select-certificate callback + ALPN h2 ---
+
+// Process-wide SSL ex-data slot used to stash the mq_mitm_core_t* on each SSL so
+// the user-data-less select-certificate callback can recover it. Registered ONCE
+// (pthread_once); never per-core. -1 means "not yet registered".
+static int g_core_idx = -1;
+static pthread_once_t g_core_idx_once = PTHREAD_ONCE_INIT;
+
+static void
+init_core_idx(void)
+{
+    g_core_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+}
+
+// Server-advertised ALPN protocol list (length-prefixed wire form): just "h2".
+static const uint8_t k_alpn_h2[] = {0x02, 'h', '2'};
+
+// ALPN selection: negotiate h2 if the client offers it, otherwise fatal alert.
+// MINOR-3: SSL_select_next_proto's out param is uint8_t** while the cb signature
+// gives us const uint8_t**; bridge with a one-line cast (don't fight -Werror).
+static int
+alpn_select_cb(SSL *ssl, const uint8_t **out, uint8_t *outlen, const uint8_t *in,
+               unsigned int inlen, void *arg)
+{
+    (void)ssl;
+    (void)arg;
+    int rc = SSL_select_next_proto((uint8_t **)out, outlen, k_alpn_h2,
+                                   (unsigned int)sizeof k_alpn_h2, in, inlen);
+    if (rc == OPENSSL_NPN_NEGOTIATED) return SSL_TLSEXT_ERR_OK;
+    return SSL_TLSEXT_ERR_ALERT_FATAL; // OPENSSL_NPN_NO_OVERLAP (no h2 offered)
+}
+
+// select-certificate callback: runs the no-ALPN guard, normalizes the SNI,
+// forges/caches the leaf, and attaches it (+ the shared leaf key). Any failure
+// returns ssl_select_cert_error so no half-configured connection proceeds.
+static enum ssl_select_cert_result_t
+select_certificate_cb(const SSL_CLIENT_HELLO *ch)
+{
+    mq_mitm_core_t *core = SSL_get_ex_data(ch->ssl, g_core_idx);
+    if (!core) return ssl_select_cert_error;
+
+    // No-ALPN guard: refuse handshakes that don't offer ALPN at all (closes the
+    // "TLS completes with no ALPN" hole). Returns 1 if the extension is present.
+    const uint8_t *alpn_ext = NULL;
+    size_t alpn_len = 0;
+    if (SSL_early_callback_ctx_extension_get(
+            ch, TLSEXT_TYPE_application_layer_protocol_negotiation, &alpn_ext,
+            &alpn_len) == 0)
+        return ssl_select_cert_error;
+
+    // SNI is mandatory: we forge per host name.
+    const char *sni = SSL_get_servername(ch->ssl, TLSEXT_NAMETYPE_host_name);
+    if (!sni) return ssl_select_cert_error;
+
+    char norm[256];
+    if (mq_mitm_normalize_sni(sni, strlen(sni), norm) != 0) return ssl_select_cert_error;
+
+    // Forge/cache the leaf (caller-owned ref).
+    X509 *leaf = cache_get_or_forge(core, norm);
+    if (!leaf) return ssl_select_cert_error;
+
+    // Attach leaf + shared key. SSL_use_certificate takes its OWN ref, so drop
+    // our ref afterwards (avoid leak) regardless of success.
+    int used = (SSL_use_certificate(ch->ssl, leaf) == 1) &&
+               (SSL_use_PrivateKey(ch->ssl, core->leaf_key) == 1);
+    X509_free(leaf);
+    if (!used) return ssl_select_cert_error;
+
+    return ssl_select_cert_success;
+}
+
+// Build the shared server SSL_CTX with TLS 1.2 floor + both callbacks. Returns
+// the ctx or NULL on failure (no half-built ctx leaks). Lazily invoked.
+static SSL_CTX *
+build_ssl_ctx(void)
+{
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) return NULL;
+    if (SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    SSL_CTX_set_select_certificate_cb(ctx, select_certificate_cb);
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
+    return ctx;
+}
+
 SSL *
 mq_mitm_core_new_ssl(mq_mitm_core_t *core)
 {
-    (void)core;
-    return NULL; // real impl in Task 6
+    if (!core) return NULL;
+
+    pthread_once(&g_core_idx_once, init_core_idx);
+    if (g_core_idx < 0) return NULL; // ex-data registration failed
+
+    // Lazily build the shared SSL_CTX on first use.
+    if (!core->ssl_ctx) {
+        core->ssl_ctx = build_ssl_ctx();
+        if (!core->ssl_ctx) return NULL;
+    }
+
+    SSL *s = SSL_new(core->ssl_ctx);
+    if (!s) return NULL;
+    if (SSL_set_ex_data(s, g_core_idx, core) != 1) {
+        SSL_free(s);
+        return NULL;
+    }
+    SSL_set_accept_state(s);
+    return s;
 }
 
 void

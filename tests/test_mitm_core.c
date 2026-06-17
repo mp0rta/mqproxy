@@ -502,10 +502,30 @@ test_cache_skew_boundary(void)
     }
 }
 
+// ---- Task 6: server SSL_CTX + new_ssl (callbacks installed; full handshake = Task 7)
+// ----
+
+// new_ssl() must yield a non-NULL, server-mode SSL* (accept state, select-cert +
+// ALPN callbacks installed on the shared SSL_CTX). The actual handshake exercise
+// is Task 7; here we only prove new_ssl produces a server-mode SSL.
+static void
+test_new_ssl_is_server(void)
+{
+    mq_mitm_core_t *c = mq_mitm_core_create(MITM_CA_CRT, MITM_CA_KEY, NULL);
+    MQ_CHECK(c != NULL);
+
+    SSL *s = mq_mitm_core_new_ssl(c);
+    MQ_CHECK(s != NULL);
+    MQ_CHECK(SSL_is_server(s) == 1);
+
+    SSL_free(s); // caller owns s; free BEFORE destroy
+    mq_mitm_core_destroy(c);
+}
+
 MQ_TEST_MAIN(test_sni_norm(); test_create_valid(); test_reject_non_ca();
              test_reject_key_mismatch(); test_reject_encrypted_key();
              test_reject_symlink_key(); test_reject_world_readable_key();
              test_forge_chains_to_ca(); test_forge_purpose_gate_is_load_bearing();
              test_cache_hit_same_serial(); test_cache_distinct_sni_distinct_serial();
              test_cache_lru_eviction(); test_cache_disabled(); test_cache_ttl_expiry();
-             test_cache_skew_boundary();)
+             test_cache_skew_boundary(); test_new_ssl_is_server();)
