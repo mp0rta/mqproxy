@@ -86,7 +86,7 @@ gw_reject_write(void *handle, int code, const char *reason, const char *xmq_erro
 }
 
 /* Map mq_gw_reject_reason_t → X-Mq-Error string: now the SHARED helper
- * mq_gw_reject_xmq (mq_gw_intake.h, implemented in mq_gw_client.c) so the H1 and
+ * mq_gw_reject_xmq (mq_gw_intake.h, implemented in mq_gw_headers.c) so the H1 and
  * H2 adapters render byte-identical strings. The former static gw_reason_xmq was
  * extracted there (Slice 3 Task 8). */
 

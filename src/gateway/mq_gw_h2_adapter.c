@@ -125,8 +125,12 @@ struct mq_gw_h2_adapter {
      *
      * NOTE: nghttp2_session_resume_data() is the OUTBOUND deferred-data-provider
      * resume; it is NOT used for inbound upload resume (re-feed is the correct
-     * mechanism). The pause is connection-wide (one in-flight request per MITM
-     * conn per the deployment model), which is simpler and sufficient. */
+     * mechanism). The pause is connection-wide: even though we advertise
+     * MQ_H2_MAX_CONCURRENT_STREAMS so a browser CAN multiplex, all H2 streams on
+     * this conn share a SINGLE downstream MPQUIC tunnel — so when that tunnel
+     * cannot accept upload bytes (any req_body returns -1), backpressuring every
+     * stream is aligned with the real bottleneck. The (acceptable for v1) cost is
+     * cross-stream head-of-line blocking of uploads while the pause holds. */
     uint8_t pending_in[MQ_H2_UPLOAD_PAUSE_CAP];
     size_t pending_len;
     int input_paused; /* a req_body returned -1; do not feed nghttp2 until resumed */
@@ -595,30 +599,34 @@ mq_h2_resume_read(void *u)
 
     a->input_paused = 0;
 
-    /* Drain the parked buffer. Each pass feeds the whole current buffer; a pause
-     * re-arms input_paused and reports a short consume, so we snapshot, clear,
-     * feed, then re-park the unconsumed tail (plus anything req_body→recv may
-     * have parked re-entrantly — but recv is not called during a feed here). */
+    /* Drain the parked buffer IN PLACE. Each pass feeds the whole current buffer
+     * (pending_in[0, pending_len)); on a pause, mem_recv reports a short consume r
+     * and re-arms input_paused, so we compact the unconsumed tail [r, plen) back
+     * down to offset 0 and stop. mem_recv only re-drives on_data_chunk_recv during
+     * the feed (recv is not re-entered), so nothing else writes pending_in here —
+     * the in-place memmove is safe and never loses or duplicates a byte. */
     while (a->pending_len > 0 && !a->input_paused && !a->input_fatal) {
-        /* Move the parked bytes out so a re-park (on pause) appends cleanly. */
-        static uint8_t scratch[MQ_H2_UPLOAD_PAUSE_CAP];
         size_t plen = a->pending_len;
-        memcpy(scratch, a->pending_in, plen);
-        a->pending_len = 0;
 
-        ssize_t r = nghttp2_session_mem_recv(a->session, scratch, plen);
+        ssize_t r = nghttp2_session_mem_recv(a->session, a->pending_in, plen);
         if (r < 0) {
             a->input_fatal = 1; /* fatal parse error — surfaced by next recv */
             return;
         }
         if ((size_t)r != plen) {
-            /* Paused (or unexpected shortfall) mid-drain: re-park the tail. */
+            /* Paused (or unexpected shortfall) mid-drain: compact the tail. */
             if (!a->input_paused) {
                 a->input_fatal = 1;
                 return;
             }
-            if (park_pending(a, scratch + (size_t)r, plen - (size_t)r) != 0) return;
+            size_t tail = plen - (size_t)r;
+            memmove(a->pending_in, a->pending_in + (size_t)r, tail);
+            a->pending_len = tail;
+            return; /* re-armed paused; loop guard would stop us anyway */
         }
+        /* Whole buffer consumed: clear and loop (resume_read may have been a no-op
+         * re-pause-free drain). */
+        a->pending_len = 0;
     }
 }
 

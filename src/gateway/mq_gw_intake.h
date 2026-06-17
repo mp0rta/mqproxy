@@ -57,7 +57,7 @@ typedef enum {
  * tests/e2e assert these verbatim). Returns a borrowed, NUL-terminated literal
  * (never NULL — an unknown reason maps to "internal-error"). Shared by every
  * gateway adapter (H1 fetch + H2 MITM) so the rendered error strings cannot
- * drift between protocols. Implemented in mq_gw_client.c (the enum's producer,
+ * drift between protocols. Implemented in mq_gw_headers.c (the enum's producer,
  * already a compiled gateway TU). */
 const char *mq_gw_reject_xmq(mq_gw_reject_reason_t reason);
 
