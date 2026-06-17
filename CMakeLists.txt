@@ -56,7 +56,8 @@ add_library(mqproxy STATIC
     src/transport/mq_stream.c
     src/transport/mq_transport.c
     src/runtime/mq_runtime_libevent.c
-    src/mitm/mq_mitm_core.c)
+    src/mitm/mq_mitm_core.c
+    src/mitm/mq_ignore_hosts.c)
 target_link_libraries(mqproxy PUBLIC CURL::libcurl)
 target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR}
     ${MQPROXY_BORINGSSL_INCLUDE_DIR})
@@ -144,6 +145,11 @@ add_executable(test_clienthello tests/test_clienthello.c)
 target_link_libraries(test_clienthello mqproxy)
 target_include_directories(test_clienthello PRIVATE tests src)
 add_test(NAME test_clienthello COMMAND test_clienthello)
+
+add_executable(test_ignore_hosts tests/test_ignore_hosts.c)
+target_link_libraries(test_ignore_hosts mqproxy)
+target_include_directories(test_ignore_hosts PRIVATE tests src)
+add_test(NAME test_ignore_hosts COMMAND test_ignore_hosts)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
