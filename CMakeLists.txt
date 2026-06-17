@@ -54,9 +54,11 @@ add_library(mqproxy STATIC
     src/transport/mq_h3.c
     src/transport/mq_stream.c
     src/transport/mq_transport.c
-    src/runtime/mq_runtime_libevent.c)
+    src/runtime/mq_runtime_libevent.c
+    src/mitm/mq_mitm_core.c)
 target_link_libraries(mqproxy PUBLIC CURL::libcurl)
-target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR}
+    ${MQPROXY_BORINGSSL_INCLUDE_DIR})
 
 enable_testing()
 add_executable(test_smoke tests/test_smoke.c)
@@ -139,6 +141,23 @@ add_test(NAME test_origdst COMMAND test_origdst)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
+    # ---- Phase 7 Slice 2: MITM crypto core unit suite ----
+    # Needs the BoringSSL static archives libxquic was built against (SSL_*/X509_*).
+    if(MQ_HAVE_BORINGSSL_ARCHIVES)
+        add_executable(test_mitm_core tests/test_mitm_core.c)
+        target_link_libraries(test_mitm_core
+            mqproxy
+            "${MQPROXY_BORINGSSL_DIR}/libssl.a"
+            "${MQPROXY_BORINGSSL_DIR}/libcrypto.a"
+            pthread dl m stdc++)
+        target_include_directories(test_mitm_core PRIVATE tests src
+            ${MQPROXY_BORINGSSL_INCLUDE_DIR})
+        add_test(NAME test_mitm_core COMMAND test_mitm_core)
+    else()
+        message(STATUS "BoringSSL archives absent — test_mitm_core not built "
+                       "(run scripts/build-xquic.sh).")
+    endif()
+
     add_executable(test_engine_boot tests/integration/test_engine_boot.c)
     target_link_libraries(test_engine_boot
         mqproxy
