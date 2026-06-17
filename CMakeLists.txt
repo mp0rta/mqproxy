@@ -160,6 +160,24 @@ target_link_libraries(test_ignore_hosts mqproxy)
 target_include_directories(test_ignore_hosts PRIVATE tests src)
 add_test(NAME test_ignore_hosts COMMAND test_ignore_hosts)
 
+# nghttp2 link probe (Slice 3 Task 4): permanent low-cost guard that the nghttp2
+# dependency stays compiled + linked + runnable in BOTH build modes. Links the
+# static archive under MQPROXY_STATIC_XQUIC (self-contained packaging binary),
+# else the system shared lib — same selection the live H2 MITM adapter uses. No
+# xquic/BoringSSL needed (nghttp2 is a leaf), so it lives in the unconditional
+# section. Calls nghttp2_version() and prints the runtime version string.
+add_executable(nghttp2_link_probe tests/nghttp2_link_probe.c)
+target_include_directories(nghttp2_link_probe PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+if(MQPROXY_STATIC_XQUIC AND NGHTTP2_STATIC_LIB)
+    # Exercise the exact static archive the packaging cli links. (When the .a is
+    # absent the cli static branch already FATAL_ERRORs; the probe falls back to
+    # the shared lib here only to stay buildable for non-cli static configs.)
+    target_link_libraries(nghttp2_link_probe "${NGHTTP2_STATIC_LIB}")
+else()
+    target_link_libraries(nghttp2_link_probe ${NGHTTP2_LIBRARIES})
+endif()
+add_test(NAME nghttp2_link_probe COMMAND nghttp2_link_probe)
+
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # ---- Phase 7 Slice 2: MITM crypto core unit suite ----
@@ -710,6 +728,19 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
                 "${MQPROXY_BORINGSSL_DIR} (expected libssl.a + libcrypto.a). Build xquic "
                 "via scripts/build-xquic.sh or set -DMQPROXY_BORINGSSL_DIR=<dir>.")
         endif()
+        # nghttp2 static archive (Slice 3 Task 4): the live H2 MITM adapter links it.
+        # nghttp2 is a leaf (no BoringSSL/xquic symbols), so link order is unconstrained
+        # and no symbol isolation is needed. Require the .a in this packaging build;
+        # mirror the BoringSSL archive-missing gate above with an actionable message.
+        if(NOT NGHTTP2_STATIC_LIB)
+            message(FATAL_ERROR
+                "MQPROXY_STATIC_XQUIC=ON but libnghttp2.a was not found (only the "
+                "shared library is installed). The static build links the H2 MITM "
+                "adapter against it. Install the nghttp2 static archive (Debian/Ubuntu: "
+                "libnghttp2-dev ships it as /usr/lib/<multiarch>/libnghttp2.a; on some "
+                "distros it is a separate -static package), or build the dynamic "
+                "binary (omit -DMQPROXY_STATIC_XQUIC=ON).")
+        endif()
         # Link order: xquic-static references BoringSSL symbols, so the archives follow it.
         # NOTE: the raw archives (not mq_boringssl) are linked here because they must
         # appear AFTER xquic-static to satisfy its undefined BoringSSL QUIC symbols;
@@ -719,9 +750,11 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             mqproxy
             xquic-static
             "${_bssl_ssl}" "${_bssl_crypto}"
+            "${NGHTTP2_STATIC_LIB}"
             ${EVENT_CORE_LIB}
             ${EVENT_EXTRA_LIB}
             pthread dl m stdc++)
+        target_include_directories(mqproxy_cli PRIVATE ${NGHTTP2_INCLUDE_DIRS})
     else()
         # Dynamic build: libxquic.so bakes its BoringSSL in internally, so the exe
         # has no BoringSSL objects today. Link mq_boringssl so the MITM core's
@@ -731,9 +764,11 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         target_link_libraries(mqproxy_cli
             mqproxy
             xquic
+            ${NGHTTP2_LIBRARIES}
             ${EVENT_CORE_LIB}
             ${EVENT_EXTRA_LIB}
             pthread dl m stdc++)
+        target_include_directories(mqproxy_cli PRIVATE ${NGHTTP2_INCLUDE_DIRS})
         if(MQ_HAVE_BORINGSSL_ARCHIVES)
             target_link_libraries(mqproxy_cli mq_boringssl)
         endif()
