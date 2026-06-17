@@ -60,6 +60,15 @@
 #include "transport/mq_transport.h"
 #include "util/mq_log.h"
 
+#if MQ_MITM_AVAILABLE
+/* Live MITM orchestrator (Phase 7 Slice 3). Compiled in only when the BoringSSL
+ * archives are present (MQ_MITM_AVAILABLE=1); a no-archive build sets it to 0 and
+ * these headers / all MITM wiring below compile out so the CLI still links. */
+#  include "mitm/mq_ignore_hosts.h"
+#  include "mitm/mq_mitm_conn.h"
+#  include "mitm/mq_mitm_core.h"
+#endif
+
 /* Default cert/key for the server when --cert/--key are omitted, taken from the
  * test cert paths the build wires in (so the server is runnable out of the box
  * for local testing). Real deployments pass --cert/--key. */
@@ -872,6 +881,13 @@ cmd_client(int argc, char **argv)
     int setup_redirect = 0;                 /* --setup-redirect */
     long tproxy_uid = -1;                   /* --tproxy-uid; -1 = geteuid() */
 
+    /* MITM (Phase 7 Slice 3). Populated by --mitm / [Mitm] config in Tasks 14/15;
+     * inert (off) until then — mitm_enabled defaults 0, so the entire MITM wiring
+     * below is compiled-in but never taken, leaving existing behavior unchanged. */
+    int mitm_enabled = 0;
+    const char *ca_cert = NULL; /* --ca-cert <pem> (MITM signing CA) */
+    const char *ca_key = NULL;  /* --ca-key <pem> (MITM signing CA key) */
+
     /* Seed from --config before getopt (defaults < file < CLI). fcfg is
      * function-scoped so the const char* aliases stay valid for the function. */
     mq_file_config_t fcfg;
@@ -1225,6 +1241,13 @@ cmd_client(int argc, char **argv)
     mq_gw_client_t *gwc = NULL;
     mq_gw_fetch_adapter_t *fetch_adp = NULL;
     mq_fetch_listener_t *fetch_l = NULL;
+#if MQ_MITM_AVAILABLE
+    /* MITM orchestrator handles (Slice 3). NULL when MITM is off (the common
+     * case until Tasks 14/15 set mitm_enabled); freed in teardown order below. */
+    mq_ignore_hosts_t *ign = NULL;
+    mq_mitm_core_t *core = NULL;
+    mq_mitm_ctx_t *mitm_ctx = NULL;
+#endif
     struct event *sint = NULL, *sterm = NULL;
     struct event *metrics_ev = NULL;
     struct client_auth_ctx auth_ctx = {NULL, NULL};
@@ -1258,6 +1281,43 @@ cmd_client(int argc, char **argv)
         MQ_LOGE("failed to bind primary path %s", primary_ip);
         goto out;
     }
+
+    /* Gateway H3 tunnel (mq_h3 + mq_gw_client). Needed by BOTH the --gateway fetch
+     * ingress AND the live MITM path (the MITM orchestrator submits H2 requests
+     * over this same gwc tunnel). HOISTED here — before the tproxy listener below —
+     * because the listener captures its open_fn/core at creation, so the MITM ctx
+     * (which references gwc) must exist first. The fetch listener/adapter that turn
+     * the gwc into a local fetch API stay gated on --gateway only (MITM has no
+     * fetch ingress). The single `if (gwc) mq_gw_client_free(gwc)` teardown covers
+     * both callers. mq_h3_init takes NULL server hooks (pure client); the gateway
+     * conn is established EAGERLY inside mq_gw_client_new. */
+    if (gateway || mitm_enabled) {
+        h3 = mq_h3_init(transport, NULL, NULL, NULL);
+        if (!h3) {
+            MQ_LOGE("failed to init H3 stack for gateway/mitm");
+            goto out;
+        }
+        gwc = mq_gw_client_new(transport, rt, h3, server_ip, server_port, token, cc,
+                               (uint64_t)keepalive_idle_s * 1000u, reconnect_enabled,
+                               (uint64_t)reconnect_max_backoff_s * 1000u);
+        if (!gwc) {
+            MQ_LOGE("failed to create gateway client (conn to %s:%u)", server_ip,
+                    server_port);
+            goto out;
+        }
+        /* The gateway conn gets its OWN extra paths — independent of mq_client's.
+         * Use the same --path list (paths[1..]); paths[0] is the primary bind,
+         * already in effect on the shared transport. */
+        if (npaths > 1) {
+            int added = mq_gw_client_add_paths(gwc, &paths[1], npaths - 1);
+            if (added < 0) {
+                MQ_LOGE("failed to register extra gateway paths");
+                goto out;
+            }
+            MQ_LOGI("registered %d extra gateway multipath bind(s)", added);
+        }
+    }
+
     /* TCP-proxy core (mq_client) + its SOCKS5/HTTP CONNECT ingress. Only created
      * when a SOCKS5 or HTTP CONNECT ingress was requested; a gateway-only client
      * skips it (the gateway conn below is independent, with its own auth). */
@@ -1319,13 +1379,57 @@ cmd_client(int argc, char **argv)
                 goto out;
             }
         }
+        /* The tproxy listener captures its open_fn/core at creation. By default
+         * it rides the plain TCP-proxy boundary (open_fn/open_core above). When
+         * MITM is enabled, it instead rides the MITM orchestrator
+         * (mq_mitm_conn_open + the mq_mitm_ctx), which terminates TLS per-SNI,
+         * forges a leaf, and splices ignore-hosts flows back onto the plain
+         * boundary. The orchestrator MUST be built BEFORE the listener. */
+        mq_tcp_open_fn tproxy_open_fn = open_fn;
+        void *tproxy_open_core = open_core;
+#if !MQ_MITM_AVAILABLE
+        /* ca_cert/ca_key are consumed only by the MITM block below; in a
+         * no-archive build that block is compiled out, so silence unused-var. */
+        (void)ca_cert;
+        (void)ca_key;
+#endif
+#if MQ_MITM_AVAILABLE
+        if (mitm_enabled) {
+            /* Build the (currently empty) ignore-hosts list — Task 15 will feed
+             * --ignore-hosts / [Mitm] entries into it. */
+            ign = mq_ignore_hosts_new();
+            if (!ign) {
+                MQ_LOGE("mitm: failed to allocate ignore-hosts list");
+                goto out;
+            }
+            mq_mitm_opts_t opts = {.cache_size = 256, .leaf_ttl_sec = 86400};
+            core = mq_mitm_core_create(ca_cert, ca_key, &opts);
+            if (!core) {
+                MQ_LOGE("mitm: failed to load CA from --ca-cert/--ca-key");
+                goto out;
+            }
+            /* The opaque (ignore-hosts) fallback splices through the plain
+             * mq_client TCP boundary. `client` is always created for a tproxy
+             * run (need_client includes tproxy_addr), so open_core is valid even
+             * under --mitm without --socks5/--http-connect. */
+            mitm_ctx = mq_mitm_ctx_new(core, ign, gwc, mq_client_tcp_open_fn(),
+                                       mq_client_tcp_open_core(client), base);
+            if (!mitm_ctx) {
+                MQ_LOGE("mitm: failed to create orchestrator context");
+                goto out;
+            }
+            tproxy_open_fn = mq_mitm_conn_open;
+            tproxy_open_core = mitm_ctx;
+        }
+#endif
         if (tproxy_addr) {
             /* Transparent capture: kernel redirects intercepted TCP connections
              * to this listener; no in-band protocol is spoken toward the client.
-             * open_fn/open_core are the same TCP-proxy boundary used for
-             * SOCKS5 / HTTP CONNECT above. */
-            tproxy_l = mq_tproxy_listener_new(base, tproxy_ip, tproxy_port,
-                                              tproxy_capture_mode, open_fn, open_core);
+             * open_fn/open_core ride the plain TCP-proxy boundary, OR — when MITM
+             * is enabled — the MITM orchestrator selected just above. */
+            tproxy_l =
+                mq_tproxy_listener_new(base, tproxy_ip, tproxy_port, tproxy_capture_mode,
+                                       tproxy_open_fn, tproxy_open_core);
             if (!tproxy_l) {
                 MQ_LOGE("failed to bind tproxy listener on %s:%u", tproxy_ip,
                         tproxy_port);
@@ -1358,35 +1462,12 @@ cmd_client(int argc, char **argv)
         mq_client_set_on_auth(client, client_on_auth, &auth_ctx);
     }
 
-    /* HTTP gateway ingress (--gateway): an independent H3 tunnel to the same
-     * server (its own conn + X-Mq-Auth), fronted by a local fetch-API listener.
-     * mq_h3_init takes NULL server hooks (pure client). The gateway conn is
-     * established EAGERLY inside mq_gw_client_new. */
+    /* HTTP gateway ingress (--gateway): the local fetch-API listener fronting the
+     * gwc H3 tunnel hoisted above. The gwc + h3 are created earlier (before the
+     * tproxy listener) since the MITM path shares them; here we only build the
+     * fetch adapter/listener, which are gateway-specific (MITM has no fetch
+     * ingress). gwc is guaranteed non-NULL here (gateway implies the hoist ran). */
     if (gateway) {
-        h3 = mq_h3_init(transport, NULL, NULL, NULL);
-        if (!h3) {
-            MQ_LOGE("failed to init H3 stack for gateway");
-            goto out;
-        }
-        gwc = mq_gw_client_new(transport, rt, h3, server_ip, server_port, token, cc,
-                               (uint64_t)keepalive_idle_s * 1000u, reconnect_enabled,
-                               (uint64_t)reconnect_max_backoff_s * 1000u);
-        if (!gwc) {
-            MQ_LOGE("failed to create gateway client (conn to %s:%u)", server_ip,
-                    server_port);
-            goto out;
-        }
-        /* The gateway conn gets its OWN extra paths — independent of mq_client's.
-         * Use the same --path list (paths[1..]); paths[0] is the primary bind,
-         * already in effect on the shared transport. */
-        if (npaths > 1) {
-            int added = mq_gw_client_add_paths(gwc, &paths[1], npaths - 1);
-            if (added < 0) {
-                MQ_LOGE("failed to register extra gateway paths");
-                goto out;
-            }
-            MQ_LOGI("registered %d extra gateway multipath bind(s)", added);
-        }
         fetch_adp = mq_gw_fetch_adapter_new(gwc);
         if (!fetch_adp) {
             MQ_LOGE("failed to create gateway fetch adapter (OOM)");
@@ -1460,9 +1541,28 @@ cmd_client(int argc, char **argv)
     }
 
 out:
-    /* Teardown order — two distinct callback graphs co-exist here (the TCP-proxy
-     * core and the HTTP-gateway ingress), and their ordering contracts pull in
-     * OPPOSITE directions across mq_transport_free. Both are honored below.
+    /* Teardown order — THREE callback graphs co-exist here (the TCP-proxy core,
+     * the HTTP-gateway ingress, and — when --mitm — the live MITM orchestrator),
+     * with ordering contracts that pull in different directions across
+     * mq_transport_free. All three are honored below.
+     *
+     * (C) MITM orchestrator (mq_mitm_ctx, when MQ_MITM_AVAILABLE && --mitm) —
+     *     the tproxy listener's open_fn=mq_mitm_conn_open hands accepted fds to
+     *     the ctx, which registers LIVE conns that hold references to the gwc
+     *     tunnel (H2→tunnel submit), an mq_gw_h2_adapter, and a terminating SSL
+     *     whose ex-data holds a core ref. So the order is:
+     *       1. STOP the tproxy listener FIRST (uninstall firewall rules + free the
+     *          listener) so NO new fd is accepted into the orchestrator mid-drain.
+     *       2. mq_mitm_ctx_free(mitm_ctx) — drains the live-conn registry (§5.1):
+     *          closes any conn still in the drain phase, freeing its events/timers/
+     *          fds and releasing its SSL (which drops that conn's core ref). This
+     *          MUST run BEFORE mq_gw_client_free(gwc) and mq_transport_free, since
+     *          the draining conns touch gwc/adapter while those are still live.
+     *       3. mq_mitm_core_destroy(core) — NAMED, AFTER the ctx is freed (so all
+     *          per-SSL core refs are gone; the owner ref then hits 0).
+     *       4. mq_ignore_hosts_free(ign) — borrowed by the ctx; free after it.
+     *     (All four are NULL / no-op when MITM is off, so the MITM-off path is
+     *     unchanged.)
      *
      * (A) TCP-proxy core (mq_client + SOCKS5/HTTP listeners) — verified against
      *     the in-flight callback graph (an earlier "free client first" ordering
@@ -1505,40 +1605,61 @@ out:
      *
      * Combined order:
      *   signal events
+     *   -> tproxy setup uninstall + tproxy listener free  (graph C step 1: stop
+     *                             accepting new fds into the MITM orchestrator;
+     *                             also the plain-tproxy listener teardown — no
+     *                             callbacks fire from it after this point)
+     *   -> mq_mitm_ctx_free      (graph C step 2: drain live MITM conns BEFORE
+     *                             gwc/transport; NULL/no-op when MITM off)
      *   -> gw_client_free        (engine+h3+fetch listener live; detaches gw
      *                             conn-state, aborts live local handles)
      *   -> fetch listener free   (gw handles already aborted/detached: safe)
      *   -> mq_h3_free            (engine live; gw conn-close cb detached -> no-op)
      *   -> mq_transport_free     (fires graph-A conn-close + in-flight-open cbs
      *                             into the live runtime/client/socks5/http)
+     *   -> mq_mitm_core_destroy  (graph C step 3: AFTER ctx freed; NULL/no-op off)
      *   -> runtime free          (closes sockets/timer; does not free base)
      *   -> mq_client_free
-     *   -> socks5 / http / tproxy listener free (tproxy_setup uninstall + free
-     *      also here: no callbacks after this point, ordering is safe)
-     *   -> base free (CLI owns base). */
+     *   -> socks5 / http listener free
+     *   -> mq_ignore_hosts_free  (graph C step 4: borrowed by the freed ctx)
+     *   -> base free (CLI owns base; strictly LAST — the MITM drain used it). */
     if (metrics_ev) {
         event_del(metrics_ev);
         event_free(metrics_ev);
     }
     if (sint) event_free(sint);
     if (sterm) event_free(sterm);
-    if (gwc) mq_gw_client_free(gwc);
-    if (fetch_l) mq_fetch_listener_free(fetch_l);
-    if (fetch_adp) mq_gw_fetch_adapter_free(fetch_adp);
-    if (h3) mq_h3_free(h3);
-    if (transport) mq_transport_free(transport);
-    if (rt) mq_runtime_free(rt);
-    if (client) mq_client_free(client);
-    if (socks5_l) mq_listener_free(socks5_l);
-    if (http_l) mq_listener_free(http_l);
-    /* tproxy: uninstall firewall rules BEFORE freeing the listener (rules
-     * reference the port; listener close is harmless either way, but keeping
-     * the ordering deterministic makes it easier to audit). */
+    /* (C step 1) Stop the tproxy ingress FIRST: uninstall firewall rules BEFORE
+     * freeing the listener (rules reference the port), then free the listener so
+     * no new fd is accepted into the MITM orchestrator while it drains below. */
     if (tproxy_setup) {
         mq_tproxy_setup_uninstall(tproxy_setup);
         mq_tproxy_setup_free(tproxy_setup);
     }
     if (tproxy_l) mq_tproxy_listener_free(tproxy_l);
+#if MQ_MITM_AVAILABLE
+    /* (C step 2) Drain the live MITM-conn registry while gwc/transport are still
+     * live (the draining conns touch them). NULL/no-op when MITM is off. */
+    if (mitm_ctx) mq_mitm_ctx_free(mitm_ctx);
+#endif
+    if (gwc) mq_gw_client_free(gwc);
+    if (fetch_l) mq_fetch_listener_free(fetch_l);
+    if (fetch_adp) mq_gw_fetch_adapter_free(fetch_adp);
+    if (h3) mq_h3_free(h3);
+    if (transport) mq_transport_free(transport);
+#if MQ_MITM_AVAILABLE
+    /* (C step 3) Destroy the MITM core AFTER the ctx (and thus all per-SSL core
+     * refs) are gone. NULL/no-op when MITM is off. */
+    if (core) mq_mitm_core_destroy(core);
+#endif
+    if (rt) mq_runtime_free(rt);
+    if (client) mq_client_free(client);
+    if (socks5_l) mq_listener_free(socks5_l);
+    if (http_l) mq_listener_free(http_l);
+#if MQ_MITM_AVAILABLE
+    /* (C step 4) Free the ignore-hosts list (borrowed by the now-freed ctx). */
+    if (ign) mq_ignore_hosts_free(ign);
+#endif
     if (base) event_base_free(base);
     return rc;
 }

@@ -151,12 +151,15 @@ no_password_cb(char *buf, int size, int rw, void *u)
     return 0;
 }
 
-// Read a private-key PEM file with TOCTOU-free safety checks. Opens with
-// O_NOFOLLOW (reject symlinks) + O_CLOEXEC, then fstat()s the fd (not the path):
-// reject non-regular files, any group/other access bits, and non-owner files.
+// Read a PEM file with TOCTOU-free safety checks. Opens with O_NOFOLLOW (reject
+// symlinks) + O_CLOEXEC, then fstat()s the fd (not the path) to reject
+// non-regular files. When `require_private_perms` is set (the CA *key*), the
+// fstat also rejects any group/other access bits and non-owner files; the CA
+// *cert* is public material, so it loads with the symlink/cloexec protection
+// only (no perms gate — the cert is routinely group/world-readable).
 // On success returns a memory BIO holding the file contents (caller frees).
 static BIO *
-read_key_file_safely(const char *path)
+read_pem_file_safely(const char *path, int require_private_perms)
 {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return NULL;
@@ -166,13 +169,17 @@ read_key_file_safely(const char *path)
         close(fd);
         return NULL;
     }
-    if (!S_ISREG(st.st_mode) || (st.st_mode & (S_IRWXG | S_IRWXO)) != 0 ||
-        st.st_uid != geteuid()) {
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        return NULL;
+    }
+    if (require_private_perms &&
+        ((st.st_mode & (S_IRWXG | S_IRWXO)) != 0 || st.st_uid != geteuid())) {
         close(fd);
         return NULL;
     }
 
-    // Read the whole file. Key PEMs are small; cap defensively at 1 MiB.
+    // Read the whole file. CA cert/key PEMs are small; cap defensively at 1 MiB.
     BIO *mem = BIO_new(BIO_s_mem());
     if (!mem) {
         close(fd);
@@ -217,19 +224,18 @@ mq_mitm_core_create(const char *ca_cert_pem_path, const char *ca_key_pem_path,
     EVP_PKEY_CTX *kctx = NULL;
     BIO *key_bio = NULL;
     BIO *cert_bio = NULL;
-    FILE *cert_fp = NULL;
 
     // --- 1. Load the CA private key with key-file safety checks first ---
     // (perms gate runs BEFORE PEM parse — see MINOR-2 in the plan.)
-    key_bio = read_key_file_safely(ca_key_pem_path);
+    key_bio = read_pem_file_safely(ca_key_pem_path, 1 /*require_private_perms*/);
     if (!key_bio) goto fail;
     ca_key = PEM_read_bio_PrivateKey(key_bio, NULL, no_password_cb, NULL);
     if (!ca_key) goto fail; // unparseable, or encrypted (no_password_cb declines)
 
-    // --- 2. Load the CA certificate ---
-    cert_fp = fopen(ca_cert_pem_path, "rb");
-    if (!cert_fp) goto fail;
-    cert_bio = BIO_new_fp(cert_fp, BIO_NOCLOSE);
+    // --- 2. Load the CA certificate. Route through the SAME safe-open helper as
+    // the key (O_NOFOLLOW|O_CLOEXEC, TOCTOU-free) but WITHOUT the perms gate: the
+    // cert is public material and routinely group/world-readable. ---
+    cert_bio = read_pem_file_safely(ca_cert_pem_path, 0 /*require_private_perms*/);
     if (!cert_bio) goto fail;
     ca_cert = PEM_read_bio_X509(cert_bio, NULL, NULL, NULL);
     if (!ca_cert) goto fail;
@@ -301,7 +307,6 @@ mq_mitm_core_create(const char *ca_cert_pem_path, const char *ca_key_pem_path,
 
     BIO_free(key_bio);
     BIO_free(cert_bio);
-    fclose(cert_fp);
     return core;
 
 fail:
@@ -310,7 +315,6 @@ fail:
     if (ca_cert) X509_free(ca_cert);
     if (ca_key) EVP_PKEY_free(ca_key);
     if (cert_bio) BIO_free(cert_bio);
-    if (cert_fp) fclose(cert_fp);
     if (key_bio) BIO_free(key_bio);
     return NULL;
 }
