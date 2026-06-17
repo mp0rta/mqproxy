@@ -144,6 +144,9 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # ---- Phase 7 Slice 2: MITM crypto core unit suite ----
     # Needs the BoringSSL static archives libxquic was built against (SSL_*/X509_*).
     if(MQ_HAVE_BORINGSSL_ARCHIVES)
+        # NOTE: links mqproxy + BoringSSL only (NO xquic) — the MITM core is sans-io /
+        # BoringSSL-only and references no xqc_* symbols, so the static archive pulls no
+        # xquic-dependent objects here. Keep it xquic-free.
         add_executable(test_mitm_core tests/test_mitm_core.c)
         target_link_libraries(test_mitm_core
             mqproxy

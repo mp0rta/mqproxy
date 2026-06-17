@@ -35,11 +35,13 @@ mq_mitm_core_new_ssl(mq_mitm_core_t *core)
     (void)core;
     return NULL;
 }
+
 void
 mq_mitm_core_destroy(mq_mitm_core_t *core)
 {
     free(core);
 }
+
 void
 mq_mitm_core_set_clock_for_test(mq_mitm_core_t *c, time_t (*f)(void))
 {

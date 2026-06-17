@@ -72,8 +72,8 @@ else()
 endif()
 
 # ---------- BoringSSL (vendored under xquic) for the MITM core ----------
-set(MQPROXY_BORINGSSL_INCLUDE_DIR
-    "${CMAKE_SOURCE_DIR}/third_party/xquic/third_party/boringssl/include")
+set(MQPROXY_BORINGSSL_INCLUDE_DIR "${MQPROXY_BORINGSSL_DIR}/../include"
+    CACHE PATH "BoringSSL include dir (must track MQPROXY_BORINGSSL_DIR)")
 set(MQ_HAVE_BORINGSSL_ARCHIVES OFF)
 if(EXISTS "${MQPROXY_BORINGSSL_DIR}/libssl.a" AND
    EXISTS "${MQPROXY_BORINGSSL_DIR}/libcrypto.a")
