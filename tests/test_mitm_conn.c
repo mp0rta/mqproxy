@@ -14,15 +14,20 @@
 #include "mitm/mq_mitm_conn.h"
 #include "wire/mq_wire.h"
 
+#include <event2/event.h>
 #include <stdint.h>
 #include <string.h>
 
-// Decision-seam entry (declared in the .c without a header — test-only).
+// A real libevent base (Task 11: mq_mitm_ctx_new now creates a deferred-free
+// event, so the base must be valid even though the decision seam never runs the
+// loop — teardown is drained synchronously by mq_mitm_ctx_free).
+static struct event_base *g_base;
+
+// Decision-seam entry: now declared with its real mq_mitm_route_t signature in
+// mq_mitm_conn.h (carry-forward fix #1 — previously an incompatible local
+// `extern int`). The route constants below mirror mq_mitm_route_t so the
+// MQ_CHECK_EQ_INT comparisons read clearly.
 typedef enum { R_OPAQUE = 0, R_MITM = 1, R_FAIL = -1 } route_t;
-extern int mq_mitm_conn_decide_for_test(mq_mitm_ctx_t *ctx, const uint8_t *buf,
-                                        size_t len, const uint8_t *host, size_t host_len,
-                                        mq_addr_type_t atype, uint16_t port,
-                                        int local_fd);
 
 // ---------------------------------------------------------------------------
 // ClientHello byte-array builder (copied from tests/test_clienthello.c).
@@ -204,8 +209,7 @@ test_ignore_hit_routes_opaque(void)
     MQ_CHECK(mq_ignore_hosts_add(ign, "example.com") == 0); // exact apex
 
     mq_mitm_ctx_t *ctx =
-        mq_mitm_ctx_new(NULL, ign, NULL, stub_opaque_open, (void *)0xC0FFEE,
-                        (struct event_base *)0x1 /* base unused by the seam */);
+        mq_mitm_ctx_new(NULL, ign, NULL, stub_opaque_open, (void *)0xC0FFEE, g_base);
     MQ_CHECK(ctx != NULL);
     mq_mitm_ctx_set_mitm_hook_for_test(ctx, mitm_hook, NULL);
 
@@ -239,8 +243,7 @@ test_ignore_suffix_routes_opaque(void)
     mq_ignore_hosts_t *ign = mq_ignore_hosts_new();
     MQ_CHECK(mq_ignore_hosts_add(ign, ".example.com") == 0); // suffix
 
-    mq_mitm_ctx_t *ctx = mq_mitm_ctx_new(NULL, ign, NULL, stub_opaque_open, NULL,
-                                         (struct event_base *)0x1);
+    mq_mitm_ctx_t *ctx = mq_mitm_ctx_new(NULL, ign, NULL, stub_opaque_open, NULL, g_base);
     mq_mitm_ctx_set_mitm_hook_for_test(ctx, mitm_hook, NULL);
 
     chb_t b;
@@ -263,8 +266,7 @@ test_ignore_miss_routes_mitm(void)
     mq_ignore_hosts_t *ign = mq_ignore_hosts_new();
     MQ_CHECK(mq_ignore_hosts_add(ign, "signal.org") == 0); // not our SNI
 
-    mq_mitm_ctx_t *ctx = mq_mitm_ctx_new(NULL, ign, NULL, stub_opaque_open, NULL,
-                                         (struct event_base *)0x1);
+    mq_mitm_ctx_t *ctx = mq_mitm_ctx_new(NULL, ign, NULL, stub_opaque_open, NULL, g_base);
     mq_mitm_ctx_set_mitm_hook_for_test(ctx, mitm_hook, NULL);
 
     chb_t b;
@@ -286,8 +288,8 @@ static void
 test_null_ignore_routes_mitm(void)
 {
     reset_captures();
-    mq_mitm_ctx_t *ctx = mq_mitm_ctx_new(NULL, NULL, NULL, stub_opaque_open, NULL,
-                                         (struct event_base *)0x1);
+    mq_mitm_ctx_t *ctx =
+        mq_mitm_ctx_new(NULL, NULL, NULL, stub_opaque_open, NULL, g_base);
     mq_mitm_ctx_set_mitm_hook_for_test(ctx, mitm_hook, NULL);
 
     chb_t b;
@@ -306,8 +308,8 @@ static void
 test_no_sni_hard_fail(void)
 {
     reset_captures();
-    mq_mitm_ctx_t *ctx = mq_mitm_ctx_new(NULL, NULL, NULL, stub_opaque_open, NULL,
-                                         (struct event_base *)0x1);
+    mq_mitm_ctx_t *ctx =
+        mq_mitm_ctx_new(NULL, NULL, NULL, stub_opaque_open, NULL, g_base);
     mq_mitm_ctx_set_mitm_hook_for_test(ctx, mitm_hook, NULL);
 
     chb_t b;
@@ -326,8 +328,8 @@ static void
 test_not_tls_hard_fail(void)
 {
     reset_captures();
-    mq_mitm_ctx_t *ctx = mq_mitm_ctx_new(NULL, NULL, NULL, stub_opaque_open, NULL,
-                                         (struct event_base *)0x1);
+    mq_mitm_ctx_t *ctx =
+        mq_mitm_ctx_new(NULL, NULL, NULL, stub_opaque_open, NULL, g_base);
     mq_mitm_ctx_set_mitm_hook_for_test(ctx, mitm_hook, NULL);
 
     const uint8_t junk[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -341,10 +343,13 @@ test_not_tls_hard_fail(void)
 }
 
 MQ_TEST_MAIN({
+    g_base = event_base_new();
+    MQ_CHECK(g_base != NULL);
     test_ignore_hit_routes_opaque();
     test_ignore_suffix_routes_opaque();
     test_ignore_miss_routes_mitm();
     test_null_ignore_routes_mitm();
     test_no_sni_hard_fail();
     test_not_tls_hard_fail();
+    event_base_free(g_base);
 })

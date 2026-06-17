@@ -992,3 +992,9 @@ mq_gw_h2_adapter_free(mq_gw_h2_adapter_t *a)
     nghttp2_session_del(a->session);
     free(a);
 }
+
+/* The production submit wrapper (mq_gw_h2_submit_ops_gwc + mq_gw_h2_submit_gwc_*)
+ * is DELIBERATELY in a SEPARATE TU (mq_gw_h2_submit_gwc.c): it references
+ * mq_gw_client_* (→ xquic), whereas THIS adapter TU is pure nghttp2. Keeping them
+ * apart preserves the adapter's xquic-free unit test (test_gw_h2_adapter binds a
+ * capturing stub, never the gwc wrapper). */

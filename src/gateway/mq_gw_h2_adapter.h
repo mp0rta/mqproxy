@@ -84,10 +84,27 @@ int mq_gw_h2_adapter_want_write(mq_gw_h2_adapter_t *a);
  * (all borrowed). Safe on NULL. */
 void mq_gw_h2_adapter_free(mq_gw_h2_adapter_t *a);
 
-/* Production vtable bound to a gwc. Returns a static vtable whose `u` is a
- * wrapper holding an mq_gw_client_t*. DEFINED in Task 11 (its first live use) —
- * declared here for the header to be complete, but NOT implemented in this task
- * because it needs mq_gw_client_token() (added in Task 6). */
+/* ── production submit vtable bound to a gwc (Task 11) ───────────────────────
+ *
+ * The adapter drives the submit vtable, not mq_gw_client_* directly. Production
+ * binds it via this pair: the STATIC vtable (mq_gw_h2_submit_ops_gwc) whose ops
+ * thin-wrap mq_gw_client_*, plus a per-conn WRAPPER (mq_gw_h2_submit_gwc_t) that
+ * carries the shared mq_gw_client_t* as the vtable's `submit_user`. */
+typedef struct mq_gw_h2_submit_gwc mq_gw_h2_submit_gwc_t;
+struct mq_gw_client_s; /* fwd — the wrapper borrows it */
+
+/* The static production vtable (thin wrappers over mq_gw_client_*). The `u`
+ * argument each op receives is the wrapper below. */
 const mq_gw_submit_ops_t *mq_gw_h2_submit_ops_gwc(void);
+
+/* Allocate a wrapper carrying the SHARED gwc (BORROWED — not freed by
+ * mq_gw_h2_submit_gwc_free). The orchestrator passes the wrapper as `submit_user`
+ * to mq_gw_h2_adapter_new and owns its lifetime (one wrapper per MITM conn; freed
+ * in the conn's teardown AFTER the adapter is freed). Returns NULL on NULL gwc /
+ * OOM. */
+mq_gw_h2_submit_gwc_t *mq_gw_h2_submit_gwc_new(struct mq_gw_client_s *gwc);
+
+/* Free a wrapper. Does NOT free the borrowed gwc. Safe on NULL. */
+void mq_gw_h2_submit_gwc_free(mq_gw_h2_submit_gwc_t *w);
 
 #endif /* MQ_GATEWAY_MQ_GW_H2_ADAPTER_H */

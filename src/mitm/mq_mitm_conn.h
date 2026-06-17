@@ -86,6 +86,16 @@ typedef enum {
     MQ_MITM_ROUTE_FAIL = -1   // no/invalid SNI → hard-fail (caller closes fd)
 } mq_mitm_route_t;
 
+// TEST-ONLY entry into the decision seam without sockets (Task 4 / 10). Builds a
+// transient conn around a caller-supplied fd + drained buffer + orig-dst, parses,
+// and dispatches. Returns the route. tests/test_mitm_conn.c passes fd=-1 + a stub
+// opaque_open. (Declared here, not extern-in-test, so the test sees the real
+// mq_mitm_route_t signature — carry-forward fix #1.)
+mq_mitm_route_t mq_mitm_conn_decide_for_test(mq_mitm_ctx_t *ctx, const uint8_t *buf,
+                                             size_t len, const uint8_t *host,
+                                             size_t host_len, mq_addr_type_t atype,
+                                             uint16_t port, int local_fd);
+
 // Test-only MITM-start hook: invoked instead of the production mitm_start() body
 // when the route is MITM, so a unit test can observe branch selection without the
 // real TLS handshake. NULL restores the production path. The conn is identified
@@ -95,5 +105,28 @@ void mq_mitm_ctx_set_mitm_hook_for_test(mq_mitm_ctx_t *ctx,
                                                      const uint8_t *buf, size_t len,
                                                      const char *normalized_sni),
                                         void *hook_user);
+
+// ── Live teardown test seam (Task 11) ───────────────────────────────────────
+// Construct a conn DIRECTLY in the post-handshake (live MITM) state, WITHOUT a
+// real TLS handshake, so the registry + ordered teardown + re-entrancy + the
+// req_aborted-per-in-flight-stream direction can be unit-tested with a fake
+// SSL/socket pair + stub submit vtable.
+//
+//   adapter   : a live mq_gw_h2_adapter_t* (built by the test against its stub
+//               submit vtable + fake send_cb). OWNED by the conn after this call
+//               (freed in teardown). May be NULL (no adapter → still exercises
+//               the SSL_free/close/unlink/free path).
+//   ssl       : a server-mode SSL* (the test may pass one built from mq_mitm_core
+//               with a mem-BIO pair, or NULL). OWNED by the conn (SSL_free'd in
+//               teardown).
+//   local_fd  : OWNED by the conn (close()'d in teardown). Pass -1 for none.
+//
+// The conn is registered live; mq_mitm_ctx_free (or an explicit close) tears it
+// down in the §5.1 order. Returns 0 on success, -1 on OOM (caller frees the
+// adapter/ssl/fd it passed in on failure).
+struct mq_gw_h2_adapter;
+struct ssl_st;
+int mq_mitm_conn_make_live_for_test(mq_mitm_ctx_t *ctx, struct mq_gw_h2_adapter *adapter,
+                                    struct ssl_st *ssl, int local_fd);
 
 #endif // MQ_MITM_CONN_H

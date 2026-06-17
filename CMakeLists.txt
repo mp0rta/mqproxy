@@ -57,6 +57,7 @@ add_library(mqproxy STATIC
     src/transport/mq_transport.c
     src/runtime/mq_runtime_libevent.c
     src/gateway/mq_gw_h2_adapter.c
+    src/gateway/mq_gw_h2_submit_gwc.c
     src/mitm/mq_ignore_hosts.c)
 target_include_directories(mqproxy PUBLIC ${NGHTTP2_INCLUDE_DIRS})
 target_link_libraries(mqproxy PUBLIC CURL::libcurl)
@@ -218,10 +219,36 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         # via the socketless decision seam. Links mqproxy + mq_boringssl (touches
         # mq_mitm_core types via the orchestrator) + libevent (the orchestrator
         # creates events; the seam itself uses none).
+        # NOTE: as of Task 11 mq_mitm_conn.c wires the live MITM path through the
+        # production submit wrapper (mq_gw_h2_adapter → mq_gw_client_* → xquic), so
+        # the orchestrator object now references nghttp2 + the full xquic/BoringSSL
+        # stack even on the decision-seam path. These unit targets therefore link the
+        # whole stack (xquic + nghttp2 + mq_boringssl + libevent) like the other
+        # integration tests, plus the xquic runtime rpath.
         add_executable(test_mitm_conn tests/test_mitm_conn.c)
-        target_link_libraries(test_mitm_conn mqproxy mq_boringssl ${EVENT_CORE_LIB})
-        target_include_directories(test_mitm_conn PRIVATE tests src)
+        target_link_libraries(test_mitm_conn mqproxy xquic mq_boringssl
+            ${NGHTTP2_LIBRARIES} ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB}
+            pthread dl m stdc++)
+        target_include_directories(test_mitm_conn PRIVATE tests src
+            ${NGHTTP2_INCLUDE_DIRS})
+        set_target_properties(test_mitm_conn PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
         add_test(NAME test_mitm_conn COMMAND test_mitm_conn)
+
+        # ---- Task 11: live MITM conn registry + ordered teardown + re-entrancy ----
+        # Builds real nghttp2 adapters holding in-flight streams, registers them in
+        # live MITM conns via the make_live_for_test seam, then mq_mitm_ctx_free —
+        # asserting each in-flight stream's req_aborted fires exactly once and the
+        # teardown is ASan/LSan-clean (no UAF/leak/double-free). Links the full stack
+        # (the orchestrator references SSL_*/BIO_* + the gwc submit wrapper → xquic).
+        add_executable(test_mitm_teardown tests/test_mitm_teardown.c)
+        target_link_libraries(test_mitm_teardown mqproxy xquic mq_boringssl
+            ${NGHTTP2_LIBRARIES} ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB}
+            pthread dl m stdc++)
+        target_include_directories(test_mitm_teardown PRIVATE tests src
+            ${NGHTTP2_INCLUDE_DIRS})
+        set_target_properties(test_mitm_teardown PROPERTIES
+            BUILD_RPATH "${XQUIC_BUILD_DIR}")
+        add_test(NAME test_mitm_teardown COMMAND test_mitm_teardown)
 
         # ---- Task 8: openssl s_client cross-implementation smoke ----
         # The single-shot helper terminates a real loopback TLS handshake via
