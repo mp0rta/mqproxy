@@ -86,6 +86,15 @@
 // its event/timer pinned forever.
 #define MQ_MITM_CH_DEADLINE_SEC 5
 
+// LIVE-phase idle timeout (H-1). Once the (cheap) h2 handshake completes the
+// drain deadline is gone; without this a client could complete the handshake then
+// idle forever, pinning local_fd + the SSL + the 64 KiB×2 BIO pair + the nghttp2
+// adapter + a registry slot (fd/memory exhaustion DoS — a malicious app on the
+// captured device can open many such conns). This re-armed idle timer reclaims a
+// conn with NO I/O progress for the window. 60s is long enough to span keep-alive
+// idle between browsing requests, short enough to reclaim dead conns promptly.
+#define MQ_MITM_LIVE_IDLE_SEC 60
+
 // Mem-BIO-pair ring size. 64 KiB matches test_mitm_core.c and comfortably holds a
 // full TLS flight (ClientHello + the server's Certificate/CertVerify/Finished).
 #define MQ_MITM_BIO_RING 65536
@@ -138,7 +147,8 @@ struct mq_mitm_conn {
     int local_fd;              // OWNED (closed on teardown)
     struct event *read_ev;     // EV_READ|EV_PERSIST on local_fd
     struct event *write_ev;    // EV_WRITE (one-shot, re-armed when send() blocks)
-    struct event *deadline_ev; // one-shot complete-ClientHello timer
+    struct event *deadline_ev; // one-shot complete-ClientHello (DRAIN) timer
+    struct event *idle_ev;     // LIVE-phase idle timer (H-1; re-armed on I/O)
 
     // Original recovered orig-dst params (forwarded UNCHANGED on the opaque path).
     uint8_t orig_host[16];
@@ -205,6 +215,10 @@ conn_free_events(struct mq_mitm_conn *c)
     if (c->deadline_ev) {
         event_free(c->deadline_ev); // cancels the pending one-shot timer
         c->deadline_ev = NULL;
+    }
+    if (c->idle_ev) {
+        event_free(c->idle_ev); // cancels the pending LIVE idle timer (H-1)
+        c->idle_ev = NULL;
     }
 }
 
@@ -300,6 +314,7 @@ static int flush_ciphertext(struct mq_mitm_conn *c);
 static int pump_outbound(struct mq_mitm_conn *c);
 static void on_local_io(evutil_socket_t fd, short what, void *user);
 static ssize_t adapter_ssl_send(void *io, const uint8_t *p, size_t n);
+static void on_idle(evutil_socket_t fd, short what, void *user); // H-1 LIVE idle
 
 // Arm the one-shot EV_WRITE event so flush_ciphertext is retried when the socket
 // becomes writable again. Safe to call repeatedly (event_add on an armed one-shot
@@ -308,6 +323,18 @@ static void
 arm_write(struct mq_mitm_conn *c)
 {
     if (c->write_ev) event_add(c->write_ev, NULL);
+}
+
+// (Re-)arm the LIVE-phase idle timer (H-1). event_add on an already-pending
+// evtimer RESETS its expiry, so calling this on each I/O-progress point cheaply
+// slides the deadline forward. Guarded on `dying` (like arm_write) so a teardown
+// in progress never re-arms a timer into an about-to-be-freed conn.
+static void
+arm_idle(struct mq_mitm_conn *c)
+{
+    if (c->dying || !c->idle_ev) return;
+    struct timeval tv = {.tv_sec = MQ_MITM_LIVE_IDLE_SEC, .tv_usec = 0};
+    event_add(c->idle_ev, &tv);
 }
 
 // Adapter writable-notify (mq_gw_h2_adapter_set_writable_cb). A RESPONSE arriving
@@ -423,6 +450,15 @@ drive_handshake(struct mq_mitm_conn *c)
     // deferred pump_outbound via the one-shot EV_WRITE. Without this the response
     // never reaches the browser (it sits in the adapter's send queue → hang).
     mq_gw_h2_adapter_set_writable_cb(c->adapter, on_adapter_writable, c);
+
+    // Arm the LIVE-phase idle timer (H-1). The DRAIN deadline was cancelled above;
+    // from here the conn is reclaimed if no I/O makes progress for the idle window.
+    c->idle_ev = evtimer_new(c->ctx->base, on_idle, c);
+    if (!c->idle_ev) {
+        MQ_LOGW("mq_mitm_conn: idle-timer alloc failed — hard-fail close");
+        return -1;
+    }
+    arm_idle(c);
 
     c->phase = MQ_MITM_PHASE_LIVE;
     MQ_LOGD("mq_mitm_conn: handshake complete (ALPN=h2) — live MITM bridge up");
@@ -561,6 +597,9 @@ on_local_io(evutil_socket_t fd, short what, void *user)
                 conn_close(c);
                 return;
             }
+            // I/O made progress (writability + outbound pump) → slide the idle
+            // deadline forward (H-1). Guarded on dying inside arm_idle.
+            arm_idle(c);
         }
     }
 
@@ -598,6 +637,9 @@ on_local_io(evutil_socket_t fd, short what, void *user)
                 conn_close(c);
                 return;
             }
+            // Inbound I/O made progress (read pump returned "stay") → slide the
+            // idle deadline forward (H-1).
+            arm_idle(c);
         }
     }
 }
@@ -706,7 +748,11 @@ mitm_conn_decide(struct mq_mitm_conn *c, const mq_clienthello_t *ch)
     // Normalize the SNI. Rejects IP literals / wildcards / empty labels.
     char norm[256];
     if (mq_mitm_normalize_sni(ch->sni, strlen(ch->sni), norm) != 0) {
-        MQ_LOGD("mq_mitm_conn: SNI '%s' failed normalization — hard-fail close", ch->sni);
+        // L-1: the raw pre-normalization SNI is attacker-controlled and may carry
+        // terminal escapes / control bytes; never echo it verbatim. Normalization
+        // just failed, so there is no safe normalized form — log only its length.
+        MQ_LOGD("mq_mitm_conn: SNI (len=%zu) failed normalization — hard-fail close",
+                strlen(ch->sni));
         conn_close(c);
         return MQ_MITM_ROUTE_FAIL;
     }
@@ -771,6 +817,20 @@ on_deadline(evutil_socket_t fd, short what, void *user)
     struct mq_mitm_conn *c = (struct mq_mitm_conn *)user;
     MQ_LOGD("mq_mitm_conn: ClientHello deadline (%ds) exceeded — hard-fail close",
             MQ_MITM_CH_DEADLINE_SEC);
+    conn_close(c);
+}
+
+// LIVE-phase idle timer callback (H-1). Fires when no I/O has made progress for
+// MQ_MITM_LIVE_IDLE_SEC. Routes teardown through conn_close (deferred-free,
+// re-entrancy-safe) — exactly like on_deadline — NOT a direct free.
+static void
+on_idle(evutil_socket_t fd, short what, void *user)
+{
+    (void)fd;
+    (void)what;
+    struct mq_mitm_conn *c = (struct mq_mitm_conn *)user;
+    MQ_LOGD("mq_mitm_conn: LIVE idle timeout (%ds, no I/O) — hard-fail close",
+            MQ_MITM_LIVE_IDLE_SEC);
     conn_close(c);
 }
 
@@ -950,4 +1010,19 @@ mq_mitm_conn_make_live_for_test(mq_mitm_ctx_t *ctx, struct mq_gw_h2_adapter *ada
     // exercises adapter_free (→ req_aborted per stream) → SSL_free → close → free.
     registry_add(ctx, c);
     return 0;
+}
+
+int
+mq_mitm_conn_arm_idle_now_for_test(mq_mitm_ctx_t *ctx)
+{
+    if (!ctx) return -1;
+    int n = 0;
+    for (struct mq_mitm_conn *c = ctx->conns; c; c = c->next) {
+        if (!c->idle_ev) c->idle_ev = evtimer_new(ctx->base, on_idle, c);
+        if (!c->idle_ev) return -1;
+        struct timeval zero = {0, 0}; // expire on the very next loop iteration
+        event_add(c->idle_ev, &zero);
+        n++;
+    }
+    return n;
 }

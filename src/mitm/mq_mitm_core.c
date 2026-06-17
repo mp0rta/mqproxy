@@ -7,8 +7,10 @@
 #include "mitm/mq_mitm_core.h"
 
 #include <openssl/asn1.h>
+#include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/bytestring.h>
+#include <openssl/crypto.h>
 #include <openssl/ec.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -185,11 +187,16 @@ read_pem_file_safely(const char *path, int require_private_perms)
         close(fd);
         return NULL;
     }
+    // M-1: this scratch may transiently hold raw CA private-key PEM bytes (the
+    // crown-jewel MITM secret). Cleanse it on EVERY exit path so it does not
+    // linger in a freed/stack frame recoverable from a core dump. The mem-BIO
+    // itself is cleansed by the caller (it owns the assembled secret bytes).
     unsigned char buf[4096];
     size_t total = 0;
     for (;;) {
         ssize_t r = read(fd, buf, sizeof buf);
         if (r < 0) {
+            OPENSSL_cleanse(buf, sizeof buf);
             BIO_free(mem);
             close(fd);
             return NULL;
@@ -197,18 +204,34 @@ read_pem_file_safely(const char *path, int require_private_perms)
         if (r == 0) break;
         total += (size_t)r;
         if (total > (1u << 20)) {
+            OPENSSL_cleanse(buf, sizeof buf);
             BIO_free(mem);
             close(fd);
             return NULL;
         }
         if (BIO_write(mem, buf, (int)r) != r) {
+            OPENSSL_cleanse(buf, sizeof buf);
             BIO_free(mem);
             close(fd);
             return NULL;
         }
     }
+    OPENSSL_cleanse(buf, sizeof buf);
     close(fd);
     return mem;
+}
+
+// Zeroize a memory BIO's backing buffer before freeing it, so secret bytes (the
+// CA private-key PEM) don't linger in freed heap (M-1). For a non-mem BIO or
+// NULL this degrades to a plain BIO_free.
+static void
+bio_free_cleanse(BIO *b)
+{
+    if (!b) return;
+    char *data = NULL;
+    long len = BIO_get_mem_data(b, &data);
+    if (data && len > 0) OPENSSL_cleanse(data, (size_t)len);
+    BIO_free(b);
 }
 
 mq_mitm_core_t *
@@ -305,8 +328,8 @@ mq_mitm_core_create(const char *ca_cert_pem_path, const char *ca_key_pem_path,
     core->cache_size = cache_size;
     core->leaf_ttl_sec = leaf_ttl_sec;
 
-    BIO_free(key_bio);
-    BIO_free(cert_bio);
+    bio_free_cleanse(key_bio); // M-1: zeroize raw CA-key PEM bytes before free
+    BIO_free(cert_bio);        // cert is public — plain free
     return core;
 
 fail:
@@ -315,7 +338,7 @@ fail:
     if (ca_cert) X509_free(ca_cert);
     if (ca_key) EVP_PKEY_free(ca_key);
     if (cert_bio) BIO_free(cert_bio);
-    if (key_bio) BIO_free(key_bio);
+    if (key_bio) bio_free_cleanse(key_bio); // M-1: zeroize on the fail path too
     return NULL;
 }
 

@@ -275,7 +275,58 @@ test_ctx_free_empty_conn(void)
     event_base_free(base);
 }
 
+// H-1: the LIVE-phase idle timer fires → conn teardown via conn_close (deferred
+// free). We build N live conns (each with one in-flight stream), arm the idle
+// timer with a zero timeout, then run the loop: on_idle fires for each, routes
+// through conn_close (deferred), and the next loop iteration reaps via free_ev.
+// ASSERTION: each conn was actually torn down by the idle path (req_aborted fired
+// exactly once per in-flight stream), and ASan/LSan is clean (no UAF from the
+// timer firing into the conn, no leak).
+static void
+test_live_idle_timeout_tears_down(void)
+{
+    enum { N = 3 };
+    struct event_base *base = event_base_new();
+    MQ_CHECK(base != NULL);
+
+    mq_mitm_ctx_t *ctx = mq_mitm_ctx_new(NULL, NULL, NULL, stub_opaque_open, NULL, base);
+    MQ_CHECK(ctx != NULL);
+
+    stub_state_t st[N] = {{0}};
+    for (int i = 0; i < N; i++) {
+        mq_gw_h2_adapter_t *a = make_inflight_adapter(&st[i]);
+        MQ_CHECK(a != NULL);
+        int sp[2];
+        MQ_CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+        close(sp[0]);
+        MQ_CHECK_EQ_INT(mq_mitm_conn_make_live_for_test(ctx, a, /*ssl=*/NULL, sp[1]), 0);
+    }
+
+    // Arm the idle timer (zero timeout) on every live conn.
+    MQ_CHECK_EQ_INT(mq_mitm_conn_arm_idle_now_for_test(ctx), N);
+
+    // Drive expiry: first pass fires each on_idle → conn_close (queues deferred
+    // free + activates free_ev); subsequent passes reap via free_ev. Loop until
+    // the base is idle so both the timers AND the deferred reap have run.
+    for (int i = 0; i < 8 && event_base_loop(base, EVLOOP_NONBLOCK) == 0; i++) {
+        // event_base_loop returns 1 when no events remain pending — stop then.
+        if (event_base_get_num_events(base, EVENT_BASE_COUNT_ACTIVE |
+                                                EVENT_BASE_COUNT_ADDED) == 0)
+            break;
+    }
+
+    // Every in-flight stream was aborted exactly once → teardown ran via the idle
+    // path. (If the idle timer had NOT torn the conn down, these would be 0.)
+    for (int i = 0; i < N; i++)
+        MQ_CHECK_EQ_INT(st[i].aborted_calls, 1);
+
+    // ctx_free now has an empty registry (all conns reaped). Still must be clean.
+    mq_mitm_ctx_free(ctx);
+    event_base_free(base);
+}
+
 MQ_TEST_MAIN({
     test_ctx_free_aborts_each_inflight_once();
     test_ctx_free_empty_conn();
+    test_live_idle_timeout_tears_down();
 })

@@ -129,4 +129,13 @@ struct ssl_st;
 int mq_mitm_conn_make_live_for_test(mq_mitm_ctx_t *ctx, struct mq_gw_h2_adapter *adapter,
                                     struct ssl_st *ssl, int local_fd);
 
+// ── LIVE-phase idle-timeout test seam (H-1) ──────────────────────────────────
+// Arm the LIVE idle timer (allocating idle_ev if needed) on EVERY conn currently
+// in the live registry with a ZERO timeout, so the next event_base loop iteration
+// fires on_idle for real — exercising the production idle→conn_close→deferred-free
+// teardown path under ASan/LSan. After this returns the caller should run
+// event_base_loop(base, EVLOOP_NONBLOCK) to drive expiry + the deferred reap.
+// Returns the number of conns armed (0 if the registry was empty), -1 on bad arg.
+int mq_mitm_conn_arm_idle_now_for_test(mq_mitm_ctx_t *ctx);
+
 #endif // MQ_MITM_CONN_H
