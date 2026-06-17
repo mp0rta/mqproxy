@@ -422,11 +422,10 @@ adapter_ssl_send(void *io, const uint8_t *p, size_t n)
     if (w <= 0) {
         int e = SSL_get_error(c->ssl, w);
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
-            // Could not take the plaintext right now; flush what ciphertext exists
-            // and signal backpressure to the adapter (it treats <0 as fatal, so
-            // report 0 accepted is not allowed by its send_cb contract → it needs
-            // full acceptance). With a 64 KiB mem BIO and 16 KiB H2 frames this
-            // essentially never trips; treat as fatal to stay simple + safe.
+            // Could not take the plaintext right now; flush what ciphertext exists.
+            // The send_cb contract has no "partial" return (only n or -1); a 0 would
+            // be read as a fatal short-write. With a 64 KiB BIO vs 16 KiB frames this
+            // is unreachable, so we fail closed on WANT_*.
             (void)flush_ciphertext(c);
         }
         return -1;
@@ -490,7 +489,10 @@ pump_inbound(struct mq_mitm_conn *c)
                 if (flush_ciphertext(c) != 0) return -1;
                 break;
             }
-            if (e == SSL_ERROR_ZERO_RETURN) return 1; // TLS close_notify
+            // TLS close_notify. A peer half-close (FIN/close_notify) is
+            // deliberately treated as a full-close here (acceptable for the
+            // h2/browser MITM case), like the WANT_WRITE-fatal choice above.
+            if (e == SSL_ERROR_ZERO_RETURN) return 1;
             MQ_LOGD("mq_mitm_conn: SSL_read error (err=%d) — hard-fail", e);
             return -1;
         }
@@ -522,6 +524,16 @@ on_local_io(evutil_socket_t fd, short what, void *user)
         // If the handshake was waiting on writability, advance it.
         if (c->phase == MQ_MITM_PHASE_HANDSHAKE) {
             if (drive_handshake(c) != 0) {
+                conn_close(c);
+                return;
+            }
+        } else if (c->phase == MQ_MITM_PHASE_LIVE) {
+            // Draining the socket holdover may have re-opened headroom for a
+            // download that was deferred under backpressure (Task 7). Re-pump the
+            // adapter so want_write clears sq_deferred and fires req_drained,
+            // resuming the gateway pump — mirroring the pump_inbound tail. Without
+            // this the download stalls until the next inbound packet re-enters.
+            if (pump_outbound(c) != 0) {
                 conn_close(c);
                 return;
             }
