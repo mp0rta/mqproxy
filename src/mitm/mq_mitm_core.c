@@ -27,6 +27,9 @@
 #define MQ_DNS_NAME_MAX  253 /* RFC 1035 presentation-form name limit */
 #define MQ_DNS_LABEL_MAX 63  /* RFC 1035 label limit */
 
+#define MQ_MITM_LEAF_SERIAL_BITS  64   /* random leaf serial width */
+#define MQ_MITM_LEAF_BACKDATE_SEC 3600 /* notBefore clock-skew tolerance */
+
 struct mq_mitm_core {
     X509 *ca_cert;
     EVP_PKEY *ca_key;
@@ -326,8 +329,8 @@ forge_leaf_ku(mq_mitm_core_t *core, const char *norm_sni, const char *ku_str)
     // Serial = positive random (~64 bits).
     bn = BN_new();
     if (!bn) goto done;
-    if (BN_rand(bn, 64, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) != 1) goto done;
-    BN_set_negative(bn, 0); // ensure positive
+    if (BN_rand(bn, MQ_MITM_LEAF_SERIAL_BITS, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY) != 1)
+        goto done;
     serial = BN_to_ASN1_INTEGER(bn, NULL);
     if (!serial) goto done;
     if (X509_set_serialNumber(leaf, serial) != 1) goto done;
@@ -335,7 +338,9 @@ forge_leaf_ku(mq_mitm_core_t *core, const char *norm_sni, const char *ku_str)
     // Validity: notBefore = now-1h, notAfter = now + leaf_ttl_sec.
     {
         time_t now = core->now_fn();
-        if (!X509_time_adj_ex(X509_getm_notBefore(leaf), 0, -3600, &now)) goto done;
+        if (!X509_time_adj_ex(X509_getm_notBefore(leaf), 0, -MQ_MITM_LEAF_BACKDATE_SEC,
+                              &now))
+            goto done;
         if (!X509_time_adj_ex(X509_getm_notAfter(leaf), 0, core->leaf_ttl_sec, &now))
             goto done;
     }
