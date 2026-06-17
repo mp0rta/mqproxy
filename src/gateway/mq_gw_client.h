@@ -35,7 +35,7 @@
  *     no UAF. If mq_h3_free ran first, the per-request wrappers would already be
  *     destroyed and any gw_client touch of r->req (set_cbs/reset) would be a UAF.
  *     mq_h3_free BEFORE mq_transport_free is the separate mq_h3.h contract.
- *   - Per-request state (mq_gw_req_t, internal) is owned by the bridge and freed
+ *   - Per-request state (mq_gw_xreq_t, internal) is owned by the bridge and freed
  *     exactly once on EVERY termination order — see mq_gw_client.c for the
  *     ownership rules across local-first / tunnel-first / racing teardown.
  */
@@ -46,6 +46,7 @@
 #include <stdint.h>
 
 #include "gateway/mq_fetch_listener.h"
+#include "gateway/mq_gw_intake.h"
 #include "runtime/mq_runtime_libevent.h"
 #include "transport/mq_conn.h" /* mq_cc_t */
 #include "transport/mq_h3.h"
@@ -85,15 +86,6 @@ mq_gw_client_t *mq_gw_client_new(mq_transport_t *t, mq_runtime_t *rt, mq_h3_t *h
                                  uint64_t keepalive_idle_ms, int reconnect_enabled,
                                  uint64_t reconnect_max_backoff_ms);
 
-/* The mq_fetch_cbs_t implementation to wire into mq_fetch_listener_new. The
- * returned pointer is to a static, immutable vtable (valid for the program
- * lifetime). */
-const mq_fetch_cbs_t *mq_gw_client_fetch_cbs(void);
-
-/* The `user` pointer to pass alongside mq_gw_client_fetch_cbs() into
- * mq_fetch_listener_new (it is the mq_gw_client_t itself). */
-void *mq_gw_client_fetch_user(mq_gw_client_t *c);
-
 /* Register up to `n` extra local bind IPs to bring up as additional MPQUIC
  * paths on the tunnel conn once it becomes multipath-ready. Mirrors
  * mq_client_add_paths (deferred via a recurring mp-poll timer on rt's base).
@@ -117,5 +109,41 @@ void mq_gw_client_dump_stats(mq_gw_client_t *c);
  * it touches r->req on live in-flight requests, which is only valid while the H3
  * engine still exists. */
 void mq_gw_client_free(mq_gw_client_t *c);
+
+/* ── Neutral intake boundary (Phase 7 MITM, Tasks 3–4) ──────────────────────
+ *
+ * Protocol-agnostic request boundary onto the gateway tunnel. Adapters (e.g.
+ * mq_gw_fetch_adapter for H1, future H2/H3 MITM adapters) plug into this
+ * boundary so the core tunnel-forwarding + response-relay logic is shared.
+ *
+ * Reject ORDER is observable (tests/e2e assert X-Mq-Error byte-for-byte) and is
+ * split across two phases to preserve it:
+ *   prevalidate  → dup-control-header, X-Mq-Auth (missing/format)
+ *   [adapter parses the fetch envelope: X-Mq-Target/Method]
+ *   req_begin    → X-Mq-Origin-Protocol, X-Mq-Cache, header-size, tunnel liveness
+ */
+
+/* Phase 1 of intake: header-only checks that, in the CURRENT code, run BEFORE the fetch
+ * envelope's target/method parse — duplicate-control-header, then X-Mq-Auth format.
+ * Returns MQ_GW_OK or the reject reason (+ *status). The adapter calls this FIRST so
+ * observable reject ORDER is preserved: dup -> auth -> [adapter parses target/method] ->
+ * req_begin. */
+mq_gw_reject_reason_t mq_gw_client_prevalidate(mq_gw_client_t *c,
+                                               const mq_h3_header_t *headers, size_t n,
+                                               int *status);
+
+/* Phase 2: begin a request (head already split + prevalidated). On acceptance returns the
+ * handle. On rejection returns NULL and sets *err_status AND *reason. Core checks here IN
+ * ORDER: X-Mq-Origin-Protocol(400), X-Mq-Cache(400), header-size(400), tunnel
+ * liveness(502). */
+mq_gw_xreq_t *mq_gw_client_req_begin(mq_gw_client_t *c, const mq_gw_req_head_t *head,
+                                     const mq_gw_sink_ops_t *sink, void *sink_user,
+                                     int *err_status, mq_gw_reject_reason_t *reason);
+int mq_gw_client_req_body(mq_gw_xreq_t *r, const uint8_t *p,
+                          size_t len); /* 0 go, -1 pause (consumed) */
+void mq_gw_client_req_body_done(mq_gw_xreq_t *r);
+void mq_gw_client_req_aborted(mq_gw_xreq_t *r);
+void mq_gw_client_req_drained(
+    mq_gw_xreq_t *r); /* adapter output drained below low watermark */
 
 #endif /* MQ_GATEWAY_MQ_GW_CLIENT_H */

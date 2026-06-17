@@ -36,12 +36,16 @@ add_library(mqproxy STATIC
     src/proxy/mq_udp_session.c
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
+    src/ingress/mq_origdst.c
+    src/ingress/mq_tproxy.c
+    src/ingress/mq_tproxy_setup.c
     src/ingress/mq_listener.c
     src/ingress/mq_udp_assoc.c
     src/gateway/mq_http1.c
     src/gateway/mq_gw_headers.c
     src/gateway/mq_fetch_listener.c
     src/gateway/mq_gw_client.c
+    src/gateway/mq_gw_fetch_adapter.c
     src/gateway/mq_gw_server.c
     src/gateway/mq_gw_metrics.c
     src/gateway/mq_gw_cache.c
@@ -127,6 +131,11 @@ add_test(NAME test_backoff COMMAND test_backoff)
 add_executable(test_gw_req_format tests/test_gw_req_format.c src/gateway/mq_gw_metrics.c)
 target_include_directories(test_gw_req_format PRIVATE tests src)  # tests → mqtest.h, src → gateway/mq_gw_metrics.h
 add_test(NAME test_gw_req_format COMMAND test_gw_req_format)
+
+add_executable(test_origdst tests/test_origdst.c)
+target_link_libraries(test_origdst mqproxy)
+target_include_directories(test_origdst PRIVATE tests)
+add_test(NAME test_origdst COMMAND test_origdst)
 
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
@@ -396,6 +405,27 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         BUILD_RPATH "${XQUIC_BUILD_DIR}")
     add_test(NAME test_gw_reconnect COMMAND test_gw_reconnect)
 
+    # Neutral intake boundary relay test (Task 5, Phase 7 MITM Slice 0+1):
+    # drives mq_gw_client_prevalidate / mq_gw_client_req_begin / req_body /
+    # req_body_done / req_aborted / req_drained directly with a fake
+    # mq_gw_sink_ops_t (no fetch adapter / fetch listener), locking the
+    # boundary a future H2/H3 MITM adapter will also rely on.
+    add_executable(test_gw_relay tests/integration/test_gw_relay.c)
+    target_link_libraries(test_gw_relay
+        mqproxy
+        xquic
+        ${EVENT_CORE_LIB}
+        ${EVENT_EXTRA_LIB}
+        pthread dl m stdc++)
+    target_include_directories(test_gw_relay PRIVATE tests src
+        ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+    target_compile_definitions(test_gw_relay PRIVATE
+        TEST_CERT_FILE="${MQ_CERT_FILE}"
+        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    set_target_properties(test_gw_relay PROPERTIES
+        BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    add_test(NAME test_gw_relay COMMAND test_gw_relay)
+
     # mq_origin_curl (Task 4.2): the libcurl-multi origin client on libevent.
     # Drives the mq_origin_* API against an in-process evhttp origin over plain
     # loopback HTTP/1.1. evhttp lives in libevent_extra (EVENT_EXTRA_LIB); curl
@@ -603,6 +633,26 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_gateway.sh)
     set_tests_properties(e2e_gateway PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ---- Phase 7 Slice 0+1: transparent capture + opaque relay e2e ----
+    # Drives the transparent-capture (REDIRECT) path end-to-end against a real
+    # python3 TLS origin on 127.0.0.1:443:
+    #   case 1: TLS opacity proof — curl as nobody through the nft REDIRECT rule
+    #           → tunnel → server relay → origin; curl verifies the origin's cert
+    #           (--cacert origin.crt); a MITM would break cert verification.
+    #   case 2: (NET_ADMIN) 2-path multipath smoke — same capture with tc shaping.
+    #   case 3: teardown assertion — nft table gone after client exit.
+    # REQUIRES root + CAP_NET_ADMIN (nft + IP_TRANSPARENT + port 443).
+    # Exits 77 (SKIP) when not root, nft absent, or no CAP_NET_ADMIN in container.
+    add_test(NAME e2e_tproxy
+        COMMAND ${CMAKE_COMMAND} -E env
+            MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+            MQPROXY_CERT=${MQ_CERT_FILE}
+            MQPROXY_KEY=${MQ_KEY_FILE}
+            MQPROXY_ORIGIN_CERT=${MQ_ORIGIN_CERT_FILE}
+            MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
+            bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_tproxy.sh)
+    set_tests_properties(e2e_tproxy PROPERTIES SKIP_RETURN_CODE 77)
 
     # ---- Phase 3 Task 7.1: e2e UDP relay test utilities ----
     # These are standalone CLI helpers driven by e2e_udp.sh (Task 7.2).
