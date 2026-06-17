@@ -19,6 +19,7 @@
 
 #include <nghttp2/nghttp2.h>
 #include <stdint.h>
+#include <stdlib.h> /* strtol */
 #include <string.h>
 #include <strings.h> /* strcasecmp / strncasecmp */
 
@@ -34,7 +35,8 @@
 /* ── adapter send_cb: capture the server's outbound plaintext ────────────────*/
 
 typedef struct {
-    uint8_t buf[64 * 1024];
+    uint8_t buf[256 * 1024]; /* large enough to hold a full flush incl. a 64 KiB
+                              * response body + framing in one want_write pass */
     size_t len;
 } sink_buf_t;
 
@@ -150,6 +152,13 @@ typedef struct {
     /* injectable prevalidate verdict (default OK). */
     mq_gw_reject_reason_t prevalidate_verdict;
     int prevalidate_status;
+
+    /* Task 7: captured sink + sink_user + the fake xreq handle, so a test acting
+     * as the core can drive the response path. */
+    const mq_gw_sink_ops_t *sink;
+    void *sink_user;
+    mq_gw_xreq_t *xreq;    /* the sentinel we returned from req_begin */
+    int req_drained_calls; /* how many times the adapter called req_drained */
 } cap_state_t;
 
 static int
@@ -197,11 +206,13 @@ cap_req_begin(void *u, const mq_gw_req_head_t *head, const mq_gw_sink_ops_t *sin
               void *sink_user, int *err_status, mq_gw_reject_reason_t *reason)
 {
     cap_state_t *st = (cap_state_t *)u;
-    (void)sink;
-    (void)sink_user;
     (void)err_status;
     (void)reason;
     st->req_begin_calls++;
+    /* Task 7: stash the sink + sink_user so a core-role test can drive the
+     * response path; the adapter passes the per-stream context as sink_user. */
+    st->sink = sink;
+    st->sink_user = sink_user;
     cap_copy(st->method, head->method);
     cap_copy(st->scheme, head->scheme);
     cap_copy(st->authority, head->authority);
@@ -214,9 +225,11 @@ cap_req_begin(void *u, const mq_gw_req_head_t *head, const mq_gw_sink_ops_t *sin
         st->n_hdrs++;
     }
     /* Return a non-NULL sentinel so the adapter stores it as the stream's xreq.
-     * The boundary ops (body/drain/abort) are never driven in these header-only
-     * tests, so the pointer is never dereferenced. */
-    return (mq_gw_xreq_t *)st;
+     * For the Task 7 response test the adapter passes this same handle back to
+     * req_drained, so the core-role test can observe download backpressure
+     * resume. The header-only Task 6 tests never dereference it. */
+    st->xreq = (mq_gw_xreq_t *)st;
+    return st->xreq;
 }
 
 static int
@@ -235,7 +248,11 @@ cap_req_body_done(mq_gw_xreq_t *r)
 static void
 cap_req_drained(mq_gw_xreq_t *r)
 {
-    (void)r;
+    /* The adapter passes back the xreq sentinel == the cap_state_t*. Count the
+     * resume so the Task 7 backpressure test can assert the download pump is
+     * re-kicked once the H2 send buffer drains below the per-stream cap. */
+    cap_state_t *st = (cap_state_t *)r;
+    if (st) st->req_drained_calls++;
 }
 static void
 cap_req_aborted(mq_gw_xreq_t *r)
@@ -652,6 +669,254 @@ test_demux_auth_bearer_dedup(void)
     MQ_CHECK(auth && strcmp(auth, "Bearer tok") == 0);
 }
 
+/* ── Task 7: response path (sink ops → H2 HEADERS/DATA) + download backpressure ─
+ *
+ * The §5.2 per-stream response send-queue cap the adapter enforces. resp_body
+ * must return 0 (highwater) once the queue is full, and call req_drained once it
+ * drains below the cap. Kept in lockstep with MQ_H2_RESP_QUEUE_CAP in the
+ * adapter. */
+#define EXP_RESP_QUEUE_CAP (64u * 1024u)
+
+/* Response-capturing nghttp2 CLIENT: records :status, the response headers, and
+ * the body bytes in arrival order for one stream. */
+typedef struct {
+    sink_buf_t out; /* bytes the client wants to send (driven by client_send) */
+
+    int status;
+    char names[CAP_MAX_HDRS][CAP_STR];
+    char values[CAP_MAX_HDRS][CAP_STR];
+    size_t n_hdrs;
+
+    uint8_t body[256 * 1024];
+    size_t body_len;
+    int stream_closed;
+} resp_cli_t;
+
+static int
+resp_cli_on_header(nghttp2_session *s, const nghttp2_frame *frame, const uint8_t *name,
+                   size_t namelen, const uint8_t *value, size_t valuelen, uint8_t flags,
+                   void *user_data)
+{
+    (void)s;
+    (void)frame;
+    (void)flags;
+    resp_cli_t *rc = (resp_cli_t *)user_data;
+    if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
+        rc->status = (int)strtol((const char *)value, NULL, 10);
+        return 0;
+    }
+    if (rc->n_hdrs < CAP_MAX_HDRS) {
+        size_t nl = namelen < CAP_STR - 1 ? namelen : CAP_STR - 1;
+        size_t vl = valuelen < CAP_STR - 1 ? valuelen : CAP_STR - 1;
+        memcpy(rc->names[rc->n_hdrs], name, nl);
+        rc->names[rc->n_hdrs][nl] = '\0';
+        memcpy(rc->values[rc->n_hdrs], value, vl);
+        rc->values[rc->n_hdrs][vl] = '\0';
+        rc->n_hdrs++;
+    }
+    return 0;
+}
+
+static int
+resp_cli_on_data_chunk(nghttp2_session *s, uint8_t flags, int32_t sid,
+                       const uint8_t *data, size_t len, void *user_data)
+{
+    (void)s;
+    (void)flags;
+    (void)sid;
+    resp_cli_t *rc = (resp_cli_t *)user_data;
+    if (rc->body_len + len <= sizeof(rc->body)) {
+        memcpy(rc->body + rc->body_len, data, len);
+        rc->body_len += len;
+    }
+    return 0;
+}
+
+static int
+resp_cli_on_stream_close(nghttp2_session *s, int32_t sid, uint32_t error_code,
+                         void *user_data)
+{
+    (void)s;
+    (void)sid;
+    (void)error_code;
+    resp_cli_t *rc = (resp_cli_t *)user_data;
+    rc->stream_closed = 1;
+    return 0;
+}
+
+/* Find a captured response header by name (case-insensitive). */
+static const char *
+resp_cli_find(const resp_cli_t *rc, const char *name)
+{
+    for (size_t i = 0; i < rc->n_hdrs; i++)
+        if (strcasecmp(rc->names[i], name) == 0) return rc->values[i];
+    return NULL;
+}
+
+/* Pump: client send -> adapter recv ; adapter want_write -> client recv. */
+static void
+shuttle(mq_gw_h2_adapter_t *a, nghttp2_session *cli, resp_cli_t *rc, sink_buf_t *srv_out)
+{
+    for (int round = 0; round < 8; round++) {
+        rc->out.len = 0;
+        MQ_CHECK_EQ_INT(nghttp2_session_send(cli), 0);
+        if (rc->out.len > 0) {
+            if (mq_gw_h2_adapter_recv(a, rc->out.buf, rc->out.len) != 0) break;
+        }
+        srv_out->len = 0;
+        MQ_CHECK_EQ_INT(mq_gw_h2_adapter_want_write(a), 0);
+        if (srv_out->len > 0) {
+            ssize_t r = nghttp2_session_mem_recv(cli, srv_out->buf, srv_out->len);
+            MQ_CHECK(r >= 0 && (size_t)r == srv_out->len);
+        }
+    }
+}
+
+/* The full response path: the test plays the CORE, driving the captured sink to
+ * deliver a 200 + headers + body, and asserts the nghttp2 CLIENT receives it.
+ * Then a backpressure case: feed a body exceeding the per-stream cap, assert
+ * resp_body returns 0 (highwater), drain via want_write→client, assert the
+ * adapter called req_drained so the core can resume, feed the rest, assert it
+ * arrives. */
+static void
+test_response_path_and_backpressure(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_OK;
+    resp_cli_t rc = {0};
+
+    sink_buf_t srv_out = {0};
+    mq_gw_h2_adapter_t *a = mq_gw_h2_adapter_new(&g_cap_ops, &st, adapter_send, &srv_out);
+    MQ_CHECK(a != NULL);
+    if (!a) return;
+
+    nghttp2_session_callbacks *cbs = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_callbacks_new(&cbs), 0);
+    nghttp2_session_callbacks_set_send_callback(cbs, client_send);
+    nghttp2_session_callbacks_set_on_header_callback(cbs, resp_cli_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs,
+                                                              resp_cli_on_data_chunk);
+    nghttp2_session_callbacks_set_on_stream_close_callback(cbs, resp_cli_on_stream_close);
+
+    nghttp2_session *cli = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_client_new(&cli, cbs, &rc), 0);
+    nghttp2_session_callbacks_del(cbs);
+
+    nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+    MQ_CHECK_EQ_INT(nghttp2_submit_settings(cli, NGHTTP2_FLAG_NONE, iv, 1), 0);
+
+    const nghttp2_nv nva[] = {
+        {(uint8_t *)":method", (uint8_t *)"GET", 7, 3, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":path", (uint8_t *)"/", 5, 1, NGHTTP2_NV_FLAG_NONE},
+    };
+    int sid = nghttp2_submit_request(cli, NULL, nva, 4, NULL, NULL);
+    MQ_CHECK(sid > 0);
+
+    /* Drive the request through so the adapter materializes it and captures the
+     * sink. */
+    shuttle(a, cli, &rc, &srv_out);
+    MQ_CHECK_EQ_INT(st.req_begin_calls, 1);
+    MQ_CHECK(st.sink != NULL);
+    MQ_CHECK(st.sink_user != NULL);
+
+    /* ── core delivers the response head + a small body chunk + finish ──────── */
+    const mq_h3_header_t rhdrs[] = {
+        {"content-type", "text/plain"},
+        {"x-demo", "yes"},
+    };
+    int hr = st.sink->resp_head(st.sink_user, 200, rhdrs, 2, MQ_GW_BODY_STREAM);
+    MQ_CHECK(hr >= 0);
+
+    static const uint8_t chunk[] = "hello world";
+    int wr = st.sink->resp_body(st.sink_user, chunk, sizeof(chunk) - 1);
+    MQ_CHECK(wr == (int)(sizeof(chunk) - 1)); /* accept path returns byte count */
+
+    st.sink->resp_finish(st.sink_user);
+
+    shuttle(a, cli, &rc, &srv_out);
+
+    MQ_CHECK_EQ_INT(rc.status, 200);
+    MQ_CHECK(resp_cli_find(&rc, "content-type") &&
+             strcmp(resp_cli_find(&rc, "content-type"), "text/plain") == 0);
+    MQ_CHECK(resp_cli_find(&rc, "x-demo") &&
+             strcmp(resp_cli_find(&rc, "x-demo"), "yes") == 0);
+    MQ_CHECK_EQ_INT((int)rc.body_len, (int)(sizeof(chunk) - 1));
+    MQ_CHECK(memcmp(rc.body, chunk, sizeof(chunk) - 1) == 0);
+    MQ_CHECK(rc.stream_closed); /* END_STREAM after resp_finish */
+
+    mq_gw_h2_adapter_free(a);
+    nghttp2_session_del(cli);
+
+    /* ── backpressure case (rigor IMP-1): fresh request, oversized body ─────── */
+    cap_state_t st2 = {0};
+    st2.prevalidate_verdict = MQ_GW_OK;
+    resp_cli_t rc2 = {0};
+    sink_buf_t srv_out2 = {0};
+    mq_gw_h2_adapter_t *a2 =
+        mq_gw_h2_adapter_new(&g_cap_ops, &st2, adapter_send, &srv_out2);
+    MQ_CHECK(a2 != NULL);
+    if (!a2) return;
+
+    nghttp2_session_callbacks *cbs2 = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_callbacks_new(&cbs2), 0);
+    nghttp2_session_callbacks_set_send_callback(cbs2, client_send);
+    nghttp2_session_callbacks_set_on_header_callback(cbs2, resp_cli_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs2,
+                                                              resp_cli_on_data_chunk);
+    nghttp2_session_callbacks_set_on_stream_close_callback(cbs2,
+                                                           resp_cli_on_stream_close);
+
+    nghttp2_session *cli2 = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_client_new(&cli2, cbs2, &rc2), 0);
+    nghttp2_session_callbacks_del(cbs2);
+    MQ_CHECK_EQ_INT(nghttp2_submit_settings(cli2, NGHTTP2_FLAG_NONE, iv, 1), 0);
+
+    int sid2 = nghttp2_submit_request(cli2, NULL, nva, 4, NULL, NULL);
+    MQ_CHECK(sid2 > 0);
+    shuttle(a2, cli2, &rc2, &srv_out2);
+    MQ_CHECK_EQ_INT(st2.req_begin_calls, 1);
+    MQ_CHECK(st2.sink != NULL);
+
+    int hr2 = st2.sink->resp_head(st2.sink_user, 200, rhdrs, 2, MQ_GW_BODY_STREAM);
+    MQ_CHECK(hr2 >= 0);
+
+    /* Fill the per-stream send queue exactly to the cap. */
+    static uint8_t big[EXP_RESP_QUEUE_CAP];
+    for (size_t i = 0; i < sizeof(big); i++)
+        big[i] = (uint8_t)(i & 0xff);
+    int w1 = st2.sink->resp_body(st2.sink_user, big, sizeof(big));
+    MQ_CHECK_EQ_INT(w1, (int)sizeof(big)); /* whole cap accepted */
+
+    /* Next byte must hit highwater (queue full) → return 0, NOT enqueued. */
+    uint8_t extra = 0xAB;
+    int w2 = st2.sink->resp_body(st2.sink_user, &extra, 1);
+    MQ_CHECK_EQ_INT(w2, 0); /* highwater */
+
+    /* Drain: the adapter flushes via want_write; once the queue drops below the
+     * cap it must call req_drained so the core can resume. */
+    shuttle(a2, cli2, &rc2, &srv_out2);
+    MQ_CHECK(st2.req_drained_calls >= 1);
+
+    /* Core resumes: feed the previously-rejected byte + finish. */
+    int w3 = st2.sink->resp_body(st2.sink_user, &extra, 1);
+    MQ_CHECK_EQ_INT(w3, 1);
+    st2.sink->resp_finish(st2.sink_user);
+    shuttle(a2, cli2, &rc2, &srv_out2);
+
+    /* All cap bytes + the trailing extra arrived, in order. */
+    MQ_CHECK_EQ_INT((int)rc2.body_len, (int)(sizeof(big) + 1));
+    MQ_CHECK(memcmp(rc2.body, big, sizeof(big)) == 0);
+    MQ_CHECK(rc2.body[sizeof(big)] == extra);
+    MQ_CHECK(rc2.stream_closed);
+
+    mq_gw_h2_adapter_free(a2);
+    nghttp2_session_del(cli2);
+}
+
 MQ_TEST_MAIN(test_settings_handshake(); test_demux_header_policy();
              test_demux_embedded_nul_rejected(); test_demux_header_bomb_rejected();
-             test_demux_prevalidate_reject(); test_demux_auth_bearer_dedup();)
+             test_demux_prevalidate_reject(); test_demux_auth_bearer_dedup();
+             test_response_path_and_backpressure();)

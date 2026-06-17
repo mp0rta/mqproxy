@@ -53,6 +53,20 @@
  * 32 bytes), so this comfortably covers any block that survives the size cap. */
 #define MQ_H2_MAX_REQ_HDRS 256
 
+/* §5.2 per-stream response (download) send-queue cap. The adapter buffers
+ * response body bytes the core hands it (resp_body) until nghttp2's data
+ * provider drains them onto the wire. Bounding it applies download backpressure:
+ * once full, resp_body returns 0 (highwater) and the core stops reading the H3
+ * tunnel until the queue drains below the cap, at which point the adapter calls
+ * submit->req_drained(xreq) to resume the download pump (rigor IMP-1). 64 KiB is
+ * a few nghttp2 max-frame-size (16 KiB) DATA frames in flight — enough to keep
+ * the wire busy without unbounded per-stream memory under a stalled client. */
+#define MQ_H2_RESP_QUEUE_CAP (64u * 1024u)
+
+/* Max regular response headers we frame back (browser-bound). Same generous
+ * bound as the request side; the core's response heads are small. */
+#define MQ_H2_MAX_RESP_HDRS 256
+
 /* ── adapter struct ─────────────────────────────────────────────────────────── */
 
 struct mq_h2_stream_s; /* fwd */
@@ -121,6 +135,24 @@ typedef struct mq_h2_stream_s {
 
     int32_t stream_id;
     int materialized; /* req_begin already driven (guards re-entry) */
+
+    /* ── response (download) path (Task 7) ──────────────────────────────────
+     *
+     * Per-stream FIFO ring of response body bytes the core handed us via
+     * resp_body but nghttp2's data provider has not yet drained onto the wire.
+     * resp_head submits the response with a data provider that pulls from here;
+     * resp_finish sets resp_eof so the provider emits END_STREAM once drained.
+     *
+     * Backpressure (rigor IMP-1): resp_body returns 0 (highwater) at the cap and
+     * sets sq_deferred; once want_write drains the ring below the cap we call
+     * submit->req_drained(xreq) exactly once per highwater episode to resume the
+     * core's download pump. */
+    uint8_t sendq[MQ_H2_RESP_QUEUE_CAP];
+    size_t sq_head;   /* index of the oldest queued byte */
+    size_t sq_len;    /* bytes currently queued */
+    int resp_started; /* resp_head submitted (data provider installed) */
+    int resp_eof;     /* resp_finish seen → provider emits END_STREAM when drained */
+    int sq_deferred;  /* resp_body hit highwater; owe a req_drained on drain */
 } mq_h2_stream_t;
 
 /* Copy a (ptr,len) slice into the stream arena as a NUL-terminated string.
@@ -287,6 +319,191 @@ on_header(nghttp2_session *session, const nghttp2_frame *frame, const uint8_t *n
     return 0;
 }
 
+/* ── response path: sink ops → H2 HEADERS/DATA + download backpressure (Task 7) ─
+ *
+ * The core (production: mq_gw_client via the Task 11 submit wrapper; tests: the
+ * stub acting as the core) drives these to deliver the H3 response back out as
+ * H2. sink_user is the per-stream context (mq_h2_stream_t) set at req_begin. */
+
+/* Dequeue up to `cap` bytes from the stream's response FIFO into `dst`. Returns
+ * the count copied. Handles the ring wrap. */
+static size_t
+sendq_pop(mq_h2_stream_t *s, uint8_t *dst, size_t cap)
+{
+    size_t n = s->sq_len < cap ? s->sq_len : cap;
+    if (n == 0) return 0;
+    size_t first = MQ_H2_RESP_QUEUE_CAP - s->sq_head; /* until the ring wraps */
+    if (first > n) first = n;
+    memcpy(dst, s->sendq + s->sq_head, first);
+    if (n > first) memcpy(dst + first, s->sendq, n - first); /* wrapped tail */
+    s->sq_head = (s->sq_head + n) % MQ_H2_RESP_QUEUE_CAP;
+    s->sq_len -= n;
+    return n;
+}
+
+/* nghttp2 data provider: pull response body bytes from the per-stream FIFO.
+ * Empty + not finished → DEFER (resumed via nghttp2_session_resume_data in
+ * resp_body / on drain). Empty + finished → EOF (nghttp2 sets END_STREAM since
+ * we send no trailers). */
+static ssize_t
+resp_data_read(nghttp2_session *session, int32_t stream_id, uint8_t *buf, size_t length,
+               uint32_t *data_flags, nghttp2_data_source *source, void *user_data)
+{
+    (void)session;
+    (void)stream_id;
+    (void)user_data;
+    mq_h2_stream_t *s = (mq_h2_stream_t *)source->ptr;
+
+    size_t n = sendq_pop(s, buf, length);
+    if (n == 0) {
+        if (s->resp_eof) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF; /* → END_STREAM (no trailers) */
+            return 0;
+        }
+        return NGHTTP2_ERR_DEFERRED; /* nothing queued yet; resume on next enqueue */
+    }
+    /* If the whole tail is queued AND the core signalled EOF, mark END_STREAM on
+     * this final non-empty frame to avoid an extra empty DATA frame. */
+    if (s->resp_eof && s->sq_len == 0) *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return (ssize_t)n;
+}
+
+/* sink->resp_head: submit the response HEADERS with a data provider that pulls
+ * the body from the per-stream FIFO. body_mode is advisory for H2 (nghttp2 owns
+ * DATA framing); the core's head already carries any Content-Length it wants
+ * forwarded, so we just render :status + the supplied headers. Returns 1 on
+ * success, -1 on a hard failure (the core maps -1 → abort). */
+static int
+mq_h2_resp_head(void *u, int status, const mq_h3_header_t *hs, size_t n,
+                mq_gw_body_mode_t body_mode)
+{
+    (void)body_mode;
+    mq_h2_stream_t *s = (mq_h2_stream_t *)u;
+    if (!s || s->rejected) return -1;
+    if (n > MQ_H2_MAX_RESP_HDRS) return -1;
+
+    /* :status as a string (3 ASCII digits for any HTTP status). */
+    char status_str[4];
+    if (status < 100 || status > 999) return -1;
+    status_str[0] = (char)('0' + (status / 100) % 10);
+    status_str[1] = (char)('0' + (status / 10) % 10);
+    status_str[2] = (char)('0' + status % 10);
+    status_str[3] = '\0';
+
+    nghttp2_nv nva[MQ_H2_MAX_RESP_HDRS + 1];
+    size_t nv = 0;
+    nva[nv].name = (uint8_t *)":status";
+    nva[nv].namelen = 7;
+    nva[nv].value = (uint8_t *)status_str;
+    nva[nv].valuelen = 3;
+    nva[nv].flags = NGHTTP2_NV_FLAG_NONE;
+    nv++;
+    for (size_t i = 0; i < n; i++) {
+        nva[nv].name = (uint8_t *)hs[i].name;
+        nva[nv].namelen = strlen(hs[i].name);
+        nva[nv].value = (uint8_t *)hs[i].value;
+        nva[nv].valuelen = strlen(hs[i].value);
+        nva[nv].flags = NGHTTP2_NV_FLAG_NONE;
+        nv++;
+    }
+
+    nghttp2_data_provider prd;
+    prd.source.ptr = s;
+    prd.read_callback = resp_data_read;
+
+    if (nghttp2_submit_response(s->a->session, s->stream_id, nva, nv, &prd) != 0)
+        return -1;
+    s->resp_started = 1;
+    return 1;
+}
+
+/* sink->resp_body: enqueue body bytes into the per-stream FIFO and resume the
+ * data provider. Contract (mq_gw_intake.h): >0 accepted byte count / 0 highwater
+ * (queue at cap; NOT enqueued — the core retries after req_drained) / -1 dead.
+ * Returns the FULL accepted count on the accept path so the core does not
+ * spuriously set read_deferred. */
+static int
+mq_h2_resp_body(void *u, const uint8_t *p, size_t len)
+{
+    mq_h2_stream_t *s = (mq_h2_stream_t *)u;
+    if (!s || s->rejected) return -1;
+    if (len == 0) return 0; /* nothing to do; treat as a no-op accept */
+
+    /* WHOLE-CHUNK-OR-HIGHWATER (NOT partial). The intake.h contract says ">0
+     * accept / 0 highwater", but the production consumer (mq_gw_client.c
+     * download_pump) treats ANY wr > 0 as full-chunk acceptance — it does NOT
+     * compare the return against the chunk length, so a partial accept (0 < wr <
+     * len) would silently DROP the unaccepted tail. The core's chunk is bounded
+     * (MQ_GW_DOWNLOAD_CHUNK = 16 KiB) and our cap is 64 KiB, so refusing a chunk
+     * that does not fit entirely is safe and lossless: the core defers it and
+     * retries the WHOLE chunk after req_drained. */
+    size_t room = MQ_H2_RESP_QUEUE_CAP - s->sq_len;
+    if (len > room) {
+        /* Won't fit in one piece → highwater. Do NOT enqueue any of it. Owe a
+         * req_drained once the FIFO drains below the cap. */
+        s->sq_deferred = 1;
+        return 0;
+    }
+    size_t tail = (s->sq_head + s->sq_len) % MQ_H2_RESP_QUEUE_CAP;
+    size_t first = MQ_H2_RESP_QUEUE_CAP - tail; /* until the ring wraps */
+    if (first > len) first = len;
+    memcpy(s->sendq + tail, p, first);
+    if (len > first) memcpy(s->sendq, p + first, len - first); /* wrap */
+    s->sq_len += len;
+
+    /* Re-arm the (possibly deferred) data provider so the new bytes flush. */
+    nghttp2_session_resume_data(s->a->session, s->stream_id);
+    return (int)len;
+}
+
+/* sink->resp_finish: mark EOF. MUST tolerate being called while the send buffer
+ * is still draining (codex M-1: the core's download_pump falls through to finish
+ * when fin coincides with a highwater chunk). We do NOT assert an empty queue —
+ * the EOF flag rides independently and resp_data_read emits END_STREAM once the
+ * FIFO drains. */
+static void
+mq_h2_resp_finish(void *u)
+{
+    mq_h2_stream_t *s = (mq_h2_stream_t *)u;
+    if (!s || s->rejected) return;
+    s->resp_eof = 1;
+    /* Resume in case the provider had deferred on an empty queue: now it can emit
+     * the (possibly empty) END_STREAM DATA frame. */
+    if (s->resp_started) nghttp2_session_resume_data(s->a->session, s->stream_id);
+}
+
+/* sink->resp_abort: mid-stream failure → RST_STREAM (never a fake clean finish).
+ * If the response had not started we still RST: the browser sees a reset, which
+ * is the correct signal for an aborted/truncated response. */
+static void
+mq_h2_resp_abort(void *u)
+{
+    mq_h2_stream_t *s = (mq_h2_stream_t *)u;
+    if (!s) return;
+    if (!s->rejected) {
+        s->rejected = 1;
+        nghttp2_submit_rst_stream(s->a->session, NGHTTP2_FLAG_NONE, s->stream_id,
+                                  NGHTTP2_INTERNAL_ERROR);
+    }
+}
+
+/* sink->resume_read: UPLOAD backpressure release (browser→origin). Wired in
+ * Task 8 when the adapter buffers request-body bytes; until then there is no
+ * upload buffer to un-pause, so this is intentionally a no-op. */
+static void
+mq_h2_resume_read(void *u)
+{
+    (void)u; /* Task 8: resume the paused inbound (upload) read path. */
+}
+
+static const mq_gw_sink_ops_t mq_h2_sink = {
+    .resp_head = mq_h2_resp_head,
+    .resp_body = mq_h2_resp_body,
+    .resp_finish = mq_h2_resp_finish,
+    .resp_abort = mq_h2_resp_abort,
+    .resume_read = mq_h2_resume_read,
+};
+
 /* Build the FINAL header list (forwarded browser headers + the two injected
  * controls) and drive the boundary: prevalidate → req_begin. Stores the returned
  * xreq on the stream. On any reject the stream is RST (full X-Mq-Error response
@@ -365,17 +582,14 @@ materialize_request(mq_h2_stream_t *s)
     head.n_headers = nf;
     head.content_length = -1; /* body framing is Task 7; head-only for now */
 
-    /* h2_sink is implemented in Task 7; pass NULL here. CAUTION for Task 7: the
-     * production boundary (mq_gw_client_req_begin) stores this sink and later
-     * dereferences sink->resp_head on the response, so a NULL sink would crash
-     * live. It is safe ONLY because the current tests bind a stub req_begin that
-     * never drives a response, and the production submit vtable
-     * (mq_gw_h2_submit_ops_gwc) is not built until Task 11. Task 7 MUST replace
-     * this NULL with a real per-stream sink + sink_user BEFORE any live wiring. */
+    /* Bind the per-stream response sink (Task 7). The boundary stores `sink` +
+     * `sink_user` and later drives resp_head/resp_body/resp_finish/resp_abort on
+     * the response; sink_user is THIS per-stream context (s), which carries the
+     * nghttp2 stream_id + the response FIFO the sink ops operate on. */
     int err_status = 0;
     reason = MQ_GW_OK;
     mq_gw_xreq_t *xreq =
-        a->submit->req_begin(a->submit_user, &head, NULL, NULL, &err_status, &reason);
+        a->submit->req_begin(a->submit_user, &head, &mq_h2_sink, s, &err_status, &reason);
     if (!xreq) {
         stream_reject(s, NGHTTP2_INTERNAL_ERROR); /* Task 8: render X-Mq-Error body */
         return;
@@ -487,10 +701,12 @@ mq_gw_h2_adapter_recv(mq_gw_h2_adapter_t *a, const uint8_t *p, size_t n)
     return 0;
 }
 
-int
-mq_gw_h2_adapter_want_write(mq_gw_h2_adapter_t *a)
+/* Drain the nghttp2 send queue fully through send_cb. Returns 0 on success, -1
+ * on a fatal/writer error. The data provider (resp_data_read) pops response body
+ * bytes from each stream's FIFO during this, so the FIFOs shrink here. */
+static int
+flush_session(mq_gw_h2_adapter_t *a)
 {
-    if (!a) return -1;
     for (;;) {
         const uint8_t *data = NULL;
         ssize_t n = nghttp2_session_mem_send(a->session, &data);
@@ -498,6 +714,34 @@ mq_gw_h2_adapter_want_write(mq_gw_h2_adapter_t *a)
         if (n == 0) return 0; /* nothing more to write */
         ssize_t w = a->send_cb(a->io, data, (size_t)n);
         if (w < 0 || (size_t)w != (size_t)n) return -1; /* writer failed/partial */
+    }
+}
+
+int
+mq_gw_h2_adapter_want_write(mq_gw_h2_adapter_t *a)
+{
+    if (!a) return -1;
+
+    /* Outer loop: flush, then resume any download-deferred streams whose FIFO
+     * has drained below the cap. req_drained re-pumps the core, which may enqueue
+     * more response bytes (resp_body → resume_data); if it did, we flush again.
+     * Bounded by the FIFO shrinking each pass (req_drained only fires when there
+     * is room, and only once per highwater episode — sq_deferred is cleared). */
+    for (;;) {
+        if (flush_session(a) != 0) return -1;
+
+        int resumed = 0;
+        for (mq_h2_stream_t *s = a->streams; s; s = s->next) {
+            /* Resume the core's download pump once our FIFO has room again. A
+             * full FIFO (== cap) stays paused; any free byte releases it. */
+            if (s->sq_deferred && s->sq_len < MQ_H2_RESP_QUEUE_CAP && s->xreq &&
+                a->submit->req_drained) {
+                s->sq_deferred = 0; /* clear BEFORE the callback (it may re-defer) */
+                a->submit->req_drained(s->xreq);
+                resumed = 1;
+            }
+        }
+        if (!resumed) return 0; /* quiescent: nothing flushed, nothing to resume */
     }
 }
 
