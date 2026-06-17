@@ -375,7 +375,16 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-httpd = http.server.HTTPServer(("127.0.0.1", PORT), H)
+# ThreadingHTTPServer (NOT the single-threaded HTTPServer) is REQUIRED here:
+# the MITM/gateway path keeps a warm HTTP/1.1 keep-alive connection to the origin
+# (case b proves origin_reuse=1). With protocol_version="HTTP/1.1" a single-thread
+# HTTPServer parks its only thread inside handle_one_request() on that persistent
+# connection, so it never returns to accept() — a SECOND, independent connection
+# (the case-d opaque-splice relay forwards a brand-new TLS ClientHello on its own
+# socket) can never be accepted, and its TLS handshake hangs → curl 000. A real
+# origin serves connections concurrently; ThreadingHTTPServer models that so the
+# warm gateway connection and the opaque relay connection are served in parallel.
+httpd = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(certfile=CERT, keyfile=KEY)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
