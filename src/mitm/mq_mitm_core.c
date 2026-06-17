@@ -14,12 +14,16 @@
 #include <openssl/x509v3.h>
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#define MQ_DNS_NAME_MAX  253 /* RFC 1035 presentation-form name limit */
+#define MQ_DNS_LABEL_MAX 63  /* RFC 1035 label limit */
 
 struct mq_mitm_core {
     X509 *ca_cert;
@@ -54,11 +58,11 @@ mq_mitm_normalize_sni(const char *sni, size_t sni_len, char out[256])
     if (sni_len == 0) return -1;
 
     // Total length cap (DNS presentation name, excluding the stripped dot).
-    if (sni_len > 253) return -1;
+    if (sni_len > MQ_DNS_NAME_MAX) return -1;
 
     // Reject wildcards and any byte outside [A-Za-z0-9.-]; lowercase ASCII;
     // enforce per-label length (1..63, no empty labels).
-    char tmp[254];
+    char tmp[MQ_DNS_NAME_MAX + 1];
     size_t label_len = 0;
     for (size_t i = 0; i < sni_len; i++) {
         unsigned char ch = (unsigned char)sni[i];
@@ -77,10 +81,12 @@ mq_mitm_normalize_sni(const char *sni, size_t sni_len, char out[256])
         } else {
             return -1; // any other byte (control chars, '_', etc.)
         }
-        if (++label_len > 63) return -1; // label too long
+        if (++label_len > MQ_DNS_LABEL_MAX) return -1; // label too long
         tmp[i] = c;
     }
-    if (label_len == 0) return -1; // trailing empty label (shouldn't happen)
+    // The loop's per-'.' empty-label guard plus the sni_len==0 checks above mean
+    // a non-empty trailing label is invariant here; assert rather than branch.
+    assert(label_len != 0);
     tmp[sni_len] = '\0';
 
     // Reject IP literals — they must not be treated as DNS names. inet_pton on

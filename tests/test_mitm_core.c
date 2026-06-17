@@ -24,6 +24,33 @@ test_sni_norm(void)
     MQ_CHECK(mq_mitm_normalize_sni("*.example.com", 13, out) == -1); // wildcard
     MQ_CHECK(mq_mitm_normalize_sni("203.0.113.5", 11, out) == -1);   // IPv4 literal
     MQ_CHECK(mq_mitm_normalize_sni("a\tb.com", 7, out) == -1);       // control char
+
+    // Length boundary: exactly 253 accepted, 254 rejected. Built from valid
+    // (<= 63-byte) labels so ONLY the name-length cap is exercised, not the
+    // per-label cap. 253 = 63+1+63+1+63+1+61; 254 = 63+1+63+1+63+1+62.
+    char n253[254];
+    memset(n253, 'a', 63);
+    n253[63] = '.';
+    memset(n253 + 64, 'a', 63);
+    n253[127] = '.';
+    memset(n253 + 128, 'a', 63);
+    n253[191] = '.';
+    memset(n253 + 192, 'a', 61);
+    n253[253] = '\0';
+    MQ_CHECK(mq_mitm_normalize_sni(n253, 253, out) == 0);
+    char n254[255];
+    memset(n254, 'a', 63);
+    n254[63] = '.';
+    memset(n254 + 64, 'a', 63);
+    n254[127] = '.';
+    memset(n254 + 128, 'a', 63);
+    n254[191] = '.';
+    memset(n254 + 192, 'a', 62);
+    n254[254] = '\0';
+    MQ_CHECK(mq_mitm_normalize_sni(n254, 254, out) == -1);
+    // Leading dot / double dot rejected (empty label).
+    MQ_CHECK(mq_mitm_normalize_sni(".example.com", 12, out) == -1);
+    MQ_CHECK(mq_mitm_normalize_sni("a..b.com", 8, out) == -1);
 }
 
 static void
