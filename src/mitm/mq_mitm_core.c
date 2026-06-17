@@ -587,7 +587,8 @@ select_certificate_cb(const SSL_CLIENT_HELLO *ch)
 
     // No-ALPN guard: refuse handshakes that don't offer ALPN at all (closes the
     // "TLS completes with no ALPN" hole). Returns 1 if the extension is present.
-    const uint8_t *alpn_ext = NULL;
+    const uint8_t *alpn_ext = NULL; // presence-only guard; the protocol contents are
+                                    // negotiated in alpn_select_cb
     size_t alpn_len = 0;
     if (SSL_early_callback_ctx_extension_get(
             ch, TLSEXT_TYPE_application_layer_protocol_negotiation, &alpn_ext,
@@ -607,6 +608,8 @@ select_certificate_cb(const SSL_CLIENT_HELLO *ch)
 
     // Attach leaf + shared key. SSL_use_certificate takes its OWN ref, so drop
     // our ref afterwards (avoid leak) regardless of success.
+    // Order matters: SSL_use_certificate silently drops an inconsistent private key, so
+    // attach the cert first and the matching key last.
     int used = (SSL_use_certificate(ch->ssl, leaf) == 1) &&
                (SSL_use_PrivateKey(ch->ssl, core->leaf_key) == 1);
     X509_free(leaf);
@@ -640,6 +643,9 @@ mq_mitm_core_new_ssl(mq_mitm_core_t *core)
     if (g_core_idx < 0) return NULL; // ex-data registration failed
 
     // Lazily build the shared SSL_CTX on first use.
+    // Lazy ctx build is not thread-safe: assumes a single owner thread per core (the
+    // 1-client/process MITM deployment model). The process-wide ex-data index IS
+    // pthread_once-guarded.
     if (!core->ssl_ctx) {
         core->ssl_ctx = build_ssl_ctx();
         if (!core->ssl_ctx) return NULL;

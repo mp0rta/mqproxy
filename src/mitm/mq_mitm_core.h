@@ -33,7 +33,8 @@ mq_mitm_core_t *mq_mitm_core_create(const char *ca_cert_pem_path,
 // core pointer is stashed on the SSL via ex_data so the user-data-less callback
 // can recover it. OWNERSHIP: caller owns the returned SSL* and MUST SSL_free it
 // before mq_mitm_core_destroy(). Attaching BIO(s) via SSL_set_bio transfers BIO
-// ownership to the SSL. Returns NULL on allocation failure.
+// ownership to the SSL. Returns NULL on any setup failure (allocation, ex-data
+// registration, or SSL_CTX build).
 SSL *mq_mitm_core_new_ssl(mq_mitm_core_t *core);
 
 void mq_mitm_core_destroy(mq_mitm_core_t *core);
