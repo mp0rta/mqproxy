@@ -935,6 +935,35 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_tproxy.sh)
     set_tests_properties(e2e_tproxy PROPERTIES SKIP_RETURN_CODE 77)
 
+    # ---- Phase 7 Slice 3 Task 16: NET_ADMIN transparent-MITM H2 e2e ----
+    # The capstone for the 🔒 security gate: the ONLY test that drives the LIVE
+    # mq_mitm_conn orchestrator end-to-end. curl --http2 is transparently captured
+    # (nft REDIRECT), the client forges a per-SNI leaf signed by the MITM CA,
+    # terminates TLS, speaks h2 over the tunnel to the gateway server, which
+    # fetches the real origin via libcurl. Asserts:
+    #   (a) transparent MITM works (h2 200 against the forged leaf trusted via the
+    #       MITM CA; a non-MITM relay would present the origin cert and be rejected),
+    #   (b) cache HIT — a second fetch is served origin-once (origin /__count == 1),
+    #   (c) a cookie-authenticated request reaches the origin WITH its Cookie (§4.5),
+    #   (d) an --ignore-host SNI is spliced OPAQUELY (origin cert verifies; the MITM
+    #       CA is REJECTED — no forged leaf presented for the excluded host),
+    #   (e) concurrent multi-stream fetch succeeds (N streams on one h2 conn).
+    # REQUIRES root + CAP_NET_ADMIN (nft) + curl(--http2) + openssl + python3 + a
+    # MITM-capable binary. Exits 77 (SKIP) when any of those is absent (mirrors
+    # e2e_tproxy). Gated on MQPROXY_MITM so it only registers for a MITM build; the
+    # MITM CA fixtures (MQ_MITM_CA_*) and a runtime-minted origin cert drive it.
+    if(MQPROXY_MITM)
+        add_test(NAME e2e_mitm_h2
+            COMMAND ${CMAKE_COMMAND} -E env
+                MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+                MQPROXY_CERT=${MQ_CERT_FILE}
+                MQPROXY_KEY=${MQ_KEY_FILE}
+                MQ_MITM_CA_CRT=${MQ_MITM_CA_CRT}
+                MQ_MITM_CA_KEY=${MQ_MITM_CA_KEY}
+                bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_mitm_h2.sh)
+        set_tests_properties(e2e_mitm_h2 PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     # ---- Phase 3 Task 7.1: e2e UDP relay test utilities ----
     # These are standalone CLI helpers driven by e2e_udp.sh (Task 7.2).
     # They are NOT registered as ctest tests (no add_test).

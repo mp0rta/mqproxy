@@ -135,6 +135,13 @@ struct mq_gw_h2_adapter {
     size_t pending_len;
     int input_paused; /* a req_body returned -1; do not feed nghttp2 until resumed */
     int input_fatal;  /* pending_in overflowed (peer flooded past its window) */
+
+    /* WRITABLE-NOTIFY (optional; mq_gw_h2_adapter_set_writable_cb). Fired when a
+     * sink op enqueues outbound frames OUTSIDE a recv/want_write turn so the io
+     * layer can SCHEDULE a deferred want_write. Deferred-safe (never re-entrant).
+     * NULL ⇒ the caller pulls want_write itself (unit-test seam). */
+    void (*writable_cb)(void *user);
+    void *writable_user;
 };
 
 /* ── per-stream demux context (Task 6) ──────────────────────────────────────
@@ -237,6 +244,15 @@ name_has_xmq_prefix(const uint8_t *name, size_t nl)
         if (c != (unsigned char)pfx[i]) return 0;
     }
     return 1;
+}
+
+/* Fire the writable-notify cb (if set) so the io layer schedules a deferred
+ * want_write. Used by the RESPONSE-side sink ops, which enqueue outbound frames
+ * on the async core→adapter path (no recv/want_write turn to drain them). */
+static void
+notify_writable(mq_gw_h2_adapter_t *a)
+{
+    if (a->writable_cb) a->writable_cb(a->writable_user);
 }
 
 /* ── demux callbacks (Task 6) ───────────────────────────────────────────────*/
@@ -510,6 +526,7 @@ mq_h2_resp_head(void *u, int status, const mq_h3_header_t *hs, size_t n,
     if (nghttp2_submit_response(s->a->session, s->stream_id, nva, nv, &prd) != 0)
         return -1;
     s->resp_started = 1;
+    notify_writable(s->a); /* async core path — schedule a flush to the transport */
     return 1;
 }
 
@@ -549,6 +566,7 @@ mq_h2_resp_body(void *u, const uint8_t *p, size_t len)
 
     /* Re-arm the (possibly deferred) data provider so the new bytes flush. */
     nghttp2_session_resume_data(s->a->session, s->stream_id);
+    notify_writable(s->a); /* async core path — schedule a flush to the transport */
     return (int)len;
 }
 
@@ -566,6 +584,15 @@ mq_h2_resp_finish(void *u)
     /* Resume in case the provider had deferred on an empty queue: now it can emit
      * the (possibly empty) END_STREAM DATA frame. */
     if (s->resp_started) nghttp2_session_resume_data(s->a->session, s->stream_id);
+    notify_writable(s->a); /* async core path — schedule the END_STREAM flush */
+    /* TERMINAL: the core (gwc) has signalled clean completion and may free the
+     * xreq the instant this returns (mq_gw_client gw_local_finish sets local_dead
+     * then a later h3_on_close → gw_req_maybe_free frees it). Drop our borrowed
+     * handle so nothing — on_stream_close, adapter_free, req_drained — ever calls
+     * a req_* op on the freed xreq (the H2-side drain uses `s`, not s->xreq, so
+     * the END_STREAM emit above is unaffected). Without this, a stream still in
+     * a->streams at MITM teardown would call req_aborted on freed memory (UAF). */
+    s->xreq = NULL;
 }
 
 /* sink->resp_abort: mid-stream failure → RST_STREAM (never a fake clean finish).
@@ -580,7 +607,13 @@ mq_h2_resp_abort(void *u)
         s->rejected = 1;
         nghttp2_submit_rst_stream(s->a->session, NGHTTP2_FLAG_NONE, s->stream_id,
                                   NGHTTP2_INTERNAL_ERROR);
+        notify_writable(s->a); /* async core path — schedule the RST flush */
     }
+    /* TERMINAL (mirror resp_finish): the core has signalled a mid-stream failure
+     * and owns the xreq's death from here (it detaches its sink + frees the xreq
+     * via gw_req_maybe_free). Drop our borrowed handle so adapter_free /
+     * on_stream_close never call req_aborted on the freed xreq (UAF). */
+    s->xreq = NULL;
 }
 
 /* sink->resume_read: UPLOAD backpressure release (browser→origin). The core has
@@ -972,6 +1005,15 @@ mq_gw_h2_adapter_want_write(mq_gw_h2_adapter_t *a)
         }
         if (!resumed) return 0; /* quiescent: nothing flushed, nothing to resume */
     }
+}
+
+void
+mq_gw_h2_adapter_set_writable_cb(mq_gw_h2_adapter_t *a, void (*cb)(void *user),
+                                 void *user)
+{
+    if (!a) return;
+    a->writable_cb = cb;
+    a->writable_user = user;
 }
 
 void

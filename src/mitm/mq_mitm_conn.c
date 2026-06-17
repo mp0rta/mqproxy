@@ -307,6 +307,22 @@ arm_write(struct mq_mitm_conn *c)
     if (c->write_ev) event_add(c->write_ev, NULL);
 }
 
+// Adapter writable-notify (mq_gw_h2_adapter_set_writable_cb). A RESPONSE arriving
+// asynchronously over the shared gwc tunnel drives the adapter's sink ops on a
+// DIFFERENT event than this conn's local-fd read, so the enqueued H2 response
+// frames would otherwise sit undrained until the next inbound byte from the
+// browser — which never comes (the browser is waiting for the response) → the
+// request hangs and the browser times out. The adapter calls this the instant a
+// sink op enqueues; we just ARM the one-shot EV_WRITE so on_local_io runs
+// flush_ciphertext + pump_outbound on the next loop tick (deferred, NOT
+// re-entrant — the sink op may be nested inside the gwc download pump).
+static void
+on_adapter_writable(void *user)
+{
+    struct mq_mitm_conn *c = (struct mq_mitm_conn *)user;
+    arm_write(c);
+}
+
 // Drain ciphertext from app_bio to local_fd. Lossless under partial sends: a send
 // that blocks parks the UNSENT tail in c->wbuf (BIO_read is destructive, so the
 // bytes can't go back) and arms EV_WRITE. While a holdover is pending we do NOT
@@ -399,6 +415,11 @@ drive_handshake(struct mq_mitm_conn *c)
         MQ_LOGW("mq_mitm_conn: H2 adapter alloc failed — hard-fail close");
         return -1;
     }
+    // Wire the async-response write-trigger: when a tunnel response enqueues H2
+    // frames (sink op on a different event than the local-fd read), schedule a
+    // deferred pump_outbound via the one-shot EV_WRITE. Without this the response
+    // never reaches the browser (it sits in the adapter's send queue → hang).
+    mq_gw_h2_adapter_set_writable_cb(c->adapter, on_adapter_writable, c);
 
     c->phase = MQ_MITM_PHASE_LIVE;
     MQ_LOGD("mq_mitm_conn: handshake complete (ALPN=h2) — live MITM bridge up");

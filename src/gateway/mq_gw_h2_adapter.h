@@ -80,6 +80,22 @@ int mq_gw_h2_adapter_recv(mq_gw_h2_adapter_t *a, const uint8_t *p, size_t n);
  * caller invokes it whenever the session may have data to write.) */
 int mq_gw_h2_adapter_want_write(mq_gw_h2_adapter_t *a);
 
+/* Register a WRITABLE-NOTIFY callback (optional). The adapter fires it whenever a
+ * RESPONSE-side event enqueues new outbound frames OUTSIDE the caller's recv /
+ * want_write turn — i.e. from a sink op (resp_head/resp_body/resp_finish/
+ * resp_abort) or an error-response render. These run on the async core→adapter
+ * path (e.g. a tunnel response arriving on a DIFFERENT event than the local-fd
+ * read), so without this notify nothing would drive the bytes to the transport
+ * until the next inbound event — a deadlock the peer never breaks (it is waiting
+ * for the response). The callback MUST be deferred-safe: it should only SCHEDULE
+ * a later want_write (e.g. arm a one-shot writable event), NEVER call want_write
+ * re-entrantly (the sink op may be nested inside the core's download pump, and a
+ * re-entrant want_write would recurse through req_drained). `user` is opaque.
+ * NULL cb clears it. Unset by default (the unit-test seam leaves it NULL and
+ * pulls want_write itself, so the adapter stays transport-agnostic). */
+void mq_gw_h2_adapter_set_writable_cb(mq_gw_h2_adapter_t *a, void (*cb)(void *user),
+                                      void *user);
+
 /* Free the adapter and its nghttp2 session. Does NOT free submit/submit_user/io
  * (all borrowed). Safe on NULL. */
 void mq_gw_h2_adapter_free(mq_gw_h2_adapter_t *a);
