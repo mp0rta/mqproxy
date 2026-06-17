@@ -724,9 +724,13 @@ mq_gw_h2_adapter_want_write(mq_gw_h2_adapter_t *a)
 
     /* Outer loop: flush, then resume any download-deferred streams whose FIFO
      * has drained below the cap. req_drained re-pumps the core, which may enqueue
-     * more response bytes (resp_body → resume_data); if it did, we flush again.
-     * Bounded by the FIFO shrinking each pass (req_drained only fires when there
-     * is room, and only once per highwater episode — sq_deferred is cleared). */
+     * more response bytes (resp_body → resume_data) and so can GROW the FIFO; if
+     * it did, we flush again. Termination is NOT "the FIFO shrinks each pass":
+     * each resumed pass clears at least one sq_deferred flag, and a flag is only
+     * re-armed when resp_body hits highwater. Because resp_body appends in 16 KiB
+     * chunks against a 64 KiB cap, a single resume admits at most a few chunks
+     * before re-deferring, so flags are re-armed strictly slower than they are
+     * cleared — a converging process that drains and quiesces. */
     for (;;) {
         if (flush_session(a) != 0) return -1;
 
@@ -735,7 +739,7 @@ mq_gw_h2_adapter_want_write(mq_gw_h2_adapter_t *a)
             /* Resume the core's download pump once our FIFO has room again. A
              * full FIFO (== cap) stays paused; any free byte releases it. */
             if (s->sq_deferred && s->sq_len < MQ_H2_RESP_QUEUE_CAP && s->xreq &&
-                a->submit->req_drained) {
+                !s->rejected && a->submit->req_drained) {
                 s->sq_deferred = 0; /* clear BEFORE the callback (it may re-defer) */
                 a->submit->req_drained(s->xreq);
                 resumed = 1;
