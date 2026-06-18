@@ -1028,6 +1028,25 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             bash ${CMAKE_SOURCE_DIR}/scripts/ci_benchmarks/bench_proxy_overhead.sh)
     set_tests_properties(bench_proxy_overhead PROPERTIES SKIP_RETURN_CODE 77)
 
+    # ---- Perf CI: MITM(H2) absolute latency/goodput trend (spec §5.3) ----
+    # Transparently MITM N curl --http2 fetches (as nobody) of one staged 4KB
+    # object through the LIVE MITM path; captures per-request %{time_total} and
+    # emits ABSOLUTE p50/p99/ratio. Reuses the e2e_mitm_h2 capture/provisioning
+    # plumbing, so it needs root + nft + sudo + nobody + a MITM-capable binary;
+    # self-skips (exit 77) unprivileged. Gated on MQPROXY_MITM (MITM-only build);
+    # the MITM CA fixtures (MQ_MITM_CA_*) and a runtime-minted origin cert drive it.
+    if(MQPROXY_MITM)
+        add_test(NAME bench_mitm_overhead
+            COMMAND ${CMAKE_COMMAND} -E env
+                MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+                MQPROXY_CERT=${MQ_CERT_FILE}
+                MQPROXY_KEY=${MQ_KEY_FILE}
+                MQ_MITM_CA_CRT=${MQ_MITM_CA_CRT}
+                MQ_MITM_CA_KEY=${MQ_MITM_CA_KEY}
+                bash ${CMAKE_SOURCE_DIR}/scripts/ci_benchmarks/bench_mitm_overhead.sh)
+        set_tests_properties(bench_mitm_overhead PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     # ---- packaging / install ----
     configure_file(packaging/systemd/mqproxy-server@.service.in
         ${CMAKE_BINARY_DIR}/packaging/mqproxy-server@.service @ONLY)
