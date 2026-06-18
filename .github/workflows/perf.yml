@@ -1,0 +1,188 @@
+name: Performance CI
+
+# Builds Release mqproxy (MITM on) + pinned picotls/picoquic, runs the four perf
+# benchmarks (smoke profile on PRs, full elsewhere), then runs the perf gate — the
+# ONLY step allowed to fail the job. See docs/superpowers/specs/2026-06-18-perf-ci-design.md §7.
+#
+# Benchmark wiring (direct `sudo -E bash <script>`, NOT CTest): the four bench
+# scripts default MQPROXY_BIN→build/mqproxy and every cert→tests/certs/* (all
+# git-committed, including the MITM CA mitm-ca.crt/key), so no env export is
+# needed — they just need `build/mqproxy` to exist and MITM compiled in. ②
+# (bench_ab_lanes.sh) is NOT a CTest test and takes explicit SKEWS/LOSSES/etc env,
+# so a uniform `ctest -R` cannot drive all four; direct invocation is used for all.
+#
+# Cache-key convention (matches ci.yml): keys carry a trailing `-vN`. Bump that in
+# EVERY affected job whenever the cached artifact's configure/flags/compiler change.
+
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+  schedule: [{ cron: '0 3 * * 0' }]
+
+permissions: { contents: read }
+concurrency:
+  group: "perf-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BENCH_PROFILE: "${{ github.event_name == 'pull_request' && 'smoke' || 'full' }}"
+      # picoquic has only one (ancient) tag, so it is pinned by master commit;
+      # picotls is pinned to the exact commit picoquic master's
+      # PICOQUIC_FETCH_PTLS_DEFAULT_TAG expects for non-AEGIS builds. Re-derive with:
+      #   git clone https://github.com/private-octopus/picoquic /tmp/pq && cd /tmp/pq
+      #   git rev-parse HEAD                                   # -> PICOQUIC_SHA
+      #   grep -A3 PICOQUIC_FETCH_PTLS_DEFAULT_TAG CMakeLists.txt  # else() branch -> PICOTLS_SHA
+      PICOQUIC_SHA: 09d29cc5bb3f47ad2f3f5ef7732dfe7b80f6d473
+      PICOTLS_SHA: bfa67875982afc4c24f21e146cef4747fa189c2f
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y
+             cmake libevent-dev libcurl4-openssl-dev golang
+             iperf3 jq python3 openssl curl libssl-dev ethtool nftables iproute2
+
+      # === copied VERBATIM from ci.yml `build` job: cached BoringSSL (gcc fPIC) ===
+      # MITM auto-enables: MQPROXY_BORINGSSL_DIR defaults to
+      # ${XQUIC_BUILD_DIR}/../third_party/boringssl/build, which resolves to exactly
+      # this clone path (third_party/xquic/third_party/boringssl/build). `make ssl
+      # crypto` produces the libssl.a/libcrypto.a archives that flip MQPROXY_MITM=ON
+      # (cmake/BuildSetup.cmake), so bench ③ registers the MITM path. No extra flag.
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (gcc fPIC)
+        id: bssl-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-gcc-fpic-v1
+      - name: Clone + build BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl
+          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j"$(nproc)" ssl crypto
+
+      # === copied VERBATIM from ci.yml `build` job: cached xquic (gcc Release) ===
+      - name: Cache xquic (gcc Release, EVENT_LOG)
+        id: xquic-cache
+        uses: actions/cache@v4
+        with:
+          # xqc_configure.h is generated INTO the source tree (not the build
+          # dir); cache it too or a restored lib pairs with a stale header.
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-9c95ec7-v1
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_EVENT_LOG=ON \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j"$(nproc)"
+
+      # === copied VERBATIM from ci.yml `build` job: build mqproxy (Release) ===
+      # MITM is on because the BoringSSL archives built above sit at the default
+      # MQPROXY_BORINGSSL_DIR; no -DMQPROXY_MITM flag is needed (it is derived).
+      - name: Build mqproxy (Release)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
+          cmake --build build -j"$(nproc)"
+          # MITM sanity: build/mqproxy must be MITM-capable (BoringSSL archives at
+          # the default MQPROXY_BORINGSSL_DIR flipped MQPROXY_MITM=ON). `--mitm` is
+          # advertised in --help unconditionally, so the real tell is that a client
+          # invocation does NOT print "--mitm unavailable: built without BoringSSL".
+          # bench ③ already self-skips (exit 77) if it sees that string, so this is
+          # informational only — never fails the build.
+          if ./build/mqproxy client --mitm 2>&1 | grep -q -- '--mitm unavailable'; then
+            echo "::warning::mqproxy built WITHOUT BoringSSL — bench ③ (mitm) will self-skip"
+          else
+            echo "MITM compiled in (bench ③ will run)"
+          fi
+
+      # === picoquic: cache on both pinned SHAs; build picotls then picoquic ===
+      - name: Cache picoquic (pinned)
+        id: pq-cache
+        uses: actions/cache@v4
+        with:
+          path: ../picoquic/picoquicdemo
+          key: picoquic-${{ env.PICOTLS_SHA }}-${{ env.PICOQUIC_SHA }}-${{ runner.os }}
+      - name: Build picoquic (pinned)
+        if: steps.pq-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          git clone https://github.com/h2o/picotls ../picotls
+          git -C ../picotls checkout "$PICOTLS_SHA" && git -C ../picotls submodule update --init
+          ( cd ../picotls && cmake -DCMAKE_BUILD_TYPE=Release . && make -j"$(nproc)" )
+          git clone https://github.com/private-octopus/picoquic ../picoquic
+          git -C ../picoquic checkout "$PICOQUIC_SHA"
+          ( cd ../picoquic && cmake -DCMAKE_BUILD_TYPE=Release . && make -j"$(nproc)" picoquicdemo )
+      - name: Export PICOQUICDEMO
+        run: echo "PICOQUICDEMO=$(cd ../picoquic && pwd)/picoquicdemo" >>"$GITHUB_ENV"
+
+      - run: mkdir -p ci_bench_results
+
+      # ── ① single-path proxy/tunnel overhead (spec §5.1) ──────────────────────
+      - name: '① proxy overhead'
+        continue-on-error: true
+        timeout-minutes: 8
+        run: sudo -E bash scripts/ci_benchmarks/bench_proxy_overhead.sh
+      - run: sudo tc qdisc del dev lo root 2>/dev/null || true; sudo nft delete table ip mqproxy 2>/dev/null || true
+        if: always()
+
+      # ── ② block vs relay over multipath (spec §5.2) ──────────────────────────
+      - name: '② block vs relay'
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          SKEWS: "${{ env.BENCH_PROFILE == 'smoke' && '0' || '0 20 50' }}"
+          LOSSES: "${{ env.BENCH_PROFILE == 'smoke' && '0' || '0 0.5 1' }}"
+          SCHEDULERS: "${{ env.BENCH_PROFILE == 'smoke' && 'minrtt' || 'minrtt backup' }}"
+          REPEAT: "${{ env.BENCH_PROFILE == 'smoke' && '1' || '3' }}"
+        run: sudo -E bash tests/integration/bench_ab_lanes.sh
+      - run: sudo tc qdisc del dev lo root 2>/dev/null || true
+        if: always()
+
+      # ── ③ MITM(H2) absolute latency/goodput trend (spec §5.3) ────────────────
+      - name: '③ mitm overhead'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: sudo -E bash scripts/ci_benchmarks/bench_mitm_overhead.sh
+      - run: sudo tc qdisc del dev lo root 2>/dev/null || true; sudo nft delete table ip mqproxy 2>/dev/null || true
+        if: always()
+
+      # ── ④ gateway req/s + latency (spec §5.4) ────────────────────────────────
+      - name: '④ gateway load'
+        continue-on-error: true
+        timeout-minutes: 8
+        run: sudo -E bash scripts/ci_benchmarks/bench_gateway_load.sh
+      - run: sudo tc qdisc del dev lo root 2>/dev/null || true
+        if: always()
+
+      # ── the gate: the ONLY step allowed to fail the job ──────────────────────
+      - name: perf gate
+        run: bash scripts/ci_benchmarks/perf_gate.sh ci_bench_results
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "perf-results-${{ github.sha }}"
+          path: ci_bench_results/*.jsonl
+          retention-days: 90
