@@ -339,6 +339,41 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _read_body(self):
+        # Read the request body regardless of framing. The MITM path forwards the
+        # browser's POST body to the origin, but the gateway sends a STREAMING
+        # upload as HTTP/1.1 chunked Transfer-Encoding (the H2 adapter reports
+        # content_length=-1 / streaming, so no Content-Length is re-emitted over the
+        # tunnel — chunked is the correct, valid framing). A naive Content-Length
+        # read would see 0 bytes under chunked, so we dechunk explicitly here.
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            out = bytearray()
+            while True:
+                line = self.rfile.readline().strip()
+                if not line:
+                    continue
+                size = int(line.split(b";", 1)[0], 16)
+                if size == 0:
+                    self.rfile.readline()  # trailing CRLF after the last chunk
+                    break
+                out += self.rfile.read(size)
+                self.rfile.readline()  # CRLF after each chunk
+            return bytes(out)
+        n = int(self.headers.get("Content-Length", "0") or "0")
+        return self.rfile.read(n) if n > 0 else b""
+
+    def do_POST(self):
+        # Echo the request body back verbatim (case f: POST upload proof). A
+        # byte-exact echo proves the full upload body reached the origin (the
+        # FIN-before-body bug would truncate/lose it).
+        body = self._read_body()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path == "/echo-cookie":
             body = (self.headers.get("Cookie") or "(none)").encode()
@@ -689,6 +724,39 @@ codes: $(tr '\n' ' ' <"${WORK}/e_codes.txt")"
 codes: $(tr '\n' ' ' <"${WORK}/e_codes.txt")"
 ok "case e: concurrent multi-stream fetch — 4/4 streams returned 200 + byte-exact body"
 
+# ── case (f): POST with a body reaches the origin (codex-1 High regression) ────
+# THE production proof for this fix. A POST upload through the transparent MITM:
+# curl --http2 --data-binary @<file> POSTs a body. The H2 adapter must report
+# content_length == -1 (streaming, has body) so the core does NOT FIN the upstream
+# H3 request before the body — the bug (content_length placeholder -1 + core's old
+# `<= 0` no_body test) FIN'd it on headers, so the body was lost. We assert the
+# ORIGIN echoed the EXACT body back (do_POST echoes the request body), which is
+# only possible if the body traversed the full MITM→tunnel→origin path intact.
+note "case f: POST upload (curl --http2 --data-binary) → origin must echo the body ..."
+# A multi-KiB body so it spans more than one DATA frame (exercises the streaming
+# body path, not just a single tiny chunk that could ride the headers).
+POST_BODY="${WORK}/post_body.bin"
+python3 - "$POST_BODY" <<'PY'
+import sys
+# 9000 deterministic bytes (> one 16 KiB frame is not required; multi-chunk is).
+data = bytes((i * 37 + 11) & 0xff for i in range(9000))
+with open(sys.argv[1], "wb") as f:
+    f.write(data)
+PY
+chmod 644 "${POST_BODY}"
+res_f="$(ncurl "${WORK}/f_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
+    --data-binary "@${POST_BODY}" -H 'Content-Type: application/octet-stream' \
+    "${MITM_URL}/upload")"
+read -r code_f ver_f <<< "${res_f:-000 0}"; ver_f="${ver_f:-0}"
+[ "${code_f}" = "200" ] || fail "case f: POST HTTP code = ${code_f} (want 200) — \
+upstream request was likely FIN'd before the body (codex-1 High); check ${WORK}/client.log + ${WORK}/server.log"
+[ "${ver_f}" = "2" ] || fail "case f: http_version = ${ver_f} (want 2) — h2 was not negotiated for the POST"
+# The origin echoes the request body verbatim → byte-exact match proves the full
+# upload body reached the origin (the FIN-before-body bug would truncate/lose it).
+cmp -s "${POST_BODY}" "${WORK}/f_body.txt" || fail "case f: origin echo differs from the POST body — \
+the request body did not reach the origin intact (FIN-before-body regression)"
+ok "case f: POST upload body reached the origin byte-exact over h2 (no FIN-before-body)"
+
 # ── summary ───────────────────────────────────────────────────────────────────
-note "RESULT = PASS (${PASS_COUNT} checks: MITM-works + cache-once + cookie-forward + ignore-host-splice + multi-stream)."
+note "RESULT = PASS (${PASS_COUNT} checks: MITM-works + cache-once + cookie-forward + ignore-host-splice + multi-stream + post-upload)."
 exit 0

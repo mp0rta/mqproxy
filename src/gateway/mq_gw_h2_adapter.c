@@ -191,6 +191,10 @@ typedef struct mq_h2_stream_s {
     int32_t stream_id;
     int materialized; /* req_begin already driven (guards re-entry) */
     int upload_done;  /* req_body_done already fired (END_STREAM seen; guards re-entry) */
+    int headers_end_stream; /* END_STREAM was set ON THE HEADERS frame → bodyless
+                             * request (content_length 0). Cleared (has body →
+                             * content_length -1 streaming) otherwise. Captured in
+                             * on_frame_recv before materialize_request. */
 
     /* ── response (download) path (Task 7) ──────────────────────────────────
      *
@@ -757,7 +761,18 @@ materialize_request(mq_h2_stream_t *s)
     head.path = s->path;
     head.headers = final;
     head.n_headers = nf;
-    head.content_length = -1; /* body framing is Task 7; head-only for now */
+    /* Body framing (codex-1 High): the HEADERS frame's END_STREAM flag tells us
+     * whether a body follows. END_STREAM on HEADERS → bodyless → content_length 0
+     * (the core fins on headers). No END_STREAM → a DATA body follows →
+     * content_length -1 (streaming/unknown length per mq_gw_intake.h; the core must
+     * NOT fin the headers and instead waits for req_body / req_body_done).
+     *
+     * We deliberately use -1 (streaming) rather than parsing a browser-supplied
+     * content-length: H2 uploads need no content-length header (DATA framing is
+     * self-delimiting via END_STREAM) and -1 is the correct "has body, length
+     * unknown" signal for the core, keeping the policy simple and robust against a
+     * lying browser content-length. */
+    head.content_length = s->headers_end_stream ? 0 : -1;
 
     /* Bind the per-stream response sink (Task 7). The boundary stores `sink` +
      * `sink_user` and later drives resp_head/resp_body/resp_finish/resp_abort on
@@ -843,6 +858,10 @@ on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame, void *user_d
         session, frame->hd.stream_id);
     if (!s) return 0;
     if (s->rejected) return 0; /* already RST'd (bomb / NUL) — do not materialize */
+
+    /* Capture whether the request is bodyless BEFORE materializing: END_STREAM on
+     * the HEADERS frame ⇒ no DATA follows ⇒ content_length 0 (codex-1 High). */
+    s->headers_end_stream = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) ? 1 : 0;
 
     materialize_request(s);
 

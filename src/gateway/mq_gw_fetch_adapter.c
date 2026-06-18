@@ -366,7 +366,16 @@ adp_on_request(const mq_http1_req_t *req, void *handle, void *user, void **req_c
     head.path = target.path;
     head.headers = H;
     head.n_headers = hn;
-    head.content_length = req->content_length;
+    /* NORMALIZE bodyless → 0 (codex-1 High boundary contract). The H1 parser sets
+     * content_length = -1 when the Content-Length header is ABSENT, which for the
+     * fetch ingress means NO body (a bodyless GET/POST). But mq_gw_intake.h defines
+     * content_length == -1 as "streaming body, unknown length" — and req_begin now
+     * treats ONLY 0 as bodyless (fin on headers). The fetch path NEVER has a true
+     * streaming/unknown-length body (chunked Transfer-Encoding is rejected with 411
+     * upstream), so map the parser's absent-CL (-1) to 0 here. Without this a
+     * bodyless fetch request would (post-fix) be left open waiting for a body that
+     * never arrives. A known length (> 0) passes through unchanged. */
+    head.content_length = req->content_length > 0 ? req->content_length : 0;
 
     int err_status = 0;
     mq_gw_reject_reason_t reason = MQ_GW_OK;

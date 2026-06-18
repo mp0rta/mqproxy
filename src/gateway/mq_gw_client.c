@@ -476,8 +476,20 @@ mq_gw_client_req_begin(mq_gw_client_t *c, const mq_gw_req_head_t *head,
     r->req = hr;
     r->resp_status = 0;
 
-    /* fin = no body. CL==-1 (absent) OR CL<=0 → no body. */
-    int no_body = (head->content_length <= 0);
+    /* fin = no body. Per mq_gw_intake.h: content_length == 0 → NO body (fin on
+     * headers); -1 → streaming body (unknown length, e.g. a chunked H2 upload);
+     * > 0 → known-length body. ONLY 0 means bodyless — both -1 and > 0 keep the
+     * stream OPEN (no fin) and expect req_body / req_body_done (codex-1 High: the
+     * old `<= 0` test FIN'd a -1 streaming upload before its body).
+     *
+     * NOTE for the H1 fetch ingress: a bodyless fetch request reaches the listener
+     * with Content-Length ABSENT (parsed as -1). The fetch adapter NORMALIZES that
+     * to 0 before req_begin (see mq_gw_fetch_adapter.c head.content_length), so a
+     * bodyless fetch request arrives here as 0 → fin-on-headers (unchanged). The
+     * fetch path never delivers a true streaming/unknown-length body (it rejects
+     * chunked Transfer-Encoding with 411), so -1 only ever arrives from the H2 MITM
+     * adapter, where it correctly means "DATA follows". */
+    int no_body = (head->content_length == 0);
 
     /* Build the forwarded header list. NUL-terminated C strings are required by
      * mq_h3_req_send_headers, so copy each (name,value) into a per-request arena.
@@ -1405,14 +1417,39 @@ mq_gw_client_free(mq_gw_client_t *c)
      *   3. ABORT the local side via the sink (the local peer sees truncation).
      *   4. Free the per-request state ourselves (we own it; both sides detached).
      * Because we cleared the callbacks, the subsequent mq_h3_free engine teardown
-     * fires no callback back into us — our wrappers and r are already gone. */
+     * fires no callback back into us — our wrappers and r are already gone.
+     *
+     * CRITICAL — null EVERY request's H3 callbacks in a SEPARATE FIRST PASS, then
+     * reset every request's stream via a SINGLE connection close, and only THEN
+     * free the per-request states (codex-1 High / streaming-upload teardown UAF).
+     * Why all three steps are separated:
+     *
+     *   - Nulling cbs first means no h3_on_close can fire during teardown, so no
+     *     gw_req is surprise-freed/unlinked out from under the loop (the loop owns
+     *     the whole list).
+     *   - But xqc_h3_request_close() on ONE still-open stream (e.g. an in-flight
+     *     streaming POST the server already remote-reset) can SYNCHRONOUSLY drive
+     *     xqc_h3_request_destroy → mq_h3_request_close_notify, which free()s the
+     *     mq_h3_req_t wrapper of OTHER streams too. So a per-request reset loop
+     *     that derefs each r->req would touch a wrapper a sibling's close already
+     *     freed → UAF. We therefore close the CONNECTION ONCE (mq_h3_conn_close
+     *     resets all live streams in one shot; the freed wrappers fire no
+     *     h3_on_close because cbs are nulled) and NEVER deref r->req again.
+     *   - The final pass frees only the gw_req_t states (and their spill); it does
+     *     not touch r->req (already reclaimed by the conn close above).
+     *
+     * Only observable once a streaming request can still be in-flight at shutdown
+     * — the all-GET fetch path always finished + freed each request before
+     * teardown, so c->reqs was empty and none of this ran. */
+    for (mq_gw_req_t *p = c->reqs; p; p = p->next) {
+        if (!p->h3_dead && p->req) mq_h3_req_set_cbs(p->req, NULL, NULL, NULL, NULL);
+    }
+    /* Reset all live streams at once via a single connection close (avoids the
+     * sibling-cascade dangling-wrapper UAF of a per-request reset loop). */
+    if (c->conn) mq_h3_conn_close(c->conn);
     mq_gw_req_t *r = c->reqs;
     while (r) {
         mq_gw_req_t *next = r->next;
-        if (!r->h3_dead && r->req) {
-            mq_h3_req_set_cbs(r->req, NULL, NULL, NULL, NULL);
-            mq_h3_req_reset(r->req);
-        }
         if (!r->local_dead && r->sink) {
             r->sink->resp_abort(r->sink_user);
         }

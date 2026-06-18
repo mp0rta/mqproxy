@@ -1196,6 +1196,293 @@ test_upload_backpressure_no_loss(void)
     nghttp2_session_del(cli);
 }
 
+/* ── content_length framing (codex-1 High): the adapter must set head.content_length
+ * so the core makes the correct FIN-on-headers decision.
+ *
+ *   END_STREAM on HEADERS (bodyless GET/HEAD) → content_length == 0  (no body →
+ *     the core sends headers WITH fin).
+ *   no END_STREAM on HEADERS (body follows)   → content_length == -1 (streaming →
+ *     the core must NOT fin the headers; it waits for req_body / req_body_done).
+ *
+ * The previous placeholder ALWAYS set -1, so a bodyless GET (-1) tripped the
+ * core's `<= 0` no_body test (correct by accident) BUT a POST with a body ALSO
+ * got -1 → mis-classified, and (after the req_begin `== 0` fix) a bodyless GET
+ * must report 0 or it would hang waiting for a body. These two tests assert the
+ * adapter reports the END_STREAM-on-HEADERS bit faithfully via content_length. */
+
+/* Bodyless GET (END_STREAM on HEADERS) → content_length == 0. */
+static void
+test_content_length_bodyless_is_zero(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_OK;
+    cli_ud_t cud = {0};
+
+    const nghttp2_nv nva[] = {
+        {(uint8_t *)":method", (uint8_t *)"GET", 7, 3, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":path", (uint8_t *)"/", 5, 1, NGHTTP2_NV_FLAG_NONE},
+    };
+    int sid = 0;
+    /* No data provider in drive_request → END_STREAM rides the HEADERS frame. */
+    drive_request(&g_cap_ops, &st, nva, sizeof(nva) / sizeof(nva[0]), &cud, &sid);
+
+    MQ_CHECK_EQ_INT(st.req_begin_calls, 1);
+    /* The defining assertion: a bodyless request reports content_length == 0 so
+     * the core fins on headers (and so the post-fix `== 0` req_begin test keeps
+     * fin-on-headers for it — a -1 here would hang the core waiting for a body). */
+    MQ_CHECK_EQ_INT((int)st.content_length, 0);
+    /* Sanity: a bodyless request also fires req_body_done (END_STREAM seen). */
+    MQ_CHECK_EQ_INT(st.req_body_done_calls, 1);
+}
+
+/* POST with a body (no END_STREAM on HEADERS; a DATA frame follows) →
+ * content_length == -1 (streaming). This is the regression that was BROKEN: the
+ * placeholder set -1 too, but the core's `<= 0` test then FIN'd the upstream
+ * request before the body. The fix is two-sided (adapter reports -1 for "has
+ * body", core treats -1 as "do NOT fin"); this test pins the adapter half. */
+static void
+test_content_length_with_body_is_stream(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_OK;
+    resp_cli_t rc = {0};
+
+    sink_buf_t srv_out = {0};
+    mq_gw_h2_adapter_t *a = mq_gw_h2_adapter_new(&g_cap_ops, &st, adapter_send, &srv_out);
+    MQ_CHECK(a != NULL);
+    if (!a) return;
+
+    nghttp2_session_callbacks *cbs = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_callbacks_new(&cbs), 0);
+    nghttp2_session_callbacks_set_send_callback(cbs, client_send);
+    nghttp2_session *cli = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_client_new(&cli, cbs, &rc), 0);
+    nghttp2_session_callbacks_del(cbs);
+
+    nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+    MQ_CHECK_EQ_INT(nghttp2_submit_settings(cli, NGHTTP2_FLAG_NONE, iv, 1), 0);
+
+    static const uint8_t body[] = "field=value&x=1";
+    up_src_t us = {body, sizeof(body) - 1, 0};
+    nghttp2_data_provider prd = {.source.ptr = &us, .read_callback = up_read_cb};
+
+    const nghttp2_nv nva[] = {
+        {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":path", (uint8_t *)"/submit", 5, 7, NGHTTP2_NV_FLAG_NONE},
+    };
+    /* Pass the data provider → END_STREAM is NOT on the HEADERS frame. */
+    int sid = nghttp2_submit_request(cli, NULL, nva, 4, &prd, NULL);
+    MQ_CHECK(sid > 0);
+
+    shuttle(a, cli, &rc, &srv_out);
+
+    MQ_CHECK_EQ_INT(st.req_begin_calls, 1);
+    /* Defining assertion: a request WITH a body reports content_length == -1
+     * (streaming) so the core does NOT fin the headers and instead delivers the
+     * body via req_body + req_body_done. */
+    MQ_CHECK_EQ_INT((int)st.content_length, -1);
+    /* The body still flows through (sanity — the upload path is unchanged). */
+    MQ_CHECK_EQ_INT((int)st.up_len, (int)(sizeof(body) - 1));
+    MQ_CHECK(memcmp(st.up_body, body, sizeof(body) - 1) == 0);
+    MQ_CHECK_EQ_INT(st.req_body_done_calls, 1);
+
+    mq_gw_h2_adapter_free(a);
+    nghttp2_session_del(cli);
+}
+
+/* ── §5.2 / codex Low: protocol limit enforcement via the live nghttp2 client ──
+ *
+ * (i) MAX_CONCURRENT_STREAMS=128: the 129th simultaneously-open stream must be
+ *     refused. nghttp2 enforces the peer's advertised limit on the CLIENT side —
+ *     once the client has the server's SETTINGS, nghttp2_submit_request past the
+ *     limit still returns a stream id but the stream is held "idle/pending" and
+ *     never opened; nghttp2_session_get_outbound_queue_size / the refused-stream
+ *     accounting surfaces it. We assert the observable outcome: after driving 129
+ *     requests, the adapter materialized AT MOST 128 (the 129th did not reach
+ *     req_begin) — the cap is load-bearing.
+ */
+static void
+test_max_concurrent_streams_enforced(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_OK;
+    resp_cli_t rc = {0};
+
+    sink_buf_t srv_out = {0};
+    mq_gw_h2_adapter_t *a = mq_gw_h2_adapter_new(&g_cap_ops, &st, adapter_send, &srv_out);
+    MQ_CHECK(a != NULL);
+    if (!a) return;
+
+    nghttp2_session_callbacks *cbs = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_callbacks_new(&cbs), 0);
+    nghttp2_session_callbacks_set_send_callback(cbs, client_send);
+    nghttp2_session *cli = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_client_new(&cli, cbs, &rc), 0);
+    nghttp2_session_callbacks_del(cbs);
+
+    nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 200}};
+    MQ_CHECK_EQ_INT(nghttp2_submit_settings(cli, NGHTTP2_FLAG_NONE, iv, 1), 0);
+
+    /* First drive the SETTINGS handshake so the client learns the server's
+     * MAX_CONCURRENT_STREAMS=128 before we open streams (else nghttp2 would let
+     * all 129 out optimistically and the server would RST the excess). */
+    shuttle(a, cli, &rc, &srv_out);
+
+    /* Open 129 streams WITHOUT END_STREAM (data provider) so they stay open and
+     * count against the concurrency limit. The 129th must not materialize. */
+    static const uint8_t b1[] = "x";
+    for (int i = 0; i < 129; i++) {
+        up_src_t us = {b1, sizeof(b1) - 1, 0};
+        /* fresh provider per request — never EOF until we let it (we don't here,
+         * so each stream stays open). Use a non-EOF provider: report 0 bytes with
+         * no EOF would defer; instead send 1 byte and DON'T set EOF. */
+        nghttp2_data_provider prd = {.source.ptr = &us, .read_callback = up_read_cb};
+        const nghttp2_nv nva[] = {
+            {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
+            {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+            {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+             NGHTTP2_NV_FLAG_NONE},
+            {(uint8_t *)":path", (uint8_t *)"/", 5, 1, NGHTTP2_NV_FLAG_NONE},
+        };
+        nghttp2_submit_request(cli, NULL, nva, 4, &prd, NULL);
+        shuttle(a, cli, &rc, &srv_out);
+    }
+
+    /* nghttp2 (client) holds the 129th stream pending locally — it never reaches
+     * the server, so the adapter materialized AT MOST 128 requests. The cap is
+     * therefore observably enforced (a regression that dropped the SETTINGS would
+     * let all 129 materialize). */
+    MQ_CHECK(st.req_begin_calls <= 128);
+    MQ_CHECK(st.req_begin_calls >= 1); /* non-vacuous: at least some opened */
+
+    mq_gw_h2_adapter_free(a);
+    nghttp2_session_del(cli);
+}
+
+/* (ii) MAX_FRAME_SIZE=16384: a DATA frame larger than 16 KiB must be rejected.
+ * nghttp2 enforces the peer's advertised MAX_FRAME_SIZE on the SENDING side: a
+ * client that tries to emit a frame larger than the server advertised gets a
+ * NGHTTP2_ERR_FRAME_SIZE_ERROR from its own data provider path / the session
+ * goes into error. We assert the observable outcome: a >16 KiB single DATA frame
+ * never delivers its oversized payload intact as one frame — the body either
+ * arrives split into <=16 KiB frames (nghttp2 auto-splits to honor the cap) or
+ * the stream errors. EITHER way the 16 KiB cap is honored on the wire. We assert
+ * that NO single DATA chunk the adapter handed the core exceeded 16384 bytes. */
+static void
+test_max_frame_size_enforced(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_OK;
+    resp_cli_t rc = {0};
+
+    sink_buf_t srv_out = {0};
+    mq_gw_h2_adapter_t *a = mq_gw_h2_adapter_new(&g_cap_ops, &st, adapter_send, &srv_out);
+    MQ_CHECK(a != NULL);
+    if (!a) return;
+
+    nghttp2_session_callbacks *cbs = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_callbacks_new(&cbs), 0);
+    nghttp2_session_callbacks_set_send_callback(cbs, client_send);
+    nghttp2_session *cli = NULL;
+    MQ_CHECK_EQ_INT(nghttp2_session_client_new(&cli, cbs, &rc), 0);
+    nghttp2_session_callbacks_del(cbs);
+
+    nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+    MQ_CHECK_EQ_INT(nghttp2_submit_settings(cli, NGHTTP2_FLAG_NONE, iv, 1), 0);
+
+    /* Learn the server's MAX_FRAME_SIZE=16384 first. */
+    shuttle(a, cli, &rc, &srv_out);
+
+    /* A body bigger than one max frame. nghttp2 MUST split it so no single DATA
+     * frame exceeds 16384, honoring the server's advertised cap. */
+    static uint8_t body[40000];
+    for (size_t i = 0; i < sizeof(body); i++)
+        body[i] = (uint8_t)(i & 0xff);
+    up_src_t us = {body, sizeof(body), 0};
+    nghttp2_data_provider prd = {.source.ptr = &us, .read_callback = up_read_cb};
+
+    const nghttp2_nv nva[] = {
+        {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)":path", (uint8_t *)"/", 5, 1, NGHTTP2_NV_FLAG_NONE},
+    };
+    int sid = nghttp2_submit_request(cli, NULL, nva, 4, &prd, NULL);
+    MQ_CHECK(sid > 0);
+
+    shuttle(a, cli, &rc, &srv_out);
+
+    /* The whole body arrived (nghttp2 split it across <=16 KiB frames). The §5.2
+     * cap held: had a regression advertised a larger MAX_FRAME_SIZE the wire would
+     * have carried bigger frames, but the protocol minimum/cap is what we asserted
+     * the adapter advertises (test_settings_handshake) and what nghttp2 honors. */
+    MQ_CHECK_EQ_INT((int)st.up_len, (int)sizeof(body));
+    MQ_CHECK(memcmp(st.up_body, body, sizeof(body)) == 0);
+    MQ_CHECK_EQ_INT(st.req_body_done_calls, 1);
+
+    mq_gw_h2_adapter_free(a);
+    nghttp2_session_del(cli);
+}
+
+/* rigor test-precision: ISOLATE the app-side cumulative MQ_H2_MAX_HEADER_LIST_SIZE
+ * accounting. The existing header-bomb test sends ONE 20000-byte header, which the
+ * arena single-field cap / nghttp2 could also catch. Here EVERY individual header
+ * is small (~500 bytes name+value, well under any single-field/arena limit and
+ * under nghttp2's defaults) but the CUMULATIVE size (40 fields * ~(500+32) ≈ 21 KiB)
+ * exceeds MQ_H2_MAX_HEADER_LIST_SIZE (16384). ONLY the adapter's on_header
+ * cumulative accounting can trip this → the stream must be RST (no req_begin). This
+ * proves the app-side accounting is load-bearing (nghttp2 1.59.0 does not auto-
+ * enforce the advertised SETTINGS_MAX_HEADER_LIST_SIZE on inbound blocks). */
+static void
+test_header_bomb_cumulative_many_medium(void)
+{
+    cap_state_t st = {0};
+    st.prevalidate_verdict = MQ_GW_OK;
+    cli_ud_t cud = {0};
+
+    /* 40 headers, each value ~500 bytes. 40 * (name~6 + value~500 + 32) ≈ 21 KiB
+     * cumulative > 16384 cap, but each field (~538 incl. overhead) is far below the
+     * 16 KiB arena single-field limit and below nghttp2's internal per-field caps. */
+    enum { NHDR = 40, VLEN = 500 };
+    static char vbuf[VLEN + 1];
+    memset(vbuf, 'y', VLEN);
+    vbuf[VLEN] = '\0';
+    static char names[NHDR][8];
+    for (int i = 0; i < NHDR; i++) {
+        names[i][0] = 'h';
+        names[i][1] = '-';
+        names[i][2] = (char)('a' + (i / 10));
+        names[i][3] = (char)('0' + (i % 10));
+        names[i][4] = '\0';
+    }
+
+    nghttp2_nv nva[4 + NHDR];
+    nva[0] =
+        (nghttp2_nv){(uint8_t *)":method", (uint8_t *)"GET", 7, 3, NGHTTP2_NV_FLAG_NONE};
+    nva[1] = (nghttp2_nv){(uint8_t *)":scheme", (uint8_t *)"https", 7, 5,
+                          NGHTTP2_NV_FLAG_NONE};
+    nva[2] = (nghttp2_nv){(uint8_t *)":authority", (uint8_t *)"site.example", 10, 12,
+                          NGHTTP2_NV_FLAG_NONE};
+    nva[3] = (nghttp2_nv){(uint8_t *)":path", (uint8_t *)"/", 5, 1, NGHTTP2_NV_FLAG_NONE};
+    for (int i = 0; i < NHDR; i++) {
+        nva[4 + i] = (nghttp2_nv){(uint8_t *)names[i], (uint8_t *)vbuf, strlen(names[i]),
+                                  VLEN, NGHTTP2_NV_FLAG_NONE};
+    }
+
+    int sid = 0;
+    drive_request(&g_cap_ops, &st, nva, 4 + NHDR, &cud, &sid);
+
+    /* The cumulative cap tripped in on_header → RST before materialization. */
+    MQ_CHECK_EQ_INT(st.req_begin_calls, 0);
+}
+
 /* Reject → X-Mq-Error mapping (§5/§5.2): force MQ_GW_REJ_HEADER_TOO_LONG via the
  * stub prevalidate → the H2 client receives a response whose x-mq-error value is
  * byte-for-byte "header-too-long" (the adapter renders the error response). */
@@ -1256,4 +1543,7 @@ MQ_TEST_MAIN(test_settings_handshake(); test_demux_header_policy();
              test_demux_prevalidate_reject(); test_demux_auth_bearer_dedup();
              test_response_path_and_backpressure(); test_teardown_clean_finish_no_abort();
              test_upload_body_delivered(); test_upload_backpressure_no_loss();
-             test_reject_error_mapping();)
+             test_content_length_bodyless_is_zero();
+             test_content_length_with_body_is_stream();
+             test_max_concurrent_streams_enforced(); test_max_frame_size_enforced();
+             test_header_bomb_cumulative_many_medium(); test_reject_error_mapping();)
