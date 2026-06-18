@@ -26,7 +26,4 @@ features:
   - icon: 🧰
     title: 5 つのイングレスモード
     details: TCP プロキシ（SOCKS5 / HTTP CONNECT）、HTTP リクエストゲートウェイ、UDP リレー、透過キャプチャ、そしてオプトインの TLS 終端 MITM L7 プロキシ。
-  - icon: 🛡️
-    title: プロダクション対応
-    details: 自動再接続／キープアライブ、パス単位・リクエスト単位のメトリクス、CC／スケジューラ選択、認証前コネクション上限、マスカレードモード、INI 設定ファイル、systemd パッケージング。
 ---

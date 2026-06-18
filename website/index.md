@@ -26,7 +26,4 @@ features:
   - icon: 🧰
     title: Five Ingress Modes
     details: TCP proxy (SOCKS5 / HTTP CONNECT), HTTP request gateway, UDP relay, transparent capture, and an opt-in TLS-terminating MITM L7 proxy.
-  - icon: 🛡️
-    title: Production-Ready
-    details: Auto reconnect/keepalive, per-path & per-request metrics, CC/scheduler selection, a pre-auth connection cap, masquerade mode, INI config files, and systemd packaging.
 ---
