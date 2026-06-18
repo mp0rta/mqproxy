@@ -53,4 +53,26 @@ for v in 200 40 40; do emit "$F" ab_lanes block_goodput "$v" ok '{"skew_ms":0,"l
 for v in 60 60 60;  do emit "$F" ab_lanes relay_goodput "$v" ok '{"skew_ms":0,"loss_pct":0}'; done
 bash "${GATE}" "$F"; rc=$?; [ "${rc}" -eq 1 ] || fail "F: median block<relay should hard-fail, got ${rc}"
 
+# Case G: full profile, relay has a MIX of skip + ok reps. One flaky skip must NOT
+# disarm the hard gate: the two ok relay reps (median 70) are evaluated vs block.
+# block median(134,130,132)=132 >= relay median(70,72)=71 => PASS, and it must NOT
+# be reported as "relay skipped".
+G="$(mkdir_fixture)"
+for v in 134 130 132; do emit "$G" ab_lanes block_goodput "$v" ok '{"skew_ms":0,"loss_pct":0}'; done
+emit "$G" ab_lanes relay_goodput  0 skip '{"skew_ms":0,"loss_pct":0}'
+emit "$G" ab_lanes relay_goodput 70 ok   '{"skew_ms":0,"loss_pct":0}'
+emit "$G" ab_lanes relay_goodput 72 ok   '{"skew_ms":0,"loss_pct":0}'
+out="$(bash "${GATE}" "$G")"; rc=$?
+[ "${rc}" -eq 0 ] || fail "G: mixed skip+ok should pass, got ${rc}"
+echo "${out}" | grep -q "relay skipped" && fail "G: must NOT report 'relay skipped' when ok reps exist"
+echo "${out}" | grep -q "block_ge_relay : 132" || fail "G: should evaluate block>=relay (median 132)"
+
+# Case H: full profile, ALL relay reps skip => invariant skipped (WARN), exit 0.
+H="$(mkdir_fixture)"
+emit "$H" ab_lanes block_goodput 134 ok '{"skew_ms":0,"loss_pct":0}'
+for _ in 1 2 3; do emit "$H" ab_lanes relay_goodput 0 skip '{"skew_ms":0,"loss_pct":0}'; done
+out="$(bash "${GATE}" "$H")"; rc=$?
+[ "${rc}" -eq 0 ] || fail "H: all-skip should pass, got ${rc}"
+echo "${out}" | grep -q "relay skipped" || fail "H: all-skip should report 'relay skipped'"
+
 echo "PASS test_perf_gate"

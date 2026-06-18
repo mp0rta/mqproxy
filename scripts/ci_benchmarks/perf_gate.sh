@@ -30,11 +30,16 @@ val_cell() {
         | sort
         | if length==0 then empty else .[(length-1)/2 | floor] end'
 }
+# status at the skew0/loss0 cell, aggregated over reps: "skip" iff ALL reps skipped,
+# "ok" if any rep produced data, "missing" if no line exists. (A single flaky/skip rep
+# must NOT disarm the hard gate — val_cell already medians the ok values.)
 status_of() {
-    echo "${ALL}" | jq -r --arg b "$1" --arg m "$2" \
-        'map(select(.bench==$b and .metric==$m
-                    and (.meta.skew_ms//0)==0 and (.meta.loss_pct//0)==0))
-         | .[0].status // "missing"'
+    echo "${ALL}" | jq -r --arg b "$1" --arg m "$2" '
+        [ .[] | select(.bench==$b and .metric==$m
+                       and (.meta.skew_ms//0)==0 and (.meta.loss_pct//0)==0) ]
+        | if length==0 then "missing"
+          elif all(.[]; (.status//"ok")=="skip") then "skip"
+          else "ok" end'
 }
 record() { summary="${summary}\n$1"; }
 

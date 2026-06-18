@@ -350,6 +350,13 @@ for skew in ${SKEWS}; do
                 for sched in ${SCHEDULERS}; do
                     run_relay_cell "${sched}" "${skew}" "${loss}" "${rep}"
                 done
+            else
+                # picoquic absent: emit a skip marker per relay cell so the gate
+                # WARNs (relay skipped) rather than hard-failing on a missing
+                # operand. SKIP (non-"OK") drives _emit_cell_json's else-branch.
+                for sched in ${SCHEDULERS}; do
+                    _emit_cell_json relay "${sched}" "${skew}" "${loss}" "${rep}" SKIP ""
+                done
             fi
         done
     done
