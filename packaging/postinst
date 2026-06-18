@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+# CPack DEB ships no debhelper, so sysusers.d/tmpfiles.d are not auto-applied.
+# Create the mqproxy system user and runtime dirs the systemd units depend on.
+# || true so a host without systemd (e.g. a container) never aborts dpkg.
+systemd-sysusers /usr/lib/sysusers.d/mqproxy.conf 2>/dev/null || true
+systemd-tmpfiles --create /usr/lib/tmpfiles.d/mqproxy.conf 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
