@@ -2,7 +2,7 @@
 
 A **multipath application proxy/accelerator** built on [Multipath QUIC](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/), using a [fork of XQUIC](https://github.com/mp0rta/xquic). mqproxy maps application flows directly onto MPQUIC primitives — one TCP flow becomes one MPQUIC stream, one HTTP request becomes one H3 stream over MPQUIC, one UDP session becomes MPQUIC DATAGRAMs — so that applications get path diversity, seamless failover, and **bandwidth aggregation** without implementing MPQUIC themselves.
 
-> **Status: TLS MITM L7 proxy (Phase 7) complete — the v0.1.0 feature set.** Phase 1's TCP proxy (SOCKS5 / HTTP CONNECT → MPQUIC → origin, ~2× aggregation over two shaped paths), Phase 2's HTTP Request Execution Gateway (delegated `POST /_mqproxy/fetch` requests carried as H3 streams over MPQUIC, run against origins via libcurl with TLS verification always on), and Phase 3's UDP relay (SOCKS5 UDP ASSOCIATE → session-tagged MPQUIC DATAGRAMs → connected UDP socket, with fragmentation/reassembly and idle-timeout teardown) are all implemented and validated end-to-end including 2-path aggregation. Phase 5 hardening is largely done — reconnect/keepalive, per-path `mq.path` + per-request `mq.req` metrics, congestion-control and multipath-scheduler selection, a pre-auth connection cap, masquerade mode, INI config files, and systemd packaging — and Phase 6's advanced gateway (origin-protocol selection, connection pooling, header filtering, download compression, response caching) is complete. Phase 7 adds an optional **TLS MITM ingress** (`--mitm`): on a managed device with the operator's CA installed, the transparent-capture path terminates the browser's HTTPS, forges a per-host leaf, speaks HTTP/2, and maps each request onto the Gateway tunnel — reaching the v0.1.0 feature set. The codebase is fuzzed (libFuzzer) and CodeQL-scanned in CI.
+mqproxy runs as a **client/server pair**: the client exposes one or more local ingresses, carries traffic to the server over a single multipath QUIC tunnel, and the server reaches the origin. Four ingress modes are available — a **TCP proxy** (SOCKS5 / HTTP CONNECT), an **HTTP request gateway** (`POST /_mqproxy/fetch`, executed against origins with TLS verification always on), a **UDP relay** (SOCKS5 UDP ASSOCIATE over MPQUIC DATAGRAMs), and **transparent capture** of kernel-redirected TCP with an optional TLS-terminating MITM mode. Every mode gets path diversity, seamless failover, and within-stream bandwidth aggregation across the bound paths. Production features include automatic reconnect/keepalive, per-path and per-request metrics, congestion-control and multipath-scheduler selection, a pre-auth connection cap, masquerade mode, INI config files, and systemd service packaging.
 
 mqproxy is the L4/L7 sibling of [mqvpn](https://github.com/mp0rta/mqvpn): where mqvpn is a standards-based L3 VPN that carries IP packets in QUIC DATAGRAMs (MASQUE CONNECT-IP), mqproxy works at the application-flow layer and is **MPQUIC-native**.
 
@@ -21,13 +21,13 @@ Because a QUIC **stream** is reassembled by offset, the STREAM frames of a singl
 
 ## Operating Modes
 
-| Mode | Mapping | Status |
+| Mode | Mapping | |
 |---|---|---|
-| **TCP Proxy** | 1 TCP flow → 1 MPQUIC bidi stream | ✅ Phase 1 |
-| **HTTP Request Execution Gateway** | 1 HTTP request → 1 H3 stream over MPQUIC | ✅ Phase 2 |
-| **UDP Relay** | 1 UDP session → MPQUIC DATAGRAMs | ✅ Phase 3 |
-| **Transparent TCP Capture** | kernel-redirected TCP → opaque MPQUIC stream | ✅ Phase 7 Slice 0+1 |
-| **TLS MITM Ingress** | terminate browser TLS (forged leaf) → H2 → Gateway tunnel | ✅ Phase 7 Slice 3, optional |
+| **TCP Proxy** | 1 TCP flow → 1 MPQUIC bidi stream | ✅ |
+| **HTTP Request Execution Gateway** | 1 HTTP request → 1 H3 stream over MPQUIC | ✅ |
+| **UDP Relay** | 1 UDP session → MPQUIC DATAGRAMs | ✅ |
+| **Transparent TCP Capture** | kernel-redirected TCP → opaque MPQUIC stream | ✅ |
+| **TLS MITM Ingress** | terminate browser TLS (forged leaf) → H2 → Gateway tunnel | ✅ optional |
 
 TCP Proxy Mode does **not** terminate TLS: for HTTPS, TLS stays end-to-end between the application and the origin. Only the WAN segment between mqproxy-client and mqproxy-server is carried over MPQUIC.
 
@@ -81,6 +81,13 @@ UDP relay carries non-QUIC UDP traffic (DNS, NTP, game, VoIP, app-specific UDP) 
 
 **Requirements:** `cmake`, `make`, a C11 compiler, `git`, `libevent`, `libcurl` dev headers (e.g. `libcurl4-openssl-dev` — the gateway's origin client), `libnghttp2` dev headers (`libnghttp2-dev` — HTTP/2 termination for the TLS MITM L7 path; the static binary additionally needs the bundled `libnghttp2.a`), and `golang` (BoringSSL's build needs Go). Network access is required on first build (BoringSSL is cloned).
 
+On Debian/Ubuntu:
+
+```bash
+sudo apt-get install -y build-essential cmake git \
+  libevent-dev libcurl4-openssl-dev libnghttp2-dev golang-go
+```
+
 > Runtime packaging dependency: the dynamically-linked binary depends on the nghttp2 shared library (Debian/Ubuntu package `libnghttp2-14`). The `-DMQPROXY_STATIC_XQUIC=ON` packaging binary instead statically links `libnghttp2.a` and so carries no runtime nghttp2 dependency.
 
 ```bash
@@ -101,8 +108,6 @@ cmake --build build -j"$(nproc)"
 # The binary is at build/mqproxy
 ./build/mqproxy --help
 ```
-
-For an AddressSanitizer/UBSan build (used in development and CI), configure with `-DMQPROXY_SANITIZE=ON` instead of `-DCMAKE_BUILD_TYPE=Release`.
 
 ## Quick Start
 
@@ -187,12 +192,12 @@ UDP relay is exposed on the **same `--socks5` listener** — any SOCKS5 client t
 
 Transparent capture redirects TCP connections at the kernel level directly into mqproxy without any application changes — no SOCKS5 configuration, no proxy settings, no app awareness. By default each captured connection is relayed **opaquely** (byte-for-byte, without decryption) over the MPQUIC tunnel as a single stream, giving flow-level multipath aggregation. End-to-end TLS is then fully preserved between the application and the origin; **mqproxy never sees plaintext**. Adding `--mitm` instead terminates and inspects the TLS as HTTP/2 — that opt-in mode is documented in [TLS MITM mode](#tls-mitm-mode).
 
-> **Linux + IPv4 only** (v1). The end-to-end test (`e2e_tproxy`) requires root/`NET_ADMIN` and self-skips otherwise.
+> **Linux + IPv4 only.** Transparent capture installs kernel firewall rules, so it needs root or `CAP_NET_ADMIN`.
 
 Two kernel capture mechanisms are supported:
 
 - **`redirect` (default)** — uses `nft nat OUTPUT` (REDIRECT target). Captures the *local machine's own outbound* TCP. Does not need `IP_TRANSPARENT` on the socket. This is the right mode when mqproxy and the apps being accelerated run on the same host.
-- **`tproxy`** — uses `nft mangle PREROUTING` (TPROXY target) with `IP_TRANSPARENT` on the listening socket. Captures *forwarded* traffic from downstream LAN hosts, as used in an OMR router deployment. Requires `fwmark` + a policy-routing table so the local TCP stack's reply packets are routed back out the right interface.
+- **`tproxy`** — uses `nft mangle PREROUTING` (TPROXY target) with `IP_TRANSPARENT` on the listening socket. Captures *forwarded* traffic from downstream LAN hosts, as on a router gateway. Requires `fwmark` + a policy-routing table so the local TCP stack's reply packets are routed back out the right interface. This is the standard Linux TPROXY setup; it composes with any router/policy-routing stack that can mark packets and steer them to the listener — OpenMPTCProuter (OMR) is one such deployment, not a requirement.
 
 **Single-host quickstart (redirect mode, `--setup-redirect`):**
 
@@ -212,11 +217,11 @@ sudo ./build/mqproxy client \
 curl https://example.com/
 ```
 
-`--setup-redirect` tells mqproxy to install the nft rules on start and remove them on exit. It needs `root` or `CAP_NET_ADMIN`. The self-installed rule captures **TCP destination port 443 by default**; use `--tproxy-dport <port>` to capture a different port. For multiple ports or finer control, install the firewall rules yourself (or let OMR manage them) and just point the traffic at the listener — mqproxy reads the original destination of whatever the rules redirect.
+`--setup-redirect` tells mqproxy to install the nft rules on start and remove them on exit. It needs `root` or `CAP_NET_ADMIN`. The self-installed rule captures **TCP destination port 443 by default**; use `--tproxy-dport <port>` to capture a different port. For multiple ports or finer control, install the firewall rules yourself and just point the traffic at the listener — mqproxy reads the original destination of whatever the rules redirect.
 
-**OMR/router deployment (tproxy mode):**
+**Router/gateway deployment (tproxy mode):**
 
-Under OMR, leave `--setup-redirect` OFF. OMR owns the firewall rules and places the `TPROXY` target in `PREROUTING`; mqproxy just provides the listener:
+When the router stack already owns the firewall and policy-routing rules (e.g. OpenMPTCProuter, or any setup that places a `TPROXY` target in `PREROUTING` and marks the packets), leave `--setup-redirect` OFF and let mqproxy just provide the listener — match its `--tproxy-fwmark`/`--tproxy-table` to whatever the rules use:
 
 ```bash
 sudo ./build/mqproxy client \
@@ -225,7 +230,7 @@ sudo ./build/mqproxy client \
   --tproxy-mode tproxy \
   --tproxy-fwmark 1 \
   --tproxy-table 100
-  # no --setup-redirect — OMR owns the rules
+  # no --setup-redirect — the router stack owns the rules
 ```
 
 **Loop-avoidance and security notes:**
@@ -278,9 +283,9 @@ IgnoreHosts = signal.org
 **Security posture:**
 
 - **Untrusted browser headers.** All browser-supplied `X-Mq-*` headers are stripped — they are never interpreted as proxy controls; the client injects its own `x-mq-auth` / `x-mq-forward-cookie`. `Cookie` and `Authorization` are forwarded so normal browsing works.
-- **Dual-ABI symbol isolation.** The MITM crypto core links the vendored BoringSSL, whose symbols are hidden from the executable's dynamic table (`-Wl,--exclude-libs`) so they cannot interpose libcurl's system OpenSSL. An `nm` CI gate verifies this.
+- **Dual-ABI symbol isolation.** The MITM crypto core links the vendored BoringSSL, whose symbols are hidden from the executable's dynamic table (`-Wl,--exclude-libs`) so they cannot interpose libcurl's system OpenSSL.
 - **Fail-closed & bounded.** Misconfigured/unavailable MITM is a startup error, never a silent passthrough. The ClientHello drain is bounded (8 KiB cap + deadline), and HTTP/2 resource limits (concurrent streams, frame size, header-list size) bound the new ingress.
-- **HTTP/2 only (v1).** The browser must offer ALPN `h2`; non-h2, non-TLS, or no-SNI connections hard-fail when MITM is on.
+- **HTTP/2 only.** The browser must offer ALPN `h2`; non-h2, non-TLS, or no-SNI connections hard-fail when MITM is on.
 
 ### Resilience: reconnect and keepalive
 
@@ -470,7 +475,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 
 ### Transparent Capture mode
 
-*Kernel-redirected TCP → opaque MPQUIC stream. No app config needed. Linux + IPv4 only (v1). TLS is preserved end-to-end by default; add `--mitm` to terminate and inspect it — see [TLS MITM mode](#tls-mitm-mode).*
+*Kernel-redirected TCP → opaque MPQUIC stream. No app config needed. Linux + IPv4 only. TLS is preserved end-to-end by default; add `--mitm` to terminate and inspect it — see [TLS MITM mode](#tls-mitm-mode).*
 
 **Server:** no mode-specific flags — transparent capture is a client-side ingress mechanism; the server handles the resulting TCP streams exactly like SOCKS5-originated ones.
 
@@ -479,11 +484,11 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | Flag | Description |
 |---|---|
 | `--tproxy <ip:port>` | Local TCP address for the transparent capture ingress (redirect or tproxy mode). Enables transparent capture; at least one of `--socks5`, `--http-connect`, `--gateway`, or `--tproxy` is required. |
-| `--tproxy-mode redirect\|tproxy` | Kernel capture mechanism (default: `redirect`). `redirect` — `nft nat OUTPUT` REDIRECT target; captures the local machine's own outbound TCP; no `IP_TRANSPARENT` on the socket. `tproxy` — `nft mangle PREROUTING` TPROXY target; captures forwarded LAN traffic on a router/OMR; needs `CAP_NET_ADMIN` for `IP_TRANSPARENT`. |
+| `--tproxy-mode redirect\|tproxy` | Kernel capture mechanism (default: `redirect`). `redirect` — `nft nat OUTPUT` REDIRECT target; captures the local machine's own outbound TCP; no `IP_TRANSPARENT` on the socket. `tproxy` — `nft mangle PREROUTING` TPROXY target; captures forwarded LAN traffic on a router/gateway (standard Linux TPROXY; works with any policy-routing stack, e.g. OMR); needs `CAP_NET_ADMIN` for `IP_TRANSPARENT`. |
 | `--tproxy-fwmark <n>` | Packet mark for policy routing in tproxy mode (default: 1; tproxy mode only). |
 | `--tproxy-table <n>` | IP routing table for tproxy reply routing (default: 100; tproxy mode only). |
 | `--tproxy-dport <port>` | TCP destination port the `--setup-redirect` rule captures (default: 443). |
-| `--setup-redirect` | Install `nft`/`ip rule` firewall rules on start and remove them on exit (requires root or `CAP_NET_ADMIN`; off by default). For single-host self-contained use; leave OFF under OMR and let OMR manage the rules. |
+| `--setup-redirect` | Install `nft`/`ip rule` firewall rules on start and remove them on exit (requires root or `CAP_NET_ADMIN`; off by default). For single-host self-contained use; leave OFF on a router/gateway and let the router stack (e.g. OMR) manage the rules. |
 | `--tproxy-uid <uid>` | UID whose outbound traffic is exempt from redirection (default: `geteuid()` of the process). Used for loop avoidance — mqproxy's own tunnel connections are not re-captured into itself. |
 
 ### TLS MITM mode (client-only)
@@ -506,44 +511,23 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 
 ## Testing
 
+After building, run the bundled test suite:
+
 ```bash
 ctest --test-dir build --output-on-failure
 ```
 
-The unit/integration suite covers wire framing, the relay/flow state machine, ingress parsing, transport setup, the H3 wrapper (a socket-free "fabric" round-trip test), the HTTP/1.1 parser and header policy at the gateway trust boundary, and both gateway halves against in-process fakes. Two end-to-end scripts complete the picture:
-
-- `tests/integration/e2e_multipath.sh` — TCP-proxy multipath aggregation benchmark (`tc`/`netem`); requires `NET_ADMIN` and **self-skips** otherwise.
-- `tests/integration/e2e_gateway.sh` — full gateway chain against a local TLS origin: 8 MB download/upload byte-exact, the whole error matrix (403/400/502/504), and a 2-path aggregation smoke (the 2-path case needs `NET_ADMIN`; the rest runs unprivileged).
-- `tests/integration/e2e_udp.sh` — UDP relay through SOCKS5 UDP ASSOCIATE against a local UDP echo (`udpsocks` + `udp_echo` helpers): byte-exact small + fragmented (3 KB) echo, concurrent sessions, idle-timeout re-OPEN, control-connection teardown, and a 2-path smoke (NET_ADMIN-gated; the rest runs unprivileged).
-- `tests/integration/e2e_tproxy.sh` — transparent capture end-to-end: self-installs nft redirect rules, verifies a connection is intercepted and relayed opaquely through the MPQUIC tunnel. **Requires root/`NET_ADMIN` and self-skips otherwise.**
-
-**TLS MITM (Phase 7 Slice 3 — live).** The `mq_mitm_core` module (`src/mitm/`) is the crypto foundation for the live MITM ingress: it loads the operator CA, forges a per-SNI leaf certificate (LRU-cached, signed by the CA), and configures a browser-facing TLS server handshake that negotiates `ALPN=h2`. Slice 3 wires this into the transparent-capture path under `--mitm` (ClientHello SNI peek, opaque-splice for ignore-hosts, an nghttp2 H2 adapter that maps each request onto the Gateway tunnel). The MITM targets build only when the BoringSSL static archives are present, so run `scripts/build-xquic.sh` first; with no archives they are skipped. Tests cover it:
-  - `test_mitm_core` — in-process unit suite (memory-BIO handshake proving the forged leaf chains to the CA, ALPN negotiates `h2`, and SAN matches the SNI; plus CA-validation, SNI-normalization, forge, LRU/TTL, and ALPN/SNI rejection negatives). Runs clean under ASan (`-DMQPROXY_SANITIZE=ON`).
-  - `e2e_mitm_smoke` — cross-implementation smoke: a real `openssl s_client` negotiates `h2` against the module and verifies the forged chain against the CA. **Self-skips (77) if `openssl` is absent.**
-
-The wire codecs and ingress parsers (the untrusted-input attack surface) also have a standalone [libFuzzer](fuzz/) harness suite, replayed against a seed corpus in CI; the C/C++ sources are scanned by CodeQL (`security-extended`) on every push to `main`.
+It covers wire framing, the relay/flow state machine, ingress parsing, the gateway request path, and the TLS MITM crypto core, alongside end-to-end scripts for multipath aggregation, the full gateway chain, UDP relay, and transparent capture. Tests that need root or `NET_ADMIN` (the multipath and transparent-capture end-to-end runs) skip automatically when run unprivileged.
 
 ## Observability
 
 Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts confirm that within-stream multipath is actually splitting a flow across paths — the key signal that aggregation is working. (xquic must be built with `XQC_ENABLE_EVENT_LOG=ON`, which `scripts/build-xquic.sh` does.)
 
-## Roadmap
-
-| Phase | Scope |
-|---|---|
-| **1. TCP Proxy MVP** | ✅ MPQUIC client/server, auth, aggregate-BDP transport sizing, SOCKS5 / HTTP CONNECT, CONNECT_TCP, EAGAIN-safe relay |
-| **2. HTTP Request Execution Gateway** | ✅ `POST /_mqproxy/fetch` (header + raw body), H3-over-MPQUIC tunnel (ALPN `h3`), libcurl origin client (h2→h1, h3-ready), per-request auth, header policy, error mapping, up/download |
-| **3. UDP Relay** | ✅ SOCKS5 UDP ASSOCIATE ingress, per-session bidi signalling, MPQUIC DATAGRAM send/recv, fragmentation + LRU reassembly, idle timeout, DNS / non-QUIC UDP |
-| ~~4. Controlled Web App Integration~~ | **Dropped** — the SDK speaks native MPQUIC directly (no gateway hop needed); the gateway's per-request value is realized via Phase 7 MITM, not a browser/Web-App ingress |
-| **5. Production Hardening** | ✅ reconnect/keepalive, per-path `mq.path` + per-request `mq.req` metrics, CC/scheduler selection (`--cc`/`--scheduler`), pre-auth connection cap (`--max-conns`), masquerade mode, INI config files, systemd packaging, fuzzing + CodeQL. Remaining: TLS-error status mapping, flow-control/QoS tuning |
-| **6. Advanced HTTP Gateway** | ✅ origin protocol selection (`X-Mq-Origin-Protocol`), connection pooling, header filtering, download compression (`X-Mq-Accept-Encoding`), cache integration (`X-Mq-Cache` / `--cache-max-bytes`) |
-| **7. TLS MITM Ingress (optional)** | ✅ Slice 0+1: neutral gateway boundary refactor + transparent TCP capture (`--tproxy`, opaque relay). ✅ Slice 2: managed-device CA + per-SNI cert forge + TLS termination (ALPN h2). ✅ Slice 3 (**v0.1.0**): live `--mitm` wiring — ClientHello SNI peek, H2 adapter (nghttp2) onto the Gateway tunnel, ignore-hosts opaque-splice policy, fail-closed config |
-
 ## Security Model
 
 mqproxy uses a **trusted proxy** model: mqproxy-client, mqproxy-server, and the MPQUIC connection between them are trusted. In TCP Proxy Mode and Transparent Capture mode (without `--mitm`), application↔origin TLS is preserved end-to-end (mqproxy never sees plaintext — it relays raw TLS bytes opaquely). Applications with certificate pinning continue to work. The HTTP Request Execution Gateway is an explicit delegation model — the client delegates HTTP request execution to a trusted gateway that establishes (and always verifies) the origin TLS — not a transparent MITM. Gateway requests are authenticated individually (`X-Mq-Auth`, per-request); `Authorization` is reserved for the origin and forwarded, while `Cookie` and `X-Mq-*` never leave the gateway.
 
-**TLS MITM ingress** (`--mitm`, opt-in) is an **operator-controlled / consenting-endpoint** model for managed devices where the operator's CA is installed locally — a corporate-proxy or personal-VPN posture, not a transparent attack on third parties. The client forges per-host leaves from that CA, terminates the browser's TLS as HTTP/2, and maps each request onto the Gateway tunnel. Its trust assumptions: the **CA private key is the anchor** (loaded with `O_NOFOLLOW`/`O_CLOEXEC`, refused if encrypted or group/world-readable); browser-supplied `X-Mq-*` headers are **always stripped** (never interpreted as controls — the client injects its own `x-mq-auth`); vendored-BoringSSL symbols are **isolated** from libcurl's system OpenSSL (verified by an `nm` CI gate); and the feature is **fail-closed** (misconfiguration is a startup error, never silent passthrough, with a bounded ClientHello drain and H2 resource limits). Cert-pinned hosts can be excluded with `--ignore-host(s)`, which splices them opaquely so the origin's real certificate reaches the client.
+**TLS MITM ingress** (`--mitm`, opt-in) is an **operator-controlled / consenting-endpoint** model for managed devices where the operator's CA is installed locally — a corporate-proxy or personal-VPN posture, not a transparent attack on third parties. The client forges per-host leaves from that CA, terminates the browser's TLS as HTTP/2, and maps each request onto the Gateway tunnel. Its trust assumptions: the **CA private key is the anchor** (loaded with `O_NOFOLLOW`/`O_CLOEXEC`, refused if encrypted or group/world-readable); browser-supplied `X-Mq-*` headers are **always stripped** (never interpreted as controls — the client injects its own `x-mq-auth`); vendored-BoringSSL symbols are **isolated** from libcurl's system OpenSSL; and the feature is **fail-closed** (misconfiguration is a startup error, never silent passthrough, with a bounded ClientHello drain and H2 resource limits). Cert-pinned hosts can be excluded with `--ignore-host(s)`, which splices them opaquely so the origin's real certificate reaches the client.
 
 ## License
 
