@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(mqproxy VERSION 0.1.0 LANGUAGES C)
+project(mqproxy VERSION 0.0.4 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -1041,4 +1041,29 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/packaging/verify_install.sh
                 ${CMAKE_BINARY_DIR})
     set_tests_properties(packaging_install_static PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ---------- CPack DEB packaging (only when dpkg is available) ----------
+    # Builds a self-contained .deb from the static (MQPROXY_STATIC_XQUIC) binary:
+    # xquic + BoringSSL + nghttp2 are statically linked, so SHLIBDEPS pins only
+    # libevent/libcurl/libc. Maintainer scripts provision the mqproxy user/dirs
+    # (raw CPack DEB has no debhelper -> sysusers.d/tmpfiles.d are not auto-run).
+    find_program(DPKG_CMD dpkg)
+    if(DPKG_CMD)
+        execute_process(COMMAND ${DPKG_CMD} --print-architecture
+            OUTPUT_VARIABLE DPKG_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+        set(CPACK_GENERATOR "DEB")
+        set(CPACK_DEBIAN_PACKAGE_NAME "mqproxy")
+        set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+        set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${DPKG_ARCH}")
+        set(CPACK_DEBIAN_FILE_NAME "mqproxy_${PROJECT_VERSION}_${DPKG_ARCH}.deb")
+        set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+        set(CPACK_DEBIAN_PACKAGE_SECTION "net")
+        set(CPACK_DEBIAN_PACKAGE_DESCRIPTION
+            "Multipath QUIC application proxy/accelerator (MPQUIC-native)")
+        set(CPACK_DEBIAN_PACKAGE_MAINTAINER "mp0rta")
+        set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/mp0rta/mqproxy")
+        set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+            "${CMAKE_SOURCE_DIR}/packaging/postinst;${CMAKE_SOURCE_DIR}/packaging/postrm")
+        include(CPack)
+    endif()
 endif()

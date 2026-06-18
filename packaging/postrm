@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+# Static binary -> no ldconfig. Just re-scan units after removal.
+# The mqproxy user is intentionally NOT deleted (avoids orphaning files owned
+# by a reused uid; matches mqvpn's conservative choice).
+systemctl daemon-reload 2>/dev/null || true

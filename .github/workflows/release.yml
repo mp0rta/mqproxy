@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # amd64 deb is intentionally built on 22.04, not ubuntu-latest.
+          # ubuntu-latest (24.04) links libevent-2.1-7t64 (the t64 transition
+          # rename), so dpkg-shlibdeps pins Depends: to a package name absent on
+          # 22.04/Debian 12. 22.04 yields Depends: libevent-2.1-7 -> satisfied
+          # natively on 22.04/Debian 12 and via Provides: libevent-2.1-7 on
+          # 24.04/Debian 13. glibc 2.35 baseline is forward-compatible. arm64
+          # stays on 24.04 because GitHub has no 22.04 ARM runner.
+          - { arch: amd64, runner: ubuntu-22.04     }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Verify tag matches CMake version
+        shell: bash
+        run: |
+          CMAKE_VERSION=$(sed -n 's/^project(mqproxy VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [[ "$TAG_VERSION" == *-* ]]; then
+              echo "Pre-release tag $TAG_VERSION - skipping strict version match"
+            elif [ "$TAG_VERSION" != "$CMAKE_VERSION" ]; then
+              echo "ERROR: Tag $TAG_VERSION != CMakeLists.txt $CMAKE_VERSION"
+              exit 1
+            fi
+          fi
+          echo "VERSION=$CMAKE_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        # libnghttp2-dev is REQUIRED: MQPROXY_STATIC_XQUIC=ON links libnghttp2.a
+        # and FATAL_ERRORs without it (CMakeLists.txt). golang: BoringSSL build.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev libcurl4-openssl-dev libnghttp2-dev golang
+
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      # Cache keys are arch-qualified: the matrix runs amd64 + arm64, and a
+      # non-arch key would let arm64 restore an amd64 BoringSSL/xquic build.
+      - name: Cache BoringSSL (fPIC)
+        id: bssl-cache
+        uses: actions/cache@v5
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-${{ matrix.arch }}-gcc-fpic-v1
+      - name: Clone + build BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl
+          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j"$(nproc)" ssl crypto
+
+      - name: Cache xquic (Release)
+        id: xquic-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-${{ matrix.arch }}-gcc-release-bssl-9c95ec7-v1
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j"$(nproc)"
+
+      - name: Configure (static, prefix=/usr)
+        run: |
+          cmake -S . -B build-pkg -DCMAKE_BUILD_TYPE=Release \
+                -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build" \
+                -DMQPROXY_STATIC_XQUIC=ON -DCMAKE_INSTALL_PREFIX=/usr
+      - name: Build CLI
+        run: cmake --build build-pkg --target mqproxy_cli -j"$(nproc)"
+
+      - name: Build deb package
+        run: cd build-pkg && cpack -G DEB
+
+      - name: Verify license files in deb
+        # Release-side Apache-2.0 §4(a) gate. OPTIONAL install rules silently
+        # skip missing third-party LICENSEs; release builds DO check out
+        # submodules, so all 3 must be present. mqproxy has NO NOTICE -> expect 3.
+        run: |
+          set -e
+          deb=$(ls build-pkg/mqproxy_*.deb)
+          expected=3
+          found=$(dpkg-deb -c "$deb" \
+                  | grep -cE 'usr/share/doc/mqproxy/(LICENSE|third-party/(xquic|boringssl)\.txt)$' \
+                  || true)
+          if [ "$found" -ne "$expected" ]; then
+            echo "::error::deb missing license files (found $found of $expected)"
+            dpkg-deb -c "$deb" | grep -E 'usr/share/doc/mqproxy|third-party' || echo "  (none found)"
+            exit 1
+          fi
+
+      - name: Verify deb install + postinst + live start (amd64 only)
+        # NEW dpkg-install smoke - distinct from ci.yml's cmake--install smoke,
+        # which never exercises postinst. dpkg -i fires postinst (creates the
+        # mqproxy user + dirs), then we start a real server instance. amd64 only:
+        # the runner is native amd64; running the arm64 .deb would need emulation.
+        if: matrix.arch == 'amd64'
+        run: |
+          set -e
+          deb=$(ls build-pkg/mqproxy_*.deb)
+          # Re-assert dpkg -i after any dependency repair so a genuinely broken
+          # postinst or malformed deb still fails the job (a bare `|| apt-get -f
+          # install` would swallow it). The static deb has no deps to repair, so
+          # the fallback is normally a no-op.
+          sudo dpkg -i "$deb" || { sudo apt-get -f install -y; sudo dpkg -i "$deb"; }
+          id mqproxy                       # postinst created the user
+          test -d /etc/mqproxy             # tmpfiles created the dir
+          # Provision a minimal server config + the repo test cert (compiled-in
+          # default cert path is under /home, blocked by ProtectHome=yes).
+          sudo install -o mqproxy -g mqproxy -m 0644 tests/certs/test.crt /etc/mqproxy/test.crt
+          sudo install -o mqproxy -g mqproxy -m 0600 tests/certs/test.key /etc/mqproxy/test.key
+          printf '[Interface]\nListen = 127.0.0.1:4433\n[TLS]\nCert = /etc/mqproxy/test.crt\nKey = /etc/mqproxy/test.key\n[Auth]\nKey = citoken\n' \
+            | sudo tee /etc/mqproxy/test.conf >/dev/null
+          sudo chown mqproxy:mqproxy /etc/mqproxy/test.conf
+          sudo chmod 0600 /etc/mqproxy/test.conf
+          sudo systemctl daemon-reload
+          sudo systemctl start mqproxy-server@test
+          sleep 2
+          sudo journalctl -u mqproxy-server@test --no-pager | tail -30
+          sudo systemctl is-active mqproxy-server@test
+          sudo systemctl stop mqproxy-server@test
+          sudo dpkg -r mqproxy
+
+      - name: Stage artifact
+        run: cp build-pkg/mqproxy_*.deb .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.arch }}
+          path: mqproxy_*.deb
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          shopt -s nullglob
+          sha256sum mqproxy_*.deb > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          VERSION="${GITHUB_REF_NAME#v}"
+          DEBS=(artifacts/mqproxy_*.deb)
+          PRERELEASE_FLAG=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "mqproxy v${VERSION}" \
+            --notes "" \
+            $PRERELEASE_FLAG \
+            "${DEBS[@]}" \
+            artifacts/SHA256SUMS \
+            LICENSE
