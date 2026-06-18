@@ -867,11 +867,9 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     endif()
     target_include_directories(mqproxy_cli PRIVATE src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
-    # Default cert/key for `server` come from the bundled test cert (so the
-    # binary is runnable out of the box); real deployments pass --cert/--key.
-    target_compile_definitions(mqproxy_cli PRIVATE
-        TEST_CERT_FILE="${MQ_CERT_FILE}"
-        TEST_KEY_FILE="${MQ_KEY_FILE}")
+    # The installed binary has NO bundled default cert/key: `server` always
+    # requires explicit --cert/--key (the committed tests/certs/* are public
+    # test fixtures and must never be a shipped server's default identity).
 
     # CLI help / smoke test (shell): asserts --help works and unknown
     # subcommands fail. Passes the binary path via $<TARGET_FILE:mqproxy>.
