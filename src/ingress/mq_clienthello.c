@@ -85,7 +85,6 @@ typedef struct {
     size_t rec_off;
     size_t frag_pos;
     size_t frag_len;
-    int started; /* a record has been entered (rec_off/frag_len valid) */
     int incomplete;
     int bad;
 } hs_t;
@@ -100,7 +99,6 @@ hs_init(hs_t *h, const uint8_t *buf, size_t len, size_t rec_off, size_t frag_len
     h->rec_off = rec_off;
     h->frag_len = frag_len;
     h->frag_pos = 0;
-    h->started = 1;
     h->incomplete = 0;
     h->bad = 0;
 }
@@ -252,10 +250,11 @@ mq_clienthello_parse(const uint8_t *buf, size_t len, mq_clienthello_t *out)
         if (h.bad) return MQ_CH_INVALID;
         return MQ_CH_NEED_MORE;
     }
-    /* The reassembled handshake body cannot exceed the cap (records are capped
-     * above, and the whole accumulation is <= MQ_CH_CAP). A declared body that
-     * is structurally too large to ever fit is INVALID; one that simply is not
-     * fully buffered yet is NEED_MORE — distinguished by walking the records. */
+    /* LOAD-BEARING bound for the body[MQ_CH_CAP] copy below: hs_len is a 24-bit
+     * field (up to ~16M), so reject any declared handshake body that cannot fit
+     * the fixed scratch BEFORE copying. A body structurally too large to ever fit
+     * is INVALID; one merely not fully buffered yet is NEED_MORE (distinguished by
+     * walking the records). On a 64-bit target 4+hs_len cannot wrap. */
     if (4 + hs_len > MQ_CH_CAP) {
         return MQ_CH_INVALID;
     }
