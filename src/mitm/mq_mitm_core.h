@@ -39,6 +39,15 @@ SSL *mq_mitm_core_new_ssl(mq_mitm_core_t *core);
 
 void mq_mitm_core_destroy(mq_mitm_core_t *core);
 
+// Normalize an SNI host name for use as a forge key / ignore-hosts lookup key.
+// On success returns 0 and writes a NUL-terminated, lowercased DNS name (<= 253
+// chars, no trailing/leading dot) into out. Returns -1 for: NULL/empty input,
+// total length > 253, any label > 63 bytes, an empty label (e.g. "a..b" or a
+// leading dot), an IP literal (IPv4/IPv6), a wildcard ('*'), or any byte outside
+// [A-Za-z0-9.-]. A single trailing dot is stripped before validation. The live
+// MITM orchestrator (mq_mitm_conn) calls this before mq_ignore_hosts_match.
+int mq_mitm_normalize_sni(const char *sni, size_t sni_len, char out[256]);
+
 // TEST-ONLY: override the clock used for leaf validity + cache expiry. Pass NULL
 // to restore the default (time(NULL)). Not for production use.
 void mq_mitm_core_set_clock_for_test(mq_mitm_core_t *core, time_t (*now_fn)(void));

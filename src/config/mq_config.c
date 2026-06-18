@@ -84,7 +84,8 @@ enum {
     SEC_UDP,
     SEC_INGRESS,
     SEC_METRICS,
-    SEC_LOG
+    SEC_LOG,
+    SEC_MITM
 };
 
 static int
@@ -100,6 +101,7 @@ parse_section(const char *n)
     if (strcasecmp(n, "Ingress") == 0) return SEC_INGRESS;
     if (strcasecmp(n, "Metrics") == 0) return SEC_METRICS;
     if (strcasecmp(n, "Log") == 0) return SEC_LOG;
+    if (strcasecmp(n, "Mitm") == 0) return SEC_MITM;
     return -1;
 }
 
@@ -288,6 +290,27 @@ handle_kv(mq_file_config_t *cfg, int section, const char *key, const char *val,
             CSTR(qlog);
         else
             MQ_LOGW("%s:%d: unknown key '%s' in [Log]", path, lineno, key);
+        break;
+    case SEC_MITM: /* client-only (Phase 7 Slice 3) */
+        if (is_server)
+            WRONG_MODE("Mitm");
+        else if (strcasecmp(key, "Enabled") == 0)
+            cfg->mitm_enabled = parse_bool(val);
+        else if (strcasecmp(key, "CACert") == 0)
+            CSTR(ca_cert);
+        else if (strcasecmp(key, "CAKey") == 0)
+            CSTR(ca_key);
+        else if (strcasecmp(key, "IgnoreHosts") == 0) {
+            /* repeatable: mirrors [Multipath] Path accumulation */
+            if (cfg->n_ignore_hosts < MQ_CONFIG_MAX_IGNORE_HOSTS) {
+                snprintf(cfg->ignore_hosts[cfg->n_ignore_hosts],
+                         sizeof(cfg->ignore_hosts[0]), "%s", val);
+                cfg->n_ignore_hosts++;
+            } else
+                MQ_LOGW("%s:%d: max %d ignore hosts; ignoring '%s'", path, lineno,
+                        MQ_CONFIG_MAX_IGNORE_HOSTS, val);
+        } else
+            MQ_LOGW("%s:%d: unknown key '%s' in [Mitm]", path, lineno, key);
         break;
     default: MQ_LOGW("%s:%d: key '%s' outside any section", path, lineno, key); break;
     }

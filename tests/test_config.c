@@ -180,6 +180,69 @@ test_perms_warning(void)
 }
 
 static void
+test_mitm_section(void)
+{
+    /* [Mitm] is client-only; Enabled bool + CACert/CAKey paths + repeatable
+     * IgnoreHosts (mirrors [Multipath] Path accumulation). */
+    char p[64];
+    write_tmp(p, sizeof(p),
+              "[Mitm]\n"
+              "Enabled = true\n"
+              "CACert = /c\n"
+              "CAKey = /k\n"
+              "IgnoreHosts = .apple.com\n"
+              "IgnoreHosts = signal.org\n");
+    mq_file_config_t c;
+    mq_config_defaults(&c);
+    MQ_CHECK_EQ_INT(c.mitm_enabled, 0); /* default off (memset) */
+    MQ_CHECK_EQ_INT(mq_config_load(&c, p, 0 /*client*/), 0);
+    MQ_CHECK_EQ_INT(c.mitm_enabled, 1);
+    MQ_CHECK(strcmp(c.ca_cert, "/c") == 0);
+    MQ_CHECK(strcmp(c.ca_key, "/k") == 0);
+    MQ_CHECK_EQ_INT(c.n_ignore_hosts, 2);
+    MQ_CHECK(strcmp(c.ignore_hosts[0], ".apple.com") == 0);
+    MQ_CHECK(strcmp(c.ignore_hosts[1], "signal.org") == 0);
+    remove(p);
+}
+
+static void
+test_mitm_server_mode_ignored(void)
+{
+    /* server-mode load warns + ignores all [Mitm] keys (client-only). */
+    char p[64];
+    write_tmp(p, sizeof(p),
+              "[Mitm]\n"
+              "Enabled = true\n"
+              "CACert = /c\n"
+              "CAKey = /k\n"
+              "IgnoreHosts = .apple.com\n");
+    mq_file_config_t c;
+    mq_config_defaults(&c);
+    MQ_CHECK_EQ_INT(mq_config_load(&c, p, 1 /*server*/), 0);
+    MQ_CHECK_EQ_INT(c.mitm_enabled, 0); /* ignored */
+    MQ_CHECK(c.ca_cert[0] == '\0');
+    MQ_CHECK(c.ca_key[0] == '\0');
+    MQ_CHECK_EQ_INT(c.n_ignore_hosts, 0);
+    remove(p);
+}
+
+static void
+test_mitm_enabled_missing_cacert(void)
+{
+    /* Enabled=true with no CACert: config layer keeps ca_cert empty (no error
+     * here — the --mitm-requires-CA check is enforced in CLI, Task 15). */
+    char p[64];
+    write_tmp(p, sizeof(p), "[Mitm]\nEnabled = true\n");
+    mq_file_config_t c;
+    mq_config_defaults(&c);
+    MQ_CHECK_EQ_INT(mq_config_load(&c, p, 0 /*client*/), 0);
+    MQ_CHECK_EQ_INT(c.mitm_enabled, 1);
+    MQ_CHECK(c.ca_cert[0] == '\0'); /* surfaced as empty; CLI enforces */
+    MQ_CHECK(c.ca_key[0] == '\0');
+    remove(p);
+}
+
+static void
 test_missing_file_fatal(void)
 {
     mq_file_config_t c;
@@ -195,6 +258,9 @@ MQ_TEST_MAIN({
     test_path_cap();
     test_lenient_and_comments();
     test_partial_file_keeps_defaults();
+    test_mitm_section();
+    test_mitm_server_mode_ignored();
+    test_mitm_enabled_missing_cacert();
     test_perms_warning();
     test_missing_file_fatal();
 })

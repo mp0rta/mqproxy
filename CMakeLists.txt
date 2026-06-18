@@ -37,6 +37,7 @@ add_library(mqproxy STATIC
     src/ingress/mq_socks5.c
     src/ingress/mq_http_connect.c
     src/ingress/mq_origdst.c
+    src/ingress/mq_clienthello.c
     src/ingress/mq_tproxy.c
     src/ingress/mq_tproxy_setup.c
     src/ingress/mq_listener.c
@@ -55,10 +56,27 @@ add_library(mqproxy STATIC
     src/transport/mq_stream.c
     src/transport/mq_transport.c
     src/runtime/mq_runtime_libevent.c
-    src/mitm/mq_mitm_core.c)
+    src/gateway/mq_gw_h2_adapter.c
+    src/gateway/mq_gw_h2_submit_gwc.c
+    src/mitm/mq_ignore_hosts.c)
+target_include_directories(mqproxy PUBLIC ${NGHTTP2_INCLUDE_DIRS})
 target_link_libraries(mqproxy PUBLIC CURL::libcurl)
-target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR}
-    ${MQPROXY_BORINGSSL_INCLUDE_DIR})
+target_include_directories(mqproxy PUBLIC src ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+
+# Fail-closed MITM gate (Slice 3 Task 3, codex H7): mq_mitm_core.c #includes
+# BoringSSL headers (openssl/bytestring.h etc.) that exist only with the static
+# archives. Compile it — and its BoringSSL include dir — into the library ONLY
+# when the archives are present (MQPROXY_MITM). A no-archive build therefore
+# pulls NO MITM source and the whole tree (library + mqproxy_cli) builds/links
+# cleanly; `--mitm` then errors at startup via the MQ_MITM_AVAILABLE=0 guard.
+if(MQPROXY_MITM)
+    # mq_mitm_core.c #includes BoringSSL headers; mq_mitm_conn.c (live orchestrator,
+    # Task 10) references mq_mitm_core types. Both compile into the lib only under
+    # MQPROXY_MITM. The CLI links the lib, so adding mq_mitm_conn here (not to
+    # mqproxy_cli) also satisfies the test_mitm_conn target, which links `mqproxy`.
+    target_sources(mqproxy PRIVATE src/mitm/mq_mitm_core.c src/mitm/mq_mitm_conn.c)
+    target_include_directories(mqproxy PUBLIC ${MQPROXY_BORINGSSL_INCLUDE_DIR})
+endif()
 
 enable_testing()
 add_executable(test_smoke tests/test_smoke.c)
@@ -139,28 +157,98 @@ target_link_libraries(test_origdst mqproxy)
 target_include_directories(test_origdst PRIVATE tests)
 add_test(NAME test_origdst COMMAND test_origdst)
 
+add_executable(test_clienthello tests/test_clienthello.c)
+target_link_libraries(test_clienthello mqproxy)
+target_include_directories(test_clienthello PRIVATE tests src)
+add_test(NAME test_clienthello COMMAND test_clienthello)
+
+add_executable(test_ignore_hosts tests/test_ignore_hosts.c)
+target_link_libraries(test_ignore_hosts mqproxy)
+target_include_directories(test_ignore_hosts PRIVATE tests src)
+add_test(NAME test_ignore_hosts COMMAND test_ignore_hosts)
+
+# nghttp2 link probe (Slice 3 Task 4): permanent low-cost guard that the nghttp2
+# dependency stays compiled + linked + runnable in BOTH build modes. Links the
+# static archive under MQPROXY_STATIC_XQUIC (self-contained packaging binary),
+# else the system shared lib — same selection the live H2 MITM adapter uses. No
+# xquic/BoringSSL needed (nghttp2 is a leaf), so it lives in the unconditional
+# section. Calls nghttp2_version() and prints the runtime version string.
+add_executable(nghttp2_link_probe tests/nghttp2_link_probe.c)
+target_include_directories(nghttp2_link_probe PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+if(MQPROXY_STATIC_XQUIC AND NGHTTP2_STATIC_LIB)
+    # Exercise the exact static archive the packaging cli links. (When the .a is
+    # absent the cli static branch already FATAL_ERRORs; the probe falls back to
+    # the shared lib here only to stay buildable for non-cli static configs.)
+    target_link_libraries(nghttp2_link_probe "${NGHTTP2_STATIC_LIB}")
+else()
+    target_link_libraries(nghttp2_link_probe ${NGHTTP2_LIBRARIES})
+endif()
+add_test(NAME nghttp2_link_probe COMMAND nghttp2_link_probe)
+
+# nghttp2 H2 server adapter unit suite (Slice 3 Task 5). Pure H2 framing — drives
+# a real nghttp2 CLIENT through an in-test memory pipe against the adapter SERVER
+# session; no xquic/BoringSSL needed (the adapter .o is pulled out of the base
+# mqproxy lib, which references only nghttp2). Lives in the unconditional section.
+add_executable(test_gw_h2_adapter tests/test_gw_h2_adapter.c)
+target_link_libraries(test_gw_h2_adapter mqproxy ${NGHTTP2_LIBRARIES})
+target_include_directories(test_gw_h2_adapter PRIVATE tests src ${NGHTTP2_INCLUDE_DIRS})
+add_test(NAME test_gw_h2_adapter COMMAND test_gw_h2_adapter)
+
 # ---- Integration tests (require xquic + libevent) ----
 if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # ---- Phase 7 Slice 2: MITM crypto core unit suite ----
     # Needs the BoringSSL static archives libxquic was built against (SSL_*/X509_*).
-    if(MQ_HAVE_BORINGSSL_ARCHIVES)
-        # Single source of truth for the BoringSSL static-link recipe (archive
-        # ORDER matters: libssl.a before libcrypto.a) + the matching include dir.
-        # Both MITM test targets link mqproxy + this — NO xquic: the MITM core is
-        # sans-io / BoringSSL-only and references no xqc_* symbols, so the static
-        # archive pulls no xquic-dependent objects. Keep it xquic-free.
-        add_library(mq_boringssl INTERFACE)
-        target_link_libraries(mq_boringssl INTERFACE
-            "${MQPROXY_BORINGSSL_DIR}/libssl.a"
-            "${MQPROXY_BORINGSSL_DIR}/libcrypto.a"
-            pthread dl m stdc++)
-        target_include_directories(mq_boringssl INTERFACE
-            ${MQPROXY_BORINGSSL_INCLUDE_DIR})
-
+    # The mq_boringssl INTERFACE target is defined in cmake/BuildSetup.cmake
+    # (hoisted out of this test-only block so mqproxy_cli can also consume it).
+    # GATE: MQPROXY_MITM, NOT MQ_HAVE_BORINGSSL_ARCHIVES. These targets reference
+    # mq_mitm_core_* symbols, which are compiled into the mqproxy lib only under
+    # MQPROXY_MITM (see ~line 69). Gating them on the raw-archive predicate while
+    # the source compilation is gated on MQPROXY_MITM would let a hypothetical
+    # MQPROXY_MITM=OFF + archives-present build still emit these targets and then
+    # fail to LINK with undefined mq_mitm_core_* — a confusing failure far from the
+    # cause. MQPROXY_MITM is an alias of MQ_HAVE_BORINGSSL_ARCHIVES today, so this
+    # is behavior-preserving; it makes the documented decoupling actually safe.
+    if(MQPROXY_MITM)
         add_executable(test_mitm_core tests/test_mitm_core.c)
         target_link_libraries(test_mitm_core mqproxy mq_boringssl)
         target_include_directories(test_mitm_core PRIVATE tests src)
         add_test(NAME test_mitm_core COMMAND test_mitm_core)
+
+        # ---- Task 10: live MITM conn orchestrator decision-seam unit ----
+        # Exercises the drain→decide routing (ignore-hosts hit→opaque vs miss→MITM)
+        # via the socketless decision seam. Links mqproxy + mq_boringssl (touches
+        # mq_mitm_core types via the orchestrator) + libevent (the orchestrator
+        # creates events; the seam itself uses none).
+        # NOTE: as of Task 11 mq_mitm_conn.c wires the live MITM path through the
+        # production submit wrapper (mq_gw_h2_adapter → mq_gw_client_* → xquic), so
+        # the orchestrator object now references nghttp2 + the full xquic/BoringSSL
+        # stack even on the decision-seam path. These unit targets therefore link the
+        # whole stack (xquic + nghttp2 + mq_boringssl + libevent) like the other
+        # integration tests, plus the xquic runtime rpath.
+        add_executable(test_mitm_conn tests/test_mitm_conn.c)
+        target_link_libraries(test_mitm_conn mqproxy xquic mq_boringssl
+            ${NGHTTP2_LIBRARIES} ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB}
+            pthread dl m stdc++)
+        target_include_directories(test_mitm_conn PRIVATE tests src
+            ${NGHTTP2_INCLUDE_DIRS})
+        set_target_properties(test_mitm_conn PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+        add_test(NAME test_mitm_conn COMMAND test_mitm_conn)
+
+        # ---- Task 11: live MITM conn registry + ordered teardown + re-entrancy ----
+        # Builds real nghttp2 adapters holding in-flight streams, registers them in
+        # live MITM conns via the make_live_for_test seam, then mq_mitm_ctx_free —
+        # asserting each in-flight stream's req_aborted fires exactly once and the
+        # teardown is ASan/LSan-clean (no UAF/leak/double-free). Links the full stack
+        # (the orchestrator references SSL_*/BIO_* + the gwc submit wrapper → xquic).
+        add_executable(test_mitm_teardown tests/test_mitm_teardown.c)
+        target_link_libraries(test_mitm_teardown mqproxy xquic mq_boringssl
+            ${NGHTTP2_LIBRARIES} ${EVENT_CORE_LIB} ${EVENT_EXTRA_LIB}
+            pthread dl m stdc++)
+        target_include_directories(test_mitm_teardown PRIVATE tests src
+            ${NGHTTP2_INCLUDE_DIRS})
+        set_target_properties(test_mitm_teardown PROPERTIES
+            BUILD_RPATH "${XQUIC_BUILD_DIR}")
+        add_test(NAME test_mitm_teardown COMMAND test_mitm_teardown)
 
         # ---- Task 8: openssl s_client cross-implementation smoke ----
         # The single-shot helper terminates a real loopback TLS handshake via
@@ -350,9 +438,11 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     endif()
 
     # Pass the fixture paths to the MITM unit suite (target created above, gated on
-    # the BoringSSL archives). The fixtures are defined here (after MQ_CERT_DIR), so
-    # we attach the compile defs here rather than at the target block.
-    if(MQ_HAVE_BORINGSSL_ARCHIVES)
+    # MQPROXY_MITM). The fixtures are defined here (after MQ_CERT_DIR), so we attach
+    # the compile defs here rather than at the target block. Gate MUST match the
+    # target-definition block above (MQPROXY_MITM) so the targets and their tests
+    # appear/disappear together.
+    if(MQPROXY_MITM)
         target_compile_definitions(test_mitm_core PRIVATE
             MITM_CA_CRT="${MQ_MITM_CA_CRT}"
             MITM_CA_KEY="${MQ_MITM_CA_KEY}"
@@ -690,22 +780,81 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
                 "${MQPROXY_BORINGSSL_DIR} (expected libssl.a + libcrypto.a). Build xquic "
                 "via scripts/build-xquic.sh or set -DMQPROXY_BORINGSSL_DIR=<dir>.")
         endif()
+        # nghttp2 static archive (Slice 3 Task 4): the live H2 MITM adapter links it.
+        # nghttp2 is a leaf (no BoringSSL/xquic symbols), so link order is unconstrained
+        # and no symbol isolation is needed. Require the .a in this packaging build;
+        # mirror the BoringSSL archive-missing gate above with an actionable message.
+        if(NOT NGHTTP2_STATIC_LIB)
+            message(FATAL_ERROR
+                "MQPROXY_STATIC_XQUIC=ON but libnghttp2.a was not found (only the "
+                "shared library is installed). The static build links the H2 MITM "
+                "adapter against it. Install the nghttp2 static archive (Debian/Ubuntu: "
+                "libnghttp2-dev ships it as /usr/lib/<multiarch>/libnghttp2.a; on some "
+                "distros it is a separate -static package), or build the dynamic "
+                "binary (omit -DMQPROXY_STATIC_XQUIC=ON).")
+        endif()
         # Link order: xquic-static references BoringSSL symbols, so the archives follow it.
+        # NOTE: the raw archives (not mq_boringssl) are linked here because they must
+        # appear AFTER xquic-static to satisfy its undefined BoringSSL QUIC symbols;
+        # the MITM core's SSL_*/X509_* resolve against the very same objects. Symbol
+        # isolation (--exclude-libs) is applied below for both branches.
         target_link_libraries(mqproxy_cli
             mqproxy
             xquic-static
             "${_bssl_ssl}" "${_bssl_crypto}"
+            "${NGHTTP2_STATIC_LIB}"
             ${EVENT_CORE_LIB}
             ${EVENT_EXTRA_LIB}
             pthread dl m stdc++)
+        target_include_directories(mqproxy_cli PRIVATE ${NGHTTP2_INCLUDE_DIRS})
     else()
+        # Dynamic build: libxquic.so bakes its BoringSSL in internally, so the exe
+        # has no BoringSSL objects today. Link mq_boringssl so the MITM core's
+        # SSL_*/X509_* can resolve once a caller references them (Task 13). When the
+        # archives are absent, mq_boringssl does not exist and MITM is compiled out
+        # (MQ_MITM_AVAILABLE=0 below), so nothing references BoringSSL → clean link.
         target_link_libraries(mqproxy_cli
             mqproxy
             xquic
+            ${NGHTTP2_LIBRARIES}
             ${EVENT_CORE_LIB}
             ${EVENT_EXTRA_LIB}
             pthread dl m stdc++)
+        target_include_directories(mqproxy_cli PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+        if(MQ_HAVE_BORINGSSL_ARCHIVES)
+            target_link_libraries(mqproxy_cli mq_boringssl)
+        endif()
         set_target_properties(mqproxy_cli PROPERTIES BUILD_RPATH "${XQUIC_BUILD_DIR}")
+    endif()
+
+    # ---- MITM availability + BoringSSL symbol isolation (Slice 3 Task 3) -------
+    # MQ_MITM_AVAILABLE is the fail-closed gate: the live MITM path is compiled in
+    # ONLY when the BoringSSL archives are present. All MITM references in cli/main.c
+    # must be wrapped in `#if MQ_MITM_AVAILABLE` (added in Task 13) so a no-archive
+    # build pulls NO MITM symbols and therefore LINKS — a runtime branch alone would
+    # fail at link time. When unavailable, `--mitm` errors at startup and exits != 0.
+    # MQPROXY_MITM (CMake var, set in BuildSetup.cmake) gates whether the live MITM
+    # path is compiled in; MQ_MITM_AVAILABLE is the matching C compile-definition.
+    if(MQPROXY_MITM)
+        target_compile_definitions(mqproxy_cli PRIVATE MQ_MITM_AVAILABLE=1)
+        # Task 10: src/mitm/mq_mitm_conn.c (live orchestrator) is compiled into the
+        # mqproxy LIB under MQPROXY_MITM (see ~line 71), which mqproxy_cli links —
+        # no per-cli target_sources needed. Task 13 wires it into cli/main.c under
+        # `#if MQ_MITM_AVAILABLE`.
+        #
+        # Isolate the BoringSSL the MITM core links against so its SSL_*/X509_*/EVP_*
+        # cannot interpose libcurl's system OpenSSL (libssl.so) at runtime. Both the
+        # static branch (raw archives) and the dynamic branch (mq_boringssl) pull
+        # libssl.a/libcrypto.a by name, so --exclude-libs by archive base-name hides
+        # all their global symbols (makes them link-local). GNU ld + lld (Linux) only;
+        # applied to mqproxy_cli ONLY — the test targets MAY export (they link
+        # mq_boringssl directly without this flag). Verified by ctest
+        # check_boringssl_isolation.
+        target_link_options(mqproxy_cli PRIVATE
+            -Wl,--exclude-libs,libssl.a
+            -Wl,--exclude-libs,libcrypto.a)
+    else()
+        target_compile_definitions(mqproxy_cli PRIVATE MQ_MITM_AVAILABLE=0)
     endif()
     target_include_directories(mqproxy_cli PRIVATE src
         ${XQUIC_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
@@ -720,6 +869,18 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     add_test(NAME test_cli_help
         COMMAND ${CMAKE_COMMAND} -E env
             sh ${CMAKE_SOURCE_DIR}/tests/test_cli_help.sh $<TARGET_FILE:mqproxy_cli>)
+
+    # ---- BoringSSL symbol-isolation gate (Slice 3 Task 3) ----
+    # Asserts the BoringSSL the MITM core links against is NOT exported from the
+    # mqproxy exe (cannot interpose libcurl's system OpenSSL), no undefined SSL_*
+    # remains, and libcurl still dynamically needs libssl.so. Gated on the archives
+    # since --exclude-libs / the MITM link only apply then. See the script header
+    # for why the checks tolerate symbol ABSENCE (static vs dynamic build).
+    if(MQ_HAVE_BORINGSSL_ARCHIVES)
+        add_test(NAME check_boringssl_isolation
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tests/integration/check_boringssl_isolation.sh
+                $<TARGET_FILE:mqproxy_cli>)
+    endif()
 
     # ---- 1-B multipath aggregation benchmark (design §9.2) ----
     # Self-contained bash benchmark the USER runs with sudo: it shapes two
@@ -773,6 +934,35 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_tproxy.sh)
     set_tests_properties(e2e_tproxy PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ---- Phase 7 Slice 3 Task 16: NET_ADMIN transparent-MITM H2 e2e ----
+    # The capstone for the 🔒 security gate: the ONLY test that drives the LIVE
+    # mq_mitm_conn orchestrator end-to-end. curl --http2 is transparently captured
+    # (nft REDIRECT), the client forges a per-SNI leaf signed by the MITM CA,
+    # terminates TLS, speaks h2 over the tunnel to the gateway server, which
+    # fetches the real origin via libcurl. Asserts:
+    #   (a) transparent MITM works (h2 200 against the forged leaf trusted via the
+    #       MITM CA; a non-MITM relay would present the origin cert and be rejected),
+    #   (b) cache HIT — a second fetch is served origin-once (origin /__count == 1),
+    #   (c) a cookie-authenticated request reaches the origin WITH its Cookie (§4.5),
+    #   (d) an --ignore-host SNI is spliced OPAQUELY (origin cert verifies; the MITM
+    #       CA is REJECTED — no forged leaf presented for the excluded host),
+    #   (e) concurrent multi-stream fetch succeeds (N streams on one h2 conn).
+    # REQUIRES root + CAP_NET_ADMIN (nft) + curl(--http2) + openssl + python3 + a
+    # MITM-capable binary. Exits 77 (SKIP) when any of those is absent (mirrors
+    # e2e_tproxy). Gated on MQPROXY_MITM so it only registers for a MITM build; the
+    # MITM CA fixtures (MQ_MITM_CA_*) and a runtime-minted origin cert drive it.
+    if(MQPROXY_MITM)
+        add_test(NAME e2e_mitm_h2
+            COMMAND ${CMAKE_COMMAND} -E env
+                MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+                MQPROXY_CERT=${MQ_CERT_FILE}
+                MQPROXY_KEY=${MQ_KEY_FILE}
+                MQ_MITM_CA_CRT=${MQ_MITM_CA_CRT}
+                MQ_MITM_CA_KEY=${MQ_MITM_CA_KEY}
+                bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_mitm_h2.sh)
+        set_tests_properties(e2e_mitm_h2 PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     # ---- Phase 3 Task 7.1: e2e UDP relay test utilities ----
     # These are standalone CLI helpers driven by e2e_udp.sh (Task 7.2).

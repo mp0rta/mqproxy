@@ -80,6 +80,53 @@ if(EXISTS "${MQPROXY_BORINGSSL_DIR}/libssl.a" AND
     set(MQ_HAVE_BORINGSSL_ARCHIVES ON)
 endif()
 
+# Derived MITM availability flag: the live MITM L7 path (Phase 7 Slice 3) needs
+# the BoringSSL static archives the MITM core links against. Kept as its own
+# name so call sites read intent ("is MITM compiled in?") rather than re-deriving
+# the archive predicate, and so a future decoupling has one place to change.
+set(MQPROXY_MITM ${MQ_HAVE_BORINGSSL_ARCHIVES})
+
+# ---- mq_boringssl: single source of truth for the BoringSSL static-link recipe.
+# Hoisted here (out of the test-only block in CMakeLists.txt) so it exists
+# whenever the archives are present, independent of which targets consume it:
+# the MITM unit/smoke test targets AND mqproxy_cli (the live MITM path) all link
+# it. Archive ORDER matters (libssl.a before libcrypto.a). NO xquic here: the
+# MITM core is sans-io / BoringSSL-only and references no xqc_* symbols, so the
+# static archive pulls no xquic-dependent objects — keep it xquic-free.
+if(MQ_HAVE_BORINGSSL_ARCHIVES AND NOT TARGET mq_boringssl)
+    add_library(mq_boringssl INTERFACE)
+    target_link_libraries(mq_boringssl INTERFACE
+        "${MQPROXY_BORINGSSL_DIR}/libssl.a"
+        "${MQPROXY_BORINGSSL_DIR}/libcrypto.a"
+        pthread dl m stdc++)
+    target_include_directories(mq_boringssl INTERFACE
+        ${MQPROXY_BORINGSSL_INCLUDE_DIR})
+endif()
+
+# ---------- nghttp2 (HTTP/2 termination for the live MITM L7 path, Slice 3) ----------
+#
+# nghttp2 is a LEAF dependency: pure HTTP/2 framing, no TLS/crypto of its own, so
+# it shares NO symbols with BoringSSL/xquic and needs no recursive build or symbol
+# isolation (unlike BoringSSL). Found via pkg-config in BOTH build modes:
+#   - dynamic (default): link the system shared libnghttp2.so (${NGHTTP2_LIBRARIES}).
+#   - static (MQPROXY_STATIC_XQUIC): link the system multiarch libnghttp2.a so the
+#     shipped binary stays self-contained. If the .a is absent (only the .so is
+#     installed), the static build MUST FATAL_ERROR — mirroring the BoringSSL
+#     archive-missing gate in CMakeLists.txt — telling the user to install it.
+# The H2 server adapter TU (#include <nghttp2/nghttp2.h>) and nghttp2_link_probe
+# consume NGHTTP2_INCLUDE_DIRS / the lib chosen by mode.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(NGHTTP2 REQUIRED libnghttp2)
+message(STATUS "Using nghttp2 ${NGHTTP2_VERSION} (dynamic: ${NGHTTP2_LIBRARIES})")
+
+# Static archive: locate libnghttp2.a so the static-link branch can use it. find_library
+# searches the standard system/multiarch lib dirs (e.g. /usr/lib/x86_64-linux-gnu).
+# Probe unconditionally (cheap); the FATAL_ERROR for absence fires ONLY in the
+# MQPROXY_STATIC_XQUIC branch (CMakeLists.txt) so the dynamic build never needs the .a.
+find_library(NGHTTP2_STATIC_LIB
+    NAMES libnghttp2.a
+    HINTS ${NGHTTP2_STATIC_LIBRARY_DIRS} ${NGHTTP2_LIBRARY_DIRS})
+
 # ---------- libevent ----------
 find_path(EVENT_INCLUDE_DIR event2/event.h)
 find_library(EVENT_CORE_LIB event_core)

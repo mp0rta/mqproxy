@@ -6,6 +6,41 @@
 #include <curl/curl.h>
 #include <string.h>
 
+#include "gateway/mq_gw_intake.h" /* mq_gw_reject_reason_t / mq_gw_reject_xmq */
+
+/* Map a reject reason → its X-Mq-Error string. SHARED across gateway adapters
+ * (H1 fetch + H2 MITM) via the mq_gw_intake.h declaration so the rendered error
+ * strings cannot drift between protocols (tests/e2e assert these 10 literals
+ * byte-for-byte — do NOT alter them).
+ *
+ * Extracted from the former static gw_reason_xmq in mq_gw_fetch_adapter.c
+ * (Slice 3 Task 8, codex M-3 / DRY). It lives HERE rather than in mq_gw_client.c
+ * (the plan's first choice) because the H2 adapter unit test links the adapter
+ * .o out of the static mqproxy archive with ONLY nghttp2 (no libevent/xquic; see
+ * CMakeLists test_gw_h2_adapter): referencing a symbol in mq_gw_client.c would
+ * drag that whole object's event/xquic undefined refs into the leaf test and
+ * break the link. mq_gw_headers.c is an already-compiled gateway TU that is a
+ * pure leaf (no event/xquic), so the shared helper stays linkable from both the
+ * fetch path AND the isolated H2 test — same parsimony (no new file), correct
+ * isolation. */
+const char *
+mq_gw_reject_xmq(mq_gw_reject_reason_t reason)
+{
+    switch (reason) {
+    case MQ_GW_REJ_DUP_CONTROL: return "duplicate-control-header";
+    case MQ_GW_REJ_MISSING_AUTH: return "missing-auth";
+    case MQ_GW_REJ_BAD_AUTH: return "bad-auth-format";
+    case MQ_GW_REJ_BAD_TARGET: return "bad-target";
+    case MQ_GW_REJ_BAD_METHOD: return "bad-method";
+    case MQ_GW_REJ_BAD_ORIGIN_PROTO: return "bad-origin-protocol";
+    case MQ_GW_REJ_BAD_CACHE_TTL: return "bad-cache-ttl";
+    case MQ_GW_REJ_HEADER_TOO_LONG: return "header-too-long";
+    case MQ_GW_REJ_TUNNEL_UNAVAIL: return "tunnel-unavailable";
+    case MQ_GW_REJ_INTERNAL: return "internal-error";
+    default: return "internal-error";
+    }
+}
+
 /* The MQ_GW_CURL_* constants in mq_gw_headers.h are mirrors of CURLE_* values
  * so that Chunk-3 unit tests compile without libcurl.  These asserts pin the
  * mirrors to the real libcurl values; any future divergence is caught at

@@ -139,6 +139,13 @@ mq_gw_reject_reason_t mq_gw_client_prevalidate(mq_gw_client_t *c,
 mq_gw_xreq_t *mq_gw_client_req_begin(mq_gw_client_t *c, const mq_gw_req_head_t *head,
                                      const mq_gw_sink_ops_t *sink, void *sink_user,
                                      int *err_status, mq_gw_reject_reason_t *reason);
+/* Return the RAW shared token stored at construction (the value EXPECTED in
+ * X-Mq-Auth, WITHOUT the "Bearer " prefix). Borrowed, NUL-terminated, valid for
+ * the client's lifetime. Used by the H2 MITM adapter's production submit vtable
+ * (mq_gw_h2_submit_ops_gwc) to inject "Bearer <token>" on demuxed requests.
+ * Safe on NULL (returns NULL). */
+const char *mq_gw_client_token(const mq_gw_client_t *c);
+
 int mq_gw_client_req_body(mq_gw_xreq_t *r, const uint8_t *p,
                           size_t len); /* 0 go, -1 pause (consumed) */
 void mq_gw_client_req_body_done(mq_gw_xreq_t *r);

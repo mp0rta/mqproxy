@@ -1610,6 +1610,25 @@ test_gw_teardown_midflight(void)
     gw_fixture_down(&f);
 }
 
+/* Step 0 (Slice 3 Task 6): mq_gw_client_token() returns the RAW stored token
+ * (no "Bearer " prefix, no new storage). The dead fixture constructs a gwc with
+ * token "tok"; the production H2 submit vtable's auth_token returns this. */
+static void
+test_gw_client_token_accessor(void)
+{
+    gw_fixture_t f;
+    if (gw_fixture_up_dead(&f) != 0) {
+        MQ_CHECK(0 && "token-accessor fixture up failed");
+        gw_fixture_down(&f);
+        return;
+    }
+    const char *tok = mq_gw_client_token(f.gw);
+    MQ_CHECK(tok != NULL);
+    if (tok) MQ_CHECK(strcmp(tok, "tok") == 0);
+    MQ_CHECK(mq_gw_client_token(NULL) == NULL);
+    gw_fixture_down(&f);
+}
+
 static void
 run_all(void)
 {
@@ -1639,6 +1658,7 @@ run_all(void)
     test_gw_tunnel_unavailable();
     test_gw_mid_download_reset();
     test_gw_teardown_midflight();
+    test_gw_client_token_accessor();
 }
 
 MQ_TEST_MAIN(run_all())
