@@ -827,6 +827,10 @@ mq_conn_connect(mq_transport_t *t, const struct sockaddr *peer, socklen_t peerle
     if (!cid) {
         MQ_LOGE("mq_conn: xqc_connect failed");
         actx->pending_client_conn = NULL;
+        /* Unsubscribe from the transport's mp-ready broadcast BEFORE free(c):
+         * a stale subscriber entry would be dereferenced on the next broadcast
+         * (use-after-free). Mirrors the close path and the mq_h3 sibling. */
+        mq_transport_remove_mp_ready_cb(t, mq_conn_on_mp_ready, c);
         free(c);
         return NULL;
     }
@@ -839,6 +843,7 @@ mq_conn_connect(mq_transport_t *t, const struct sockaddr *peer, socklen_t peerle
          * user_data binding will then be missing — treat as a hard error. */
         actx->pending_client_conn = NULL;
         MQ_LOGE("mq_conn: conn_create_notify did not fire during xqc_connect");
+        mq_transport_remove_mp_ready_cb(t, mq_conn_on_mp_ready, c);
         free(c);
         return NULL;
     }

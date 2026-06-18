@@ -79,12 +79,12 @@ UDP relay carries non-QUIC UDP traffic (DNS, NTP, game, VoIP, app-specific UDP) 
 
 ## Building from source
 
-**Requirements:** `cmake`, `make`, a C11 compiler, `git`, `libevent`, `libcurl` dev headers (e.g. `libcurl4-openssl-dev` — the gateway's origin client), `libnghttp2` dev headers (`libnghttp2-dev` — HTTP/2 termination for the TLS MITM L7 path; the static binary additionally needs the bundled `libnghttp2.a`), and `golang` (BoringSSL's build needs Go). Network access is required on first build (BoringSSL is cloned).
+**Requirements:** `cmake`, `make`, a C11 compiler, `git`, the `openssl` CLI (used at configure time to generate the bundled test certificates), `libevent`, `libcurl` dev headers (e.g. `libcurl4-openssl-dev` — the gateway's origin client), `libnghttp2` dev headers (`libnghttp2-dev` — HTTP/2 termination for the TLS MITM L7 path; the static binary additionally needs the bundled `libnghttp2.a`), and `golang` (BoringSSL's build needs Go). Network access is required on first build (BoringSSL is cloned).
 
 On Debian/Ubuntu:
 
 ```bash
-sudo apt-get install -y build-essential cmake git \
+sudo apt-get install -y build-essential cmake git openssl \
   libevent-dev libcurl4-openssl-dev libnghttp2-dev golang-go
 ```
 
@@ -417,7 +417,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | `--scheduler <s>` | Multipath scheduler: `minrtt` (default) \| `backup` \| `wlb` |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/client.qlog` |
 | `--reconnect` / `--no-reconnect` | Auto-reconnect on tunnel loss (default: enabled) |
-| `--reconnect-max-backoff <sec>` | Cap on exponential reconnect backoff in seconds (default 30; floored to 1) |
+| `--reconnect-max-backoff <sec>` | Cap on exponential reconnect backoff in seconds (default 30; must be > 0) |
 | `--keepalive-idle <sec>` | Send QUIC PINGs when idle for this many seconds (default 30; 0 = disable; values <15 have no additional effect since xquic's PING cadence is ~15 s) |
 | `--metrics-interval <sec>` | Periodically log per-path stats (`mq.conn` / `mq.path` logfmt lines) every `<sec>`s (must be > 0; omit to disable). Logs the proxy conn (and the gateway conn when `--gateway` is set). |
 
