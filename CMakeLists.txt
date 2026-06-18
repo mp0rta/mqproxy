@@ -1063,6 +1063,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         set(CPACK_DEBIAN_PACKAGE_DESCRIPTION
             "Multipath QUIC application proxy/accelerator (MPQUIC-native)")
         set(CPACK_DEBIAN_PACKAGE_MAINTAINER "mp0rta")
+        set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/mp0rta/mqproxy")
         set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
             "${CMAKE_SOURCE_DIR}/packaging/postinst;${CMAKE_SOURCE_DIR}/packaging/postrm")
         include(CPack)

@@ -130,7 +130,11 @@ jobs:
         run: |
           set -e
           deb=$(ls build-pkg/mqproxy_*.deb)
-          sudo dpkg -i "$deb" || sudo apt-get -f install -y
+          # Re-assert dpkg -i after any dependency repair so a genuinely broken
+          # postinst or malformed deb still fails the job (a bare `|| apt-get -f
+          # install` would swallow it). The static deb has no deps to repair, so
+          # the fallback is normally a no-op.
+          sudo dpkg -i "$deb" || { sudo apt-get -f install -y; sudo dpkg -i "$deb"; }
           id mqproxy                       # postinst created the user
           test -d /etc/mqproxy             # tmpfiles created the dir
           # Provision a minimal server config + the repo test cert (compiled-in
