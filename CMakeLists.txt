@@ -1007,6 +1007,10 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_udp.sh)
     set_tests_properties(e2e_udp PROPERTIES SKIP_RETURN_CODE 77)
 
+    # ---- Perf CI: bench_common.sh pure-helper unit tests (no privilege) ----
+    add_test(NAME test_bench_common
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/integration/test_bench_common.sh)
+
     # ---- packaging / install ----
     configure_file(packaging/systemd/mqproxy-server@.service.in
         ${CMAKE_BINARY_DIR}/packaging/mqproxy-server@.service @ONLY)
