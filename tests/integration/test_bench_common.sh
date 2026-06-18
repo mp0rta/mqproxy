@@ -33,4 +33,20 @@ bench_emit_json ab_lanes relay_goodput 0 mbps '{}' skip
 sline="$(cat "${CI_BENCH_RESULTS_DIR}"/ab_lanes_*.jsonl)"
 [ "$(echo "${sline}" | jq -r .status)" = "skip" ] || fail "explicit skip status"
 
+# bench_require_root_netem must return non-zero (skip) when not root, never crash.
+if [ "$(id -u)" -ne 0 ]; then
+    ( bench_require_root_netem ); rc=$?
+    [ "${rc}" -eq 77 ] || fail "guard should exit 77 when unprivileged, got ${rc}"
+fi
+
+# bench_pctile_or_skip: ≥30 samples → emits p50/p99/ratio; <30 → insufficient_samples.
+SF="${WORK}/samples.txt"; : >"${SF}"; for i in $(seq 1 40); do echo "0.0${i}" >>"${SF}"; done
+bench_pctile_or_skip mitm "${SF}" mitm '{}'
+[ "$(cat "${CI_BENCH_RESULTS_DIR}"/mitm_*.jsonl | jq -r 'select(.metric=="mitm_p99_over_p50").value' | head -1)" != "" ] \
+    || fail "pctile helper did not emit ratio for 40 samples"
+SF2="${WORK}/few.txt"; printf '0.01\n0.02\n' >"${SF2}"
+bench_pctile_or_skip gateway "${SF2}" gw '{}'
+[ "$(cat "${CI_BENCH_RESULTS_DIR}"/gateway_*.jsonl | jq -r 'select(.status=="insufficient_samples").metric' | head -1)" != "" ] \
+    || fail "pctile helper should emit insufficient_samples for 2 samples"
+
 echo "PASS test_bench_common"
