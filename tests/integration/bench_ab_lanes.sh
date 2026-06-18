@@ -217,6 +217,18 @@ path_bytes() {
 
 emit() { echo "$1" >>"${CSV}"; note "bench_ab_lanes: ${1}"; }
 
+# Additive JSONL for the perf gate (spec §5.2). CSV stays the human source of truth.
+# shellcheck source=/dev/null
+. "${REPO_ROOT}/scripts/ci_benchmarks/bench_common.sh" 2>/dev/null || true
+_emit_cell_json() {   # _emit_cell_json <arm> <sched> <skew> <loss> <rep> <status> <goodput>
+    command -v bench_emit_json >/dev/null 2>&1 || return 0
+    local meta; meta="$(jq -cn --arg s "$2" --argjson sk "$3" --argjson lo "$4" \
+        --argjson rp "$5" '{scheduler:$s,skew_ms:$sk,loss_pct:$lo,rep:$rp}')"
+    if [ "$6" = "OK" ]; then bench_emit_json ab_lanes "$1_goodput" "$7"  mbps "${meta}" ok
+    else                     bench_emit_json ab_lanes "$1_goodput" 0     mbps "${meta}" skip
+    fi
+}
+
 # ── block arm: curl bulk download via SOCKS5 TCP -> STREAM lane ──────────────
 run_block_cell() {
     local skew="$1" loss="$2" rep="$3"
@@ -245,6 +257,7 @@ run_block_cell() {
         goodput="$(awk -v s="${speed}" 'BEGIN { if (s+0<=0) print ""; else printf "%.2f", s*8/1000000 }')"
     fi
     emit "block,minrtt,${skew},${loss},${rep},${status},${goodput},${elapsed},${pa},${pb},,$((d1-d0))"
+    _emit_cell_json block minrtt "${skew}" "${loss}" "${rep}" "${status}" "${goodput}"
 }
 
 # ── relay arm: picoquic H3 via udpsocks shim -> DATAGRAM lane ────────────────
@@ -319,6 +332,7 @@ run_relay_cell() {
         fi
     fi
     emit "relay,${sched},${skew},${loss},${rep},${status},${goodput},${elapsed},${pa},${pb},${lost},$((d1-d0))"
+    _emit_cell_json relay "${sched}" "${skew}" "${loss}" "${rep}" "${status}" "${goodput}"
 }
 
 # ── run ──────────────────────────────────────────────────────────────────────
