@@ -29,6 +29,7 @@ All harness binaries land in `build-fuzz/fuzz_*`.
 | `fuzz_socks5_feed` | `mq_socks5_feed` (greeting + request) |
 | `fuzz_socks5_udp_hdr` | `mq_socks5_parse_udp_hdr` |
 | `fuzz_http_connect` | `mq_http_connect_parse` |
+| `fuzz_clienthello` | `mq_clienthello_parse` (TLS ClientHello SNI/ALPN peek) |
 
 ## Run
 

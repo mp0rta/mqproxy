@@ -2,6 +2,13 @@ cmake_minimum_required(VERSION 3.10)
 project(mqproxy VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Warning gate for first-party code. The tree compiles clean under these; not
+# -Werror by default so a newer compiler's novel warning never blocks a distro
+# build (CI can add -Werror). xquic/BoringSSL are prebuilt + linked, not compiled
+# here, so these flags only touch mqproxy's own sources.
+add_compile_options(-Wall -Wextra)
+
 include(cmake/BuildSetup.cmake)
 include(GNUInstallDirs)
 if(MQPROXY_H3_CURL)
@@ -760,6 +767,8 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # distinct target name but emit it as the `mqproxy` binary.
     add_executable(mqproxy_cli cli/main.c)
     set_target_properties(mqproxy_cli PROPERTIES OUTPUT_NAME mqproxy)
+    # Surface project(VERSION) into the binary so `mqproxy --version` self-identifies.
+    target_compile_definitions(mqproxy_cli PRIVATE MQPROXY_VERSION="${PROJECT_VERSION}")
     if(MQPROXY_STATIC_XQUIC)
         # Self-contained binary for packaging: statically link xquic + the BoringSSL
         # it was built against (libxquic-static.a leaves ~118 BoringSSL SSL_*/EVP_AEAD_*/

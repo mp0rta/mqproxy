@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 /* nghttp2_link_probe — minimal link/runtime guard for the nghttp2 dependency
  * (Phase 7 Slice 3 Task 4).
  *

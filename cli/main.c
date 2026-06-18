@@ -60,6 +60,13 @@
 #include "transport/mq_transport.h"
 #include "util/mq_log.h"
 
+/* Release version string. Defined by CMake from project(VERSION) as a compile
+ * define (-DMQPROXY_VERSION=...); the fallback keeps non-CMake/ad-hoc builds
+ * compiling and makes an un-versioned build self-identify as such. */
+#ifndef MQPROXY_VERSION
+#  define MQPROXY_VERSION "0.0.0-unknown"
+#endif
+
 #if MQ_MITM_AVAILABLE
 /* Live MITM orchestrator (Phase 7 Slice 3). Compiled in only when the BoringSSL
  * archives are present (MQ_MITM_AVAILABLE=1); a no-archive build sets it to 0 and
@@ -109,6 +116,8 @@ usage_top(FILE *out)
                  "  server   Run the mqproxy server (terminates proxied TCP).\n"
                  "  client   Run the mqproxy client with local SOCKS5 / HTTP CONNECT\n"
                  "           ingress listeners.\n"
+                 "\n"
+                 "  -V, --version  Print the mqproxy version and exit.\n"
                  "\n"
                  "Run 'mqproxy <command> --help' for command-specific options.\n");
 }
@@ -1795,6 +1804,11 @@ main(int argc, char **argv)
     const char *sub = argv[1];
     if (strcmp(sub, "-h") == 0 || strcmp(sub, "--help") == 0) {
         usage_top(stdout);
+        return 0;
+    }
+    if (strcmp(sub, "-V") == 0 || strcmp(sub, "--version") == 0 ||
+        strcmp(sub, "version") == 0) {
+        printf("mqproxy %s\n", MQPROXY_VERSION);
         return 0;
     }
     if (strcmp(sub, "server") == 0) {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 #ifndef MQ_GW_METRICS_H
 #define MQ_GW_METRICS_H
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta
+
 #include "mqtest.h" /* MQ_CHECK / MQ_TEST_MAIN (NOT C assert — vacuous under -DNDEBUG) */
 #include "gateway/mq_gw_metrics.h"
 
