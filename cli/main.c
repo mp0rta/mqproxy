@@ -76,16 +76,6 @@
 #  include "mitm/mq_mitm_core.h"
 #endif
 
-/* Default cert/key for the server when --cert/--key are omitted, taken from the
- * test cert paths the build wires in (so the server is runnable out of the box
- * for local testing). Real deployments pass --cert/--key. */
-#ifndef TEST_CERT_FILE
-#  define TEST_CERT_FILE ""
-#endif
-#ifndef TEST_KEY_FILE
-#  define TEST_KEY_FILE ""
-#endif
-
 /* Flow-control windows (MQ_STREAM_WINDOW / MQ_CONN_WINDOW) are defined in
  * transport/mq_conn.h and applied by mq_client_new / mq_server_new via
  * mq_conn_apply_mp_settings — no CLI window flags in Phase 1. */
@@ -685,11 +675,8 @@ cmd_server(int argc, char **argv)
         usage_server(stderr);
         return 2;
     }
-    if (!cert) cert = TEST_CERT_FILE;
-    if (!key) key = TEST_KEY_FILE;
-    if (cert[0] == '\0' || key[0] == '\0') {
-        fprintf(stderr, "mqproxy server: --cert and --key are required (no bundled "
-                        "default in this build)\n\n");
+    if (!cert || cert[0] == '\0' || !key || key[0] == '\0') {
+        fprintf(stderr, "mqproxy server: --cert and --key are required\n\n");
         usage_server(stderr);
         return 2;
     }
