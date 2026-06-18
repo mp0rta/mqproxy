@@ -81,6 +81,13 @@ UDP relay carries non-QUIC UDP traffic (DNS, NTP, game, VoIP, app-specific UDP) 
 
 **Requirements:** `cmake`, `make`, a C11 compiler, `git`, `libevent`, `libcurl` dev headers (e.g. `libcurl4-openssl-dev` — the gateway's origin client), `libnghttp2` dev headers (`libnghttp2-dev` — HTTP/2 termination for the TLS MITM L7 path; the static binary additionally needs the bundled `libnghttp2.a`), and `golang` (BoringSSL's build needs Go). Network access is required on first build (BoringSSL is cloned).
 
+On Debian/Ubuntu:
+
+```bash
+sudo apt-get install -y build-essential cmake git \
+  libevent-dev libcurl4-openssl-dev libnghttp2-dev golang-go
+```
+
 > Runtime packaging dependency: the dynamically-linked binary depends on the nghttp2 shared library (Debian/Ubuntu package `libnghttp2-14`). The `-DMQPROXY_STATIC_XQUIC=ON` packaging binary instead statically links `libnghttp2.a` and so carries no runtime nghttp2 dependency.
 
 ```bash
