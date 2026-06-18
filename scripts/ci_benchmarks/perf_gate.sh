@@ -19,15 +19,22 @@ val() {
     echo "${ALL}" | jq -r --arg b "$1" --arg m "$2" \
         'map(select(.bench==$b and .metric==$m and (.status//"ok")=="ok")) | .[0].value // empty'
 }
-# value at a meta-joined cell (skew_ms==0 && loss_pct==0)
+# value at a meta-joined cell (skew_ms==0 && loss_pct==0), MEDIAN over reps.
+# NOTE: meta.skew_ms / meta.loss_pct MUST be JSON numbers (emitters use jq --argjson);
+# a string "0" would NOT match and would spuriously trip the "operand missing" hard-fail.
 val_cell() {
-    echo "${ALL}" | jq -r --arg b "$1" --arg m "$2" \
-        'map(select(.bench==$b and .metric==$m and (.status//"ok")=="ok"
-                    and .meta.skew_ms==0 and .meta.loss_pct==0)) | .[0].value // empty'
+    echo "${ALL}" | jq -r --arg b "$1" --arg m "$2" '
+        [ .[] | select(.bench==$b and .metric==$m and (.status//"ok")=="ok"
+                        and .meta.skew_ms==0 and .meta.loss_pct==0)
+              | .value ]
+        | sort
+        | if length==0 then empty else .[(length-1)/2 | floor] end'
 }
 status_of() {
     echo "${ALL}" | jq -r --arg b "$1" --arg m "$2" \
-        'map(select(.bench==$b and .metric==$m)) | .[0].status // "missing"'
+        'map(select(.bench==$b and .metric==$m
+                    and (.meta.skew_ms//0)==0 and (.meta.loss_pct//0)==0))
+         | .[0].status // "missing"'
 }
 record() { summary="${summary}\n$1"; }
 

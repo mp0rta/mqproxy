@@ -39,4 +39,18 @@ emit "$D" ab_lanes relay_goodput  70 ok '{"skew_ms":0,"loss_pct":0}'
 emit "$D" proxy_overhead tunnel_overhead_pct 95 ok '{}'   # > 60 ceiling, but warn
 bash "${GATE}" "$D"; rc=$?; [ "${rc}" -eq 0 ] || fail "D: warn must not fail, got ${rc}"
 
+# Case E: full profile, 3 reps; median block(50,134,130)=130 >= median relay(40,70,60)=60 => PASS
+E="$(mkdir_fixture)"
+for v in 50 134 130; do emit "$E" ab_lanes block_goodput "$v" ok '{"skew_ms":0,"loss_pct":0}'; done
+for v in 40 70 60;  do emit "$E" ab_lanes relay_goodput "$v" ok '{"skew_ms":0,"loss_pct":0}'; done
+bash "${GATE}" "$E"; rc=$?; [ "${rc}" -eq 0 ] || fail "E: median block>=relay should pass, got ${rc}"
+
+# Case F: full profile where MEDIAN flips a first-rep pass into a real fail.
+# block reps (200,40,40) median=40; relay reps (60,60,60) median=60 => 40<60 => HARD FAIL.
+# (With the old first-rep logic this would have PASSED on block rep1=200 => proves median is used.)
+F="$(mkdir_fixture)"
+for v in 200 40 40; do emit "$F" ab_lanes block_goodput "$v" ok '{"skew_ms":0,"loss_pct":0}'; done
+for v in 60 60 60;  do emit "$F" ab_lanes relay_goodput "$v" ok '{"skew_ms":0,"loss_pct":0}'; done
+bash "${GATE}" "$F"; rc=$?; [ "${rc}" -eq 1 ] || fail "F: median block<relay should hard-fail, got ${rc}"
+
 echo "PASS test_perf_gate"
