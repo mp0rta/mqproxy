@@ -1011,6 +1011,10 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     add_test(NAME test_bench_common
         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/integration/test_bench_common.sh)
 
+    # ---- Perf CI: perf_gate.sh logic tests over JSONL fixtures (no privilege) ----
+    add_test(NAME test_perf_gate
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/integration/test_perf_gate.sh)
+
     # ---- packaging / install ----
     configure_file(packaging/systemd/mqproxy-server@.service.in
         ${CMAKE_BINARY_DIR}/packaging/mqproxy-server@.service @ONLY)
