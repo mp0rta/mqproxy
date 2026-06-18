@@ -1015,6 +1015,19 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     add_test(NAME test_perf_gate
         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/integration/test_perf_gate.sh)
 
+    # ---- Perf CI: single-path proxy/tunnel-overhead benchmark (spec §5.1) ----
+    # Transfers a fixed 32MB object through the SOCKS5 listener over ONE QUIC path
+    # vs a direct (no-proxy) baseline under the same lo HTB+netem shaping; emits
+    # proxy/direct goodput + tunnel_overhead_pct. Needs root + tc-on-lo, so it
+    # self-skips (exit 77) unprivileged.
+    add_test(NAME bench_proxy_overhead
+        COMMAND ${CMAKE_COMMAND} -E env
+            MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+            MQPROXY_CERT=${MQ_CERT_FILE} MQPROXY_KEY=${MQ_KEY_FILE}
+            MQPROXY_ORIGIN_CERT=${MQ_ORIGIN_CERT_FILE} MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
+            bash ${CMAKE_SOURCE_DIR}/scripts/ci_benchmarks/bench_proxy_overhead.sh)
+    set_tests_properties(bench_proxy_overhead PROPERTIES SKIP_RETURN_CODE 77)
+
     # ---- packaging / install ----
     configure_file(packaging/systemd/mqproxy-server@.service.in
         ${CMAKE_BINARY_DIR}/packaging/mqproxy-server@.service @ONLY)
