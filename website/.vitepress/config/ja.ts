@@ -29,6 +29,7 @@ export const ja: LocaleSpecificConfig<DefaultTheme.Config> & { label: string; la
         {
           text: '動作モード',
           items: [
+            { text: 'TCP プロキシ', link: '/ja/guide/tcp-proxy' },
             { text: 'HTTP ゲートウェイ', link: '/ja/guide/http-gateway' },
             { text: 'UDP リレー', link: '/ja/guide/udp-relay' },
             { text: '透過キャプチャ', link: '/ja/guide/transparent-capture' },

@@ -29,6 +29,7 @@ export const en: LocaleSpecificConfig<DefaultTheme.Config> & { label: string; la
         {
           text: 'Operating Modes',
           items: [
+            { text: 'TCP Proxy', link: '/guide/tcp-proxy' },
             { text: 'HTTP Gateway', link: '/guide/http-gateway' },
             { text: 'UDP Relay', link: '/guide/udp-relay' },
             { text: 'Transparent Capture', link: '/guide/transparent-capture' },
