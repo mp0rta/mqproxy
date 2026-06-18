@@ -49,4 +49,4 @@ mqproxy-client ──────────────── MPQUIC (multipat
 
 A TCP flow arriving at the client (via SOCKS5 or HTTP CONNECT) opens a new MPQUIC bidirectional stream. The stream begins with a `CONNECT_TCP_REQUEST` (SOCKS5-style address types); the server dials the target and replies `CONNECT_TCP_RESPONSE`, after which the same stream relays raw bytes in both directions. Connection-level authentication happens once on a control stream before any flow is opened.
 
-Continue to [Building from Source](./building) and the [Quick Start](./quick-start), or jump to a specific mode: [HTTP Gateway](./http-gateway), [UDP Relay](./udp-relay), [Transparent Capture](./transparent-capture), [TLS MITM](./tls-mitm).
+Continue to [Building from Source](./building) and the [Quick Start](./quick-start), or jump to a specific mode: [TCP Proxy](./tcp-proxy), [HTTP Gateway](./http-gateway), [UDP Relay](./udp-relay), [Transparent Capture](./transparent-capture), [TLS MITM](./tls-mitm).
