@@ -341,6 +341,17 @@ mqproxy server --config /etc/mqproxy/edge1.conf
 
 See [`server.conf.example`](server.conf.example) and [`client.conf.example`](client.conf.example) for complete starting points.
 
+## Install from a `.deb`
+
+Prebuilt `amd64` and `arm64` packages are attached to each [GitHub Release](https://github.com/mp0rta/mqproxy/releases). The binary is self-contained (xquic + BoringSSL + nghttp2 statically linked), so it depends only on the system libevent/libcurl.
+
+```bash
+# pick the .deb for your architecture from the latest release
+sudo dpkg -i mqproxy_<version>_amd64.deb     # or _arm64.deb
+```
+
+The package installs `/usr/bin/mqproxy`, the `mqproxy-server@` / `mqproxy-client@` systemd template units, and creates the unprivileged `mqproxy` user plus `/etc/mqproxy` (via the bundled `sysusers.d`/`tmpfiles.d`, applied in the package's `postinst`). Continue from the per-instance config steps in [Install as a systemd service](#install-as-a-systemd-service) below — the configure/enable steps are identical; only the build-from-source steps are skipped.
+
 ## Install as a systemd service
 
 mqproxy ships systemd template units so each instance runs as a hardened, unprivileged service. Build a self-contained binary (xquic + BoringSSL statically linked, so the installed binary has no non-standard runtime deps) and install it:
