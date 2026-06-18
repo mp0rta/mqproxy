@@ -1047,6 +1047,21 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         set_tests_properties(bench_mitm_overhead PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
+    # ---- Perf CI: gateway req/s + p50/p99 latency benchmark (spec §5.4) ----
+    # Drives N independent POST /_mqproxy/fetch requests through the gateway fetch
+    # ingress, each on a FRESH connection (the ingress is HTTP/1.1 one-request-per-
+    # connection); captures per-request %{time_total} and emits req_per_sec plus
+    # p50/p99/ratio. Reuses the e2e_gateway startup plumbing (TLS origin + gateway
+    # client/server). Local-listener load — does NOT shape lo — but keeps the root
+    # guard for consistent CTest skip behavior; self-skips (exit 77) unprivileged.
+    add_test(NAME bench_gateway_load
+        COMMAND ${CMAKE_COMMAND} -E env
+            MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
+            MQPROXY_CERT=${MQ_CERT_FILE} MQPROXY_KEY=${MQ_KEY_FILE}
+            MQPROXY_ORIGIN_CERT=${MQ_ORIGIN_CERT_FILE} MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
+            bash ${CMAKE_SOURCE_DIR}/scripts/ci_benchmarks/bench_gateway_load.sh)
+    set_tests_properties(bench_gateway_load PROPERTIES SKIP_RETURN_CODE 77)
+
     # ---- packaging / install ----
     configure_file(packaging/systemd/mqproxy-server@.service.in
         ${CMAKE_BINARY_DIR}/packaging/mqproxy-server@.service @ONLY)
