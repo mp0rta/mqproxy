@@ -10,14 +10,14 @@ ways to handle a client's HTTP/3 traffic:
 - **block** — drop/block UDP 443 so the client falls back to HTTP/2 over TCP;
   the proxy **terminates** that TCP flow and carries it as **one MPQUIC STREAM**.
   A QUIC stream is reassembled by offset, so its STREAM frames can be split across
-  paths and still arrive correct → *within-stream* multipath aggregation.
+  paths and still arrive correctly → *within-stream* multipath aggregation.
 - **relay** — carry the client's QUIC packets **opaquely** over the MPQUIC
   **DATAGRAM** lane (CONNECT-UDP / SOCKS5 UDP ASSOCIATE style). The proxy never
   decrypts; the inner end-to-end QUIC owns reliability and congestion control and
   has no idea multipath exists underneath it.
 - **MITM** — terminate the client's QUIC itself (decrypt TLS), then carry each
   inner H3 request as its **own MPQUIC STREAM**, the same per-stream aggregation
-  block gets — but *without* forcing a TCP fallback, so it works even on
+  that block gets — but *without* forcing a TCP fallback, so it works even on
   un-block-able H3. This is the strongest option in principle, but it requires
   intercepting TLS (a trusted cert on the client) and so **breaks transparency**;
   it is also the most involved to build. **We defer it** and measure only the two
@@ -92,9 +92,9 @@ not the protocol.)
 | `relay,minrtt` | HTTP/3 (picoquicdemo) | opaque **DATAGRAM** relay via `udpsocks --listen` shim | spread datagrams per-packet across both paths |
 | `relay,backup` | HTTP/3 (picoquicdemo) | opaque DATAGRAM relay | pin to the primary path (secondary marked STANDBY) |
 
-¹ The block arm uses HTTP/1.1, not H2, as a stand-in for the "fall back off H3" case.
-The workload is a single bulk download, so H1 vs H2 makes no difference here — H2's
-head-of-line advantage only appears under *concurrent* requests, which is out of scope
+¹ The block arm uses HTTP/1.1, not H2, as a stand-in for the "fall back from H3" case.
+The workload is a single bulk download, so H1 vs H2 makes no difference here — H1.1's
+head-of-line cost only appears under *concurrent* requests, which is out of scope
 for this run (see §5).
 
 **Inner stack = picoquic, deliberately.** The experimental subject is how an inner,
@@ -226,7 +226,7 @@ These bound how far the verdict generalises. State them whenever citing this.
 
 ## 6. Design decision (what this fed)
 
-For the OMR integration, H3 handling is now decided by data, not folklore:
+mqproxy's H3 handling policy is now decided by data, not folklore:
 
 1. **Default = block.** Block UDP/443 → client falls back to H2/TCP → mqproxy
    terminates and restreams → real aggregation, resilient to loss/skew. Best in every
