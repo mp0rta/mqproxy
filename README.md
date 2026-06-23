@@ -19,6 +19,8 @@ The two are complementary and can coexist: run mqvpn for whole-device transparen
 
 Because a QUIC **stream** is reassembled by offset, the STREAM frames of a single stream can be spread across multiple paths while correctness is preserved. So a single large download/upload — carried as one MPQUIC stream — gets *within-stream* multipath aggregation. This is a structural advantage over carrying inner traffic in DATAGRAMs (the mqvpn/MASQUE path), where flow pinning forces a single path and not-pinning risks inner-QUIC reordering.
 
+**Measured:** in a 2-path 100 Mbit/s testbed the TCP proxy aggregates even a *single* TCP stream — **1.81× single-path at `-P 1`**, 1.93× at `-P 16` — whereas a flow-pinned L3 datagram tunnel needs multiple parallel flows before its second path engages. Full matrix (`-P 1…16`, symmetric + asymmetric, vs mqvpn `wlb`/`minrtt`) in the [TCP aggregation benchmark](docs/report/2026-06-23-single-tcp-aggregation-mqvpn-vs-mqproxy.md).
+
 ## Operating Modes
 
 | Mode | Mapping | |
