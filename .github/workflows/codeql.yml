@@ -29,7 +29,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libevent-dev libcurl4-openssl-dev golang
+        run: sudo apt-get update && sudo apt-get install -y cmake libevent-dev libcurl4-openssl-dev libnghttp2-dev golang
 
       # --- BoringSSL + xquic: mirror ci.yml `build` so mqproxy compiles for
       # extraction. Same cache keys as ci.yml to ride the existing caches. ---
