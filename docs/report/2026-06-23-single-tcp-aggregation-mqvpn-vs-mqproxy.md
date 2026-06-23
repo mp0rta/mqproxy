@@ -172,8 +172,10 @@ few percent.
 sudo REPEAT=5 tests/integration/bench_single_tcp_aggregation.sh
 ```
 
-CSV → `bench_results/single_tcp_aggregation_<epoch>.csv`, figures →
-`docs/report/figures/`. Wall-clock ≈ 2.5 h for the 6 × 5 × 2 × 5 matrix.
+CSV →
+[`docs/report/bench_results/2026-06-23-single-tcp-aggregation.csv`](bench_results/2026-06-23-single-tcp-aggregation.csv),
+figures → `docs/report/figures/`.
+Wall-clock ≈ 2.5 h for the 6 × 5 × 2 × 5 matrix.
 
 ## Caveats
 
