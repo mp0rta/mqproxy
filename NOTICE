@@ -1,0 +1,21 @@
+mqproxy
+Copyright (c) 2026 mp0rta and mqproxy contributors
+
+This product includes software developed as part of the mqproxy project
+(https://github.com/mp0rta/mqproxy). Licensed under the Apache License,
+Version 2.0; see the LICENSE file.
+
+Third-party software included:
+
+  * xquic (mp0rta fork of alibaba/xquic)
+    Copyright (c) 2022, Alibaba Group Holding Limited
+    Apache License 2.0 — see third_party/xquic/LICENSE
+
+  * BoringSSL (https://boringssl.googlesource.com/boringssl)
+    Copyright (c) 1998-2011 The OpenSSL Project. All rights reserved.
+    ISC-style license — see third_party/xquic/third_party/boringssl/LICENSE
+
+  * nghttp2 (https://nghttp2.org)
+    Copyright (c) 2012, 2014, 2015, 2016 Tatsuhiro Tsujikawa
+    Copyright (c) 2012, 2014, 2015, 2016 nghttp2 contributors
+    MIT License — see third_party/nghttp2.LICENSE
