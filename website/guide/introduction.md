@@ -35,7 +35,15 @@ Because a QUIC **stream** is reassembled by offset, the STREAM frames of a singl
 | **Transparent TCP Capture** | kernel-redirected TCP → opaque MPQUIC stream | ✅ |
 | **TLS MITM Ingress** | terminate browser TLS (forged leaf) → H2 → Gateway tunnel | ✅ optional |
 
-TCP Proxy Mode does **not** terminate TLS: for HTTPS, TLS stays end-to-end between the application and the origin. Only the WAN segment between mqproxy-client and mqproxy-server is carried over MPQUIC.
+**What each mode gives you:**
+
+- **TCP Proxy** — zero app changes, end-to-end TLS preserved (mqproxy never sees plaintext). Each TCP connection becomes one MPQUIC stream, so even a single download aggregates bandwidth across all paths. Separate TCP connections get separate MPQUIC streams and do not block each other. The trade-off: when a browser multiplexes many HTTP/2 requests over a *single* TCP connection, all those requests share one MPQUIC stream, so a retransmission within that stream stalls them all (the same transport-layer head-of-line blocking that HTTP/3 was designed to eliminate).
+- **TLS MITM** — opt-in TLS termination lifts the proxy to L7 visibility. Each HTTP/2 request stream is mapped to its *own* MPQUIC stream, so a loss on one request does not block others — your HTTP/2 traffic effectively gains HTTP/3-class stream independence, plus multipath aggregation that even native HTTP/3 does not provide. Requires installing the operator's CA on the device.
+- **HTTP Gateway** — an explicit request-delegation API (`POST /_mqproxy/fetch`); each request is one H3 stream with independent multipath aggregation. Useful for SDKs and server-to-server calls that can set `X-Mq-*` headers directly, without SOCKS5 or transparent capture.
+- **UDP Relay** — carries non-QUIC UDP (DNS, game, VoIP) over MPQUIC DATAGRAMs, preserving the lossy/unordered semantics applications expect. Packets ride the multipath tunnel but are not retransmitted — latency-sensitive traffic stays latency-sensitive.
+- **Transparent Capture** (without `--mitm`) — kernel-level redirect with no app config; same aggregation and end-to-end TLS guarantees as TCP Proxy mode, but apps need no SOCKS5/proxy configuration at all.
+
+TCP Proxy and Transparent Capture (without `--mitm`) do **not** terminate TLS: for HTTPS, TLS stays end-to-end between the application and the origin. Only the WAN segment between mqproxy-client and mqproxy-server is carried over MPQUIC.
 
 ## How It Works
 
