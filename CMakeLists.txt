@@ -1026,14 +1026,17 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     install(FILES server.conf.example client.conf.example
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
-    # License bundling (Apache-2.0 §4(a)). The binary statically links xquic AND
-    # BoringSSL, so both LICENSEs are mandatory. OPTIONAL only so CI jobs that skip
-    # the xquic submodule don't fail the install rule.
+    # License bundling (Apache-2.0 §4(a) + third-party notices). The packaging
+    # binary statically links xquic, BoringSSL, and nghttp2, so bundle their
+    # notices alongside mqproxy's own license. OPTIONAL only so CI jobs that skip
+    # fetched third-party sources don't fail the install rule.
     install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
     install(FILES third_party/xquic/LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third-party RENAME xquic.txt OPTIONAL)
     install(FILES third_party/xquic/third_party/boringssl/LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third-party RENAME boringssl.txt OPTIONAL)
+    install(FILES third_party/nghttp2.LICENSE
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third-party RENAME nghttp2.txt)
 
     # Verify the install layout + static self-containment. SKIPs (77) unless the
     # build was configured with -DCMAKE_INSTALL_PREFIX=/usr (packaging build).

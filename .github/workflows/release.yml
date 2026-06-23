@@ -105,15 +105,15 @@ jobs:
         run: cd build-pkg && cpack -G DEB
 
       - name: Verify license files in deb
-        # Release-side Apache-2.0 §4(a) gate. OPTIONAL install rules silently
-        # skip missing third-party LICENSEs; release builds DO check out
-        # submodules, so all 3 must be present. mqproxy has NO NOTICE -> expect 3.
+        # Release-side license notice gate. OPTIONAL install rules silently
+        # skip fetched third-party LICENSEs; release builds DO check out/build
+        # them, so mqproxy + xquic + BoringSSL + nghttp2 must be present.
         run: |
           set -e
           deb=$(ls build-pkg/mqproxy_*.deb)
-          expected=3
+          expected=4
           found=$(dpkg-deb -c "$deb" \
-                  | grep -cE 'usr/share/doc/mqproxy/(LICENSE|third-party/(xquic|boringssl)\.txt)$' \
+                  | grep -cE 'usr/share/doc/mqproxy/(LICENSE|third-party/(xquic|boringssl|nghttp2)\.txt)$' \
                   || true)
           if [ "$found" -ne "$expected" ]; then
             echo "::error::deb missing license files (found $found of $expected)"

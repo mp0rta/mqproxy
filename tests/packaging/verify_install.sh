@@ -28,7 +28,10 @@ for f in \
   usr/lib/tmpfiles.d/mqproxy.conf \
   usr/share/doc/mqproxy/server.conf.example \
   usr/share/doc/mqproxy/client.conf.example \
-  usr/share/doc/mqproxy/LICENSE ; do
+  usr/share/doc/mqproxy/LICENSE \
+  usr/share/doc/mqproxy/third-party/xquic.txt \
+  usr/share/doc/mqproxy/third-party/boringssl.txt \
+  usr/share/doc/mqproxy/third-party/nghttp2.txt ; do
   [ -e "$STAGE/$f" ] || { echo "MISSING: $f"; fail=1; }
 done
 
