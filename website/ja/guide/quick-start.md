@@ -3,8 +3,10 @@
 サーバーとクライアントをローカルで動かし、クライアントの SOCKS5 イングレス経由で TCP トラフィックを流します。
 
 ```bash
-# サーバー — UDP :4433 で MPQUIC を待ち受け。デフォルトで同梱のテスト証明書を使用。
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123
+# サーバー — UDP :4433 で MPQUIC を待ち受け。--cert/--key は必須。
+# リポジトリには tests/certs にローカル用の自己署名テスト証明書が同梱されています。
+./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+  --cert tests/certs/test.crt --key tests/certs/test.key
 
 # クライアント — サーバーへ接続し、ローカルの SOCKS5 リスナーを :1080 で公開。
 ./build/mqproxy client \
@@ -19,7 +21,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 ```
 
 ::: warning
-同梱のテスト証明書はローカルテスト専用です。実運用では独自の `--cert`/`--key` と強力な `--token` を渡してください。
+`tests/certs` のテスト証明書はローカルテスト専用です。実運用では独自の `--cert`/`--key` と強力な `--token` を渡してください。
 :::
 
 ## マルチパスアグリゲーション

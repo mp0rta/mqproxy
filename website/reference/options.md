@@ -12,7 +12,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 |---|---|
 | `--listen <ip:port>` | **(required)** UDP address to accept MPQUIC connections on |
 | `--token <token>` | **(required)** Shared auth token clients must present |
-| `--cert <path>` / `--key <path>` | TLS cert/key (PEM); defaults to the bundled test cert |
+| `--cert <path>` / `--key <path>` | **(required)** TLS cert/key (PEM). The repo ships a self-signed test cert under `tests/certs` for local use. |
 | `--max-conns <N>` | Cap on simultaneous QUIC connections (default 16; `0` = unlimited). Excess inbound connections are refused (`CONNECTION_REFUSED`) — a pre-auth DoS guard. |
 | `--cc <algo>` | Congestion control: `bbr` (default) \| `bbr2` \| `cubic` |
 | `--scheduler <s>` | Multipath scheduler: `minrtt` (default) \| `backup` \| `wlb` |
@@ -124,5 +124,5 @@ At least one client ingress flag (`--socks5`, `--http-connect`, `--gateway`, or 
 | `--ignore-hosts <a,b,c>` | Same as `--ignore-host` but a comma-separated list. CLI and `[Mitm] IgnoreHosts` config entries union. |
 
 ::: warning
-The bundled test certificate is for local testing only. For real deployments, pass your own `--cert`/`--key` and a strong `--token`.
+The test certificate under `tests/certs` is for local testing only. For real deployments, pass your own `--cert`/`--key` and a strong `--token`.
 :::

@@ -118,8 +118,10 @@ cmake --build build -j"$(nproc)"
 Run a server and a client locally, then send TCP traffic through the client's SOCKS5 ingress.
 
 ```bash
-# Server — listens for MPQUIC on UDP :4433, uses the bundled test cert by default.
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123
+# Server — listens for MPQUIC on UDP :4433. --cert/--key are required;
+# the repo ships a self-signed test cert under tests/certs for local use.
+./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+  --cert tests/certs/test.crt --key tests/certs/test.key
 
 # Client — connects to the server, exposes a local SOCKS5 listener on :1080.
 ./build/mqproxy client \
@@ -413,7 +415,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 |---|---|
 | `--listen <ip:port>` | **(required)** UDP address to accept MPQUIC connections on |
 | `--token <token>` | **(required)** Shared auth token clients must present |
-| `--cert <path>` / `--key <path>` | TLS cert/key (PEM); defaults to the bundled test cert |
+| `--cert <path>` / `--key <path>` | **(required)** TLS cert/key (PEM). The repo ships a self-signed test cert under `tests/certs` for local use. |
 | `--max-conns <N>` | Cap on simultaneous QUIC connections (default 16; `0` = unlimited). Excess inbound connections are refused (`CONNECTION_REFUSED`) — a pre-auth DoS guard. |
 | `--cc <algo>` | Congestion control: `bbr` (default) \| `bbr2` \| `cubic` |
 | `--scheduler <s>` | Multipath scheduler: `minrtt` (default) \| `backup` \| `wlb` |
@@ -522,7 +524,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | `--ignore-host <host>` | Host to splice **opaquely** (bypass MITM — relay raw TLS so the origin's real cert reaches the client; for cert-pinned apps). **Repeatable.** Match is exact or leading-dot suffix on the normalized SNI. |
 | `--ignore-hosts <a,b,c>` | Same as `--ignore-host` but a comma-separated list. CLI and `[Mitm] IgnoreHosts` config entries union. |
 
-> The bundled test certificate is for local testing only. For real deployments, pass your own `--cert`/`--key` and a strong `--token`.
+> The test certificate under `tests/certs` is for local testing only. For real deployments, pass your own `--cert`/`--key` and a strong `--token`.
 
 ## Testing
 
@@ -547,6 +549,12 @@ mqproxy uses a **trusted proxy** model: mqproxy-client, mqproxy-server, and the 
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+## Disclaimer
+
+mqproxy is licensed under the Apache License 2.0 and is provided "AS IS", without warranties or conditions of any kind.
+
+Use of mqproxy is at your own risk. Users are solely responsible for validating its suitability, security, and operational safety, especially in production or commercial environments.
 
 ## Acknowledgments
 

@@ -12,7 +12,7 @@
 |---|---|
 | `--listen <ip:port>` | **(必須)** MPQUIC コネクションを受け付ける UDP アドレス |
 | `--token <token>` | **(必須)** クライアントが提示すべき共有認証トークン |
-| `--cert <path>` / `--key <path>` | TLS 証明書／鍵 (PEM)。デフォルトは同梱のテスト証明書 |
+| `--cert <path>` / `--key <path>` | **（必須）** TLS 証明書／鍵 (PEM)。リポジトリには `tests/certs` にローカル用の自己署名テスト証明書が同梱されています。 |
 | `--max-conns <N>` | 同時 QUIC コネクション数の上限 (デフォルト 16、`0` = 無制限)。超過した受信コネクションは拒否されます (`CONNECTION_REFUSED`) — 認証前 DoS ガード。 |
 | `--cc <algo>` | 輻輳制御: `bbr` (デフォルト) \| `bbr2` \| `cubic` |
 | `--scheduler <s>` | マルチパススケジューラ: `minrtt` (デフォルト) \| `backup` \| `wlb` |
@@ -124,5 +124,5 @@
 | `--ignore-hosts <a,b,c>` | `--ignore-host` と同じだがカンマ区切りリスト。CLI と `[Mitm] IgnoreHosts` 設定エントリは和集合になる。 |
 
 ::: warning
-同梱のテスト証明書はローカルテスト専用です。実運用では独自の `--cert`/`--key` と強力な `--token` を渡してください。
+`tests/certs` のテスト証明書はローカルテスト専用です。実運用では独自の `--cert`/`--key` と強力な `--token` を渡してください。
 :::
