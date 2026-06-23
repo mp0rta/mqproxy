@@ -21,7 +21,14 @@ Cert-pinned hosts can be excluded with `--ignore-host(s)`, which splices them op
 
 Apache-2.0. See [LICENSE](https://github.com/mp0rta/mqproxy/blob/main/LICENSE).
 
+## Disclaimer
+
+mqproxy is licensed under the Apache License 2.0 and is provided "AS IS", without warranties or conditions of any kind.
+
+Use of mqproxy is at your own risk. Users are solely responsible for validating its suitability, security, and operational safety, especially in production or commercial environments.
+
 ## Acknowledgments
 
 - [XQUIC](https://github.com/alibaba/xquic) (Alibaba) — the QUIC/MPQUIC transport, via the [mp0rta fork](https://github.com/mp0rta/xquic).
 - [BoringSSL](https://boringssl.googlesource.com/boringssl) — TLS backend.
+- [nghttp2](https://nghttp2.org/) — HTTP/2 framing for the TLS MITM ingress.

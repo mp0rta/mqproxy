@@ -21,7 +21,9 @@ Because a QUIC **stream** is reassembled by offset, the STREAM frames of a singl
 
 **Measured:** in a 2-path 100 Mbit/s testbed the TCP proxy aggregates even a *single* TCP stream — **1.81× single-path at `-P 1`**, 1.93× at `-P 16` — whereas a flow-pinned L3 datagram tunnel needs multiple parallel flows before its second path engages. Full matrix (`-P 1…16`, symmetric + asymmetric, vs mqvpn `wlb`/`minrtt`) in the [TCP aggregation benchmark](docs/report/2026-06-23-single-tcp-aggregation-mqvpn-vs-mqproxy.md).
 
-![asymmetric](docs/report/figures/2026-06-23-single-tcp-asymmetric.png)
+![Single-TCP aggregation across two paths: mqproxy-tcp roughly doubles the single-path goodput](docs/report/figures/2026-06-23-single-tcp-simple.png)
+
+*`direct-single` = no tunnel, one path (the baseline); `mqproxy-single` = mqproxy over a single path (tunnel overhead only); `mqproxy-tcp` = mqproxy aggregating one TCP stream across both paths.*
 
 ## Operating Modes
 
@@ -560,3 +562,4 @@ Use of mqproxy is at your own risk. Users are solely responsible for validating 
 
 - [XQUIC](https://github.com/alibaba/xquic) (Alibaba) — the QUIC/MPQUIC transport, via the [mp0rta fork](https://github.com/mp0rta/xquic).
 - [BoringSSL](https://boringssl.googlesource.com/boringssl) — TLS backend.
+- [nghttp2](https://nghttp2.org/) — HTTP/2 framing for the TLS MITM ingress.

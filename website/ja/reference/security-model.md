@@ -21,7 +21,14 @@ HTTP リクエスト実行ゲートウェイは明示的な委譲モデルです
 
 Apache-2.0。[LICENSE](https://github.com/mp0rta/mqproxy/blob/main/LICENSE) を参照してください。
 
+## 免責事項
+
+mqproxy は Apache License 2.0 の下でライセンスされ、現状有姿（"AS IS"）で提供され、いかなる種類の保証も条件も伴いません。
+
+mqproxy の利用は自己責任で行ってください。その適合性・セキュリティ・運用上の安全性の検証は、特に本番環境や商用環境において、利用者が単独で責任を負うものとします。
+
 ## 謝辞
 
 - [XQUIC](https://github.com/alibaba/xquic) (Alibaba) — QUIC/MPQUIC トランスポート。[mp0rta フォーク](https://github.com/mp0rta/xquic) 経由。
 - [BoringSSL](https://boringssl.googlesource.com/boringssl) — TLS バックエンド。
+- [nghttp2](https://nghttp2.org/) — TLS MITM イングレスの HTTP/2 フレーミング。
