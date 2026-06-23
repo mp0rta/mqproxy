@@ -9,7 +9,7 @@
 ## 2 つのカーネルキャプチャ方式
 
 - **`redirect`（デフォルト）** — `nft nat OUTPUT`（REDIRECT ターゲット）を使用します。*ローカルマシン自身の外向き* TCP をキャプチャします。ソケットに `IP_TRANSPARENT` を必要としません。mqproxy と高速化対象のアプリが同じホストで動く場合に適したモードです。
-- **`tproxy`** — `nft mangle PREROUTING`（TPROXY ターゲット）を、待ち受けソケットの `IP_TRANSPARENT` とともに使用します。ルータゲートウェイのように、下流の LAN ホストからの *転送* トラフィックをキャプチャします。ローカル TCP スタックの応答パケットを正しいインターフェースから送り返すために、`fwmark` + ポリシールーティングテーブルが必要です。これは標準的な Linux TPROXY セットアップで、パケットをマークしてリスナーへ誘導できる任意のルータ／ポリシールーティングスタックと組み合わせられます — OpenMPTCProuter（OMR）はそうしたデプロイの一例であって、必須ではありません。
+- **`tproxy`** — `nft mangle PREROUTING`（TPROXY ターゲット）を、待ち受けソケットの `IP_TRANSPARENT` とともに使用します。ルータゲートウェイのように、下流の LAN ホストからの *転送* トラフィックをキャプチャします。ローカル TCP スタックの応答パケットを正しいインターフェースから送り返すために、`fwmark` + ポリシールーティングテーブルが必要です。これは標準的な Linux TPROXY セットアップで、パケットをマークしてリスナーへ誘導できる任意のルータ／ポリシールーティングスタックと組み合わせられます。
 
 ## 単一ホストのクイックスタート（redirect モード、`--setup-redirect`）
 
@@ -33,7 +33,7 @@ curl https://example.com/
 
 ## ルータ／ゲートウェイのデプロイ（tproxy モード）
 
-ルータスタックが既にファイアウォールとポリシールーティングのルールを所有している場合（例: OpenMPTCProuter、または `PREROUTING` に `TPROXY` ターゲットを置きパケットをマークする任意のセットアップ）、`--setup-redirect` を OFF のままにし、mqproxy にはリスナーの提供だけをさせます — その `--tproxy-fwmark`/`--tproxy-table` をルールが使う値に合わせてください。
+ルータスタックが既にファイアウォールとポリシールーティングのルールを所有している場合（`PREROUTING` に `TPROXY` ターゲットを置きパケットをマークする任意のセットアップ）、`--setup-redirect` を OFF のままにし、mqproxy にはリスナーの提供だけをさせます — その `--tproxy-fwmark`/`--tproxy-table` をルールが使う値に合わせてください。
 
 ```bash
 sudo ./build/mqproxy client \

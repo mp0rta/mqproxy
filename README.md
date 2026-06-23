@@ -213,7 +213,7 @@ Transparent capture redirects TCP connections at the kernel level directly into 
 Two kernel capture mechanisms are supported:
 
 - **`redirect` (default)** — uses `nft nat OUTPUT` (REDIRECT target). Captures the *local machine's own outbound* TCP. Does not need `IP_TRANSPARENT` on the socket. This is the right mode when mqproxy and the apps being accelerated run on the same host.
-- **`tproxy`** — uses `nft mangle PREROUTING` (TPROXY target) with `IP_TRANSPARENT` on the listening socket. Captures *forwarded* traffic from downstream LAN hosts, as on a router gateway. Requires `fwmark` + a policy-routing table so the local TCP stack's reply packets are routed back out the right interface. This is the standard Linux TPROXY setup; it composes with any router/policy-routing stack that can mark packets and steer them to the listener — OpenMPTCProuter (OMR) is one such deployment, not a requirement.
+- **`tproxy`** — uses `nft mangle PREROUTING` (TPROXY target) with `IP_TRANSPARENT` on the listening socket. Captures *forwarded* traffic from downstream LAN hosts, as on a router gateway. Requires `fwmark` + a policy-routing table so the local TCP stack's reply packets are routed back out the right interface. This is the standard Linux TPROXY setup; it composes with any router/policy-routing stack that can mark packets and steer them to the listener.
 
 **Single-host quickstart (redirect mode, `--setup-redirect`):**
 
@@ -237,7 +237,7 @@ curl https://example.com/
 
 **Router/gateway deployment (tproxy mode):**
 
-When the router stack already owns the firewall and policy-routing rules (e.g. OpenMPTCProuter, or any setup that places a `TPROXY` target in `PREROUTING` and marks the packets), leave `--setup-redirect` OFF and let mqproxy just provide the listener — match its `--tproxy-fwmark`/`--tproxy-table` to whatever the rules use:
+When the router stack already owns the firewall and policy-routing rules (any setup that places a `TPROXY` target in `PREROUTING` and marks the packets), leave `--setup-redirect` OFF and let mqproxy just provide the listener — match its `--tproxy-fwmark`/`--tproxy-table` to whatever the rules use:
 
 ```bash
 sudo ./build/mqproxy client \
@@ -511,11 +511,11 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | Flag | Description |
 |---|---|
 | `--tproxy <ip:port>` | Local TCP address for the transparent capture ingress (redirect or tproxy mode). Enables transparent capture; at least one of `--socks5`, `--http-connect`, `--gateway`, or `--tproxy` is required. |
-| `--tproxy-mode redirect\|tproxy` | Kernel capture mechanism (default: `redirect`). `redirect` — `nft nat OUTPUT` REDIRECT target; captures the local machine's own outbound TCP; no `IP_TRANSPARENT` on the socket. `tproxy` — `nft mangle PREROUTING` TPROXY target; captures forwarded LAN traffic on a router/gateway (standard Linux TPROXY; works with any policy-routing stack, e.g. OMR); needs `CAP_NET_ADMIN` for `IP_TRANSPARENT`. |
+| `--tproxy-mode redirect\|tproxy` | Kernel capture mechanism (default: `redirect`). `redirect` — `nft nat OUTPUT` REDIRECT target; captures the local machine's own outbound TCP; no `IP_TRANSPARENT` on the socket. `tproxy` — `nft mangle PREROUTING` TPROXY target; captures forwarded LAN traffic on a router/gateway (standard Linux TPROXY; works with any policy-routing stack); needs `CAP_NET_ADMIN` for `IP_TRANSPARENT`. |
 | `--tproxy-fwmark <n>` | Packet mark for policy routing in tproxy mode (default: 1; tproxy mode only). |
 | `--tproxy-table <n>` | IP routing table for tproxy reply routing (default: 100; tproxy mode only). |
 | `--tproxy-dport <port>` | TCP destination port the `--setup-redirect` rule captures (default: 443). |
-| `--setup-redirect` | Install `nft`/`ip rule` firewall rules on start and remove them on exit (requires root or `CAP_NET_ADMIN`; off by default). For single-host self-contained use; leave OFF on a router/gateway and let the router stack (e.g. OMR) manage the rules. |
+| `--setup-redirect` | Install `nft`/`ip rule` firewall rules on start and remove them on exit (requires root or `CAP_NET_ADMIN`; off by default). For single-host self-contained use; leave OFF on a router/gateway and let the router stack manage the rules. |
 | `--tproxy-uid <uid>` | UID whose outbound traffic is exempt from redirection (default: `geteuid()` of the process). Used for loop avoidance — mqproxy's own tunnel connections are not re-captured into itself. |
 
 ### TLS MITM mode (client-only)

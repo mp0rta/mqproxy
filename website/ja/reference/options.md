@@ -100,11 +100,11 @@
 | フラグ | 説明 |
 |---|---|
 | `--tproxy <ip:port>` | 透過キャプチャイングレス (redirect または tproxy モード) のローカル TCP アドレス。透過キャプチャを有効化する。`--socks5`、`--http-connect`、`--gateway`、`--tproxy` のうち少なくとも 1 つが必要。 |
-| `--tproxy-mode redirect\|tproxy` | カーネルキャプチャ機構 (デフォルト: `redirect`)。`redirect` — `nft nat OUTPUT` REDIRECT ターゲット。ローカルマシン自身の外向き TCP をキャプチャ。ソケットに `IP_TRANSPARENT` 不要。`tproxy` — `nft mangle PREROUTING` TPROXY ターゲット。ルータ／ゲートウェイ上で転送 LAN トラフィックをキャプチャ (標準的な Linux TPROXY。任意のポリシールーティングスタック、例: OMR で動作)。`IP_TRANSPARENT` のため `CAP_NET_ADMIN` が必要。 |
+| `--tproxy-mode redirect\|tproxy` | カーネルキャプチャ機構 (デフォルト: `redirect`)。`redirect` — `nft nat OUTPUT` REDIRECT ターゲット。ローカルマシン自身の外向き TCP をキャプチャ。ソケットに `IP_TRANSPARENT` 不要。`tproxy` — `nft mangle PREROUTING` TPROXY ターゲット。ルータ／ゲートウェイ上で転送 LAN トラフィックをキャプチャ (標準的な Linux TPROXY。任意のポリシールーティングスタックで動作)。`IP_TRANSPARENT` のため `CAP_NET_ADMIN` が必要。 |
 | `--tproxy-fwmark <n>` | tproxy モードでのポリシールーティング用パケットマーク (デフォルト: 1。tproxy モードのみ)。 |
 | `--tproxy-table <n>` | tproxy 応答ルーティング用の IP ルーティングテーブル (デフォルト: 100。tproxy モードのみ)。 |
 | `--tproxy-dport <port>` | `--setup-redirect` ルールがキャプチャする TCP 宛先ポート (デフォルト: 443)。 |
-| `--setup-redirect` | 起動時に `nft`/`ip rule` のファイアウォールルールをインストールし終了時に削除 (root または `CAP_NET_ADMIN` が必要。デフォルト OFF)。単一ホストの自己完結用途向け。ルータ／ゲートウェイでは OFF のままにし、ルータスタック (例: OMR) にルールを管理させる。 |
+| `--setup-redirect` | 起動時に `nft`/`ip rule` のファイアウォールルールをインストールし終了時に削除 (root または `CAP_NET_ADMIN` が必要。デフォルト OFF)。単一ホストの自己完結用途向け。ルータ／ゲートウェイでは OFF のままにし、ルータスタックにルールを管理させる。 |
 | `--tproxy-uid <uid>` | 外向きトラフィックがリダイレクトから除外される UID (デフォルト: プロセスの `geteuid()`)。ループ回避に使用 — mqproxy 自身のトンネルコネクションが自分自身に再キャプチャされないように。 |
 
 ## TLS MITM モード（クライアント専用）

@@ -9,7 +9,7 @@ Transparent capture installs kernel firewall rules, so it needs root or `CAP_NET
 ## Two kernel capture mechanisms
 
 - **`redirect` (default)** — uses `nft nat OUTPUT` (REDIRECT target). Captures the *local machine's own outbound* TCP. Does not need `IP_TRANSPARENT` on the socket. This is the right mode when mqproxy and the apps being accelerated run on the same host.
-- **`tproxy`** — uses `nft mangle PREROUTING` (TPROXY target) with `IP_TRANSPARENT` on the listening socket. Captures *forwarded* traffic from downstream LAN hosts, as on a router gateway. Requires `fwmark` + a policy-routing table so the local TCP stack's reply packets are routed back out the right interface. This is the standard Linux TPROXY setup; it composes with any router/policy-routing stack that can mark packets and steer them to the listener — OpenMPTCProuter (OMR) is one such deployment, not a requirement.
+- **`tproxy`** — uses `nft mangle PREROUTING` (TPROXY target) with `IP_TRANSPARENT` on the listening socket. Captures *forwarded* traffic from downstream LAN hosts, as on a router gateway. Requires `fwmark` + a policy-routing table so the local TCP stack's reply packets are routed back out the right interface. This is the standard Linux TPROXY setup; it composes with any router/policy-routing stack that can mark packets and steer them to the listener.
 
 ## Single-host quickstart (redirect mode, `--setup-redirect`)
 
@@ -33,7 +33,7 @@ curl https://example.com/
 
 ## Router/gateway deployment (tproxy mode)
 
-When the router stack already owns the firewall and policy-routing rules (e.g. OpenMPTCProuter, or any setup that places a `TPROXY` target in `PREROUTING` and marks the packets), leave `--setup-redirect` OFF and let mqproxy just provide the listener — match its `--tproxy-fwmark`/`--tproxy-table` to whatever the rules use:
+When the router stack already owns the firewall and policy-routing rules (any setup that places a `TPROXY` target in `PREROUTING` and marks the packets), leave `--setup-redirect` OFF and let mqproxy just provide the listener — match its `--tproxy-fwmark`/`--tproxy-table` to whatever the rules use:
 
 ```bash
 sudo ./build/mqproxy client \
