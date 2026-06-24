@@ -328,7 +328,7 @@ jobs:
                 -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
           cmake --build build -j"$(nproc)"
       - name: E2E tests (ctest, with NET_ADMIN)
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build -V
       - name: Upload e2e logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
