@@ -256,6 +256,85 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-asan --output-on-failure
 
+  perf:
+    # NET_ADMIN e2e tests (multipath aggregation, tproxy, MITM, UDP multipath
+    # sub-cases) that cannot run on the unprivileged default runner. Runs inside
+    # a Docker container with CAP_NET_ADMIN so tc/netem/nft work. The multipath
+    # aggregation test (e2e_multipath) is the perf regression gate: it asserts
+    # >=1.5x throughput over two shaped paths. All other NET_ADMIN-gated e2e
+    # sub-cases (e2e_gateway case 8, e2e_tproxy, e2e_mitm_h2, e2e_udp case 6)
+    # exercise their full codepath here instead of being SKIPPED.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    container:
+      image: ubuntu:24.04
+      options: --cap-add=NET_ADMIN
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y \
+            cmake gcc g++ make \
+            libevent-dev libcurl4-openssl-dev libnghttp2-dev golang \
+            iproute2 nftables curl python3 openssl sudo \
+            git ca-certificates
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (gcc fPIC)
+        id: bssl-cache
+        uses: actions/cache@v5
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-gcc-fpic-v1
+      - name: Clone + build BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl
+          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j"$(nproc)" ssl crypto
+
+      - name: Cache xquic (gcc Release, EVENT_LOG)
+        id: xquic-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-9c95ec7-v1
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_EVENT_LOG=ON \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j"$(nproc)"
+
+      - name: Build mqproxy (Release)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
+          cmake --build build -j"$(nproc)"
+      - name: E2E tests (ctest, with NET_ADMIN)
+        run: ctest --test-dir build --output-on-failure
+      - name: Upload e2e logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-e2e-logs
+          path: /tmp/mqproxy_e2e_*
+          if-no-files-found: ignore
+
   h3-curl:
     # OPTIONAL / NON-BLOCKING h3-libcurl build (Phase 6 origin-protocol h3).
     # Builds ngtcp2 + nghttp3 + libcurl on the pinned BoringSSL via
