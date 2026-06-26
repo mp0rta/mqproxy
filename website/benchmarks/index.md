@@ -34,17 +34,20 @@ const filteredMultiStream = computed(() =>
   <div class="summary-card">
     <div class="card-label">TCP Proxy Throughput</div>
     <div class="card-value">{{ push.tcpProxyRows.value[0]?.multipath ?? '—' }} <span class="unit">Mbps</span></div>
-    <div class="card-sub">multipath, latest commit</div>
+    <div class="card-sub">multipath, 2 × 100 Mbit / 25 ms</div>
+    <div class="card-meta"><code>{{ push.tcpProxyRows.value[0]?.commit ?? '' }}</code> · {{ push.tcpProxyRows.value[0]?.date ?? '' }}</div>
   </div>
   <div class="summary-card">
     <div class="card-label">Aggregation Ratio</div>
     <div class="card-value">{{ push.tcpProxyRows.value[0]?.aggregation_ratio ?? '—' }}<span class="unit">×</span></div>
-    <div class="card-sub">multipath / direct, latest commit</div>
+    <div class="card-sub">multipath / direct, 2 × 100 Mbit / 25 ms</div>
+    <div class="card-meta"><code>{{ push.tcpProxyRows.value[0]?.commit ?? '' }}</code> · {{ push.tcpProxyRows.value[0]?.date ?? '' }}</div>
   </div>
   <div class="summary-card">
-    <div class="card-label">MITM Throughput</div>
+    <div class="card-label">MITM H2 Throughput</div>
     <div class="card-value">{{ push.mitmRows.value[0]?.multipath ?? '—' }} <span class="unit">Mbps</span></div>
-    <div class="card-sub">multipath H2, latest commit</div>
+    <div class="card-sub">multipath, 2 × 100 Mbit / 25 ms, tproxy</div>
+    <div class="card-meta"><code>{{ push.mitmRows.value[0]?.commit ?? '' }}</code> · {{ push.mitmRows.value[0]?.date ?? '' }}</div>
   </div>
 </div>
 
@@ -260,6 +263,11 @@ const filteredMultiStream = computed(() =>
   font-size: 0.75rem;
   color: var(--vp-c-text-2);
   margin-top: 0.25rem;
+}
+.card-meta {
+  font-size: 0.7rem;
+  color: var(--vp-c-text-3);
+  margin-top: 0.35rem;
 }
 
 table {
