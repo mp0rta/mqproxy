@@ -231,8 +231,10 @@ BLOB_BASENAME="$(basename "${BLOB_FILE}")"
 # ── Build + start Go TLS origin ──
 note "Building Go origin server..."
 ORIGIN_BIN="${WORK}/bench_origin"
-if ! go build -o "${ORIGIN_BIN}" "${SCRIPT_DIR}/bench_origin_server.go" 2>"${WORK}/go-build.log"; then
-    note "error: Go origin build failed — see ${WORK}/go-build.log" >&2; exit 1
+if ! GOPATH="${WORK}/gopath" GOCACHE="${WORK}/go-cache" \
+     go build -o "${ORIGIN_BIN}" "${SCRIPT_DIR}/bench_origin_server.go" 2>"${WORK}/go-build.log"; then
+    cat "${WORK}/go-build.log" >&2
+    note "error: Go origin build failed" >&2; exit 1
 fi
 
 "${ORIGIN_BIN}" \
