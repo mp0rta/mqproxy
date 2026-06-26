@@ -231,8 +231,7 @@ BLOB_BASENAME="$(basename "${BLOB_FILE}")"
 # ── Build + start Go TLS origin ──
 note "Building Go origin server..."
 ORIGIN_BIN="${WORK}/bench_origin"
-if ! GOPATH="${WORK}/gopath" GOCACHE="${WORK}/go-cache" \
-     go build -o "${ORIGIN_BIN}" "${SCRIPT_DIR}/bench_origin_server.go" 2>"${WORK}/go-build.log"; then
+if ! go build -o "${ORIGIN_BIN}" "${SCRIPT_DIR}/bench_origin_server.go" 2>"${WORK}/go-build.log"; then
     cat "${WORK}/go-build.log" >&2
     note "error: Go origin build failed" >&2; exit 1
 fi
@@ -336,23 +335,8 @@ measure_variant() {
             > "${stat_file}" 2>/dev/null || true
 
         # Aggregate: throughput = sum(bytes) * 8 / max(time) / 1e6
-        mbps=$(python3 -c "
-total_bytes = 0.0
-max_time = 0.0
-with open('${stat_file}') as f:
-    for line in f:
-        parts = line.strip().split()
-        if len(parts) >= 2:
-            try:
-                total_bytes += float(parts[0])
-                max_time = max(max_time, float(parts[1]))
-            except ValueError:
-                pass
-if max_time > 0:
-    print('%.2f' % (total_bytes * 8 / max_time / 1e6))
-else:
-    print('0.0')
-" 2>/dev/null || echo "0.0")
+        mbps=$(awk '{b+=$1; if($2>t)t=$2} END{if(t>0) printf "%.2f\n",b*8/t/1e6; else print "0.0"}' \
+            "${stat_file}" 2>/dev/null || echo "0.0")
     else
         note "warning: MITM client not ready for variant=${path_mode}" >&2
     fi
