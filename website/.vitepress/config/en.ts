@@ -9,6 +9,7 @@ export const en: LocaleSpecificConfig<DefaultTheme.Config> & { label: string; la
     nav: [
       { text: 'Guide', link: '/guide/introduction' },
       { text: 'Reference', link: '/reference/options' },
+      { text: 'Benchmarks', link: '/benchmarks/' },
     ],
 
     footer: {

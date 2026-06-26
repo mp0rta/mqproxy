@@ -1,0 +1,122 @@
+name: Performance Tests
+
+# Security: only push to main and manual trigger.
+# Never runs on PRs — prevents fork code execution on GitHub-hosted runner.
+# Runner requires CAP_NET_ADMIN (tc/netem/nft) — runs in ubuntu:24.04 container.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqproxy-perf-commit
+  cancel-in-progress: true
+
+jobs:
+  perf-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ubuntu:24.04
+      options: --cap-add=NET_ADMIN
+    steps:
+      - name: Install git (needed before checkout for submodules)
+        run: apt-get update && apt-get install -y git
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          apt-get install -y \
+            cmake gcc g++ make \
+            libevent-dev libcurl4-openssl-dev libnghttp2-dev golang \
+            iproute2 nftables curl python3 openssl sudo \
+            iperf3 socat \
+            awscli \
+            ca-certificates
+
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (gcc fPIC)
+        id: bssl-cache
+        uses: actions/cache@v5
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-gcc-fpic-v1
+
+      - name: Clone + build BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git \
+            third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl
+          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j"$(nproc)" ssl crypto
+
+      - name: Cache xquic (gcc Release, EVENT_LOG)
+        id: xquic-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-9c95ec7-v1
+
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_EVENT_LOG=ON \
+                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j"$(nproc)"
+
+      - name: Build mqproxy (Release)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
+          cmake --build build -j"$(nproc)"
+
+      - name: TCP proxy benchmark
+        run: sudo bash scripts/ci_benchmarks/ci_bench_tcp_proxy.sh build/mqproxy
+
+      - name: MITM H2 benchmark
+        run: sudo bash scripts/ci_benchmarks/ci_bench_mitm.sh build/mqproxy
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results-${{ github.sha }}
+          path: ci_bench_results/*.json
+          retention-days: 90
+
+      - name: Verify aws-cli is installed
+        if: success()
+        run: aws --version
+
+      - name: Publish results to R2
+        if: success()
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: bash scripts/ci_publish/publish_to_r2.sh mqproxy/perf-data push
+
+      - name: Post-job cleanup
+        if: always()
+        run: rm -rf ci_bench_results
