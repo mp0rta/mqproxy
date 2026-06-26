@@ -311,9 +311,15 @@ ci_bench_stop_proxy() {
     for pid in "${_CB_SOCAT_PID}" "${_CB_CLIENT_PID}" "${_CB_SERVER_PID}"; do
         if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
             kill "${pid}" 2>/dev/null
+            # SIGKILL after 2 s if SIGTERM didn't work (prevent hangs).
+            local _dl=$(( $(date +%s) + 2 ))
+            while kill -0 "${pid}" 2>/dev/null && [ "$(date +%s)" -lt "${_dl}" ]; do
+                sleep 0.1
+            done
+            kill -9 "${pid}" 2>/dev/null || true
             wait "${pid}" 2>/dev/null
         fi
-    done || true
+    done 2>/dev/null || true
     _CB_SOCAT_PID=""; _CB_CLIENT_PID=""; _CB_SERVER_PID=""
 }
 
@@ -469,11 +475,22 @@ if zeros:
 # ci_bench_cleanup — tear down netns, veths, stale processes
 # ─────────────────────────────────────────────────────────────────────────────
 ci_bench_cleanup() {
+    local rc=$?
     set +eu
+
+    # Suppress "Segmentation fault (core dumped)" and similar async SIGCHLD
+    # messages that bash prints when collecting crashed children — they are
+    # harmless but pollute CI output and can confuse failure scanners.
+    exec 2>/dev/null
 
     for pid in "${_CB_SOCAT_PID}" "${_CB_CLIENT_PID}" "${_CB_SERVER_PID}" "${_CB_IPERF_S_PID}"; do
         if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
             kill "${pid}" 2>/dev/null
+            local _dl=$(( $(date +%s) + 2 ))
+            while kill -0 "${pid}" 2>/dev/null && [ "$(date +%s)" -lt "${_dl}" ]; do
+                sleep 0.1
+            done
+            kill -9 "${pid}" 2>/dev/null || true
             wait "${pid}" 2>/dev/null
         fi
     done
@@ -491,4 +508,6 @@ ci_bench_cleanup() {
     ip link del "${CB_VETH_B0}" 2>/dev/null || true
 
     [ -n "${_CB_WORK_DIR}" ] && [ -d "${_CB_WORK_DIR}" ] && rm -rf "${_CB_WORK_DIR}"
+
+    exit "${rc}"
 }
