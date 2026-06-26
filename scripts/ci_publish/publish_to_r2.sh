@@ -25,6 +25,7 @@ RUN_TYPE="$2"
 : "${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY env required}"
 : "${R2_BUCKET:?R2_BUCKET env required}"
 
+git config --global --add safe.directory "${PWD}" 2>/dev/null || true
 COMMIT_SHORT=$(git rev-parse --short HEAD)
 TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
