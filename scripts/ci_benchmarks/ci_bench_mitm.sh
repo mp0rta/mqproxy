@@ -300,6 +300,18 @@ measure_variant() {
     clear_tc
     setup_tc "${path_count}"
 
+    # ── DIAGNOSTIC: verify tc state before measurement ──
+    echo ""
+    echo "=== TC DIAG (${path_mode}, ${path_count} path(s)) ==="
+    echo "--- qdisc ---"
+    tc -s qdisc show dev lo 2>&1
+    echo "--- classes ---"
+    tc -s class show dev lo 2>&1
+    echo "--- filters ---"
+    tc filter show dev lo 2>&1
+    echo "=== END TC DIAG ==="
+    echo ""
+
     # Build path args for client
     local path_args="--path ${PATH_A_IP}"
     [ "${path_mode}" = "multi" ] && path_args="${path_args} --path ${PATH_B_IP}"
@@ -336,6 +348,11 @@ measure_variant() {
 
     local mbps="0.0"
     if [ "${ready}" -eq 1 ]; then
+        # ── DIAGNOSTIC: capture QUIC source IPs during transfer ──
+        echo "=== QUIC PACKET DIAG (first 10 UDP pkts on port ${QUIC_PORT}) ==="
+        timeout 3 tcpdump -i lo -c 10 "udp port ${QUIC_PORT}" -nn 2>&1 || echo "(tcpdump not available or no packets)"
+        echo "=== END QUIC DIAG ==="
+
         local speed
         speed=$(sudo -u nobody \
             curl --http2 --cacert "${MITM_CA_CRT_RUN}" \
@@ -345,6 +362,11 @@ measure_variant() {
             2>/dev/null || echo "0")
         # speed_download is bytes/sec; convert to Mbps
         mbps=$(python3 -c "print('%.2f' % (float('${speed}') * 8 / 1e6))" 2>/dev/null || echo "0.0")
+
+        # ── DIAGNOSTIC: tc stats after transfer ──
+        echo "=== TC STATS POST-TRANSFER (${path_mode}) ==="
+        tc -s class show dev lo 2>&1
+        echo "=== END TC STATS ==="
     else
         note "warning: MITM client not ready for variant=${path_mode}" >&2
     fi

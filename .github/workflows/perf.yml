@@ -37,7 +37,7 @@ jobs:
             cmake gcc g++ make \
             libevent-dev libcurl4-openssl-dev libnghttp2-dev golang \
             iproute2 nftables curl python3 openssl sudo \
-            iperf3 socat \
+            iperf3 socat tcpdump \
             python3-pip pipx \
             ca-certificates
           pipx install awscli
