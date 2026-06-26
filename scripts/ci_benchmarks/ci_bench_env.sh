@@ -334,13 +334,23 @@ ci_bench_run_iperf() {
 
     # Wait for iperf3 server to listen
     local deadline=$(( $(date +%s) + 5 ))
+    local _iperf_ready=0
     while [ "$(date +%s)" -lt "${deadline}" ]; do
         if ip netns exec "${CB_NS_SERVER}" ss -ltn "src ${CB_SERVER_LO}:${CB_IPERF_PORT}" 2>/dev/null \
                 | grep -q LISTEN; then
+            _iperf_ready=1
             break
         fi
         sleep 0.1
     done
+    if [ "${_iperf_ready}" -ne 1 ]; then
+        echo "ERROR: iperf3 server not listening after 5s" >&2
+        kill "${_CB_IPERF_S_PID}" 2>/dev/null || true
+        wait "${_CB_IPERF_S_PID}" 2>/dev/null || true
+        _CB_IPERF_S_PID=""
+        echo "/dev/null"
+        return 1
+    fi
 
     # iperf3 client via socat bridge (DL = reverse: data flows server→client)
     timeout 60 ip netns exec "${CB_NS_CLIENT}" iperf3 \
@@ -370,13 +380,23 @@ ci_bench_run_iperf_direct() {
     _CB_IPERF_S_PID=$!
 
     local deadline=$(( $(date +%s) + 5 ))
+    local _iperf_ready=0
     while [ "$(date +%s)" -lt "${deadline}" ]; do
         if ip netns exec "${CB_NS_SERVER}" ss -ltn "src ${CB_SERVER_LO}:${CB_IPERF_PORT}" 2>/dev/null \
                 | grep -q LISTEN; then
+            _iperf_ready=1
             break
         fi
         sleep 0.1
     done
+    if [ "${_iperf_ready}" -ne 1 ]; then
+        echo "ERROR: iperf3 server not listening after 5s (direct)" >&2
+        kill "${_CB_IPERF_S_PID}" 2>/dev/null || true
+        wait "${_CB_IPERF_S_PID}" 2>/dev/null || true
+        _CB_IPERF_S_PID=""
+        echo "/dev/null"
+        return 1
+    fi
 
     timeout 60 ip netns exec "${CB_NS_CLIENT}" iperf3 \
         -c "${CB_SERVER_LO}" -p "${CB_IPERF_PORT}" \
@@ -414,25 +434,32 @@ ci_bench_sanity_check() {
     local json_file="$1"
     local desc="${2:-benchmark}"
 
-    local ok
-    ok=$(python3 -c "
-import json
+    local bad
+    bad=$(python3 -c "
+import json, sys
 with open('${json_file}') as f:
     d = json.load(f)
-def has_nonzero(obj):
-    if isinstance(obj, dict):
-        return any(has_nonzero(v) for v in obj.values())
-    if isinstance(obj, list):
-        return any(has_nonzero(v) for v in obj)
-    if isinstance(obj, (int, float)):
-        return obj > 0
-    return False
-results = d.get('results', d)
-print('1' if has_nonzero(results) else '0')
-" 2>/dev/null || echo "0")
 
-    if [ "${ok}" != "1" ]; then
-        echo "SANITY FAIL: ${desc} — all throughput values are zero (iperf3 may have failed)" >&2
+zeros = []
+def check_mbps(obj, path=''):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f'{path}.{k}' if path else k
+            if isinstance(v, (int, float)) and p.endswith('_mbps') and v <= 0:
+                zeros.append(p)
+            elif isinstance(v, (dict, list)):
+                check_mbps(v, p)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            check_mbps(v, f'{path}[{i}]')
+
+check_mbps(d.get('results', d))
+if zeros:
+    print(' '.join(zeros))
+" 2>/dev/null || echo "PARSE_ERROR")
+
+    if [ -n "${bad}" ]; then
+        echo "SANITY FAIL: ${desc} — zero-value throughput fields: ${bad}" >&2
         exit 1
     fi
     echo "OK: sanity check passed for ${desc}"

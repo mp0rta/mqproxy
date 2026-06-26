@@ -418,14 +418,21 @@ PYEOF
 echo ""
 echo "Results written to: ${OUTPUT_FILE}"
 
-# Sanity check: at least one non-zero value
+# Sanity check: ALL _mbps fields must be positive (not just any)
 python3 -c "
-import json
+import json, sys
 d = json.load(open('${OUTPUT_FILE}'))
-vals = [v for r in d.get('results',{}).values() for v in r.values() if isinstance(v,(int,float))]
-assert any(v > 0 for v in vals), 'all results are zero — MITM bench failed'
+zeros = []
+for dir_key, dir_vals in d.get('results', {}).items():
+    if isinstance(dir_vals, dict):
+        for k, v in dir_vals.items():
+            if k.endswith('_mbps') and isinstance(v, (int, float)) and v <= 0:
+                zeros.append(f'results.{dir_key}.{k}')
+if zeros:
+    print(f'FAIL: zero-value fields: {\" \".join(zeros)}', file=sys.stderr)
+    sys.exit(1)
 print('OK: sanity check passed')
-" || { note "SANITY FAIL: all results zero" >&2; exit 1; }
+" || { note "SANITY FAIL: zero-value throughput fields" >&2; exit 1; }
 
 echo ""
 echo "================================================================"
