@@ -5,11 +5,12 @@
 # Measures MITM proxy throughput with tc-netem shaping on lo.
 # Follows e2e_mitm_h2.sh for MITM setup, e2e_multipath.sh for tc shaping.
 #
-# Known limitations:
-#   - python3 origin is HTTP/1.1 (single-threaded); at high throughput the
-#     origin may bottleneck. Numbers track regression trends, not absolute peak.
-#   - curl -w '%{speed_download}' includes connection setup (~1s). Warmup
-#     dilution accepted for the MITM bench (trend tracking, not peak).
+# Origin: Go TLS server (bench_origin_server.go) — goroutine-per-connection,
+# no GIL bottleneck.  Replaced the Python HTTP/1.1 origin that capped
+# multipath throughput at ~150 Mbps.
+#
+# Measurement: P=4 parallel H2 streams via curl --parallel (matches TCP proxy
+# bench P=4).  Aggregate throughput = sum(bytes) / max(time) across streams.
 #
 # Variants:
 #   1. single_path — path A only (127.0.0.2)
@@ -45,7 +46,8 @@ SERVER_IP="127.0.0.1"
 MITM_HOST="ci-bench-mitm.test"
 HOSTS_LINE="127.0.0.1 ${MITM_HOST}"
 
-DURATION=10      # curl max-time (seconds)
+DURATION=10      # curl max-time per stream (seconds)
+PARALLEL=4       # H2 streams (matches TCP proxy bench P=4)
 RATE="100mbit"   # per-path bandwidth
 DELAY="25ms"     # per-path one-way delay (RTT ≈ 2×delay)
 BLOB_MB=128      # origin blob size
@@ -79,7 +81,7 @@ if ! nft add table ip mqproxy_mitm_probe 2>/dev/null; then
 fi
 nft delete table ip mqproxy_mitm_probe 2>/dev/null || true
 
-for tool in curl openssl sudo python3 tc; do
+for tool in curl openssl sudo python3 tc go; do
     if ! command -v "${tool}" >/dev/null 2>&1; then
         note "SKIP: required tool not found: ${tool}"
         exit "${SKIP}"
@@ -167,6 +169,11 @@ setup_tc() {
         tc filter add dev lo protocol ip parent 1: prio 1 u32 \
             match ip dst "${PATH_B_IP}/32" flowid 1:11
     fi
+
+    # Netlink fence: force a round-trip so the kernel finishes installing
+    # the qdisc/classes/filters before any traffic flows. Without this,
+    # packets arriving before filters are ready fall to the unshaped default.
+    tc qdisc show dev lo > /dev/null 2>&1
 }
 
 clear_tc() {
@@ -221,46 +228,17 @@ dd if=/dev/urandom of="${BLOB_FILE}" bs=1M count="${BLOB_MB}" 2>/dev/null
 chmod 644 "${BLOB_FILE}"
 BLOB_BASENAME="$(basename "${BLOB_FILE}")"
 
-# ── Start python3 TLS origin (HTTP/1.1) ──
-cat > "${WORK}/origin.py" << 'PY'
-import http.server, os, ssl
+# ── Build + start Go TLS origin ──
+note "Building Go origin server..."
+ORIGIN_BIN="${WORK}/bench_origin"
+if ! go build -o "${ORIGIN_BIN}" "${SCRIPT_DIR}/bench_origin_server.go" 2>"${WORK}/go-build.log"; then
+    note "error: Go origin build failed — see ${WORK}/go-build.log" >&2; exit 1
+fi
 
-ROOT = os.environ["MQ_ORIGIN_ROOT"]
-PORT = int(os.environ["MQ_ORIGIN_PORT"])
-CERT = os.environ["MQ_ORIGIN_CERT"]
-KEY  = os.environ["MQ_ORIGIN_KEY"]
-
-class H(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *a):
-        pass
-
-    def do_GET(self):
-        path = os.path.join(ROOT, os.path.basename(self.path))
-        if not os.path.isfile(path):
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        with open(path, "rb") as f:
-            data = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-httpd = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H)
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-ctx.load_cert_chain(certfile=CERT, keyfile=KEY)
-httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-httpd.serve_forever()
-PY
-
-MQ_ORIGIN_ROOT="${WORK}" MQ_ORIGIN_PORT="${ORIGIN_PORT}" \
-    MQ_ORIGIN_CERT="${ORIGIN_CERT}" MQ_ORIGIN_KEY="${ORIGIN_KEY}" \
-    python3 "${WORK}/origin.py" > "${WORK}/origin.log" 2>&1 &
+"${ORIGIN_BIN}" \
+    -cert "${ORIGIN_CERT}" -key "${ORIGIN_KEY}" \
+    -port "${ORIGIN_PORT}" -root "${WORK}" \
+    > "${WORK}/origin.log" 2>&1 &
 ORIGIN_PID=$!
 
 # Wait for origin to be ready
@@ -337,14 +315,42 @@ measure_variant() {
 
     local mbps="0.0"
     if [ "${ready}" -eq 1 ]; then
-        local speed
-        speed=$(sudo -u nobody \
+        # P parallel H2 streams over one multiplexed connection
+        local curl_outputs="" curl_urls=""
+        for _ in $(seq 1 "${PARALLEL}"); do
+            curl_outputs="${curl_outputs} -o /dev/null"
+            curl_urls="${curl_urls} https://${MITM_HOST}:${ORIGIN_PORT}/${BLOB_BASENAME}"
+        done
+
+        local stat_file="${WORK}/curl-stats-${path_mode}.txt"
+        # shellcheck disable=SC2086
+        sudo -u nobody \
             curl --http2 --cacert "${MITM_CA_CRT_RUN}" \
-            -o /dev/null --max-time "${DURATION}" \
-            -w '%{speed_download}' \
-            "https://${MITM_HOST}:${ORIGIN_PORT}/${BLOB_BASENAME}" \
-            2>/dev/null || echo "0")
-        mbps=$(python3 -c "print('%.2f' % (float('${speed}') * 8 / 1e6))" 2>/dev/null || echo "0.0")
+            --parallel --parallel-max "${PARALLEL}" \
+            ${curl_outputs} \
+            --max-time "${DURATION}" \
+            -w '%{size_download} %{time_total}\n' \
+            ${curl_urls} \
+            > "${stat_file}" 2>/dev/null || true
+
+        # Aggregate: throughput = sum(bytes) * 8 / max(time) / 1e6
+        mbps=$(python3 -c "
+total_bytes = 0.0
+max_time = 0.0
+with open('${stat_file}') as f:
+    for line in f:
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            try:
+                total_bytes += float(parts[0])
+                max_time = max(max_time, float(parts[1]))
+            except ValueError:
+                pass
+if max_time > 0:
+    print('%.2f' % (total_bytes * 8 / max_time / 1e6))
+else:
+    print('0.0')
+" 2>/dev/null || echo "0.0")
     else
         note "warning: MITM client not ready for variant=${path_mode}" >&2
     fi
@@ -370,7 +376,7 @@ echo "================================================================"
 echo "  CI MITM Benchmark"
 echo "  Binary:  ${MQPROXY_BIN}"
 echo "  Profile: symmetric ${RATE}/${DELAY} each path"
-echo "  Duration: ${DURATION}s per variant"
+echo "  Params:  ${DURATION}s duration, P=${PARALLEL} H2 streams, DL"
 echo "  Commit:  ${CI_BENCH_COMMIT}"
 echo "  Date:    $(date '+%Y-%m-%d %H:%M')"
 echo "================================================================"
@@ -406,6 +412,7 @@ output = {
     "timestamp": "${TIMESTAMP}",
     "profile": "symmetric",
     "duration_sec": ${DURATION},
+    "parallel_streams": ${PARALLEL},
     "results": {
         "DL": {
             "single_path_mbps": single,
