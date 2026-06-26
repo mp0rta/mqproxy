@@ -300,20 +300,6 @@ measure_variant() {
     clear_tc
     setup_tc "${path_count}"
 
-    # ── DIAGNOSTIC (stderr, not captured by $()) ──
-    {
-        echo ""
-        echo "=== TC DIAG (${path_mode}, ${path_count} path(s)) ==="
-        echo "--- qdisc ---"
-        tc -s qdisc show dev lo 2>&1
-        echo "--- classes ---"
-        tc -s class show dev lo 2>&1
-        echo "--- filters ---"
-        tc filter show dev lo 2>&1
-        echo "=== END TC DIAG ==="
-        echo ""
-    } >&2
-
     # Build path args for client
     local path_args="--path ${PATH_A_IP}"
     [ "${path_mode}" = "multi" ] && path_args="${path_args} --path ${PATH_B_IP}"
@@ -354,28 +340,10 @@ measure_variant() {
         speed=$(sudo -u nobody \
             curl --http2 --cacert "${MITM_CA_CRT_RUN}" \
             -o /dev/null --max-time "${DURATION}" \
-            -w '%{speed_download}\n%{size_download}\n%{time_total}' \
+            -w '%{speed_download}' \
             "https://${MITM_HOST}:${ORIGIN_PORT}/${BLOB_BASENAME}" \
             2>/dev/null || echo "0")
-
-        local speed_bps size_bytes time_total
-        speed_bps=$(echo "${speed}" | sed -n '1p')
-        size_bytes=$(echo "${speed}" | sed -n '2p')
-        time_total=$(echo "${speed}" | sed -n '3p')
-
-        mbps=$(python3 -c "print('%.2f' % (float('${speed_bps}') * 8 / 1e6))" 2>/dev/null || echo "0.0")
-
-        # ── DIAGNOSTIC (stderr) ──
-        {
-            echo "=== CURL DIAG (${path_mode}) ==="
-            echo "  speed_download=${speed_bps} bytes/s"
-            echo "  size_download=${size_bytes} bytes"
-            echo "  time_total=${time_total} s"
-            echo "  computed=${mbps} Mbps"
-            echo "=== TC STATS POST-TRANSFER (${path_mode}) ==="
-            tc -s class show dev lo 2>&1
-            echo "=== END TC STATS ==="
-        } >&2
+        mbps=$(python3 -c "print('%.2f' % (float('${speed}') * 8 / 1e6))" 2>/dev/null || echo "0.0")
     else
         note "warning: MITM client not ready for variant=${path_mode}" >&2
     fi
