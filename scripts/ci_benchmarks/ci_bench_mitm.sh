@@ -323,7 +323,7 @@ measure_variant() {
         done
 
         local stat_file="${WORK}/curl-stats-${path_mode}.txt"
-        # shellcheck disable=SC2086
+        # shellcheck disable=SC2086,SC2024
         sudo -u nobody \
             curl --http2 --cacert "${MITM_CA_CRT_RUN}" \
             --parallel --parallel-max "${PARALLEL}" \
