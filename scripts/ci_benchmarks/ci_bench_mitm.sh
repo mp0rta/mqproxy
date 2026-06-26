@@ -148,7 +148,9 @@ setup_tc() {
     #     packets unshaped, defeating the bench.
     #   - quantum 1514 prevents large-burst dequeuing that causes spurious
     #     loss under netem, which confuses BBR's pacing.
-    tc qdisc add dev lo root handle 1: htb default 1
+    # Use `replace` (not del+add) to avoid a race where the kernel hasn't
+    # finished tearing down the old qdisc before the new add arrives.
+    tc qdisc replace dev lo root handle 1: htb default 1
     tc class add dev lo parent 1: classid 1:1  htb rate 10gbit ceil 10gbit
     tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}" quantum 1514
     tc qdisc add dev lo parent 1:10 handle 10: netem delay "${DELAY}" limit 25000
@@ -296,8 +298,7 @@ measure_variant() {
     local path_count
     [ "${path_mode}" = "single" ] && path_count=1 || path_count=2
 
-    # Apply tc shaping
-    clear_tc
+    # Apply tc shaping (setup_tc uses replace, no separate clear needed)
     setup_tc "${path_count}"
 
     # Build path args for client
