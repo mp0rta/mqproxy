@@ -310,10 +310,10 @@ ci_bench_start_client() {
 ci_bench_stop_proxy() {
     for pid in "${_CB_SOCAT_PID}" "${_CB_CLIENT_PID}" "${_CB_SERVER_PID}"; do
         if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-            kill "${pid}" 2>/dev/null || true
-            wait "${pid}" 2>/dev/null || true
+            kill "${pid}" 2>/dev/null
+            wait "${pid}" 2>/dev/null
         fi
-    done
+    done || true
     _CB_SOCAT_PID=""; _CB_CLIENT_PID=""; _CB_SERVER_PID=""
 }
 
@@ -469,19 +469,19 @@ if zeros:
 # ci_bench_cleanup — tear down netns, veths, stale processes
 # ─────────────────────────────────────────────────────────────────────────────
 ci_bench_cleanup() {
-    local rc=$?
-    set +e
+    set +eu
 
     for pid in "${_CB_SOCAT_PID}" "${_CB_CLIENT_PID}" "${_CB_SERVER_PID}" "${_CB_IPERF_S_PID}"; do
-        [ -n "${pid}" ] && kill "${pid}" 2>/dev/null && wait "${pid}" 2>/dev/null || true
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null
+            wait "${pid}" 2>/dev/null
+        fi
     done
 
-    # Kill any stray processes in netns
     for ns in "${CB_NS_CLIENT}" "${CB_NS_SERVER}"; do
-        ip netns exec "${ns}" pkill -f iperf3 2>/dev/null || true
-        ip netns exec "${ns}" pkill -f socat 2>/dev/null || true
-        ip netns exec "${ns}" pkill -f mqproxy 2>/dev/null || true
+        ip netns pids "${ns}" 2>/dev/null | xargs -r kill 2>/dev/null || true
     done
+    sleep 0.5
 
     ci_bench_clear_netem 2>/dev/null || true
 
@@ -491,6 +491,4 @@ ci_bench_cleanup() {
     ip link del "${CB_VETH_B0}" 2>/dev/null || true
 
     [ -n "${_CB_WORK_DIR}" ] && [ -d "${_CB_WORK_DIR}" ] && rm -rf "${_CB_WORK_DIR}"
-
-    exit "${rc}"
 }
