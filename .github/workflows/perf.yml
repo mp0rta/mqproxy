@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
-      image: ubuntu:22.04
+      image: ubuntu:latest
       options: --cap-add=NET_ADMIN
     steps:
       - name: Install git (needed before checkout for submodules)
@@ -38,8 +38,10 @@ jobs:
             libevent-dev libcurl4-openssl-dev libnghttp2-dev golang \
             iproute2 nftables curl python3 openssl sudo \
             iperf3 socat \
-            awscli \
+            python3-pip pipx \
             ca-certificates
+          pipx install awscli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Compute xquic SHA
         id: xqsha
