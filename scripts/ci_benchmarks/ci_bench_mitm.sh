@@ -141,22 +141,28 @@ BLOB_FILE="${WORK}/blob.bin"
 setup_tc() {
     local path_count="$1"  # 1 or 2
 
-    # HTB root + netem per path via u32 src/dst filters (same as e2e_multipath.sh)
-    tc qdisc add dev lo root handle 1: htb default 99
-    tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}"
+    # HTB root + netem per path via u32 src/dst filters.
+    # Matches the proven e2e_multipath.sh layout:
+    #   - default class 1:1 at 10gbit for unmatched traffic (origin fetch,
+    #     curl→nft, etc.) — WITHOUT a valid default class HTB can pass
+    #     packets unshaped, defeating the bench.
+    #   - quantum 1514 prevents large-burst dequeuing that causes spurious
+    #     loss under netem, which confuses BBR's pacing.
+    tc qdisc add dev lo root handle 1: htb default 1
+    tc class add dev lo parent 1: classid 1:1  htb rate 10gbit ceil 10gbit
+    tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}" quantum 1514
     tc qdisc add dev lo parent 1:10 handle 10: netem delay "${DELAY}" limit 25000
-    # u32 filters: shape by client src OR dst IP in both directions
-    tc filter add dev lo parent 1: protocol ip u32 \
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 \
         match ip src "${PATH_A_IP}/32" flowid 1:10
-    tc filter add dev lo parent 1: protocol ip u32 \
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 \
         match ip dst "${PATH_A_IP}/32" flowid 1:10
 
     if [ "${path_count}" -eq 2 ]; then
-        tc class add dev lo parent 1: classid 1:11 htb rate "${RATE}" ceil "${RATE}"
+        tc class add dev lo parent 1: classid 1:11 htb rate "${RATE}" ceil "${RATE}" quantum 1514
         tc qdisc add dev lo parent 1:11 handle 11: netem delay "${DELAY}" limit 25000
-        tc filter add dev lo parent 1: protocol ip u32 \
+        tc filter add dev lo protocol ip parent 1: prio 1 u32 \
             match ip src "${PATH_B_IP}/32" flowid 1:11
-        tc filter add dev lo parent 1: protocol ip u32 \
+        tc filter add dev lo protocol ip parent 1: prio 1 u32 \
             match ip dst "${PATH_B_IP}/32" flowid 1:11
     fi
 }
