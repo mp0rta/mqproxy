@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 30
     container:
       image: ubuntu:latest
-      options: --cap-add=NET_ADMIN
+      options: --cap-add=NET_ADMIN --cap-add=SYS_ADMIN
     steps:
       - name: Install git (needed before checkout for submodules)
         run: apt-get update && apt-get install -y git
