@@ -188,7 +188,7 @@ cleanup() {
 
     if [ "${HOSTS_BACKED_UP}" -eq 1 ] && [ -f "${WORK}/hosts.bak" ]; then
         cp "${WORK}/hosts.bak" /etc/hosts 2>/dev/null || \
-            sed -i "| ${MITM_HOST}\$|d" /etc/hosts 2>/dev/null || true
+            sed -i "/ ${MITM_HOST}\$/d" /etc/hosts 2>/dev/null || true
     fi
 
     rm -rf "${WORK}" 2>/dev/null || true

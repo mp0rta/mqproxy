@@ -178,7 +178,8 @@ const filteredMultiStream = computed(() =>
 <div class="filter-bar">
   Profile:
   <select v-model="selectedProfile">
-    <option v-for="p in profiles" :key="p" :value="p">{{ p }}</option>
+    <option value="symmetric">symmetric</option>
+    <option value="asymmetric">asymmetric</option>
   </select>
 </div>
 

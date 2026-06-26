@@ -2,7 +2,7 @@ name: Performance Tests
 
 # Security: only push to main and manual trigger.
 # Never runs on PRs — prevents fork code execution on GitHub-hosted runner.
-# Runner requires CAP_NET_ADMIN (tc/netem/nft) — runs in ubuntu:24.04 container.
+# Runner requires --privileged (netns mount + tc/netem/nft) — runs in ubuntu:latest container.
 
 on:
   push:
