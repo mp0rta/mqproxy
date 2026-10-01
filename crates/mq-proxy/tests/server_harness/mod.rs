@@ -248,3 +248,13 @@ impl H {
         self.event(Event::ConnClosed(c, closed_reason()));
     }
 }
+
+/// `frame` (ending in `padding_length = 0`) re-padded to exactly `total` bytes.
+pub fn pad_to(frame: &[u8], total: usize) -> Vec<u8> {
+    let mut b = frame[..frame.len() - 1].to_vec();
+    let p = total - b.len() - 2;
+    assert!((64..16384).contains(&p), "2-byte varint padding");
+    b.extend_from_slice(&[0x40 | (p >> 8) as u8, p as u8]);
+    b.resize(total, 0);
+    b
+}

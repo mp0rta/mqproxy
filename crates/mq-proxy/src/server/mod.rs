@@ -158,7 +158,9 @@ fn map_dial_error(e: DialError) -> TcpErr {
 
 /// spec §6.3: stream type then `CONNECT_TCP_REQUEST`, as C `srv_data_header_readable`.
 fn parse_request(buf: &[u8], fin: bool) -> Parsed {
-    let wait = if fin || buf.len() >= REQ_BUF {
+    // spec §6.2: a header (discriminator + frame) over 512 bytes never fits
+    // C's 512-byte frame buffer, complete or not.
+    let wait = if fin || buf.len() >= MAX_FRAME {
         Parsed::Bad
     } else {
         Parsed::Wait
@@ -175,6 +177,9 @@ fn parse_request(buf: &[u8], fin: bool) -> Parsed {
         Err(_) => return Parsed::Bad,
     };
     let used = tl + used;
+    if used > MAX_FRAME {
+        return Parsed::Bad;
+    }
     // C `srv_resolve_target`: a wrong address length or an unusable name is DNS_FAILED.
     let host = match req.address_type {
         AddrType::Ipv4 => <[u8; 4]>::try_from(req.host)
@@ -370,13 +375,16 @@ impl Server {
                 }
                 Recv::Data { n, fin } => match AuthReq::decode(&ctrl.rx) {
                     // spec §6.3: constant-time compare against the truncated token.
-                    Ok((r, _)) => break bool::from(r.auth_token.ct_eq(&self.token)),
-                    Err(DecodeError::Short) if !fin && ctrl.rx.len() < REQ_BUF => {
+                    Ok((r, used)) if used <= MAX_FRAME => {
+                        break bool::from(r.auth_token.ct_eq(&self.token));
+                    }
+                    // spec §6.2: frames are at most 512 bytes, complete or not.
+                    Err(DecodeError::Short) if !fin && ctrl.rx.len() < MAX_FRAME => {
                         if n == 0 {
                             return;
                         }
                     }
-                    Err(_) => {
+                    Ok(_) | Err(_) => {
                         log::warn!("mq_server: AUTH_REQUEST malformed/oversized, rejecting");
                         break false;
                     }

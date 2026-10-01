@@ -81,16 +81,24 @@ fn request_buffer_1k() {
         "1 KiB buffer"
     );
     assert!(h.dial().is_none());
-    // padding that fits in 1 KiB completes.
-    let mut fits = CONNECT_REQ_C.to_vec();
-    fits.pop();
-    fits.extend_from_slice(&[0x43, 0x84]); // padding_length 900
-    fits.resize(fits.len() + 900, 0);
-    assert!(fits.len() <= 1024);
+    // spec §6.2: a whole header of 512 bytes completes ...
+    let fits = pad_to(CONNECT_REQ_C, 512);
     let ok = h.data(c);
     h.feed(ok, &fits, false);
     assert!(!h.reset(ok));
     assert!(h.dial().is_some());
+    // ... one of 513 bytes is rejected even though it decodes within 1 KiB.
+    let over512 = h.data(c);
+    h.feed(over512, &pad_to(CONNECT_REQ_C, 513), false);
+    assert!(h.reset(over512));
+    assert!(h.dial().is_none());
+    // An incomplete header is rejected once 512 bytes are buffered.
+    let mut part = pad_to(CONNECT_REQ_C, 600);
+    part.truncate(512);
+    let short = h.data(c);
+    h.feed(short, &part, false);
+    assert!(h.reset(short));
+    assert!(h.dial().is_none());
 }
 
 #[test]

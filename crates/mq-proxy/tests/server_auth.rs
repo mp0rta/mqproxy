@@ -92,17 +92,28 @@ fn auth_malformed_same() {
     big.resize(1500, 0);
     let cc = h.ctrl(c, &big, false);
     assert_eq!(h.recv_caps(cc)[0], 1024, "rejected on a full 1 KiB buffer");
-    for (conn, ctrl) in [(a, ca), (b, cb), (c, cc)] {
+    // spec §6.2: a complete AUTH_REQUEST of 513 bytes (over the frame limit).
+    let d = h.conn();
+    let cd = h.ctrl(d, &pad_to(&auth_req(b"secret"), 513), false);
+    for (conn, ctrl) in [(a, ca), (b, cb), (c, cc), (d, cd)] {
         assert_eq!(h.t.sent_bytes(ctrl), AUTH_FAILED_C);
         assert_eq!(h.send_fins(ctrl), [true]);
         assert!(!h.reset(ctrl));
         assert_eq!(h.close_conn_count(conn), 0);
     }
-    assert_eq!(h.sh.app().auth_attempts(), 3, "each counts as an attempt");
+    assert_eq!(h.sh.app().auth_attempts(), 4, "each counts as an attempt");
     h.advance(Duration::from_secs(1));
-    for conn in [a, b, c] {
+    for conn in [a, b, c, d] {
         assert_eq!(h.close_conn_count(conn), 1);
     }
+}
+
+#[test]
+fn auth_request_of_512_bytes_accepted() {
+    let mut h = H::new(cfg());
+    let c = h.conn();
+    let ctrl = h.ctrl(c, &pad_to(&auth_req(b"secret"), 512), false);
+    assert_eq!(h.t.sent_bytes(ctrl), AUTH_OK_C);
 }
 
 #[test]

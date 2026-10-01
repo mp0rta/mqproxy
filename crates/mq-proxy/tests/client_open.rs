@@ -99,6 +99,27 @@ fn malformed_response_conn_refused_and_reset() {
 }
 
 #[test]
+fn response_over_512_bytes_is_malformed() {
+    let mut h = H::new(cfg());
+    h.serving();
+    // spec §6.2: an OK response of exactly 512 bytes is accepted.
+    let s = h.next_stream(h.conn);
+    let tcp = h.socks_request(b"");
+    h.t.expect_stream_recv(s, Ok((pad_to(&connect_resp(0, 0), 512), false)));
+    h.event(Event::StreamReadable(s));
+    assert_eq!(h.reply(tcp), SOCKS_OK);
+    assert!(!h.reset(s));
+    // 513 bytes, delivered whole within one 1 KiB read: malformed.
+    let s2 = h.next_stream(h.conn);
+    let tcp2 = h.socks_request(b"");
+    h.t.expect_stream_recv(s2, Ok((pad_to(&connect_resp(0, 0), 513), false)));
+    h.event(Event::StreamReadable(s2));
+    assert_eq!(h.reply(tcp2), SOCKS_REFUSED);
+    assert!(H::closed(&h.reqs(), tcp2));
+    assert!(h.reset(s2));
+}
+
+#[test]
 fn stream_closed_before_response_conn_refused() {
     let mut h = H::new(cfg());
     h.serving();

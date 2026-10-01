@@ -281,6 +281,11 @@ impl Client {
                     return self.close(cx);
                 }
                 Recv::Data { n, fin } => match AuthResp::decode(&ctrl.rx) {
+                    // spec §6.2: frames are at most 512 bytes, complete or not.
+                    Ok((_, used)) if used > MAX_FRAME => {
+                        log::warn!("mq_client: AUTH_RESPONSE malformed");
+                        break false;
+                    }
                     Ok((r, _)) if r.is_ok() => break true,
                     Ok((r, _)) => {
                         log::warn!("mq_client: auth refused (error {})", r.error_code);
@@ -395,7 +400,8 @@ impl Client {
         };
         let o = self.opens.remove(&s).expect("present");
         match ConnectTcpResp::decode(&o.rx) {
-            Ok((r, used)) if r.is_ok() => {
+            // spec §6.2: frames are at most 512 bytes; over that is malformed.
+            Ok((r, used)) if r.is_ok() && used <= MAX_FRAME => {
                 if let Some(b) = o.kind.success_reply() {
                     let _ = cx.tcp_write(o.tcp, &b);
                 }
@@ -409,12 +415,12 @@ impl Client {
                     cx.stream_reset(s);
                 }
             }
-            Ok((r, _)) => {
+            Ok((r, used)) if used <= MAX_FRAME => {
                 let e = r.error().unwrap_or(TcpErr::ConnRefused);
                 refuse(cx, o.tcp, o.kind, e);
                 cx.stream_reset(s);
             }
-            Err(_) => {
+            Ok(_) | Err(_) => {
                 log::warn!("mq_client: CONNECT_TCP_RESPONSE malformed/oversized");
                 refuse(cx, o.tcp, o.kind, TcpErr::ConnRefused);
                 cx.stream_reset(s);

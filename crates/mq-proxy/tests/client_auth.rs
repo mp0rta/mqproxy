@@ -70,6 +70,17 @@ fn auth_refused_fails_pending_and_closes() {
 }
 
 #[test]
+fn auth_response_over_512_bytes_is_malformed() {
+    let mut h = H::new(cfg());
+    let ctrl = h.establish();
+    let tcp = h.socks_request(b"");
+    h.t.expect_stream_recv(ctrl, Ok((pad_to(&auth_resp(0, 0), 513), false)));
+    h.event(Event::StreamReadable(ctrl));
+    assert_eq!(h.reply(tcp), SOCKS_REFUSED, "treated as a refusal");
+    assert_eq!(h.close_conn_count(h.conn), 1);
+}
+
+#[test]
 fn control_stream_closed_closes_conn() {
     let mut h = H::new(cfg());
     let ctrl = h.serving();
