@@ -28,3 +28,6 @@ demo_token_store.bin
 # MITM test fixtures — regenerated at configure time by CMake (openssl), like the
 # committed test.crt/origin.crt but never committed (they include private keys).
 tests/certs/mitm-*
+
+# Rust
+/target

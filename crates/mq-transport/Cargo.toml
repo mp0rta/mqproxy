@@ -1,0 +1,13 @@
+[package]
+name = "mq-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mq-transport-api = { path = "../mq-transport-api" }
+xquic-sys = { path = "../xquic-sys" }
+
+[features]
+test-support = []

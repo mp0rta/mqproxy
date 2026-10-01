@@ -1,0 +1,14 @@
+[package]
+name = "mq-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mq-runtime = { path = "../mq-runtime" }
+mq-transport-api = { path = "../mq-transport-api" }
+mq-wire = { path = "../mq-wire" }
+
+[features]
+test-support = []

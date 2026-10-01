@@ -1,0 +1,14 @@
+[package]
+name = "mq-integration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+mq-proxy = { path = "../mq-proxy" }
+mq-runtime = { path = "../mq-runtime" }
+mq-transport = { path = "../mq-transport" }
+mq-transport-api = { path = "../mq-transport-api" }
+mq-linux = { path = "../mq-linux" }
