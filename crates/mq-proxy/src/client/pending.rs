@@ -1,5 +1,5 @@
 //! spec §6.2 "Pending requests (before auth)": at most 256, kept across reconnects,
-//! 8 KiB of preread each, 30 s deadline.
+//! 30 s deadline.
 
 use crate::ingress::{
     http_error_reply, http_success_reply, socks5_error_reply, socks5_success_reply,
@@ -12,8 +12,6 @@ use std::time::Duration;
 
 /// spec §6.2: C `MQ_CLIENT_QUEUE_MAX`.
 pub const MAX_PENDING: usize = 256;
-/// spec §6.2: preread held per pending request.
-pub const PREREAD_CAP: usize = 8 * 1024;
 
 /// spec §6.1: which ingress accepted the socket, i.e. which reply format it expects.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -49,10 +47,6 @@ impl IngressKind {
 pub struct PendingOpen<K = TcpId> {
     pub tcp: K,
     pub target: Target,
-    /// Bytes read past the ingress request; forwarded after the OK response.
-    pub preread: Vec<u8>,
-    /// The socket reported `TcpEnd::ReadEof`; the request stays pending.
-    pub read_eof: bool,
     pub kind: IngressKind,
     pub enqueued_at: Time,
 }
@@ -61,12 +55,10 @@ pub struct PendingOpen<K = TcpId> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Full<K = TcpId>(pub PendingOpen<K>);
 
-/// spec §6.2: the preread would exceed 8 KiB (or the socket is not pending).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CapExceeded;
-
 /// spec §6.2: the pending queue, in arrival order. Owned by the client, not the
-/// connection, so a tunnel loss leaves it untouched.
+/// connection, so a tunnel loss leaves it untouched. Early bytes are not held
+/// here: they stay in the shard's socket receive buffer (spec §6.1 prebuffer),
+/// as does a read EOF.
 #[derive(Debug)]
 pub struct Pending<K = TcpId> {
     q: VecDeque<PendingOpen<K>>,
@@ -99,21 +91,6 @@ impl<K: PartialEq> Pending<K> {
         Ok(())
     }
 
-    /// spec §6.2: append preread bytes, up to 8 KiB in total.
-    pub fn push_preread(&mut self, tcp: &K, bytes: &[u8]) -> Result<(), CapExceeded> {
-        let o = self.find(tcp).ok_or(CapExceeded)?;
-        if o.preread.len() + bytes.len() > PREREAD_CAP {
-            return Err(CapExceeded);
-        }
-        o.preread.extend_from_slice(bytes);
-        Ok(())
-    }
-
-    /// spec §6.2: `TcpEnd::ReadEof` keeps the request pending; returns whether it was found.
-    pub fn set_read_eof(&mut self, tcp: &K) -> bool {
-        self.find(tcp).map(|o| o.read_eof = true).is_some()
-    }
-
     /// spec §6.2: `TcpEnd::Error` drops the request at once (the shard already closed it).
     pub fn remove(&mut self, tcp: &K) -> Option<PendingOpen<K>> {
         let i = self.q.iter().position(|o| o.tcp == *tcp)?;
@@ -135,9 +112,5 @@ impl<K: PartialEq> Pending<K> {
     /// `--no-reconnect` loss).
     pub fn drain(&mut self) -> Vec<PendingOpen<K>> {
         self.q.drain(..).collect()
-    }
-
-    fn find(&mut self, tcp: &K) -> Option<&mut PendingOpen<K>> {
-        self.q.iter_mut().find(|o| o.tcp == *tcp)
     }
 }

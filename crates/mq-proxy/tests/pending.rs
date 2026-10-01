@@ -1,8 +1,6 @@
 //! spec §6.2 "Pending requests (before auth)".
 
-use mq_proxy::client::pending::{
-    CapExceeded, Full, IngressKind, MAX_PENDING, PREREAD_CAP, Pending, PendingOpen,
-};
+use mq_proxy::client::pending::{Full, IngressKind, MAX_PENDING, Pending, PendingOpen};
 use mq_proxy::config::ClientConfig;
 use mq_runtime::{Host, Target};
 use mq_transport_api::Time;
@@ -18,8 +16,6 @@ fn open(tcp: u32, kind: IngressKind, at: Time) -> PendingOpen<u32> {
             host: Host::Ip(Ipv4Addr::new(1, 2, 3, 4).into()),
             port: 80,
         },
-        preread: Vec::new(),
-        read_eof: false,
         kind,
         enqueued_at: at,
     }
@@ -84,20 +80,17 @@ fn deadline_30s_replies_timeout_and_closes() {
 }
 
 #[test]
-fn error_drops_pending_and_read_eof_keeps() {
+fn error_drops_pending() {
     let mut q = queue();
     q.push(open(1, IngressKind::Socks5, Time::ZERO)).unwrap();
     q.push(open(2, IngressKind::Socks5, Time::ZERO)).unwrap();
 
-    assert!(q.set_read_eof(&2));
     assert_eq!(q.remove(&1).map(|o| o.tcp), Some(1));
     assert!(q.remove(&1).is_none());
-    assert!(!q.set_read_eof(&1));
 
     let rest = q.drain();
     assert_eq!(rest.len(), 1);
     assert_eq!(rest[0].tcp, 2);
-    assert!(rest[0].read_eof);
 }
 
 #[test]
@@ -114,18 +107,4 @@ fn kept_across_reconnect() {
     let order: Vec<u32> = q.drain().into_iter().map(|o| o.tcp).collect();
     assert_eq!(order, [0, 1, 2]);
     assert!(q.is_empty());
-}
-
-#[test]
-fn preread_cap_8k() {
-    assert_eq!(PREREAD_CAP, 8 * 1024);
-    let mut q = queue();
-    q.push(open(1, IngressKind::Socks5, Time::ZERO)).unwrap();
-    q.push_preread(&1, &[0xAA; 8000]).unwrap();
-    q.push_preread(&1, &[0xBB; 192]).unwrap();
-    assert_eq!(q.push_preread(&1, &[0xCC]), Err(CapExceeded));
-    assert_eq!(q.push_preread(&9, b"x"), Err(CapExceeded));
-    let o = q.drain().pop().unwrap();
-    assert_eq!(o.preread.len(), 8192);
-    assert_eq!(o.preread[8191], 0xBB);
 }

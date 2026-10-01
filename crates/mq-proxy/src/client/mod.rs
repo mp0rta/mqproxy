@@ -334,8 +334,6 @@ impl Client {
         let open = PendingOpen {
             tcp,
             target,
-            preread: Vec::new(),
-            read_eof: false,
             kind,
             enqueued_at: cx.now(),
         };
@@ -566,10 +564,8 @@ impl App for Client {
             return;
         }
         match end {
-            // spec §6.2: a pending request that read EOF stays pending.
-            TcpEnd::ReadEof => {
-                self.pending.set_read_eof(&tcp);
-            }
+            // spec §6.2: a pending request that read EOF stays pending (the shard keeps the EOF).
+            TcpEnd::ReadEof => {}
             TcpEnd::Error(_) => {
                 self.pending.remove(&tcp);
                 // spec §6.2: a socket error while the open is in flight resets the stream.
