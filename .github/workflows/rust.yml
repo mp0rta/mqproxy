@@ -43,6 +43,8 @@ jobs:
         with:
           tool: cross
       - run: cross build --workspace --target ${{ matrix.target }}
+      # a library build never links: run the layout + engine tests (qemu for aarch64)
+      - run: cross test -p xquic-sys --target ${{ matrix.target }}
 
   fuzz-replay:
     runs-on: ubuntu-latest

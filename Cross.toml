@@ -1,0 +1,15 @@
+# Cross images pinned to cross-rs `main` (Ubuntu 24.04, cmake 3.23.1 -- BoringSSL needs >= 3.22).
+# The cross 0.2.5 default images are too old for BoringSSL's C++17 (aarch64-gnu ships g++ 5.4)
+# and mix glibc 2.23/2.27/2.31, so a build script built in one image fails in another sharing target/.
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:479dfab9e4020c9cf29d28a600069e97a1d8cb705ef6008da7abc10e2fbebbf4"
+
+# musl-cross-make g++ 9.2 ICEs (expand_debug_locations) on BoringSSL's avx2 keccak_f_x4 under -ggdb.
+[target.x86_64-unknown-linux-musl.env]
+passthrough = ["CXXFLAGS_x86_64_unknown_linux_musl=-fno-var-tracking-assignments"]
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:adbd580b3f1c48a278e8352202bc4bc63f6f57f8e7975572cb7d2b7f033e4a0f"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:d1c86ae6eee5c65e9c9696bdfe48a6a8a61a45d962f26c6465d35ef30acff684"
