@@ -115,6 +115,28 @@ fn finish<A: App>(d: Driver, shard: Shard<Transport, A>) -> i32 {
     code
 }
 
+/// spec §6.6: the installed `--setup-redirect` rules, removed at most once —
+/// by the shutdown hook (sharing `opts`), or on drop: a normal return or a
+/// panic unwinding past `finish`.
+struct Rules {
+    opts: Rc<Cell<Option<setup_redirect::Opts>>>,
+    uninstall: fn(&setup_redirect::Opts),
+}
+
+impl Rules {
+    fn remove(opts: &Cell<Option<setup_redirect::Opts>>, uninstall: fn(&setup_redirect::Opts)) {
+        if let Some(o) = opts.take() {
+            uninstall(&o);
+        }
+    }
+}
+
+impl Drop for Rules {
+    fn drop(&mut self) {
+        Rules::remove(&self.opts, self.uninstall);
+    }
+}
+
 fn run_server(r: &Resolved, s: &ServerArgs) -> Result<i32, String> {
     let t = transport(
         r,
@@ -171,7 +193,10 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
         .expect("first attach");
 
     let mut ingress = String::new();
-    let rules: Rc<Cell<Option<setup_redirect::Opts>>> = Rc::default();
+    let rules = Rules {
+        opts: Rc::default(),
+        uninstall: setup_redirect::uninstall,
+    };
     let plain = [
         (c.socks5, client::SOCKS5, "SOCKS5", "socks5"),
         (
@@ -214,13 +239,9 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
             if !setup_redirect::install(&o) {
                 log::warn!("tproxy: firewall setup failed (rules may be partial)");
             }
-            rules.set(Some(o));
-            let hook = rules.clone();
-            d.on_shutdown(move || {
-                if let Some(o) = hook.take() {
-                    setup_redirect::uninstall(&o);
-                }
-            });
+            rules.opts.set(Some(o));
+            let (hook, f) = (rules.opts.clone(), rules.uninstall);
+            d.on_shutdown(move || Rules::remove(&hook, f));
         }
     }
     ready(
@@ -232,11 +253,53 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
             sched_name(r.scheduler)
         ),
     );
-    let code = finish(d, shard);
     // spec §6.6: the hook removes the rules in the signal's loop iteration; an
-    // exit without a signal removes them here.
-    if let Some(o) = rules.take() {
-        setup_redirect::uninstall(&o);
+    // exit without a signal (or a panic) removes them when `rules` drops.
+    Ok(finish(d, shard))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    thread_local!(static CALLS: Cell<u32> = const { Cell::new(0) });
+
+    fn count(_: &setup_redirect::Opts) {
+        CALLS.with(|c| c.set(c.get() + 1));
     }
-    Ok(code)
+
+    fn rules() -> Rules {
+        Rules {
+            opts: Rc::new(Cell::new(Some(setup_redirect::Opts {
+                mode: ListenKind::Redirect,
+                listener_port: 1,
+                dport: 443,
+                uid: 0,
+                fwmark: 1,
+                table: 100,
+            }))),
+            uninstall: count,
+        }
+    }
+
+    #[test]
+    fn rules_removed_once_by_hook_then_drop() {
+        CALLS.with(|c| c.set(0));
+        let r = rules();
+        let hook = r.opts.clone();
+        Rules::remove(&hook, r.uninstall); // the shutdown hook
+        drop(r);
+        assert_eq!(CALLS.with(Cell::get), 1);
+    }
+
+    #[test]
+    fn rules_removed_on_unwind() {
+        CALLS.with(|c| c.set(0));
+        let r = std::panic::catch_unwind(|| {
+            let _r = rules();
+            panic!("boom");
+        });
+        assert!(r.is_err());
+        assert_eq!(CALLS.with(Cell::get), 1);
+    }
 }
