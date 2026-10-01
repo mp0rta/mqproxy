@@ -1,7 +1,9 @@
 //! spec §6.2 "Pending requests (before auth)": at most 256, kept across reconnects,
 //! 8 KiB of preread each, 30 s deadline.
 
-use crate::ingress::{http_error_reply, socks5_error_reply};
+use crate::ingress::{
+    http_error_reply, http_success_reply, socks5_error_reply, socks5_success_reply,
+};
 use mq_runtime::{Target, TcpId};
 use mq_transport_api::Time;
 use mq_wire::frames::TcpErr;
@@ -23,6 +25,15 @@ pub enum IngressKind {
 }
 
 impl IngressKind {
+    /// spec §6.1: the ingress success reply, or `None` for transparent capture.
+    pub fn success_reply(self) -> Option<Vec<u8>> {
+        match self {
+            IngressKind::Socks5 => Some(socks5_success_reply().to_vec()),
+            IngressKind::HttpConnect => Some(http_success_reply().to_vec()),
+            IngressKind::Transparent => None,
+        }
+    }
+
     /// spec §6.1: the ingress error reply for `e`, or `None` for transparent capture.
     pub fn error_reply(self, e: TcpErr) -> Option<Vec<u8>> {
         match self {

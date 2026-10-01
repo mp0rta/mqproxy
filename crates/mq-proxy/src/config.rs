@@ -1,10 +1,21 @@
 //! spec §6.2, §6.3, §6.5: client and server settings; the CLI maps onto these (Task 9.1).
 
+use mq_transport_api::Scheduler;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 /// spec §6.2: client settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
+    /// `--server`.
+    pub server: SocketAddr,
+    /// `--path` entries, config file first then CLI, at most 8 (the CLI caps the
+    /// list). The first is the primary bind; the rest are the path candidates.
+    pub paths: Vec<IpAddr>,
+    /// `--scheduler`; `Backup` adds the extra paths as standby.
+    pub scheduler: Scheduler,
+    /// `--keepalive-idle`: the QUIC idle timeout; `None` disables it.
+    pub keepalive_idle: Option<Duration>,
     /// `--client-id` (C default "mqproxy"); truncated to 63 bytes on the wire.
     pub client_id: String,
     /// `--token`; truncated to 255 bytes on the wire.
@@ -26,6 +37,10 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         ClientConfig {
+            server: SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
+            paths: Vec::new(),
+            scheduler: Scheduler::MinRtt,
+            keepalive_idle: Some(Duration::from_secs(30)),
             client_id: "mqproxy".to_owned(),
             token: String::new(),
             reconnect: true,

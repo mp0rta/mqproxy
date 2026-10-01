@@ -145,6 +145,7 @@ dependencies = [
 name = "mq-proxy"
 version = "0.0.4"
 dependencies = [
+ "log",
  "mq-runtime",
  "mq-transport-api",
  "mq-wire",

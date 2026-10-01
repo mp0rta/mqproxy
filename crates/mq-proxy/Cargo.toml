@@ -9,6 +9,10 @@ license.workspace = true
 mq-runtime = { path = "../mq-runtime" }
 mq-transport-api = { path = "../mq-transport-api" }
 mq-wire = { path = "../mq-wire" }
+log = { workspace = true }
+
+[dev-dependencies]
+mq-runtime = { path = "../mq-runtime", features = ["test-support"] }
 
 [features]
 test-support = []
