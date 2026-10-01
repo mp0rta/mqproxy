@@ -8,7 +8,6 @@ fn assert_dyn(_: &mut dyn TransportOps) {}
 #[test]
 fn transport_ops_is_object_safe() {
     // Compiles only if TransportOps is dyn-compatible.
-    type _Boxed = Box<dyn TransportOps>;
     let _f: fn(&mut dyn TransportOps) = assert_dyn;
 
     // Shapes downstream relies on.

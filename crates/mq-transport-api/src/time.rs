@@ -18,22 +18,24 @@ impl Time {
     }
 }
 
-// Durations are truncated to whole microseconds.
+// Durations are truncated to whole microseconds, saturating at u64::MAX.
 fn us(d: Duration) -> u64 {
-    d.as_micros() as u64
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
 impl Add<Duration> for Time {
     type Output = Time;
+    /// Saturates at `u64::MAX`.
     fn add(self, d: Duration) -> Time {
-        Time(self.0 + us(d))
+        Time(self.0.saturating_add(us(d)))
     }
 }
 
 impl Sub<Duration> for Time {
     type Output = Time;
+    /// Saturates at zero.
     fn sub(self, d: Duration) -> Time {
-        Time(self.0 - us(d))
+        Time(self.0.saturating_sub(us(d)))
     }
 }
 

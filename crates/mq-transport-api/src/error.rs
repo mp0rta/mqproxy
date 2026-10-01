@@ -9,8 +9,7 @@ pub enum StreamError {
     Reset,
     /// The id's object is gone (spec §4.8).
     Stale,
-    /// Connection-level failure. `open_stream` also returns this for a
-    /// server-role transport and for a connection at the 8192-slot ceiling.
+    /// Connection-level failure.
     Conn,
 }
 
@@ -23,16 +22,15 @@ pub enum PathError {
     Other,
 }
 
-/// `connect` failure.
+/// `connect` failure. (`max_conns` is a server-side accept limit, so a
+/// client `connect` has no "limit" case.)
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ConnectError {
-    /// The `max_conns` limit is reached.
-    Limit,
     /// The engine refused; carries xquic's return code.
     Other(i32),
 }
 
-/// Failure of `conn_stats` / `stream_info` (and other non-stream calls).
+/// Failure of `open_stream` / `conn_stats` / `stream_info` (spec §4.2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
     Stale,

@@ -34,7 +34,7 @@ impl SlotId {
 macro_rules! gen_id {
     ($(#[$m:meta])* $name:ident) => {
         $(#[$m])*
-        #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+        #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, PartialOrd, Ord)]
         pub struct $name {
             index: u32,
             generation: NonZeroU32,

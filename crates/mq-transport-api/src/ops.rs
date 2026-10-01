@@ -31,9 +31,9 @@ pub trait TransportOps {
 
     // operations
     fn connect(&mut self, now: Time, cfg: &ConnConfig) -> Result<ConnId, ConnectError>;
-    /// Client only. A server-role transport or a conn at the 8192-slot
-    /// ceiling returns `StreamError::Conn` (spec §4.2).
-    fn open_stream(&mut self, now: Time, conn: ConnId) -> Result<StreamId, StreamError>;
+    /// Client only: a server-role transport returns `Error::Role`, a conn at
+    /// the 8192-slot ceiling `Error::Ceiling` (spec §4.2).
+    fn open_stream(&mut self, now: Time, conn: ConnId) -> Result<StreamId, Error>;
     /// `Ok(n)` accepted bytes; FIN committed only when `n == data.len()`.
     fn stream_send(
         &mut self,

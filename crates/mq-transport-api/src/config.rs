@@ -18,12 +18,14 @@ pub struct TransportConfig {
     pub realtime_offset_us: i64,
 }
 
+/// Client or server; the server needs a cert and key (spec §4.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     Client,
     Server { cert: PathBuf, key: PathBuf },
 }
 
+/// xquic multipath scheduler (spec §4.2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Scheduler {
     MinRtt,
@@ -31,6 +33,7 @@ pub enum Scheduler {
     Wlb,
 }
 
+/// Congestion controller (spec §4.2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CongestionControl {
     Bbr,

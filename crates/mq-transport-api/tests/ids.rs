@@ -49,6 +49,9 @@ fn time_arithmetic() {
     assert_eq!(Time::from_micros(5_000) - t, Duration::from_micros(4_000));
     // Time - Time saturates at zero
     assert_eq!(t - Time::from_micros(5_000), Duration::ZERO);
+    // Time ± Duration saturates too
+    assert_eq!(t - Duration::from_secs(1), Time::ZERO);
+    assert_eq!((t + Duration::MAX).as_micros(), u64::MAX);
     assert!(t < t + Duration::from_micros(1));
     // sub-microsecond parts of a Duration are truncated
     assert_eq!((t + Duration::from_nanos(1_999)).as_micros(), 1_001);
