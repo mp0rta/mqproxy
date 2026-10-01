@@ -2,3 +2,4 @@
 #![forbid(unsafe_code)]
 
 pub mod driver_harness;
+pub mod loopback;

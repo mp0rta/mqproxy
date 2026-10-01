@@ -525,6 +525,7 @@ impl Io for MioIo {
             }
             self.scratch_metas.clear();
             let r = s.recv_batch(&mut self.scratch, &mut self.scratch_metas);
+            let dgrams = self.scratch_metas.len();
             for m in self.scratch_metas.drain(..) {
                 let start = out.buf.len();
                 out.buf.extend_from_slice(&self.scratch[m.range]);
@@ -534,7 +535,8 @@ impl Io for MioIo {
                 });
             }
             match r {
-                Ok(n) => used += n,
+                // At least one byte per datagram: zero-length datagrams must not escape the budget.
+                Ok(n) => used += n.max(dgrams),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(RecvStop::Drained),
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),

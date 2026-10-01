@@ -1,12 +1,14 @@
 //! The driver harness (spec §8.1 "Driver"): the production `Driver` on its
 //! own thread over a `ScriptedTransport` and a `RecordingApp`, real loopback
-//! sockets, and a resolver the test answers on command.
+//! sockets, and a resolver the test answers on command. `DriverThread` is
+//! the generic part: any shard, built by a factory on the driver thread.
 
 use mq_runtime::driver::{Driver, DriverConfig, Resolver, ShutdownHandle, Stats};
 use mq_runtime::testing::{
     RecordHandle, Recorded, RecordingApp, ScriptedHandle, ScriptedTransport,
 };
-use mq_runtime::{ListenKind, ListenerTag, Shard, TcpEnd};
+use mq_runtime::{App, ListenKind, ListenerTag, Shard, TcpEnd};
+use mq_transport_api::TransportOps;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -72,21 +74,21 @@ impl Default for HarnessConfig {
     }
 }
 
-struct Ready {
-    scripted: ScriptedHandle,
-    record: RecordHandle,
+struct Ready<H> {
+    handle: H,
     udp: SocketAddr,
     listeners: Vec<SocketAddr>,
     shutdown: ShutdownHandle,
     stats: Stats,
 }
 
-/// A driver on its own thread. Built and bound by `spawn`; `run` starts
-/// only at `start`, so reactions can be installed before `on_start`.
-pub struct DriverHarness {
-    pub scripted: ScriptedHandle,
-    pub record: RecordHandle,
-    pub resolver: ResolverControl,
+/// A production `Driver` on its own thread over a shard built by a factory
+/// on that thread (`Transport` and `Shard` are `!Send`). Built and bound by
+/// `spawn_with`; `run` starts only at `start`, so reactions can be installed
+/// before `on_start`.
+pub struct DriverThread<H> {
+    /// What the factory handed back to the test (e.g. a `RecordHandle`).
+    pub handle: H,
     /// The primary UDP socket.
     pub udp_addr: SocketAddr,
     pub listen_addrs: Vec<SocketAddr>,
@@ -97,53 +99,53 @@ pub struct DriverHarness {
     thread: Option<JoinHandle<()>>,
 }
 
-impl DriverHarness {
-    pub fn spawn(cfg: HarnessConfig) -> DriverHarness {
-        let (req_tx, req_rx) = mpsc::channel();
+impl<H: Send + 'static> DriverThread<H> {
+    /// Binds the primary UDP socket on `127.0.0.1:0`, builds the shard with
+    /// `factory(primary_local)` on the driver thread, then binds one loopback
+    /// listener per `(kind, tag)`.
+    pub fn spawn_with<T, A, F>(
+        cfg: DriverConfig,
+        listeners: Vec<(ListenKind, ListenerTag)>,
+        factory: F,
+    ) -> DriverThread<H>
+    where
+        T: TransportOps + 'static,
+        A: App + 'static,
+        F: FnOnce(SocketAddr) -> (Shard<T, A>, H) + Send + 'static,
+    {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel::<()>();
         let (done_tx, done) = mpsc::channel();
         let thread = thread::spawn(move || {
-            let mut d = Driver::new(DriverConfig {
-                resolver: Arc::new(ChanResolver(req_tx)),
-                emfile_retry: cfg.emfile_retry,
-                shutdown_cap: cfg.shutdown_cap,
-                install_signal_handlers: false,
-            })
-            .expect("driver");
+            let mut d = Driver::new(cfg).expect("driver");
             let udp = d.bind_udp(loopback()).expect("bind_udp");
-            // `Transport`/`Shard` are `!Send`: built here, on the driver thread.
-            let (t, scripted) = ScriptedTransport::new();
-            let (app, record) = RecordingApp::new();
-            let mut shard = Shard::new(t, app, udp.local_addr(), 1);
             let udp_addr = udp.local_addr();
+            let (mut shard, handle) = factory(udp_addr);
             d.attach_primary_udp(udp, shard.primary_udp())
                 .expect("first attach");
-            let mut listeners = Vec::new();
-            for (i, kind) in cfg.listeners.into_iter().enumerate() {
+            let mut addrs = Vec::new();
+            for (kind, tag) in listeners {
                 let l = d.listen(loopback(), kind).expect("listen");
-                listeners.push(l.local_addr());
-                d.attach_listener(l, shard.add_listener(ListenerTag(i as u32)));
+                addrs.push(l.local_addr());
+                d.attach_listener(l, shard.add_listener(tag));
             }
             let _ = ready_tx.send(Ready {
-                scripted,
-                record,
+                handle,
                 udp: udp_addr,
-                listeners,
+                listeners: addrs,
                 shutdown: d.shutdown_handle(),
                 stats: d.stats(),
             });
             if go_rx.recv().is_err() {
                 return;
             }
+            // The shard, and its transport, drop here on their own thread.
             let (code, _shard) = d.run(shard);
             let _ = done_tx.send(code);
         });
         let r = ready_rx.recv().expect("driver thread failed during setup");
-        DriverHarness {
-            scripted: r.scripted,
-            record: r.record,
-            resolver: ResolverControl(req_rx),
+        DriverThread {
+            handle: r.handle,
             udp_addr: r.udp,
             listen_addrs: r.listeners,
             shutdown: r.shutdown,
@@ -153,11 +155,81 @@ impl DriverHarness {
             thread: Some(thread),
         }
     }
+}
 
+impl<H> DriverThread<H> {
     /// Starts `Driver::run` (and so `on_start`).
     pub fn start(&mut self) {
         if let Some(go) = self.go.take() {
             go.send(()).expect("driver thread alive");
+        }
+    }
+
+    /// The exit status, if the driver exits within `timeout`.
+    pub fn join_timeout(&mut self, timeout: Duration) -> Option<i32> {
+        let code = match self.done.recv_timeout(timeout) {
+            Ok(c) => c,
+            Err(RecvTimeoutError::Timeout) => return None,
+            Err(RecvTimeoutError::Disconnected) => panic!("driver thread panicked"),
+        };
+        if let Some(t) = self.thread.take() {
+            t.join().expect("driver thread");
+        }
+        Some(code)
+    }
+
+    /// The exit status; panics if the driver does not exit within 10 s.
+    pub fn join(mut self) -> i32 {
+        self.join_timeout(Duration::from_secs(10))
+            .expect("driver did not exit")
+    }
+}
+
+/// `DriverThread` over a `ScriptedTransport` and a `RecordingApp`, with the
+/// channel-backed resolver. Derefs to the `DriverThread` for the addresses,
+/// handles, `start` and `join_timeout`.
+pub struct DriverHarness {
+    pub scripted: ScriptedHandle,
+    pub record: RecordHandle,
+    pub resolver: ResolverControl,
+    d: DriverThread<(ScriptedHandle, RecordHandle)>,
+}
+
+impl std::ops::Deref for DriverHarness {
+    type Target = DriverThread<(ScriptedHandle, RecordHandle)>;
+    fn deref(&self) -> &Self::Target {
+        &self.d
+    }
+}
+
+impl std::ops::DerefMut for DriverHarness {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.d
+    }
+}
+
+impl DriverHarness {
+    pub fn spawn(cfg: HarnessConfig) -> DriverHarness {
+        let (req_tx, req_rx) = mpsc::channel();
+        let dcfg = DriverConfig {
+            resolver: Arc::new(ChanResolver(req_tx)),
+            emfile_retry: cfg.emfile_retry,
+            shutdown_cap: cfg.shutdown_cap,
+            install_signal_handlers: false,
+        };
+        let listeners = (cfg.listeners.into_iter().enumerate())
+            .map(|(i, kind)| (kind, ListenerTag(i as u32)))
+            .collect();
+        let d = DriverThread::spawn_with(dcfg, listeners, |local| {
+            let (t, scripted) = ScriptedTransport::new();
+            let (app, record) = RecordingApp::new();
+            (Shard::new(t, app, local, 1), (scripted, record))
+        });
+        DriverHarness {
+            scripted: d.handle.0.clone(),
+            record: d.handle.1.clone(),
+            resolver: ResolverControl(req_rx),
+            d,
         }
     }
 
@@ -179,23 +251,9 @@ impl DriverHarness {
         }
     }
 
-    /// The exit status, if the driver exits within `timeout`.
-    pub fn join_timeout(&mut self, timeout: Duration) -> Option<i32> {
-        let code = match self.done.recv_timeout(timeout) {
-            Ok(c) => c,
-            Err(RecvTimeoutError::Timeout) => return None,
-            Err(RecvTimeoutError::Disconnected) => panic!("driver thread panicked"),
-        };
-        if let Some(t) = self.thread.take() {
-            t.join().expect("driver thread");
-        }
-        Some(code)
-    }
-
     /// The exit status; panics if the driver does not exit within 10 s.
-    pub fn join(mut self) -> i32 {
-        self.join_timeout(Duration::from_secs(10))
-            .expect("driver did not exit")
+    pub fn join(self) -> i32 {
+        self.d.join()
     }
 }
 
