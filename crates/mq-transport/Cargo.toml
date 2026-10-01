@@ -16,3 +16,4 @@ test-support = []
 
 [dev-dependencies]
 static_assertions = { workspace = true }
+mq-transport = { path = ".", features = ["test-support"] }

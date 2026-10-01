@@ -71,6 +71,7 @@ impl<T> Slots<T> {
                 .map(|v| (SlotId::new(i as u32, e.generation), v))
         })
     }
+    #[cfg(test)]
     pub fn len_live(&self) -> usize {
         self.entries.len() - self.free.len()
     }
@@ -90,6 +91,22 @@ pub(crate) struct ConnSlot {
     pub mp_ready_queued: bool,
 }
 
+impl ConnSlot {
+    pub fn new(server: bool, xqc: *mut xqc_connection_t, cid: xqc_cid_t) -> Self {
+        Self {
+            xqc,
+            cid,
+            counted: false,
+            server,
+            provisional: false,
+            provisional_deadline: None,
+            streams: 0,
+            pending_close: None,
+            mp_ready_queued: false,
+        }
+    }
+}
+
 pub(crate) struct StreamSlot {
     pub xqc: *mut xqc_stream_t,
     pub conn: SlotId,
@@ -99,6 +116,21 @@ pub(crate) struct StreamSlot {
     pub writable_queued: bool,
     pub fin_seen: bool,
     pub abandoned: bool,
+}
+
+impl StreamSlot {
+    pub fn new(conn: SlotId, xqc: *mut xqc_stream_t, quic_id: u64, kind: StreamKind) -> Self {
+        Self {
+            xqc,
+            conn,
+            quic_id,
+            kind,
+            readable_queued: false,
+            writable_queued: false,
+            fin_seen: false,
+            abandoned: false,
+        }
+    }
 }
 
 #[cfg(test)]

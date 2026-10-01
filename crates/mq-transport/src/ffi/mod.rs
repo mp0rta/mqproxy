@@ -1,11 +1,13 @@
 //! Callback tables (spec §4.8, §4.9). Every xquic user-data slot holds a `SlotId` or 0 ("none").
-//! Conn/stream bodies marked `TODO(task 4.6)` are stubs that Task 4.6 replaces with trampolines.
+//! The bodies that touch transport state live in `trampolines`.
 
-use crate::clock;
+pub(crate) mod trampolines;
+
 use core::ffi::{c_char, c_int, c_uchar, c_void};
-use libc::{sockaddr, socklen_t};
-use mq_transport_api::SlotId;
+use libc::{sa_family_t, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use trampolines::*;
 use xquic_sys::*;
 
 /// spec §4.8: a panic never unwinds into C — log and abort.
@@ -68,97 +70,7 @@ pub(crate) fn app_proto_callbacks() -> xqc_app_proto_callbacks_t {
     }
 }
 
-// ── transport callbacks ─────────────────────────────────────────────────
-
-// TODO(task 4.6): cap checks, provisional slot, transport user data.
-unsafe extern "C" fn server_accept(
-    _engine: *mut xqc_engine_t,
-    _conn: *mut xqc_connection_t,
-    _cid: *const xqc_cid_t,
-    _ud: *mut c_void,
-) -> c_int {
-    0
-}
-
-// TODO(task 4.6): release the provisional slot.
-unsafe extern "C" fn server_refuse(
-    _engine: *mut xqc_engine_t,
-    _conn: *mut xqc_connection_t,
-    _cid: *const xqc_cid_t,
-    _ud: *mut c_void,
-) {
-}
-
-// TODO(task 4.6): push_or_drop((None, PathId(0))).
-unsafe extern "C" fn stateless_reset(
-    _buf: *const c_uchar,
-    size: usize,
-    _peer: *const sockaddr,
-    _peerlen: socklen_t,
-    _local: *const sockaddr,
-    _locallen: socklen_t,
-    _ud: *mut c_void,
-) -> isize {
-    size as isize
-}
-
-// TODO(task 4.6): queue on (conn, PathId(0)).
-unsafe extern "C" fn write_socket(
-    _buf: *const c_uchar,
-    size: usize,
-    _peer: *const sockaddr,
-    _peerlen: socklen_t,
-    _ud: *mut c_void,
-) -> isize {
-    size as isize
-}
-
-// TODO(task 4.6): queue on (conn, path).
-unsafe extern "C" fn write_socket_ex(
-    _path_id: u64,
-    _buf: *const c_uchar,
-    size: usize,
-    _peer: *const sockaddr,
-    _peerlen: socklen_t,
-    _ud: *mut c_void,
-) -> isize {
-    size as isize
-}
-
-// TODO(task 4.6): push_or_drop((None, PathId(0))).
-unsafe extern "C" fn conn_send_packet_before_accept(
-    _buf: *const c_uchar,
-    size: usize,
-    _peer: *const sockaddr,
-    _peerlen: socklen_t,
-    _ud: *mut c_void,
-) -> isize {
-    size as isize
-}
-
-/// spec §4.9: the peer can retire the user SCID; keep the slot's cid current.
-unsafe extern "C" fn conn_update_cid_notify(
-    _conn: *mut xqc_connection_t,
-    _retire: *const xqc_cid_t,
-    new_cid: *const xqc_cid_t,
-    ud: *mut c_void,
-) {
-    guard(|| {
-        let inner = clock::current();
-        if inner.is_null() || new_cid.is_null() {
-            return;
-        }
-        // SAFETY: `new_cid` is valid for this call (copied before return, spec §4.8 "Borrowed
-        // data"; xquic may hand an unaligned pointer, hence read_unaligned). `inner` is the live
-        // Box<Inner> set by `clock::enter`; no other reference into it exists during a callback.
-        unsafe {
-            let cid = new_cid.read_unaligned();
-            if let Some(slot) = (*inner).conns.get_mut(SlotId::from_raw(ud as u64)) {
-                slot.cid = cid;
-            }
-        }
-    })
-}
+// ── callbacks with no state ─────────────────────────────────────────────
 
 /// spec §4.7: accept any certificate (as the C client does).
 unsafe extern "C" fn cert_verify(
@@ -170,61 +82,95 @@ unsafe extern "C" fn cert_verify(
     0
 }
 
-// TODO(task 4.6): push_mp_ready(conn).
-unsafe extern "C" fn ready_to_create_path_notify(_scid: *const xqc_cid_t, _ud: *mut c_void) {}
-
 /// No resumption store, as in C.
 unsafe extern "C" fn save_token(_token: *const c_uchar, _len: u32, _ud: *mut c_void) {}
 
 /// `save_session_cb` and `save_tp_cb`: no-ops, as in C.
 unsafe extern "C" fn save_string(_data: *const c_char, _len: usize, _ud: *mut c_void) {}
 
-// ── ALPN callbacks ──────────────────────────────────────────────────────
+// ── socket addresses ────────────────────────────────────────────────────
 
-// TODO(task 4.6): second cap check / bind ALPN user data.
-unsafe extern "C" fn conn_create_notify(
-    _conn: *mut xqc_connection_t,
-    _cid: *const xqc_cid_t,
-    _ud: *mut c_void,
-    _proto: *mut c_void,
-) -> c_int {
-    0
+/// `SocketAddr` → C socket address for xquic (which copies it).
+pub(crate) fn to_sockaddr(a: SocketAddr) -> (sockaddr_storage, socklen_t) {
+    // SAFETY: sockaddr_storage is plain data; all-zero is a valid (AF_UNSPEC) value.
+    let mut ss: sockaddr_storage = unsafe { core::mem::zeroed() };
+    let p = (&mut ss as *mut sockaddr_storage).cast::<u8>();
+    let len = match a {
+        SocketAddr::V4(v4) => {
+            let sin = sockaddr_in {
+                sin_family: libc::AF_INET as sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: sockaddr_storage is large and aligned enough for any sockaddr_*.
+            unsafe { p.cast::<sockaddr_in>().write(sin) };
+            size_of::<sockaddr_in>()
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo().to_be(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            // SAFETY: as above.
+            unsafe { p.cast::<sockaddr_in6>().write(sin6) };
+            size_of::<sockaddr_in6>()
+        }
+    };
+    (ss, len as socklen_t)
 }
 
-// TODO(task 4.6): ConnClosed + release.
-unsafe extern "C" fn conn_close_notify(
-    _conn: *mut xqc_connection_t,
-    _cid: *const xqc_cid_t,
-    _ud: *mut c_void,
-    _proto: *mut c_void,
-) -> c_int {
-    0
+/// C socket address from xquic → `SocketAddr`; `None` for null, short or non-IP addresses.
+///
+/// # Safety
+/// `sa` is null or points to `len` readable bytes (valid for this call, spec §4.8).
+pub(crate) unsafe fn from_sockaddr(sa: *const sockaddr, len: socklen_t) -> Option<SocketAddr> {
+    let len = len as usize;
+    if sa.is_null() || len < size_of::<sa_family_t>() {
+        return None;
+    }
+    // SAFETY: at least the family is readable; xquic may hand unaligned pointers.
+    let family = unsafe { sa.cast::<sa_family_t>().read_unaligned() };
+    match i32::from(family) {
+        libc::AF_INET if len >= size_of::<sockaddr_in>() => {
+            // SAFETY: `len` covers a sockaddr_in.
+            let sin = unsafe { sa.cast::<sockaddr_in>().read_unaligned() };
+            let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+            Some(SocketAddrV4::new(ip, u16::from_be(sin.sin_port)).into())
+        }
+        libc::AF_INET6 if len >= size_of::<sockaddr_in6>() => {
+            // SAFETY: `len` covers a sockaddr_in6.
+            let s = unsafe { sa.cast::<sockaddr_in6>().read_unaligned() };
+            let ip = Ipv6Addr::from(s.sin6_addr.s6_addr);
+            let port = u16::from_be(s.sin6_port);
+            let flow = u32::from_be(s.sin6_flowinfo);
+            Some(SocketAddrV6::new(ip, port, flow, s.sin6_scope_id).into())
+        }
+        _ => None,
+    }
 }
 
-// TODO(task 4.6): ConnEstablished.
-unsafe extern "C" fn conn_handshake_finished(
-    _conn: *mut xqc_connection_t,
-    _ud: *mut c_void,
-    _proto: *mut c_void,
-) {
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// TODO(task 4.6): readable / abandoned drain.
-unsafe extern "C" fn stream_read_notify(_s: *mut xqc_stream_t, _ud: *mut c_void) -> xqc_int_t {
-    0
-}
-
-// TODO(task 4.6): writable.
-unsafe extern "C" fn stream_write_notify(_s: *mut xqc_stream_t, _ud: *mut c_void) -> xqc_int_t {
-    0
-}
-
-// TODO(task 4.6): admission / bind.
-unsafe extern "C" fn stream_create_notify(_s: *mut xqc_stream_t, _ud: *mut c_void) -> xqc_int_t {
-    0
-}
-
-// TODO(task 4.6): release + StreamClosed.
-unsafe extern "C" fn stream_close_notify(_s: *mut xqc_stream_t, _ud: *mut c_void) -> xqc_int_t {
-    0
+    #[test]
+    fn sockaddr_round_trip() {
+        for a in ["10.1.2.3:4433", "[2001:db8::1]:443", "[fe80::1%3]:9"] {
+            let a: SocketAddr = a.parse().unwrap();
+            let (ss, len) = to_sockaddr(a);
+            // SAFETY: `ss` holds `len` initialised bytes.
+            let back = unsafe { from_sockaddr((&ss as *const sockaddr_storage).cast(), len) };
+            assert_eq!(back, Some(a));
+        }
+        // SAFETY: null is allowed.
+        assert_eq!(unsafe { from_sockaddr(core::ptr::null(), 16) }, None);
+    }
 }

@@ -208,6 +208,11 @@ impl TxQueues {
         !self.resumable.is_empty()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn blocked_conns(&self) -> Vec<ConnId> {
+        self.blocked.keys().copied().collect()
+    }
+
     #[cfg(feature = "test-support")]
     pub fn queued_bytes(&self, key: TxKey) -> usize {
         self.queues.get(&key).map_or(0, |q| q.bytes)

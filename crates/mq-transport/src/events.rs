@@ -79,10 +79,12 @@ impl Events {
         Some(e)
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.queue.len()
     }

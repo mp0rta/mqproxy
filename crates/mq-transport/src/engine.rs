@@ -73,20 +73,7 @@ impl Transport {
             }
         };
         let mut t = Transport {
-            inner: Box::new(Inner {
-                engine: ptr::null_mut(),
-                cfg,
-                alpn,
-                n_counted: 0,
-                n_provisional: 0,
-                conns: Default::default(),
-                streams: Default::default(),
-                txq: Default::default(),
-                events: Default::default(),
-                deadline: None,
-                last_now: Time(0),
-                qlog: None,
-            }),
+            inner: Box::new(Inner::new(cfg, alpn)),
         };
         let (server, cert, key) = match &t.inner.cfg.role {
             Role::Client => (false, None, None),
