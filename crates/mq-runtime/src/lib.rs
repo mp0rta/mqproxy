@@ -4,6 +4,8 @@
 mod app;
 mod ids;
 mod shard;
+#[cfg(feature = "test-support")]
+pub mod testing;
 
 pub use app::{
     AcceptMeta, App, Cx, DialError, Host, Interest, IoRequest, IoResult, ListenKind, ListenerTag,

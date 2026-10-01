@@ -10,7 +10,7 @@ mq-transport-api = { path = "../mq-transport-api" }
 mq-linux = { path = "../mq-linux" }
 
 [features]
-test-support = []
+test-support = ["mq-transport-api/test-support"]
 
 [dev-dependencies]
 mq-runtime = { path = ".", features = ["test-support"] }

@@ -155,6 +155,7 @@ name = "mq-runtime"
 version = "0.0.4"
 dependencies = [
  "mq-linux",
+ "mq-runtime",
  "mq-transport-api",
 ]
 
@@ -164,6 +165,7 @@ version = "0.0.4"
 dependencies = [
  "libc",
  "log",
+ "mq-transport",
  "mq-transport-api",
  "static_assertions",
  "xquic-sys",
