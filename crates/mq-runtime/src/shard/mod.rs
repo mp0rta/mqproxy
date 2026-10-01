@@ -1,8 +1,11 @@
 //! The shard (spec §5.2). This module currently holds only `ShardState`, the
 //! part of the shard that `Cx` acts on; `Shard<T, A>` is built around it.
 
+pub(crate) mod relay;
+pub(crate) mod ringbuf;
 mod rng;
 
+pub use relay::{PumpOutcome, RELAY_BUF, Relay, RelayEnd, RelayState};
 pub use rng::Rng;
 
 use crate::app::{IoRequest, PrereadTooLarge, SendBufFull, StreamPreread};

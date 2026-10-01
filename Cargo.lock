@@ -157,6 +157,7 @@ dependencies = [
  "mq-linux",
  "mq-runtime",
  "mq-transport-api",
+ "proptest",
 ]
 
 [[package]]

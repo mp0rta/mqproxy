@@ -12,4 +12,4 @@ pub use app::{
     PrereadTooLarge, SendBufFull, StreamPreread, Target, TcpEnd,
 };
 pub use ids::{DialOpId, ListenerId, SocketOpId, TcpId, TimerId, UdpSocketId};
-pub use shard::{Rng, ShardState, TCP_BUF};
+pub use shard::{PumpOutcome, RELAY_BUF, Relay, RelayEnd, RelayState, Rng, ShardState, TCP_BUF};

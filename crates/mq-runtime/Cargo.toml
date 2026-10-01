@@ -14,3 +14,4 @@ test-support = ["mq-transport-api/test-support"]
 
 [dev-dependencies]
 mq-runtime = { path = ".", features = ["test-support"] }
+proptest = { workspace = true }
