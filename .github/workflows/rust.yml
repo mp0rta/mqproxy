@@ -91,3 +91,14 @@ jobs:
         env:
           LIBCLANG_PATH: /usr/lib/llvm-18/lib
       - run: git diff --exit-code crates/xquic-sys/src/bindings.rs
+
+  asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: scripts/rust-asan.sh
