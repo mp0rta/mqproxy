@@ -77,3 +77,17 @@ jobs:
             mkdir -p crates/mq-wire/fuzz/corpus/$t
             cargo +nightly fuzz run --fuzz-dir crates/mq-wire/fuzz $t crates/mq-wire/fuzz/corpus/$t fuzz/corpus/$c -- -max_total_time=30
           done
+
+  bindings-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y libclang-18-dev
+      - run: cargo install bindgen-cli --version 0.72.1 --locked
+      - run: ./scripts/update-xquic-bindings.sh
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+      - run: git diff --exit-code crates/xquic-sys/src/bindings.rs

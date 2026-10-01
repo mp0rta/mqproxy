@@ -7,3 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+libc = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
