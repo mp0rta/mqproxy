@@ -8,3 +8,6 @@ publish = false
 
 [dependencies]
 mq-wire = { path = "../mq-wire" }
+
+[build-dependencies]
+cc = { workspace = true }
