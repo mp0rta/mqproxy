@@ -247,6 +247,7 @@ dependencies = [
 name = "mq-integration"
 version = "0.0.4"
 dependencies = [
+ "mq-integration",
  "mq-linux",
  "mq-proxy",
  "mq-runtime",

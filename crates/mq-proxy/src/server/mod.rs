@@ -231,6 +231,12 @@ impl Server {
         self.active
     }
 
+    /// spec §6.3: stream-budget entries `c` holds (control stream included).
+    #[cfg(feature = "test-support")]
+    pub fn held(&self, c: ConnId) -> Option<usize> {
+        self.conns.get(&c).map(|k| k.held)
+    }
+
     fn timer(&mut self, cx: &mut Cx<'_>, after: Duration, tm: Tm) -> TimerId {
         let id = cx.set_timer(after);
         self.timers.insert(id, tm);

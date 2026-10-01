@@ -49,7 +49,7 @@ fn op_of(p: &Pair<Server, impl mq_runtime::App + 'static>, f: fn(&Op) -> bool) -
 /// exactly once.
 #[test]
 fn pair_server_auth_timeout_slot_released_once() {
-    let mut p = Pair::new(spawn_server(server_cfg(), 0), spawn_raw(true));
+    let mut p = Pair::new(spawn_server(server_cfg(), 0), spawn_silent());
     assert!(p.run_until(5 * SEC, |p| !p.server_conns().is_empty()));
     let c = p.server_conns()[0];
     let accepted = p.with_server(move |n| {
@@ -217,6 +217,8 @@ fn pair_repeated_failed_opens_return_budget_to_baseline() {
     let (mut p, sc, cc) = authed_real();
     p.origin(OriginMode::Refuse);
     assert_eq!(p.stream_counts(sc, cc), (1, 1));
+    let held = move |p: &Pair<Server, Client>| p.with_server(move |n| n.app().held(sc));
+    assert_eq!(held(&p), Some(1), "control stream only");
     let refused = [5, 0, 5, 5, 0, 1, 0, 0, 0, 0, 0, 0];
     for _ in 0..10 {
         let socks: Vec<_> = (0..10).map(|_| p.socks_open(origin_addr(), b"")).collect();
@@ -230,7 +232,8 @@ fn pair_repeated_failed_opens_return_budget_to_baseline() {
     }
     assert_eq!(p.server_connects(), 100);
     back_to_baseline(&mut p, sc, cc);
-    // The budget is back: the server still serves new streams.
+    assert_eq!(held(&p), Some(1), "budget entries leaked");
+    // And the server still serves new streams.
     p.origin(OriginMode::Echo);
     let s = p.socks_open(origin_addr(), b"ping");
     let mut want = SOCKS5_OK.to_vec();

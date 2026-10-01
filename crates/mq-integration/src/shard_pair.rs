@@ -499,6 +499,11 @@ pub fn spawn_client(cfg: ClientConfig) -> Side<Client> {
     })
 }
 
+/// The `SilentClient` of spec §8.1: `RawClient` with `silent` set.
+pub fn spawn_silent() -> Side<RawClient> {
+    spawn_raw(true)
+}
+
 /// A `RawClient` (token "secret") at `client_addr()`.
 pub fn spawn_raw(silent: bool) -> Side<RawClient> {
     Side::spawn(
@@ -525,6 +530,8 @@ pub struct Pair<S: App, C: App> {
     pub blackhole: bool,
     /// When `Some`, every datagram sent is appended with its time.
     pub wire: Option<Vec<(Time, Packet)>>,
+    /// Datagrams to an address neither side owns (e.g. a closed socket), dropped.
+    pub unrouted: u64,
 }
 
 impl<S: App + 'static, C: App + 'static> Pair<S, C> {
@@ -536,6 +543,7 @@ impl<S: App + 'static, C: App + 'static> Pair<S, C> {
             now: T0,
             blackhole: false,
             wire: None,
+            unrouted: 0,
         }
     }
 
@@ -561,6 +569,8 @@ impl<S: App + 'static, C: App + 'static> Pair<S, C> {
                 s.push(p);
             } else if self.cli.owns(p.to) {
                 c.push(p);
+            } else {
+                self.unrouted += 1;
             }
         }
         (s, c)
