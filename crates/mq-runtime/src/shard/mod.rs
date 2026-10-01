@@ -334,6 +334,10 @@ impl<T: TransportOps, A: App> Shard<T, A> {
                 .values()
                 .any(|e| matches!(e, TcpEntry::Relay(r) if r.is_runnable()))
     }
+    /// spec §5.5 step 7: the transport's `resume_pending`.
+    pub fn resume_pending(&self) -> bool {
+        self.transport.resume_pending()
+    }
     /// spec §5.2: min(transport, app timers).
     pub fn next_timeout(&self) -> Option<Time> {
         [self.transport.next_timeout(), self.st.next_timer()]

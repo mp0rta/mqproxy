@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+pub mod driver;
 mod ids;
 mod shard;
 #[cfg(feature = "test-support")]

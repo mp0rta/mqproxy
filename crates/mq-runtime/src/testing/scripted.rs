@@ -50,6 +50,7 @@ pub enum Call {
 type RecvChunk = Result<(Vec<u8>, bool), StreamError>;
 type ConnectRule = Box<dyn Fn(&ScriptedHandle) -> Result<ConnId, ConnectError> + Send>;
 type OpenRule = Box<dyn Fn(&ScriptedHandle, ConnId) -> Result<StreamId, Error> + Send>;
+type DriveRule = Box<dyn Fn(&ScriptedHandle, Time) + Send>;
 type SendRule =
     Box<dyn Fn(&ScriptedHandle, StreamId, &[u8], bool) -> Result<usize, StreamError> + Send>;
 
@@ -75,6 +76,7 @@ struct ScriptState {
     on_connect: Option<ConnectRule>,
     on_open_stream: Option<OpenRule>,
     on_stream_send: Option<SendRule>,
+    on_drive: Option<DriveRule>,
     log: Vec<Call>,
     sent: HashMap<StreamId, Vec<u8>>,
 }
@@ -186,6 +188,10 @@ impl ScriptedHandle {
     ) {
         self.st().on_stream_send = Some(Box::new(f));
     }
+    /// Runs after every `drive` is logged.
+    pub fn on_drive(&self, f: impl Fn(&ScriptedHandle, Time) + Send + 'static) {
+        self.st().on_drive = Some(Box::new(f));
+    }
     pub fn new_conn_id(&self) -> ConnId {
         ConnId::from_slot(self.st().fresh_slot()).expect("generation 1")
     }
@@ -232,6 +238,7 @@ impl TransportOps for ScriptedTransport {
     fn drive(&mut self, now: Time) {
         self.last_now = now;
         self.st().log.push(Call::Drive(now));
+        run_rule(&self.h, |s| &mut s.on_drive, |f| f(&self.h, now));
     }
 
     fn pending_transmit(&self, out: &mut Vec<TxKey>) {
