@@ -112,7 +112,7 @@ mod tests {
     fn second_claim_fails_until_release() {
         let _r = Released;
         claim_thread(0).unwrap();
-        assert_eq!(claim_thread(0), Err(Error::EngineAlreadyOnThread));
+        assert!(matches!(claim_thread(0), Err(Error::EngineAlreadyOnThread)));
         release_thread();
         claim_thread(0).unwrap();
     }

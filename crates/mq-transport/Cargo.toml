@@ -8,6 +8,11 @@ license.workspace = true
 [dependencies]
 mq-transport-api = { path = "../mq-transport-api" }
 xquic-sys = { path = "../xquic-sys" }
+log = { workspace = true }
+libc = { workspace = true }
 
 [features]
 test-support = []
+
+[dev-dependencies]
+static_assertions = { workspace = true }

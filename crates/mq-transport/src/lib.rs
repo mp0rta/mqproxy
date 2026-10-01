@@ -9,16 +9,54 @@
 #![allow(dead_code)]
 
 mod clock;
+mod engine;
 mod events;
+mod ffi;
 mod slots;
 mod txq;
 
-/// Stub; fleshed out in Tasks 4.5/4.6.
-pub(crate) struct Inner;
+use mq_transport_api::{Time, TransportConfig};
+use slots::{ConnSlot, Slots, StreamSlot};
+use std::ffi::CString;
+use std::fs::File;
 
-/// Extended in Task 4.5.
-#[derive(Debug, PartialEq, Eq)]
+/// Everything a callback can reach (spec §4.8). Lives in a `Box` owned by `Transport`, so its
+/// address is stable for the transport's lifetime.
+pub(crate) struct Inner {
+    /// Null once destroyed (destroy-once, spec §4.2 `close`).
+    engine: *mut xquic_sys::xqc_engine_t,
+    /// Role, max_conns, scheduler, cc: read by `connect` / admission (Task 4.6).
+    cfg: TransportConfig,
+    /// NUL-terminated copy of `cfg.alpn` for `xqc_connect`.
+    alpn: CString,
+    /// Established connections that passed the second cap check (spec §4.7).
+    n_counted: u32,
+    /// Accepted, not yet admitted or released (spec §4.7).
+    n_provisional: u32,
+    conns: Slots<ConnSlot>,
+    streams: Slots<StreamSlot>,
+    txq: txq::TxQueues,
+    events: events::Events,
+    /// Recorded by `set_event_timer` (spec §4.3).
+    deadline: Option<Time>,
+    /// The last `now` a method was given; `Drop` destroys with it (spec §4.2).
+    last_now: Time,
+    /// qlog sink; written only while open (spec §4.9).
+    qlog: Option<File>,
+}
+
+/// One xquic engine (spec §4). `!Send + !Sync` through the raw engine pointer in `Inner`.
+pub struct Transport {
+    inner: Box<Inner>,
+}
+
+#[derive(Debug)]
 pub enum Error {
+    /// spec §4.6
     EngineAlreadyOnThread,
-    // more later
+    /// `xqc_engine_create` (e.g. unreadable cert/key) or ALPN registration failed.
+    EngineCreate,
+    /// Invalid configuration (e.g. a path or ALPN with an interior NUL).
+    Config(String),
+    Qlog(std::io::Error),
 }
