@@ -8,7 +8,14 @@ publish = false
 
 [dependencies]
 mq-proxy = { path = "../mq-proxy" }
-mq-runtime = { path = "../mq-runtime" }
+# The driver harness (src/) is built on the runtime's test-support types.
+mq-runtime = { path = "../mq-runtime", features = ["test-support"] }
 mq-transport = { path = "../mq-transport" }
 mq-transport-api = { path = "../mq-transport-api" }
 mq-linux = { path = "../mq-linux" }
+
+[dev-dependencies]
+mq-proxy = { path = "../mq-proxy", features = ["test-support"] }
+mq-runtime = { path = "../mq-runtime", features = ["test-support"] }
+mq-transport = { path = "../mq-transport", features = ["test-support"] }
+mq-transport-api = { path = "../mq-transport-api", features = ["test-support"] }

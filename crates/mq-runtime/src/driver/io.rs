@@ -75,8 +75,9 @@ pub trait Io {
     fn recv_udp(&mut self, s: UdpSock, out: &mut RecvBatch, budget: usize) -> io::Result<RecvStop>;
     /// Sends as much of `t` as the kernel takes, in ≤64-segment / ≤65507-byte GSO calls; owns the GSO-off fallback.
     /// Ok(n) = datagrams sent. `Ok(n < total)` occurs only on WouldBlock: the rest stays queued and the caller
-    /// clears the writable latch. Err(WouldBlock) when none were sent. Other errors: the failed batch's
-    /// datagrams count as sent (dropped) and are reported by a counter.
+    /// clears the writable latch. Err(WouldBlock) when none were sent. Any other Err (even after a sent
+    /// prefix) means the whole transmit is finished: the loop core commits all of it (sent + dropped) and
+    /// owns the send-error counter and its rate-limited log; the `Io` neither counts nor logs it.
     fn send_udp(&mut self, s: UdpSock, t: &Transmit<'_>) -> io::Result<usize>;
     fn start_resolve(&mut self, op: DialOpId, host: String, port: u16);
     /// A connect that fails synchronously (ECONNREFUSED on loopback, EMFILE from socket()) is reported as
