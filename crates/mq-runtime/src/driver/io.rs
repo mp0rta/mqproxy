@@ -6,6 +6,7 @@ use crate::ids::DialOpId;
 use mq_transport_api::{Time, Transmit};
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::ops::Range;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, PartialOrd, Ord)]
 pub struct SockKey(pub u64);
@@ -16,11 +17,20 @@ pub struct UdpSock(pub SockKey);
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ListenerKey(pub SockKey);
 
-/// One allocation, reused; filled by `UdpSocket::recv_batch`.
+/// One received datagram: `range` indexes `RecvBatch::buf`. OS-neutral so
+/// the `Io` surface carries no platform crate types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecvMeta {
+    pub src: SocketAddr,
+    pub local: SocketAddr,
+    pub range: Range<usize>,
+}
+
+/// One allocation, reused; filled by `Io::recv_udp`.
 #[derive(Default, Debug)]
 pub struct RecvBatch {
     pub buf: Vec<u8>,
-    pub metas: Vec<mq_linux::RecvMeta>,
+    pub metas: Vec<RecvMeta>,
 }
 
 /// spec §5.3: edges, completions and signals returned by `Io::wait`.
