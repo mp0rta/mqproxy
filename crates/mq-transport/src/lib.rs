@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 mod clock;
+mod events;
 mod slots;
 mod txq;
 
