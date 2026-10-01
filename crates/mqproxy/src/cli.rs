@@ -1,6 +1,7 @@
 //! spec §6.4: the C-identical command line (cli/main.c `usage_*`, `longopts`).
 //! `parse` turns argv into a fully resolved `Resolved` or an `Exit`.
 
+use crate::config::{self, FileConfig};
 use clap::error::ErrorKind;
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 use mq_proxy::config::{ClientConfig, ServerConfig};
@@ -26,7 +27,7 @@ pub struct Exit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     pub mode: Mode,
-    /// `--config`; loaded by Task 9.2.
+    /// `--config`, already applied (spec §6.4: defaults < file < CLI).
     pub config: Option<PathBuf>,
     /// `--qlog <dir>`.
     pub qlog: Option<PathBuf>,
@@ -267,8 +268,14 @@ pub fn parse(argv: &[&str]) -> Result<Resolved, Exit> {
             code: 0,
             message: format!("mqproxy {}\n", env!("CARGO_PKG_VERSION")),
         }),
-        Cmd::Server(a) => server(a).map_err(|m| usage_error("server", m)),
-        Cmd::Client(a) => client(a).map_err(|m| usage_error("client", m)),
+        Cmd::Server(a) => {
+            let f = config::load(a.config.as_deref(), true)?;
+            server(a, f).map_err(|m| usage_error("server", m))
+        }
+        Cmd::Client(a) => {
+            let f = config::load(a.config.as_deref(), false)?;
+            client(a, f).map_err(|m| usage_error("client", m))
+        }
     }
 }
 
@@ -288,31 +295,35 @@ fn unavailable(flag: &str) -> String {
     format!("{flag} is not available in this build")
 }
 
-fn server(a: ServerArgs) -> Result<Resolved, String> {
-    // spec §6.4 table: startup error, exit 2.
-    if a.origin_ca.is_some() {
-        return Err(unavailable("--origin-ca"));
+// spec §6.4: each value below is `CLI.or(file)`, then the C default.
+fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
+    // spec §6.4 table: startup error, exit 2 (an INI bool only when true).
+    if a.origin_ca.is_some() || f.origin_ca.is_some() {
+        return Err(unavailable("--origin-ca ([Gateway] OriginCA)"));
     }
-    if a.masquerade {
-        return Err(unavailable("--masquerade"));
+    if a.masquerade || f.masquerade {
+        return Err(unavailable("--masquerade ([Gateway] Masquerade)"));
     }
-    if a.request_metrics {
-        return Err(unavailable("--request-metrics"));
+    if a.request_metrics || f.request_metrics {
+        return Err(unavailable("--request-metrics ([Metrics] PerRequest)"));
     }
     // Accepted, no effect: --no-gateway, --no-udp, --udp-idle-timeout (validated only).
     let _ = (a.no_gateway, a.no_udp, a.udp_idle_timeout);
-    let mut warnings = Vec::new();
+    let mut warnings = f.warnings;
     // Warning, ignored: the feature was removed.
-    if a.cache_max_bytes.is_some() {
-        warnings.push("--cache-max-bytes is ignored: the origin response cache was removed".into());
+    if a.cache_max_bytes.or(f.cache_max_bytes).is_some() {
+        warnings.push(
+            "--cache-max-bytes ([Gateway] CacheMaxBytes) is ignored: the origin response cache was removed"
+                .into(),
+        );
     }
-    let cc = cc(a.cc.as_deref())?;
-    let scheduler = scheduler(a.scheduler.as_deref())?;
-    let listen = a.listen.ok_or("missing required --listen")?;
-    let token = a.token.ok_or("missing required --token")?;
+    let cc = cc(a.cc.or(f.cc).as_deref())?;
+    let scheduler = scheduler(a.scheduler.or(f.scheduler).as_deref())?;
+    let listen = a.listen.or(f.listen).ok_or("missing required --listen")?;
+    let token = a.token.or(f.token).ok_or("missing required --token")?;
     let (Some(cert), Some(key)) = (
-        a.cert.filter(|s| !s.is_empty()),
-        a.key.filter(|s| !s.is_empty()),
+        a.cert.or(f.cert).filter(|s| !s.is_empty()),
+        a.key.or(f.key).filter(|s| !s.is_empty()),
     ) else {
         return Err("--cert and --key are required".into());
     };
@@ -321,16 +332,16 @@ fn server(a: ServerArgs) -> Result<Resolved, String> {
         mode: Mode::Server(Server {
             config: ServerConfig {
                 token,
-                metrics_interval: a.metrics_interval.map(Duration::from_secs),
+                metrics_interval: metrics_interval(a.metrics_interval, f.metrics_interval),
                 ..ServerConfig::default()
             },
             listen,
             cert: cert.into(),
             key: key.into(),
-            max_conns: a.max_conns.unwrap_or(16), // C default
+            max_conns: a.max_conns.or(f.max_conns).unwrap_or(16), // C default
         }),
         config: a.config,
-        qlog: a.qlog,
+        qlog: a.qlog.or(f.qlog),
         cc,
         scheduler,
         warnings,
@@ -342,37 +353,41 @@ fn server(a: ServerArgs) -> Result<Resolved, String> {
     })
 }
 
-fn client(a: ClientArgs) -> Result<Resolved, String> {
-    // spec §6.4 table: startup error, exit 2.
-    if a.gateway.is_some() {
-        return Err(unavailable("--gateway"));
+fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
+    // spec §6.4 table: startup error, exit 2 (an INI bool only when true).
+    if a.gateway.is_some() || f.gateway.is_some() {
+        return Err(unavailable("--gateway ([Ingress] Gateway)"));
     }
-    if a.mitm {
-        return Err(unavailable("--mitm"));
+    if a.mitm || f.mitm {
+        return Err(unavailable("--mitm ([Mitm] Enabled)"));
     }
     // Accepted, no effect (C accepts them without --mitm).
     let _ = (a.ca_cert, a.ca_key, a.ignore_host, a.ignore_hosts);
-    let cc = cc(a.cc.as_deref())?;
-    let scheduler = scheduler(a.scheduler.as_deref())?;
-    let tproxy_mode = match a.tproxy_mode.as_deref() {
+    let cc = cc(a.cc.or(f.cc).as_deref())?;
+    let scheduler = scheduler(a.scheduler.or(f.scheduler).as_deref())?;
+    let tproxy_mode = match a.tproxy_mode.or(f.tproxy_mode).as_deref() {
         None | Some("redirect") => ListenKind::Redirect,
         Some("tproxy") => ListenKind::Tproxy,
         Some(m) => return Err(format!("invalid --tproxy-mode '{m}' (redirect|tproxy)")),
     };
-    let server = a.server.ok_or("missing required --server")?;
-    let token = a.token.ok_or("missing required --token")?;
-    if a.socks5.is_none() && a.http_connect.is_none() && a.tproxy.is_none() {
+    let server = a.server.or(f.server).ok_or("missing required --server")?;
+    let token = a.token.or(f.token).ok_or("missing required --token")?;
+    let socks5 = a.socks5.or(f.socks5);
+    let http_connect = a.http_connect.or(f.http_connect);
+    let tproxy = a.tproxy.or(f.tproxy);
+    if socks5.is_none() && http_connect.is_none() && tproxy.is_none() {
         return Err(
             "at least one ingress is required (--socks5, --http-connect, or --tproxy)".into(),
         );
     }
     let opt = |flag, s: Option<String>| s.map(|s| ip_port(flag, &s)).transpose();
-    let mut warnings = Vec::new();
+    let mut warnings = f.warnings;
     let mut paths = Vec::new();
-    for p in a.path {
+    // spec §6.4: file entries first, then the CLI's.
+    for p in f.paths.into_iter().chain(a.path) {
         if paths.len() == MAX_PATHS {
             warnings.push(format!(
-                "too many --path options (max {MAX_PATHS}); ignoring {p}"
+                "too many paths (--path / [Multipath] Path, max {MAX_PATHS}); ignoring {p}"
             ));
             continue;
         }
@@ -382,7 +397,7 @@ fn client(a: ClientArgs) -> Result<Resolved, String> {
         );
     }
     // C default 30; 0 disables the idle timeout (and so the PINGs).
-    let ka = a.keepalive_idle.unwrap_or(30);
+    let ka = a.keepalive_idle.or(f.keepalive_idle).unwrap_or(30);
     let keepalive_idle = (ka > 0).then(|| Duration::from_secs(ka));
     if (1..=XQUIC_PING_SECS).contains(&ka) {
         warnings.push(format!(
@@ -398,31 +413,47 @@ fn client(a: ClientArgs) -> Result<Resolved, String> {
                 paths,
                 scheduler,
                 keepalive_idle,
-                client_id: a.client_id.unwrap_or_else(|| "mqproxy".into()),
+                client_id: a
+                    .client_id
+                    .or(f.client_id)
+                    .unwrap_or_else(|| "mqproxy".into()),
                 token,
-                reconnect: !a.no_reconnect,
-                reconnect_max_backoff: Duration::from_secs(a.reconnect_max_backoff.unwrap_or(30)),
-                metrics_interval: a.metrics_interval.map(Duration::from_secs),
+                // The last of --reconnect/--no-reconnect wins; neither → the file.
+                reconnect: !a.no_reconnect && (a.reconnect || f.reconnect.unwrap_or(true)),
+                reconnect_max_backoff: Duration::from_secs(
+                    a.reconnect_max_backoff
+                        .or(f.reconnect_max_backoff)
+                        .unwrap_or(30),
+                ),
+                metrics_interval: metrics_interval(a.metrics_interval, f.metrics_interval),
                 ..ClientConfig::default()
             },
-            socks5: opt("--socks5", a.socks5)?,
-            http_connect: opt("--http-connect", a.http_connect)?,
-            tproxy: opt("--tproxy", a.tproxy)?,
+            socks5: opt("--socks5", socks5)?,
+            http_connect: opt("--http-connect", http_connect)?,
+            tproxy: opt("--tproxy", tproxy)?,
             tproxy_mode,
             // C defaults: fwmark 1, table 100, dport 443, uid = geteuid().
-            tproxy_fwmark: a.tproxy_fwmark.unwrap_or(1),
-            tproxy_table: a.tproxy_table.unwrap_or(100),
-            tproxy_dport: a.tproxy_dport.unwrap_or(443),
-            setup_redirect: a.setup_redirect,
-            tproxy_uid: a.tproxy_uid.unwrap_or_else(mq_linux::geteuid),
+            tproxy_fwmark: a.tproxy_fwmark.or(f.tproxy_fwmark).unwrap_or(1),
+            tproxy_table: a.tproxy_table.or(f.tproxy_table).unwrap_or(100),
+            tproxy_dport: a.tproxy_dport.or(f.tproxy_dport).unwrap_or(443),
+            setup_redirect: a.setup_redirect || f.setup_redirect,
+            tproxy_uid: a
+                .tproxy_uid
+                .or(f.tproxy_uid)
+                .unwrap_or_else(mq_linux::geteuid),
         }),
         config: a.config,
-        qlog: a.qlog,
+        qlog: a.qlog.or(f.qlog),
         cc,
         scheduler,
         warnings,
         startup_lines: Vec::new(),
     })
+}
+
+/// `--metrics-interval`, else the file's `[Metrics] Interval` (0 = off, as in C).
+fn metrics_interval(cli: Option<u64>, file: Option<u64>) -> Option<Duration> {
+    cli.or(file.filter(|&s| s > 0)).map(Duration::from_secs)
 }
 
 /// C `mq_cc_from_string`: exact, case-sensitive.

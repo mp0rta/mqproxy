@@ -85,8 +85,6 @@ fn server_implemented_flags_resolve() {
         "5",
         "--max-conns",
         "0",
-        "--config",
-        "/etc/m.ini",
     ])
     .unwrap();
     let s = server(&r);
@@ -99,7 +97,6 @@ fn server_implemented_flags_resolve() {
     assert_eq!(r.qlog, Some(PathBuf::from("/tmp/q")));
     assert_eq!(r.cc, CongestionControl::Cubic);
     assert_eq!(r.scheduler, Scheduler::Wlb);
-    assert_eq!(r.config, Some(PathBuf::from("/etc/m.ini")));
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     // C parse_ip_port also takes an unbracketed IPv6 literal (split at the last ':').
     let r = cli::parse(&[
@@ -142,8 +139,6 @@ fn client_implemented_flags_resolve() {
         "7",
         "--metrics-interval",
         "3",
-        "--config",
-        "c.ini",
         "--tproxy-mode",
         "tproxy",
         "--tproxy-fwmark",
@@ -179,7 +174,6 @@ fn client_implemented_flags_resolve() {
     assert!(!c.config.reconnect);
     assert_eq!(c.config.reconnect_max_backoff, Duration::from_secs(7));
     assert_eq!(c.config.metrics_interval, Some(Duration::from_secs(3)));
-    assert_eq!(r.config, Some(PathBuf::from("c.ini")));
     assert_eq!(c.tproxy_mode, ListenKind::Tproxy);
     assert_eq!(c.tproxy_fwmark, 9);
     assert_eq!(c.tproxy_table, 200);
