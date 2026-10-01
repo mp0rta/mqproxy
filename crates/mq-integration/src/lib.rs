@@ -3,3 +3,4 @@
 
 pub mod driver_harness;
 pub mod loopback;
+pub mod shard_pair;
