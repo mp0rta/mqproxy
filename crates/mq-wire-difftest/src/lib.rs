@@ -60,7 +60,7 @@ unsafe extern "C" {
 const ENC_CAP: usize = 1024;
 
 macro_rules! codec {
-    ($dec:ident, $enc:ident, $ty:ty, $c_dec:ident, $c_enc:ident) => {
+    ($dec:ident, $enc:ident, $ty:ty, $c_dec:ident, $c_enc:ident, [$($cstr:ident),*]) => {
         /// C decode: `(frame, consumed)`, or `None` when C returns -1.
         pub fn $dec(buf: &[u8]) -> Option<($ty, usize)> {
             // SAFETY: all-zero is a valid value of these plain-data structs; C
@@ -70,9 +70,17 @@ macro_rules! codec {
             usize::try_from(n).ok().map(|n| (out, n))
         }
         /// C encode, or `None` when C returns -1.
+        ///
+        /// # Panics
+        /// If a field C reads with `strlen` holds no NUL (C would read past it).
         pub fn $enc(f: &$ty) -> Option<Vec<u8>> {
+            $(assert!(
+                f.$cstr.contains(&0),
+                concat!(stringify!($cstr), " is not NUL-terminated")
+            );)*
             let mut buf = vec![0u8; ENC_CAP];
-            // SAFETY: C writes at most `ENC_CAP` bytes and only reads `f`.
+            // SAFETY: every strlen'd field is NUL-terminated (asserted above);
+            // C writes at most `ENC_CAP` bytes and only reads `f`.
             let n = unsafe { $c_enc(buf.as_mut_ptr(), buf.len(), f) };
             buf.truncate(usize::try_from(n).ok()?);
             Some(buf)
@@ -85,28 +93,32 @@ codec!(
     encode_auth_req,
     AuthReqC,
     mq_decode_auth_req,
-    mq_encode_auth_req
+    mq_encode_auth_req,
+    [client_id, auth_token]
 );
 codec!(
     decode_auth_resp,
     encode_auth_resp,
     AuthRespC,
     mq_decode_auth_resp,
-    mq_encode_auth_resp
+    mq_encode_auth_resp,
+    [server_id]
 );
 codec!(
     decode_connect_tcp_req,
     encode_connect_tcp_req,
     ConnectTcpReqC,
     mq_decode_connect_tcp_req,
-    mq_encode_connect_tcp_req
+    mq_encode_connect_tcp_req,
+    []
 );
 codec!(
     decode_connect_tcp_resp,
     encode_connect_tcp_resp,
     ConnectTcpRespC,
     mq_decode_connect_tcp_resp,
-    mq_encode_connect_tcp_resp
+    mq_encode_connect_tcp_resp,
+    [message]
 );
 
 /// C varint encode into a `cap`-byte buffer: the written bytes, or `None` on -1.

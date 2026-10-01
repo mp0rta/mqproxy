@@ -58,14 +58,15 @@ fn cmp_auth_req(input: &[u8]) -> Option<bool> {
         "auth_req outcome differs on {input:02x?}"
     );
     let ((r, rn), (cf, cn)) = (r.ok()?, cd?);
+    // Consumed length and scalars do not depend on the domain limits.
+    assert_eq!(rn, cn, "consumed on {input:02x?}");
+    assert_eq!(r.version, cf.version);
+    assert_eq!(r.features, cf.features);
     if r.client_id.contains(&0) || r.auth_token.contains(&0) {
         return Some(false);
     }
-    assert_eq!(rn, cn, "consumed on {input:02x?}");
-    assert_eq!(r.version, cf.version);
     assert_eq!(r.client_id, cstr(&cf.client_id));
     assert_eq!(r.auth_token, cstr(&cf.auth_token));
-    assert_eq!(r.features, cf.features);
     let re = rust_reencode(|o| r.encode(o).unwrap());
     assert_eq!(
         re,
@@ -84,14 +85,15 @@ fn cmp_auth_resp(input: &[u8]) -> Option<bool> {
         "auth_resp outcome differs on {input:02x?}"
     );
     let ((r, rn), (cf, cn)) = (r.ok()?, cd?);
+    // Consumed length and scalars do not depend on the domain limits.
+    assert_eq!(rn, cn, "consumed on {input:02x?}");
+    assert_eq!(u32::from(r.status), cf.status as u32);
+    assert_eq!(r.features, cf.features);
     if r.server_id.contains(&0) || r.error_code >= ERR_DOMAIN {
         return Some(false);
     }
-    assert_eq!(rn, cn, "consumed on {input:02x?}");
-    assert_eq!(u32::from(r.status), cf.status as u32);
     assert_eq!(r.error_code, u64::from(cf.error_code as u32));
     assert_eq!(r.server_id, cstr(&cf.server_id));
-    assert_eq!(r.features, cf.features);
     let re = rust_reencode(|o| r.encode(o).unwrap());
     assert_eq!(
         re,
@@ -134,14 +136,16 @@ fn cmp_connect_tcp_resp(input: &[u8]) -> Option<bool> {
         "connect_tcp_resp outcome differs on {input:02x?}"
     );
     let ((r, rn), (cf, cn)) = (r.ok()?, cd?);
+    // Consumed length, status and the length-carrying message do not depend
+    // on the domain limits.
+    assert_eq!(rn, cn, "consumed on {input:02x?}");
+    assert_eq!(u32::from(r.status), cf.status as u32);
+    assert_eq!(r.message, &cf.message[..cf.message_len]);
     // C decodes message with an explicit length but re-encodes it with strlen.
     if r.message.contains(&0) || r.error_code >= ERR_DOMAIN {
         return Some(false);
     }
-    assert_eq!(rn, cn, "consumed on {input:02x?}");
-    assert_eq!(u32::from(r.status), cf.status as u32);
     assert_eq!(r.error_code, u64::from(cf.error_code as u32));
-    assert_eq!(r.message, &cf.message[..cf.message_len]);
     let re = rust_reencode(|o| r.encode(o).unwrap());
     assert_eq!(
         re,
@@ -366,4 +370,12 @@ fn varint_decode_parity() {
 #[test]
 fn struct_layout_matches_header() {
     assert_eq!(c::rust_layout(), c::c_layout());
+}
+
+#[test]
+#[should_panic(expected = "server_id is not NUL-terminated")]
+fn c_encode_refuses_unterminated_string() {
+    let (mut f, _) = c::decode_auth_resp(&[0, 0, 0, 0, 0]).unwrap();
+    f.server_id = [b'x'; 64];
+    c::encode_auth_resp(&f);
 }
