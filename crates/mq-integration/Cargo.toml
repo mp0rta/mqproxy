@@ -19,3 +19,4 @@ mq-proxy = { path = "../mq-proxy", features = ["test-support"] }
 mq-runtime = { path = "../mq-runtime", features = ["test-support"] }
 mq-transport = { path = "../mq-transport", features = ["test-support"] }
 mq-transport-api = { path = "../mq-transport-api", features = ["test-support"] }
+mq-wire = { path = "../mq-wire" }

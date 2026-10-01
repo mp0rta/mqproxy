@@ -42,6 +42,13 @@ impl ResolverControl {
 
 struct ChanResolver(Sender<ResolveRequest>);
 
+/// A resolver for `DriverConfig::resolver` that blocks until the test answers
+/// through the returned control.
+pub fn chan_resolver() -> (Arc<dyn Resolver>, ResolverControl) {
+    let (tx, rx) = mpsc::channel();
+    (Arc::new(ChanResolver(tx)), ResolverControl(rx))
+}
+
 impl Resolver for ChanResolver {
     fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let (reply, rx) = mpsc::channel();
@@ -210,9 +217,9 @@ impl std::ops::DerefMut for DriverHarness {
 
 impl DriverHarness {
     pub fn spawn(cfg: HarnessConfig) -> DriverHarness {
-        let (req_tx, req_rx) = mpsc::channel();
+        let (resolver, control) = chan_resolver();
         let dcfg = DriverConfig {
-            resolver: Arc::new(ChanResolver(req_tx)),
+            resolver,
             emfile_retry: cfg.emfile_retry,
             shutdown_cap: cfg.shutdown_cap,
             install_signal_handlers: false,
@@ -228,7 +235,7 @@ impl DriverHarness {
         DriverHarness {
             scripted: d.handle.0.clone(),
             record: d.handle.1.clone(),
-            resolver: ResolverControl(req_rx),
+            resolver: control,
             d,
         }
     }

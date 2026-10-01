@@ -252,6 +252,7 @@ dependencies = [
  "mq-runtime",
  "mq-transport",
  "mq-transport-api",
+ "mq-wire",
 ]
 
 [[package]]
