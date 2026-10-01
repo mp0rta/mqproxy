@@ -1,0 +1,21 @@
+[package]
+name = "mq-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mq-transport-api = { path = "../mq-transport-api" }
+mq-linux = { path = "../mq-linux" }
+log = { workspace = true }
+mio = { workspace = true }
+tokio = { workspace = true }
+signal-hook = { workspace = true }
+
+[features]
+test-support = ["mq-transport-api/test-support"]
+
+[dev-dependencies]
+mq-runtime = { path = ".", features = ["test-support"] }
+proptest = { workspace = true }

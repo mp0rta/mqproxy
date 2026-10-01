@@ -1,0 +1,14 @@
+[package]
+name = "mq-transport-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[features]
+test-support = []
+
+[dev-dependencies]
+mq-transport-api = { path = ".", features = ["test-support"] }

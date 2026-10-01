@@ -93,7 +93,7 @@ ORIGIN_PORT="${ORIGIN_PORT:-18080}"
 QUIC_PORT="${QUIC_PORT:-18443}"
 SOCKS_PORT="${SOCKS_PORT:-11080}"
 
-TOKEN="bench-token"
+TOKEN="${TOKEN:-bench-token}"
 
 # ── skip if not privileged (no NET_ADMIN -> can't shape lo) ───────────────────
 SKIP=77

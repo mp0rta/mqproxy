@@ -1,0 +1,53 @@
+[package]
+name = "mq-wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.mq-wire]
+path = ".."
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "auth_req"
+path = "fuzz_targets/auth_req.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_resp"
+path = "fuzz_targets/auth_resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connect_tcp_req"
+path = "fuzz_targets/connect_tcp_req.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connect_tcp_resp"
+path = "fuzz_targets/connect_tcp_resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "varint"
+path = "fuzz_targets/varint.rs"
+test = false
+doc = false
+bench = false

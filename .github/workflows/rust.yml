@@ -1,0 +1,277 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 0'   # Sunday 04:00 UTC: the weekly unshaped + idle run (perf-rust)
+
+jobs:
+  fmt-clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: cargo test --workspace
+
+  build-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - run: cross build --workspace --target ${{ matrix.target }}
+      # a library build never links: run the layout + engine tests (qemu for aarch64)
+      - run: cross test -p xquic-sys --target ${{ matrix.target }}
+      # x86_64 musl runs the whole suite (spec §10: tests on x86_64 glibc and musl)
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cross test --workspace --target ${{ matrix.target }}
+
+  fuzz-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo install cargo-fuzz --locked
+      - name: Replay the C corpora
+        run: |
+          for pair in varint:varint auth_req:wire_auth_req auth_resp:wire_auth_resp connect_tcp_req:wire_connect_tcp_req connect_tcp_resp:wire_connect_tcp_resp; do
+            t=${pair%%:*}; c=${pair##*:}
+            mkdir -p crates/mq-wire/fuzz/corpus/$t
+            cargo +nightly fuzz run --fuzz-dir crates/mq-wire/fuzz $t crates/mq-wire/fuzz/corpus/$t fuzz/corpus/$c -- -runs=0
+          done
+          for pair in socks5:socks5_feed http_connect:http_connect; do
+            t=${pair%%:*}; c=${pair##*:}
+            mkdir -p crates/mq-proxy/fuzz/corpus/$t
+            cargo +nightly fuzz run --fuzz-dir crates/mq-proxy/fuzz $t crates/mq-proxy/fuzz/corpus/$t fuzz/corpus/$c -- -runs=0
+          done
+
+  fuzz-explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo install cargo-fuzz --locked
+      - name: Explore 30 s per target
+        run: |
+          for pair in varint:varint auth_req:wire_auth_req auth_resp:wire_auth_resp connect_tcp_req:wire_connect_tcp_req connect_tcp_resp:wire_connect_tcp_resp; do
+            t=${pair%%:*}; c=${pair##*:}
+            mkdir -p crates/mq-wire/fuzz/corpus/$t
+            cargo +nightly fuzz run --fuzz-dir crates/mq-wire/fuzz $t crates/mq-wire/fuzz/corpus/$t fuzz/corpus/$c -- -max_total_time=30
+          done
+          for pair in socks5:socks5_feed http_connect:http_connect; do
+            t=${pair%%:*}; c=${pair##*:}
+            mkdir -p crates/mq-proxy/fuzz/corpus/$t
+            cargo +nightly fuzz run --fuzz-dir crates/mq-proxy/fuzz $t crates/mq-proxy/fuzz/corpus/$t fuzz/corpus/$c -- -max_total_time=30
+          done
+
+  bindings-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y libclang-18-dev
+      - run: cargo install bindgen-cli --version 0.72.1 --locked
+      - run: ./scripts/update-xquic-bindings.sh
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+      - run: git diff --exit-code crates/xquic-sys/src/bindings.rs
+
+  asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: scripts/rust-asan.sh
+
+  deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+      - run: cargo deny check
+      - run: cargo audit
+
+  xquic-fork-tests:
+    # The fork's own CUnit suite (spec §9.2 "fork unit tests pass"); validate.sh
+    # generates the TLS fixtures (ensure_test_certificate) and runs ctest.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      # libevent-dev: the fork's tests/CMakeLists.txt requires LibEvent >= 2.0.21
+      # even for the CUnit suite (validate.sh test).
+      - run: sudo apt-get update && sudo apt-get install -y libcunit1-dev libevent-dev openssl
+      - run: scripts/build-xquic.sh
+      - run: cd third_party/xquic && scripts/validate.sh test
+
+  e2e:
+    # Black box + interop (spec §8.2, §9.2) with the Release Rust binary, in the
+    # same NET_ADMIN container as ci.yml's e2e job. A skip (exit 77) fails the step.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ubuntu:24.04
+      options: --cap-add=NET_ADMIN
+    steps:
+      - name: Install git (needed before checkout for submodules)
+        run: apt-get update && apt-get install -y git
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          apt-get install -y \
+            cmake gcc g++ make \
+            libevent-dev libcurl4-openssl-dev libnghttp2-dev golang \
+            iproute2 nftables curl python3 openssl sudo \
+            iperf3 socat procps ca-certificates
+      - name: Install Rust (rust-toolchain.toml picks the version)
+        run: |
+          curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+      - name: Cache xquic + BoringSSL (build-xquic.sh)
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/third_party/boringssl/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-build-xquic-sh-v1
+      - name: Build the C mqproxy (interop peer)
+        run: |
+          scripts/build-xquic.sh
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
+          cmake --build build -j"$(nproc)" --target mqproxy_cli
+      - run: cargo build --release --locked -p mqproxy
+      - name: e2e_multipath (Rust both ends)
+        run: MQPROXY_BIN=$PWD/target/release/mqproxy tests/integration/e2e_multipath.sh
+      - name: e2e_tproxy (Rust)
+        run: MQPROXY_BIN=$PWD/target/release/mqproxy tests/integration/e2e_tproxy.sh
+      - name: Interop, C client -> Rust server
+        run: |
+          MQPROXY_BIN=$PWD/tests/integration/mqproxy-interop-wrapper.sh \
+          MQPROXY_CLIENT_BIN=$PWD/build/mqproxy MQPROXY_SERVER_BIN=$PWD/target/release/mqproxy \
+            tests/integration/e2e_multipath.sh
+      - name: Interop, Rust client -> C server
+        run: |
+          MQPROXY_BIN=$PWD/tests/integration/mqproxy-interop-wrapper.sh \
+          MQPROXY_CLIENT_BIN=$PWD/target/release/mqproxy MQPROXY_SERVER_BIN=$PWD/build/mqproxy \
+            tests/integration/e2e_multipath.sh
+      - name: Upload e2e logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-e2e-logs
+          path: /tmp/mqproxy_e2e_*
+          if-no-files-found: ignore
+
+  perf-rust:
+    # The Rust binary in the perf job, under perf.yml's rules (privileged
+    # container, never on PRs). Push to main: ci_bench_tcp_proxy.sh, informational.
+    # Weekly schedule / manual: unshaped + idle for both binaries (spec §9.2).
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ubuntu:24.04
+      options: --privileged
+    steps:
+      - name: Install git (needed before checkout for submodules)
+        run: apt-get update && apt-get install -y git
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          apt-get install -y \
+            cmake gcc g++ make \
+            libevent-dev libcurl4-openssl-dev libnghttp2-dev golang \
+            iproute2 nftables curl python3 openssl sudo \
+            iperf3 socat procps ca-certificates
+      - name: Install Rust (rust-toolchain.toml picks the version)
+        run: |
+          curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: cargo build --release --locked -p mqproxy
+      - name: TCP proxy benchmark (Rust, informational)
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: bash scripts/ci_benchmarks/ci_bench_tcp_proxy.sh target/release/mqproxy
+      - name: Compute xquic SHA
+        if: github.event_name != 'push'
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+      - name: Cache xquic + BoringSSL (build-xquic.sh)
+        if: github.event_name != 'push'
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/third_party/boringssl/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-build-xquic-sh-v1
+      - name: Build the C mqproxy (baseline)
+        if: github.event_name != 'push'
+        run: |
+          scripts/build-xquic.sh
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
+          cmake --build build -j"$(nproc)" --target mqproxy_cli
+      - name: Unshaped + idle, C and Rust
+        if: github.event_name != 'push'
+        run: |
+          for b in c:build/mqproxy rust:target/release/mqproxy; do
+            MQPROXY_BIN=$PWD/${b#*:} BENCH_LABEL=${b%%:*} bash scripts/ci_benchmarks/ci_bench_unshaped.sh
+            MQPROXY_BIN=$PWD/${b#*:} BENCH_LABEL=${b%%:*} bash scripts/ci_benchmarks/ci_bench_idle.sh
+          done
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-rust-results-${{ github.sha }}
+          path: ci_bench_results/*.json
+          retention-days: 90

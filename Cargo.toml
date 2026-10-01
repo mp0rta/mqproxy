@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/xquic-sys", "crates/mq-linux", "crates/mq-wire", "crates/mq-wire-difftest",
+  "crates/mq-transport-api", "crates/mq-transport", "crates/mq-runtime",
+  "crates/mq-proxy", "crates/mqproxy", "crates/mq-integration",
+]
+exclude = ["crates/mq-wire/fuzz", "crates/mq-proxy/fuzz"]   # cargo-fuzz crates are their own workspaces
+
+[workspace.package]
+version = "0.0.4"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+libc = "0.2"
+mio = { version = "1", features = ["os-poll", "os-ext", "net"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "net", "macros"] }
+signal-hook = "0.3"
+thiserror = "2"
+log = "0.4"
+clap = { version = "4", features = ["derive"] }
+subtle = "2"
+proptest = "1"
+static_assertions = "1"
+cmake = "0.1"
+cc = "1"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1

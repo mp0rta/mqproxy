@@ -1,0 +1,18 @@
+[package]
+name = "xquic-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+libc = { workspace = true }
+
+[features]
+# Builds xquic with -DXQC_ENABLE_TEST_HOOKS=ON and exposes its test-only entry points.
+test-hooks = []
+
+[build-dependencies]
+cc = { workspace = true }
+cmake = { workspace = true }

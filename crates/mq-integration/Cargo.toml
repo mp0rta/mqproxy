@@ -1,0 +1,36 @@
+[package]
+name = "mq-integration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# The harnesses (src/) need the test-support types and accessors. Behind a
+# feature so that `cargo build --workspace` does not unify `test-support`
+# (and xquic's test hooks) into the `mqproxy` binary; the tests enable it
+# through the self dev-dependency below.
+harness = [
+    "dep:mq-wire",
+    "mq-proxy/test-support",
+    "mq-runtime/test-support",
+    "mq-transport/test-support",
+    "mq-transport-api/test-support",
+]
+
+[dependencies]
+mq-proxy = { path = "../mq-proxy" }
+mq-runtime = { path = "../mq-runtime" }
+mq-transport = { path = "../mq-transport" }
+mq-transport-api = { path = "../mq-transport-api" }
+mq-linux = { path = "../mq-linux" }
+mq-wire = { path = "../mq-wire", optional = true }
+
+[dev-dependencies]
+mq-integration = { path = ".", features = ["harness"] }
+mq-proxy = { path = "../mq-proxy", features = ["test-support"] }
+mq-runtime = { path = "../mq-runtime", features = ["test-support"] }
+mq-transport = { path = "../mq-transport", features = ["test-support"] }
+mq-transport-api = { path = "../mq-transport-api", features = ["test-support"] }
+mq-wire = { path = "../mq-wire" }

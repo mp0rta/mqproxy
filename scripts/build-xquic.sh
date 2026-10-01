@@ -27,7 +27,7 @@
 #     cmake -S . -B build \
 #       -DXQUIC_BUILD_DIR="$(pwd)/third_party/xquic/build"
 #
-# REQUIREMENTS: cmake, make, cc, git, time + network (clones BoringSSL on first
+# REQUIREMENTS: cmake, make, cc, git, time + network (submodule init on first
 #   run). Not run by CI automatically — it is the privileged/one-time bootstrap.
 #
 set -e
@@ -66,32 +66,24 @@ if [ "$err" -ne 0 ]; then
 fi
 
 # Ensure the submodule is checked out.
-if [ ! -f "$XQUIC_DIR/CMakeLists.txt" ]; then
+if [ ! -f "$XQUIC_DIR/CMakeLists.txt" ] || [ ! -f "$BSSL_DIR/CMakeLists.txt" ]; then
     echo "=== Initializing xquic submodule ==="
     git -C "$REPO_ROOT" submodule update --init --recursive third_party/xquic
 fi
 
 # ---------- 1. BoringSSL ----------
 
-# BoringSSL is not a git submodule of xquic; clone it if absent (mirrors mqvpn).
-# Pin the same commit the CI (.github/workflows/ci.yml) and mqvpn use, so local
-# and CI builds are reproducible against an identical BoringSSL (HEAD can break).
-BSSL_COMMIT="9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c"
-if [ ! -f "$BSSL_DIR/CMakeLists.txt" ]; then
-    echo "=== Cloning BoringSSL (pinned $BSSL_COMMIT) ==="
-    git clone https://github.com/google/boringssl.git "$BSSL_DIR"
-    git -C "$BSSL_DIR" checkout "$BSSL_COMMIT"
-fi
-
-echo "=== Building BoringSSL ==="
-mkdir -p "$BSSL_BUILD"
-if [ ! -f "$BSSL_BUILD/CMakeCache.txt" ]; then
+# BoringSSL is xquic's nested submodule (pinned by the xquic revision); the
+# recursive submodule init above checks it out.
+if [ ! -f "$BSSL_BUILD/libssl.a" ]; then
+    echo "=== Building BoringSSL ==="
     cmake -S "$BSSL_DIR" -B "$BSSL_BUILD" \
+        -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=0 \
-        -DCMAKE_C_FLAGS="-fPIC" \
-        -DCMAKE_CXX_FLAGS="-fPIC"
+        -DCMAKE_C_FLAGS=-fPIC \
+        -DCMAKE_CXX_FLAGS=-fPIC
+    cmake --build "$BSSL_BUILD" -j"$NPROC"
 fi
-make -C "$BSSL_BUILD" -j"$NPROC" ssl crypto
 
 # ---------- 2. xquic (with qlog / event-log enabled) ----------
 

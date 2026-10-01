@@ -1,0 +1,32 @@
+[package]
+name = "mq-proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.mq-proxy]
+path = ".."
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "socks5"
+path = "fuzz_targets/socks5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_connect"
+path = "fuzz_targets/http_connect.rs"
+test = false
+doc = false
+bench = false
