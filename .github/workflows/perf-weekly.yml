@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     container:
-      image: ubuntu:latest
+      image: ubuntu:24.04  # must match every job sharing the xquic cache key (glibc ABI)
       options: --privileged
     steps:
       - name: Install git (needed before checkout for submodules)
@@ -69,7 +69,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v2
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'

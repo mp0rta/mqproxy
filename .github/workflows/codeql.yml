@@ -58,7 +58,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v2
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
