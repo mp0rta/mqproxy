@@ -2,7 +2,7 @@ name: Performance Tests
 
 # Security: only push to main and manual trigger.
 # Never runs on PRs — prevents fork code execution on GitHub-hosted runner.
-# Runner requires --privileged (netns mount + tc/netem/nft) — runs in ubuntu:latest container.
+# Runner requires --privileged (netns mount + tc/netem/nft) — runs in ubuntu:24.04 container.
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
-      image: ubuntu:latest
+      image: ubuntu:24.04  # must match every job sharing the xquic cache key (glibc ABI)
       options: --privileged
     steps:
       - name: Install git (needed before checkout for submodules)
@@ -69,7 +69,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v2
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
