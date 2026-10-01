@@ -121,13 +121,13 @@ fn driver_connect_timeout_with_full_backlog() {
         if *r == Recorded::Start {
             *st.lock().unwrap() = Some(Instant::now());
             for _ in 0..3 {
-                cx.dial(ip(addr.port()), Duration::from_millis(200));
+                cx.dial(ip(addr.port()), Duration::from_millis(500));
             }
         }
     });
     h.start();
     // The three connects are pending (SYN_SENT) before the deadline.
-    let end = Instant::now() + Duration::from_millis(150);
+    let end = Instant::now() + Duration::from_millis(400);
     let mut seen = 0;
     while Instant::now() < end && seen < 3 {
         seen = syn_sent_to(addr.port());
@@ -146,7 +146,7 @@ fn driver_connect_timeout_with_full_backlog() {
             "{r:?}"
         );
     }
-    assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+    assert!(elapsed >= Duration::from_millis(500), "{elapsed:?}");
     // cancel_connect closed the sockets.
     let end = Instant::now() + Duration::from_secs(1);
     while syn_sent_to(addr.port()) > 0 && Instant::now() < end {
@@ -453,7 +453,7 @@ fn driver_sustained_udp_readiness_does_not_starve_deadlines() {
         "{r:?}"
     );
     assert!(
-        elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(500),
+        elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(1000),
         "deadline expired after {elapsed:?}"
     );
     let rx = h

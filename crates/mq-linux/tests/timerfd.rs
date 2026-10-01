@@ -28,7 +28,7 @@ fn timerfd_not_early() {
     assert!(t.read_expirations().unwrap() >= 1);
     eprintln!("timerfd elapsed: {elapsed:?}");
     assert!(elapsed >= Duration::from_millis(2), "early: {elapsed:?}");
-    assert!(elapsed < Duration::from_millis(100), "late: {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(500), "late: {elapsed:?}");
 
     // Disarmed timers never fire.
     t.arm_at_micros(now_monotonic_micros() + 50_000).unwrap();

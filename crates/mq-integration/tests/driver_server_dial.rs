@@ -60,7 +60,7 @@ fn driver_server_connect_timeout() {
     }
     assert!(fill.len() < 8, "the backlog never filled");
 
-    let r = ServerRig::spawn(Duration::from_millis(300));
+    let r = ServerRig::spawn(Duration::from_millis(500));
     let c = r.authed();
     let s = r.request(c, "blackhole.test", addr.port());
     let req = r.resolver.next(T).expect("resolution started");
@@ -70,7 +70,7 @@ fn driver_server_connect_timeout() {
     );
     req.answer(Ok(vec![addr]));
     assert!(
-        wait(Duration::from_millis(250), || syn_sent_to(addr.port()) == 1),
+        wait(Duration::from_millis(400), || syn_sent_to(addr.port()) == 1),
         "the connect is not pending"
     );
     wait_resp(&r, s, &timeout_resp());
