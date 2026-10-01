@@ -10,7 +10,7 @@ use mq_runtime::testing::{
 use mq_runtime::{App, ListenKind, ListenerTag, Shard, TcpEnd};
 use mq_transport_api::TransportOps;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
@@ -120,12 +120,27 @@ impl<H: Send + 'static> DriverThread<H> {
         A: App + 'static,
         F: FnOnce(SocketAddr) -> (Shard<T, A>, H) + Send + 'static,
     {
+        Self::spawn_on(loopback().ip(), cfg, listeners, factory)
+    }
+
+    /// `spawn_with` with the primary UDP socket on `udp_ip` (port 0).
+    pub fn spawn_on<T, A, F>(
+        udp_ip: IpAddr,
+        cfg: DriverConfig,
+        listeners: Vec<(ListenKind, ListenerTag)>,
+        factory: F,
+    ) -> DriverThread<H>
+    where
+        T: TransportOps + 'static,
+        A: App + 'static,
+        F: FnOnce(SocketAddr) -> (Shard<T, A>, H) + Send + 'static,
+    {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel::<()>();
         let (done_tx, done) = mpsc::channel();
         let thread = thread::spawn(move || {
             let mut d = Driver::new(cfg).expect("driver");
-            let udp = d.bind_udp(loopback()).expect("bind_udp");
+            let udp = d.bind_udp(SocketAddr::new(udp_ip, 0)).expect("bind_udp");
             let udp_addr = udp.local_addr();
             let (mut shard, handle) = factory(udp_addr);
             d.attach_primary_udp(udp, shard.primary_udp())

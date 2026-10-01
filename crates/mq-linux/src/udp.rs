@@ -1,22 +1,23 @@
 //! UDP sockets with GSO (`UDP_SEGMENT`) send and GRO (`UDP_GRO`) batched
-//! receive. spec §2.2. IPv4 only (SP1 needs IPv4); an IPv6 bind returns
-//! `Unsupported`.
+//! receive. spec §2.2. IPv4 or IPv6 by the bind address (C supports
+//! `AF_INET6` QUIC paths); a socket sends only to its own family.
 //!
 //! Every OS error is returned to the caller unchanged: the driver owns the
 //! GSO-off decision (spec §5.3), so this layer never retries or degrades.
 
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
 
-use crate::sockopt::{from_sockaddr_in, setsockopt_int, sockaddr_in};
+use crate::sockopt::{from_sockaddr_storage, setsockopt_int, sockaddr_storage};
 
 /// Kernel per-call segment limit we commit to (`UDP_MAX_SEGMENTS` was 64
 /// before Linux 6.x raised it; we keep the portable value). spec §5.3.
 pub const MAX_GSO_SEGMENTS: usize = 64;
-/// IPv4 UDP payload maximum.
+/// IPv4 UDP payload maximum; also the cap for IPv6 (whose maximum, 65527,
+/// is larger), so one conservative limit serves both families.
 pub const MAX_GSO_BYTES: usize = 65507;
 
 /// Room per received message: the largest GRO-coalesced payload.
@@ -33,11 +34,13 @@ pub struct RecvMeta {
     pub range: Range<usize>,
 }
 
-/// Non-blocking IPv4 UDP socket with `UDP_GRO` and `IP_PKTINFO` enabled.
+/// Non-blocking UDP socket with `UDP_GRO` and `IP_PKTINFO` (IPv4) or
+/// `IPV6_RECVPKTINFO` (IPv6) enabled.
 #[derive(Debug)]
 pub struct UdpSocket {
     inner: std::net::UdpSocket,
     port: u16,
+    v4: bool,
 }
 
 impl AsRawFd for UdpSocket {
@@ -48,19 +51,21 @@ impl AsRawFd for UdpSocket {
 
 impl UdpSocket {
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
-        if addr.is_ipv6() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "mq-linux UDP is IPv4-only",
-            ));
-        }
         let inner = std::net::UdpSocket::bind(addr)?;
         inner.set_nonblocking(true)?;
         let fd = inner.as_raw_fd();
         setsockopt_int(fd, libc::SOL_UDP, libc::UDP_GRO, 1)?;
-        setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, 1)?;
+        if addr.is_ipv4() {
+            setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, 1)?;
+        } else {
+            setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1)?;
+        }
         let port = inner.local_addr()?.port();
-        Ok(Self { inner, port })
+        Ok(Self {
+            inner,
+            port,
+            v4: addr.is_ipv4(),
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -69,8 +74,8 @@ impl UdpSocket {
 
     /// One `sendmsg` with a `UDP_SEGMENT` cmsg: the kernel splits `payload`
     /// into `segment_size` datagrams (the last may be shorter).
-    /// `InvalidInput` above `MAX_GSO_BYTES` / `MAX_GSO_SEGMENTS` or for a zero
-    /// segment size; any OS error (incl. `WouldBlock`, `EIO`, `EINVAL`,
+    /// `InvalidInput` above `MAX_GSO_BYTES` / `MAX_GSO_SEGMENTS`, for a zero
+    /// segment size or for a destination of the other family; any OS error (incl. `WouldBlock`, `EIO`, `EINVAL`,
     /// `EMSGSIZE`) is returned as is.
     pub fn send_gso(&self, dst: SocketAddr, segment_size: usize, payload: &[u8]) -> io::Result<()> {
         let seg = u16::try_from(segment_size).ok().filter(|&s| s > 0);
@@ -81,10 +86,10 @@ impl UdpSocket {
         {
             return Err(invalid("GSO batch exceeds 64 segments or 65507 bytes"));
         }
-        let SocketAddr::V4(dst) = dst else {
-            return Err(invalid("IPv6 destination on an IPv4 socket"));
-        };
-        let mut name = sockaddr_in(dst);
+        if dst.is_ipv4() != self.v4 {
+            return Err(invalid("destination family differs from the socket's"));
+        }
+        let (mut name, namelen) = sockaddr_storage(dst);
         let mut iov = libc::iovec {
             iov_base: payload.as_ptr() as *mut _,
             iov_len: payload.len(),
@@ -93,7 +98,7 @@ impl UdpSocket {
         // SAFETY: an all-zero msghdr is valid.
         let mut msg: libc::msghdr = unsafe { zeroed() };
         msg.msg_name = &mut name as *mut _ as *mut _;
-        msg.msg_namelen = size_of::<libc::sockaddr_in>() as _;
+        msg.msg_namelen = namelen;
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = ctrl.as_mut_ptr() as *mut _;
@@ -137,10 +142,11 @@ impl UdpSocket {
             return Err(invalid("recv_batch buffer smaller than 65535 bytes"));
         }
         // SAFETY: all-zero is valid for these plain C structs.
-        let mut names: [libc::sockaddr_in; BATCH] = unsafe { zeroed() };
+        let mut names: [libc::sockaddr_storage; BATCH] = unsafe { zeroed() };
         let mut iovs: [libc::iovec; BATCH] = unsafe { zeroed() };
         let mut hdrs: [libc::mmsghdr; BATCH] = unsafe { zeroed() };
-        let mut ctrls = [[0u64; 8]; BATCH]; // 64 bytes each >= CMSG_SPACE(int) + CMSG_SPACE(in_pktinfo)
+        // 64 bytes each >= CMSG_SPACE(int) + CMSG_SPACE(in6_pktinfo) = 16 + 40.
+        let mut ctrls = [[0u64; 8]; BATCH];
         for i in 0..slots {
             iovs[i] = libc::iovec {
                 iov_base: buf[i * SLOT..].as_mut_ptr() as *mut _,
@@ -148,7 +154,7 @@ impl UdpSocket {
             };
             let h = &mut hdrs[i].msg_hdr;
             h.msg_name = &mut names[i] as *mut _ as *mut _;
-            h.msg_namelen = size_of::<libc::sockaddr_in>() as _;
+            h.msg_namelen = size_of::<libc::sockaddr_storage>() as _;
             h.msg_iov = &mut iovs[i];
             h.msg_iovlen = 1;
             h.msg_control = ctrls[i].as_mut_ptr() as *mut _;
@@ -172,9 +178,9 @@ impl UdpSocket {
         for (i, h) in hdrs.iter().enumerate().take(n as usize) {
             let len = h.msg_len as usize;
             let (stride, dst_ip) = parse_cmsgs(&h.msg_hdr);
-            let src = SocketAddr::V4(from_sockaddr_in(&names[i]));
+            let src = from_sockaddr_storage(&names[i])?;
             let local = match dst_ip {
-                Some(ip) => SocketAddr::new(ip.into(), self.port),
+                Some(ip) => SocketAddr::new(ip, self.port),
                 None => self.local_addr()?,
             };
             let stride = stride.unwrap_or(len).max(1);
@@ -199,8 +205,9 @@ impl UdpSocket {
     }
 }
 
-/// Reads the `UDP_GRO` segment size and the `IP_PKTINFO` destination address.
-fn parse_cmsgs(msg: &libc::msghdr) -> (Option<usize>, Option<Ipv4Addr>) {
+/// Reads the `UDP_GRO` segment size and the `IP_PKTINFO` / `IPV6_PKTINFO`
+/// destination address.
+fn parse_cmsgs(msg: &libc::msghdr) -> (Option<usize>, Option<IpAddr>) {
     let (mut stride, mut dst) = (None, None);
     // SAFETY: `msg` was filled by recvmmsg; CMSG_FIRSTHDR/CMSG_NXTHDR stay within
     // msg_control..msg_controllen, and the data reads are sized by cmsg type.
@@ -215,7 +222,12 @@ fn parse_cmsgs(msg: &libc::msghdr) -> (Option<usize>, Option<Ipv4Addr>) {
                 (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
                     let p: libc::in_pktinfo =
                         std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const _);
-                    dst = Some(Ipv4Addr::from(u32::from_be(p.ipi_addr.s_addr)));
+                    dst = Some(Ipv4Addr::from(u32::from_be(p.ipi_addr.s_addr)).into());
+                }
+                (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
+                    let p: libc::in6_pktinfo =
+                        std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const _);
+                    dst = Some(Ipv6Addr::from(p.ipi6_addr.s6_addr).into());
                 }
                 _ => {}
             }

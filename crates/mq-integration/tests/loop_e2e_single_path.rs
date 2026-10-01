@@ -15,13 +15,16 @@
 //! | `test_socks5_refused`          | `socks5_refused`            | dead port → REP 0x05, then close |
 //! | `test_http_refused`            | `http_refused`              | dead port → `HTTP/1.1 502`, then close |
 //!
+//! `socks5_echo_ipv6_path` (no C counterpart in this file; C supports
+//! `AF_INET6` QUIC paths) runs the tunnel over `::1` with IPv4 ingress.
+//!
 //! Each test ends with both drivers stopped through their handles, exit (0, 0).
 #![forbid(unsafe_code)]
 
 use mq_integration::loopback::LoopbackProxy;
 use mq_proxy::config::{ClientConfig, ServerConfig};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
@@ -176,6 +179,31 @@ fn socks5_echo() {
     let p = proxy();
     let mut c = socks5_open(p.socks5_addr(), echo_origin());
     echo_round_trip(&mut c, &pattern(4096, |i| i * 31 + 7));
+    drop(c);
+    assert_eq!(p.join_both(), (0, 0));
+}
+
+#[test]
+fn socks5_echo_ipv6_path() {
+    let token = "secret".to_owned();
+    let p = LoopbackProxy::spawn_proxy_on(
+        Ipv6Addr::LOCALHOST.into(),
+        ServerConfig {
+            token: token.clone(),
+            ..ServerConfig::default()
+        },
+        ClientConfig {
+            token,
+            client_id: "client-1".into(),
+            paths: vec![Ipv6Addr::LOCALHOST.into()],
+            ..ClientConfig::default()
+        },
+    );
+    assert!(p.server.udp_addr.is_ipv6() && p.client.udp_addr.is_ipv6());
+    assert!(p.socks5_addr().is_ipv4(), "ingress stays IPv4");
+    let mut c = socks5_open(p.socks5_addr(), echo_origin());
+    // 64 KiB each way: GSO batches on the IPv6 socket.
+    echo_round_trip(&mut c, &pattern(65536, |i| i * 31 + 7));
     drop(c);
     assert_eq!(p.join_both(), (0, 0));
 }

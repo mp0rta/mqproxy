@@ -6,7 +6,7 @@
 
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, RawFd};
 
 /// `original_dst` of a socket: `getsockopt(SOL_IP, SO_ORIGINAL_DST)`. IPv4
@@ -93,19 +93,58 @@ pub(crate) fn from_sockaddr_in(s: &libc::sockaddr_in) -> SocketAddrV4 {
     )
 }
 
-/// Rejects every family but `AF_INET` (the `unsupported_family` case of
-/// `tests/test_origdst.c`).
-fn from_sockaddr_storage(ss: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
-    if ss.ss_family != libc::AF_INET as libc::sa_family_t {
-        return Err(io::Error::new(
+/// `a` as a `sockaddr_in` or `sockaddr_in6` in storage, with its length.
+pub(crate) fn sockaddr_storage(a: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: all-zero is a valid sockaddr_storage.
+    let mut ss: libc::sockaddr_storage = unsafe { zeroed() };
+    let p = &mut ss as *mut libc::sockaddr_storage;
+    let len = match a {
+        SocketAddr::V4(a) => {
+            // SAFETY: storage is larger than and aligned for sockaddr_in.
+            unsafe { p.cast::<libc::sockaddr_in>().write(sockaddr_in(a)) };
+            size_of::<libc::sockaddr_in>()
+        }
+        SocketAddr::V6(a) => {
+            // SAFETY: all-zero is a valid sockaddr_in6.
+            let mut s: libc::sockaddr_in6 = unsafe { zeroed() };
+            s.sin6_family = libc::AF_INET6 as _;
+            s.sin6_port = a.port().to_be();
+            s.sin6_flowinfo = a.flowinfo();
+            s.sin6_addr.s6_addr = a.ip().octets();
+            s.sin6_scope_id = a.scope_id();
+            // SAFETY: storage is larger than and aligned for sockaddr_in6.
+            unsafe { p.cast::<libc::sockaddr_in6>().write(s) };
+            size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (ss, len as _)
+}
+
+/// `AF_INET` or `AF_INET6`; rejects every other family (the
+/// `unsupported_family` case of `tests/test_origdst.c`).
+pub(crate) fn from_sockaddr_storage(ss: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
+    match ss.ss_family as libc::c_int {
+        libc::AF_INET => {
+            // SAFETY: AF_INET storage holds a sockaddr_in; storage is larger
+            // and suitably aligned.
+            let sin = unsafe { &*(ss as *const _ as *const libc::sockaddr_in) };
+            Ok(SocketAddr::V4(from_sockaddr_in(sin)))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: as above, for sockaddr_in6.
+            let s = unsafe { &*(ss as *const _ as *const libc::sockaddr_in6) };
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(s.sin6_addr.s6_addr),
+                u16::from_be(s.sin6_port),
+                s.sin6_flowinfo,
+                s.sin6_scope_id,
+            )))
+        }
+        _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "original_dst: address family not AF_INET",
-        ));
+            "address family not AF_INET or AF_INET6",
+        )),
     }
-    // SAFETY: AF_INET storage holds a sockaddr_in; storage is larger and
-    // suitably aligned.
-    let sin = unsafe { &*(ss as *const _ as *const libc::sockaddr_in) };
-    Ok(SocketAddr::V4(from_sockaddr_in(sin)))
 }
 
 #[cfg(test)]
@@ -125,5 +164,20 @@ mod tests {
             from_sockaddr_storage(&ss).unwrap(),
             "0.0.0.0:0".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn sockaddr_storage_round_trips_both_families() {
+        for a in ["127.0.0.1:4433", "[::1]:4433", "[fe80::1%2]:9"] {
+            let a: SocketAddr = a.parse().unwrap();
+            let (ss, len) = sockaddr_storage(a);
+            let want = if a.is_ipv4() {
+                size_of::<libc::sockaddr_in>()
+            } else {
+                size_of::<libc::sockaddr_in6>()
+            };
+            assert_eq!(len as usize, want);
+            assert_eq!(from_sockaddr_storage(&ss).unwrap(), a);
+        }
     }
 }

@@ -11,7 +11,7 @@ use mq_runtime::driver::{DriverConfig, StdResolver};
 use mq_runtime::{App, ListenKind, ListenerTag, Shard};
 use mq_transport::Transport;
 use mq_transport_api::{CongestionControl, Role, Scheduler, TransportConfig, TransportOps};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,8 +33,10 @@ impl<S: Send + 'static, C: Send + 'static> LoopbackPair<S, C> {
     /// spec §8.1: `server(local)` and `client(local, server_udp)` build each
     /// side's shard on its own driver thread (one transport per thread);
     /// `client_listeners` are bound on loopback for the test's local app.
-    /// The server starts first, then the client.
+    /// Both primary UDP sockets bind `udp_ip`. The server starts first, then
+    /// the client.
     pub fn spawn<TS, AS, TC, AC>(
+        udp_ip: IpAddr,
         client_listeners: Vec<(ListenKind, ListenerTag)>,
         server: impl FnOnce(SocketAddr) -> (Shard<TS, AS>, S) + Send + 'static,
         client: impl FnOnce(SocketAddr, SocketAddr) -> (Shard<TC, AC>, C) + Send + 'static,
@@ -45,10 +47,10 @@ impl<S: Send + 'static, C: Send + 'static> LoopbackPair<S, C> {
         TC: TransportOps + 'static,
         AC: App + 'static,
     {
-        let mut server = DriverThread::spawn_with(driver_config(), Vec::new(), server);
+        let mut server = DriverThread::spawn_on(udp_ip, driver_config(), Vec::new(), server);
         let server_udp = server.udp_addr;
         let mut client =
-            DriverThread::spawn_with(driver_config(), client_listeners, move |local| {
+            DriverThread::spawn_on(udp_ip, driver_config(), client_listeners, move |local| {
                 client(local, server_udp)
             });
         server.start();
@@ -89,8 +91,19 @@ fn cert(name: &str) -> PathBuf {
 
 impl LoopbackProxy {
     /// `client.server` is overwritten with the server's bound UDP address.
-    pub fn spawn_proxy(server: ServerConfig, mut client: ClientConfig) -> LoopbackProxy {
+    pub fn spawn_proxy(server: ServerConfig, client: ClientConfig) -> LoopbackProxy {
+        Self::spawn_proxy_on(Ipv4Addr::LOCALHOST.into(), server, client)
+    }
+
+    /// `spawn_proxy` with both QUIC endpoints on `udp_ip` (e.g. `::1`); the
+    /// TCP listeners stay on IPv4 loopback.
+    pub fn spawn_proxy_on(
+        udp_ip: IpAddr,
+        server: ServerConfig,
+        mut client: ClientConfig,
+    ) -> LoopbackProxy {
         LoopbackPair::spawn(
+            udp_ip,
             vec![
                 (ListenKind::Plain, SOCKS5),
                 (ListenKind::Plain, HTTP_CONNECT),
