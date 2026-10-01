@@ -659,6 +659,32 @@ fn app_owned_interest_follows_flag_and_buffer_room() {
 }
 
 #[test]
+fn rx_limit_caps_app_owned_reads_and_lifts_on_relay() {
+    let mut h = setup();
+    let tcp = h.accept();
+    h.sh.with_app(T0, |_, cx| cx.tcp_set_rx_limit(tcp, 8192));
+    assert_eq!(h.sh.tcp_rx_buf(tcp).len(), 8192);
+    h.rx(tcp, &[1; 100]);
+    assert_eq!(h.sh.tcp_rx_buf(tcp).len(), 8092, "room up to the limit");
+    h.rx(tcp, &[2; 8092]);
+    assert!(!h.sh.tcp_interest(tcp).read, "limit reached");
+    assert!(h.sh.tcp_rx_buf(tcp).is_empty());
+    h.sh.with_app(T0, |_, cx| cx.tcp_consume(tcp, 100));
+    assert_eq!(h.sh.tcp_rx_buf(tcp).len(), 100);
+    // Above the 64 KiB buffer: clamped.
+    h.sh.with_app(T0, |_, cx| cx.tcp_set_rx_limit(tcp, 1 << 20));
+    assert_eq!(h.sh.tcp_rx_buf(tcp).len(), TCP_BUF - 8092);
+    h.sh.with_app(T0, |_, cx| cx.tcp_set_rx_limit(tcp, 8192));
+    // The relay has its own 64 KiB buffer: the limit is gone.
+    let s = h.stream(h.conn());
+    h.sh.with_app(T0, |_, cx| cx.start_relay(tcp, s, NO_PREREAD))
+        .unwrap();
+    h.sh.drive(T0);
+    assert!(h.sh.tcp_interest(tcp).read);
+    assert!(h.sh.tcp_rx_buf(tcp).len() > 8192);
+}
+
+#[test]
 fn app_owned_read_interest_off_after_eof() {
     let mut h = setup();
     let tcp = h.accept();

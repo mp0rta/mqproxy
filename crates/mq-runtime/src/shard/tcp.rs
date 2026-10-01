@@ -18,6 +18,8 @@ pub(crate) struct AppTcp {
     /// Receive buffer, sized to `TCP_BUF` on first read; `rx[..rx_len]` is data.
     rx: Vec<u8>,
     rx_len: usize,
+    /// `tcp_set_rx_limit`: at most this much is read ahead; `TCP_BUF` by default.
+    rx_limit: usize,
     /// Send buffer, at most `TCP_BUF`.
     pub(crate) tx: Vec<u8>,
     /// The app's `tcp_set_read` flag; on for a new socket.
@@ -33,6 +35,7 @@ impl AppTcp {
         AppTcp {
             rx: Vec::new(),
             rx_len: 0,
+            rx_limit: TCP_BUF,
             tx: Vec::new(),
             read: true,
             read_eof: false,
@@ -43,7 +46,7 @@ impl AppTcp {
     /// spec §5.2 "Interest" for an app-owned socket.
     pub(crate) fn interest(&self) -> Interest {
         Interest {
-            read: self.read && !self.read_eof && !self.closing && self.rx_len < TCP_BUF,
+            read: self.read && !self.read_eof && !self.closing && self.rx_len < self.rx_limit,
             write: !self.tx.is_empty(),
         }
     }
@@ -53,7 +56,7 @@ impl AppTcp {
             return &mut [];
         }
         self.rx.resize(TCP_BUF, 0);
-        &mut self.rx[self.rx_len..]
+        &mut self.rx[self.rx_len..self.rx_limit]
     }
     pub(crate) fn rx_commit(&mut self, n: usize) {
         assert!(
@@ -117,6 +120,12 @@ impl ShardState {
     pub(crate) fn tcp_set_read(&mut self, tcp: TcpId, on: bool) {
         if let Some(e) = self.app_tcp(tcp) {
             e.read = on;
+        }
+    }
+    /// Caps what is read ahead (at most `TCP_BUF`); a relay has its own buffers.
+    pub(crate) fn tcp_set_rx_limit(&mut self, tcp: TcpId, n: usize) {
+        if let Some(e) = self.app_tcp(tcp) {
+            e.rx_limit = n.min(TCP_BUF);
         }
     }
     /// Graceful: closes now if nothing is queued, else once `tx` drains.

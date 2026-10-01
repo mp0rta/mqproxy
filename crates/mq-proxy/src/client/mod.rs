@@ -17,7 +17,7 @@ pub mod pending;
 
 use crate::app_stream::{self, CHUNK, Recv};
 use crate::config::ClientConfig;
-use crate::ingress::target_from_original_dst;
+use crate::ingress::{INGRESS_CAP, target_from_original_dst};
 use crate::metrics::format_metrics;
 use backoff::Backoff;
 use ingress_glue::{Fed, Ingress, kind_of};
@@ -528,6 +528,9 @@ impl App for Client {
         let Some(kind) = kind_of(l) else {
             return cx.tcp_close(tcp);
         };
+        // spec §6.1/§6.2: the 8 KiB parse cap; a pending request then holds
+        // at most 8 KiB of preread, the rest waits in the kernel for the relay.
+        cx.tcp_set_rx_limit(tcp, INGRESS_CAP);
         if kind == IngressKind::Transparent {
             // spec §6.1: the target is the original destination, IPv4 only.
             return match target_from_original_dst(&meta) {

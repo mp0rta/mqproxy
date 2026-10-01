@@ -289,6 +289,11 @@ impl<'a> Cx<'a> {
     pub fn tcp_set_read(&mut self, tcp: TcpId, on: bool) {
         self.st.tcp_set_read(tcp, on)
     }
+    /// spec §6.2: caps the bytes read ahead into the receive buffer (default
+    /// and maximum 64 KiB); the rest stays in the kernel. `start_relay` lifts it.
+    pub fn tcp_set_rx_limit(&mut self, tcp: TcpId, n: usize) {
+        self.st.tcp_set_rx_limit(tcp, n)
+    }
     /// spec §5.4: closes once the send buffer has drained.
     pub fn tcp_close(&mut self, tcp: TcpId) {
         self.st.tcp_close(tcp)
