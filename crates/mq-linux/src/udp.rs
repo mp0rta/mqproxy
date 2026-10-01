@@ -7,9 +7,11 @@
 
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
+
+use crate::sockopt::{from_sockaddr_in, setsockopt_int, sockaddr_in};
 
 /// Kernel per-call segment limit we commit to (`UDP_MAX_SEGMENTS` was 64
 /// before Linux 6.x raised it; we keep the portable value). spec §5.3.
@@ -216,45 +218,6 @@ fn parse_cmsgs(msg: &libc::msghdr) -> (Option<usize>, Option<Ipv4Addr>) {
         }
     }
     (stride, dst)
-}
-
-fn sockaddr_in(a: SocketAddrV4) -> libc::sockaddr_in {
-    // SAFETY: all-zero is a valid sockaddr_in.
-    let mut s: libc::sockaddr_in = unsafe { zeroed() };
-    s.sin_family = libc::AF_INET as _;
-    s.sin_port = a.port().to_be();
-    s.sin_addr.s_addr = u32::from(*a.ip()).to_be();
-    s
-}
-
-fn from_sockaddr_in(s: &libc::sockaddr_in) -> SocketAddrV4 {
-    SocketAddrV4::new(
-        Ipv4Addr::from(u32::from_be(s.sin_addr.s_addr)),
-        u16::from_be(s.sin_port),
-    )
-}
-
-fn setsockopt_int(
-    fd: RawFd,
-    level: libc::c_int,
-    name: libc::c_int,
-    v: libc::c_int,
-) -> io::Result<()> {
-    // SAFETY: passes a pointer to a live c_int with its exact size.
-    let r = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            &v as *const _ as *const _,
-            size_of::<libc::c_int>() as _,
-        )
-    };
-    if r < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }
 
 fn invalid(msg: &'static str) -> io::Error {
