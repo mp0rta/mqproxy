@@ -100,7 +100,7 @@ done
 python3 -c 'import matplotlib' 2>/dev/null \
     || { note "python3 matplotlib not installed (tail plot would fail). SKIPPING."; exit "${SKIP}"; }
 [ -x "${MQPROXY_BIN}" ] || { note "missing mqproxy binary: ${MQPROXY_BIN}"; exit "${SKIP}"; }
-[ -x "${MQVPN_BIN}"   ] || { note "missing mqvpn binary: ${MQVPN_BIN}";     exit "${SKIP}"; }
+case " ${VARIANTS} " in *" mqvpn-"*) [ -x "${MQVPN_BIN}" ] || { note "missing mqvpn binary: ${MQVPN_BIN}"; exit "${SKIP}"; } ;; esac
 [ -f "${MQPROXY_CERT}" ] || { note "missing mqproxy cert: ${MQPROXY_CERT}"; exit "${SKIP}"; }
 [ -f "${MQPROXY_KEY}"  ] || { note "missing mqproxy key:  ${MQPROXY_KEY}";  exit "${SKIP}"; }
 
