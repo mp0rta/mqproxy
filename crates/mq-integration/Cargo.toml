@@ -12,6 +12,7 @@ publish = false
 # (and xquic's test hooks) into the `mqproxy` binary; the tests enable it
 # through the self dev-dependency below.
 harness = [
+    "dep:mq-wire",
     "mq-proxy/test-support",
     "mq-runtime/test-support",
     "mq-transport/test-support",
@@ -24,7 +25,7 @@ mq-runtime = { path = "../mq-runtime" }
 mq-transport = { path = "../mq-transport" }
 mq-transport-api = { path = "../mq-transport-api" }
 mq-linux = { path = "../mq-linux" }
-mq-wire = { path = "../mq-wire" }
+mq-wire = { path = "../mq-wire", optional = true }
 
 [dev-dependencies]
 mq-integration = { path = ".", features = ["harness"] }
