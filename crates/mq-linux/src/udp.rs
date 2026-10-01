@@ -1,6 +1,9 @@
 //! UDP sockets with GSO (`UDP_SEGMENT`) send and GRO (`UDP_GRO`) batched
 //! receive. spec §2.2. IPv4 or IPv6 by the bind address (C supports
-//! `AF_INET6` QUIC paths); a socket sends only to its own family.
+//! `AF_INET6` QUIC paths). An IPv6 socket is dual-stack (`IPV6_V6ONLY` = 0,
+//! as C's default socket): it sends to IPv4 destinations as v4-mapped
+//! addresses and reports IPv4 peers as `SocketAddr::V4`. An IPv4 socket
+//! sends only to IPv4.
 //!
 //! Every OS error is returned to the caller unchanged: the driver owns the
 //! GSO-off decision (spec §5.3), so this layer never retries or degrades.
@@ -9,9 +12,9 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Range;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use crate::sockopt::{from_sockaddr_storage, setsockopt_int, sockaddr_storage};
+use crate::sockopt::{cvt, from_sockaddr_storage, setsockopt_int, sockaddr_storage};
 
 /// Kernel per-call segment limit we commit to (`UDP_MAX_SEGMENTS` was 64
 /// before Linux 6.x raised it; we keep the portable value). spec §5.3.
@@ -51,7 +54,11 @@ impl AsRawFd for UdpSocket {
 
 impl UdpSocket {
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let inner = std::net::UdpSocket::bind(addr)?;
+        let inner = if addr.is_ipv4() {
+            std::net::UdpSocket::bind(addr)?
+        } else {
+            bind_dual_stack(addr)?
+        };
         inner.set_nonblocking(true)?;
         let fd = inner.as_raw_fd();
         setsockopt_int(fd, libc::SOL_UDP, libc::UDP_GRO, 1)?;
@@ -75,8 +82,9 @@ impl UdpSocket {
     /// One `sendmsg` with a `UDP_SEGMENT` cmsg: the kernel splits `payload`
     /// into `segment_size` datagrams (the last may be shorter).
     /// `InvalidInput` above `MAX_GSO_BYTES` / `MAX_GSO_SEGMENTS`, for a zero
-    /// segment size or for a destination of the other family; any OS error (incl. `WouldBlock`, `EIO`, `EINVAL`,
-    /// `EMSGSIZE`) is returned as is.
+    /// segment size or for an IPv6 destination on an IPv4 socket; any OS
+    /// error (incl. `WouldBlock`, `EIO`, `EINVAL`, `EMSGSIZE`) is returned
+    /// as is.
     pub fn send_gso(&self, dst: SocketAddr, segment_size: usize, payload: &[u8]) -> io::Result<()> {
         let seg = u16::try_from(segment_size).ok().filter(|&s| s > 0);
         let Some(seg) = seg else {
@@ -86,10 +94,7 @@ impl UdpSocket {
         {
             return Err(invalid("GSO batch exceeds 64 segments or 65507 bytes"));
         }
-        if dst.is_ipv4() != self.v4 {
-            return Err(invalid("destination family differs from the socket's"));
-        }
-        let (mut name, namelen) = sockaddr_storage(dst);
+        let (mut name, namelen) = sockaddr_storage(self.dst(dst)?);
         let mut iov = libc::iovec {
             iov_base: payload.as_ptr() as *mut _,
             iov_len: payload.len(),
@@ -125,7 +130,16 @@ impl UdpSocket {
 
     /// One plain `sendto`.
     pub fn send_one(&self, dst: SocketAddr, payload: &[u8]) -> io::Result<()> {
-        self.inner.send_to(payload, dst).map(drop)
+        self.inner.send_to(payload, self.dst(dst)?).map(drop)
+    }
+
+    /// `dst` in this socket's family: v4-mapped on an IPv6 socket.
+    fn dst(&self, dst: SocketAddr) -> io::Result<SocketAddr> {
+        match dst {
+            SocketAddr::V4(a) if !self.v4 => Ok((a.ip().to_ipv6_mapped(), a.port()).into()),
+            SocketAddr::V6(_) if self.v4 => Err(invalid("IPv6 destination on an IPv4 socket")),
+            _ => Ok(dst),
+        }
     }
 
     /// One `recvmmsg` pass into `buf` (up to 16 slots of 65535 bytes; `buf`
@@ -145,7 +159,8 @@ impl UdpSocket {
         let mut names: [libc::sockaddr_storage; BATCH] = unsafe { zeroed() };
         let mut iovs: [libc::iovec; BATCH] = unsafe { zeroed() };
         let mut hdrs: [libc::mmsghdr; BATCH] = unsafe { zeroed() };
-        // 64 bytes each >= CMSG_SPACE(int) + CMSG_SPACE(in6_pktinfo) = 16 + 40.
+        // 64 bytes each >= CMSG_SPACE(int) + CMSG_SPACE(in6_pktinfo) = 24 + 40
+        // (and > CMSG_SPACE(int) + CMSG_SPACE(in_pktinfo) = 24 + 32).
         let mut ctrls = [[0u64; 8]; BATCH];
         for i in 0..slots {
             iovs[i] = libc::iovec {
@@ -178,11 +193,11 @@ impl UdpSocket {
         for (i, h) in hdrs.iter().enumerate().take(n as usize) {
             let len = h.msg_len as usize;
             let (stride, dst_ip) = parse_cmsgs(&h.msg_hdr);
-            let src = from_sockaddr_storage(&names[i])?;
-            let local = match dst_ip {
+            let src = unmap(from_sockaddr_storage(&names[i])?);
+            let local = unmap(match dst_ip {
                 Some(ip) => SocketAddr::new(ip, self.port),
                 None => self.local_addr()?,
-            };
+            });
             let stride = stride.unwrap_or(len).max(1);
             let base = i * SLOT;
             let mut off = 0;
@@ -235,6 +250,35 @@ fn parse_cmsgs(msg: &libc::msghdr) -> (Option<usize>, Option<IpAddr>) {
         }
     }
     (stride, dst)
+}
+
+/// An IPv4 peer of a dual-stack socket arrives v4-mapped; report it as V4
+/// so it matches the address the transport dialled.
+fn unmap(a: SocketAddr) -> SocketAddr {
+    match a {
+        SocketAddr::V6(v) => match v.ip().to_ipv4_mapped() {
+            Some(ip) => (ip, v.port()).into(),
+            None => a,
+        },
+        a => a,
+    }
+}
+
+/// An `AF_INET6` socket with `IPV6_V6ONLY` = 0 set before `bind` (it cannot
+/// change after), so the result does not depend on `net.ipv6.bindv6only`.
+fn bind_dual_stack(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    // SAFETY: plain socket(2); the fd is owned immediately below.
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh socket we own.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    setsockopt_int(fd.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
+    let (name, len) = sockaddr_storage(addr);
+    // SAFETY: `name` holds a sockaddr_in6 of length `len`.
+    cvt(unsafe { libc::bind(fd.as_raw_fd(), &name as *const _ as *const _, len) })?;
+    Ok(fd.into())
 }
 
 fn invalid(msg: &'static str) -> io::Error {

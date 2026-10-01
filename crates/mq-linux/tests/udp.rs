@@ -153,7 +153,7 @@ fn v6_gro_recv_reports_each_datagram_with_local_addr() {
 }
 
 #[test]
-fn v6_send_gso_rejects_oversize_and_other_family() {
+fn v6_send_gso_rejects_oversize_and_v4_socket_rejects_v6_dst() {
     let (a, b) = (loopback6(), loopback6());
     let b_addr = b.local_addr().unwrap();
     let kind = |r: std::io::Result<()>| r.unwrap_err().kind();
@@ -165,11 +165,6 @@ fn v6_send_gso_rejects_oversize_and_other_family() {
         kind(a.send_gso(b_addr, 1200, &vec![0; MAX_GSO_BYTES + 1])),
         ErrorKind::InvalidInput
     );
-    let v4 = loopback().local_addr().unwrap();
-    assert_eq!(
-        kind(a.send_gso(v4, 100, &[0; 100])),
-        ErrorKind::InvalidInput
-    );
     assert_eq!(
         kind(loopback().send_gso(b_addr, 100, &[0; 100])),
         ErrorKind::InvalidInput
@@ -178,4 +173,34 @@ fn v6_send_gso_rejects_oversize_and_other_family() {
     let got = recv_n(&b, 64);
     assert_eq!(got.len(), 64);
     assert!(got.iter().all(|(_, d)| d == &vec![7u8; 100]));
+}
+
+fn wildcard6() -> UdpSocket {
+    UdpSocket::bind("[::]:0".parse().unwrap()).unwrap()
+}
+
+#[test]
+fn dual_stack_v6_socket_sends_gso_to_v4_peer() {
+    let (a, b) = (wildcard6(), loopback());
+    let b_addr = b.local_addr().unwrap();
+    a.send_gso(b_addr, 1000, &[3; 60 * 1000]).unwrap();
+    a.send_one(b_addr, &[4; 10]).unwrap();
+    let got = recv_n(&b, 61);
+    assert_eq!(got.len(), 61);
+    assert!(got[..60].iter().all(|(_, d)| d == &vec![3u8; 1000]));
+    assert_eq!(got[60].1, vec![4u8; 10]);
+    assert!(got.iter().all(|(m, _)| m.src.is_ipv4()));
+}
+
+#[test]
+fn dual_stack_v6_socket_receives_v4_peer_as_v4() {
+    let (a, b) = (loopback(), wildcard6());
+    let port = b.local_addr().unwrap().port();
+    let b_v4: SocketAddr = ([127, 0, 0, 1], port).into();
+    a.send_one(b_v4, &[9; 100]).unwrap();
+    let got = recv_n(&b, 1);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0.src, a.local_addr().unwrap());
+    assert_eq!(got[0].0.local, b_v4);
+    assert_eq!(got[0].1, vec![9u8; 100]);
 }

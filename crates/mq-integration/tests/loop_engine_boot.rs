@@ -55,7 +55,10 @@ fn wait_for(rec: &RecordHandle, pred: impl Fn(&Recorded) -> bool) -> bool {
 #[test]
 fn loop_engine_boot() {
     let pair = LoopbackPair::spawn(
-        std::net::Ipv4Addr::LOCALHOST.into(),
+        (
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
+        ),
         Vec::new(),
         |local| {
             let t = Transport::new(cfg(Role::Server {
