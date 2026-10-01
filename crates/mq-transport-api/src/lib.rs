@@ -16,3 +16,6 @@ pub use event::{CloseReason, ErrType, Event, StreamInfo, StreamKind, Transmit};
 pub use ids::{ConnId, PathId, SlotId, StreamId, TxKey};
 pub use ops::TransportOps;
 pub use time::Time;
+
+#[cfg(feature = "test-support")]
+pub mod fabric;

@@ -9,3 +9,6 @@ license.workspace = true
 
 [features]
 test-support = []
+
+[dev-dependencies]
+mq-transport-api = { path = ".", features = ["test-support"] }

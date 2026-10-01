@@ -163,6 +163,9 @@ dependencies = [
 [[package]]
 name = "mq-transport-api"
 version = "0.0.4"
+dependencies = [
+ "mq-transport-api",
+]
 
 [[package]]
 name = "mq-wire"
