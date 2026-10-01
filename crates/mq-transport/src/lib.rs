@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 mod clock;
+mod slots;
 
 /// Stub; fleshed out in Tasks 4.5/4.6.
 pub(crate) struct Inner;
