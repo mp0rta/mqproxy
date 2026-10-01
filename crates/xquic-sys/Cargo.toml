@@ -11,3 +11,4 @@ libc = { workspace = true }
 
 [build-dependencies]
 cc = { workspace = true }
+cmake = { workspace = true }
