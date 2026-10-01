@@ -1,6 +1,7 @@
 //! Lockstep fabric harness (spec §8.1 "Fabric"): one `Transport` per thread (spec §4.6). The
 //! test sends one command at a time and waits for the reply, so only one side runs at a time.
-//! Each command carries `now`; there is no shared clock. Path k sends from `local_addrs[k]`.
+//! Each command carries `now`; there is no shared clock. Path k sends from `local_addrs[k]`
+//! (from the last address when there are fewer addresses than paths, as a one-socket server).
 
 use mq_transport::Transport;
 use mq_transport_api::{CongestionControl, Event, Role, Scheduler, Time, TransportConfig};
@@ -37,6 +38,8 @@ type Cmd = Box<dyn FnOnce(&mut Transport) + Send>;
 /// One datagram on the wire.
 #[derive(Clone, Debug)]
 pub struct Datagram {
+    /// The transmit queue it came from.
+    pub key: TxKey,
     pub from: SocketAddr,
     pub to: SocketAddr,
     pub data: Vec<u8>,
@@ -96,10 +99,12 @@ impl Peer {
             t.pending_transmit(&mut keys);
             let mut out = Vec::new();
             for key in keys.into_iter().filter(|k| !blocked.contains(k)) {
-                let from = addrs[key.1.0 as usize];
+                // A server has one socket for every path.
+                let from = addrs[(key.1.0 as usize).min(addrs.len() - 1)];
                 while let Some(tx) = t.peek_transmit(key) {
                     let before = out.len();
                     out.extend(tx.payload.chunks(tx.segment_size).map(|d| Datagram {
+                        key,
                         from,
                         to: tx.dst,
                         data: d.to_vec(),
@@ -140,6 +145,28 @@ impl Drop for Peer {
         drop(self.tx.take()); // ends the command loop; the transport drops on its own thread
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+        }
+    }
+}
+
+/// `exchange` for any number of peers: datagrams go to the peer owning their destination
+/// (to nobody if none does).
+pub fn exchange_many(now: Time, peers: &[&Peer]) -> usize {
+    let mut moved = 0;
+    loop {
+        let mut progress = false;
+        for src in peers {
+            for d in src.pump_out(now) {
+                progress = true;
+                moved += 1;
+                if let Some(dst) = peers.iter().find(|p| p.owns(d.to)) {
+                    dst.deliver(now, d.to, d.from, d.data);
+                    dst.drive(now);
+                }
+            }
+        }
+        if !progress {
+            return moved;
         }
     }
 }

@@ -148,6 +148,14 @@ pub(crate) fn on_conn_close(inner: &mut Inner, s: SlotId, reason: CloseReason) {
         return;
     };
     let id = conn_id(s);
+    let reason = if slot.closed_locally {
+        CloseReason {
+            err_type: ErrType::Unknown, // spec §4.2: known only for a close the peer sent
+            ..reason
+        }
+    } else {
+        reason
+    };
     inner.events.push(Event::ConnClosed(id, reason));
     if slot.counted {
         inner.n_counted -= 1;
@@ -614,6 +622,32 @@ mod tests {
             evs,
             vec![Event::NewConn(conn_id(a)), Event::ConnClosed(conn_id(a), r)]
         );
+    }
+
+    #[test]
+    fn local_close_reports_unknown_even_after_a_peer_echo() {
+        let mut i = inner(0);
+        let (a, b) = (accept(&mut i), accept(&mut i));
+        assert!(on_conn_create(&mut i, core::ptr::null_mut(), None, a));
+        assert!(on_conn_create(&mut i, core::ptr::null_mut(), None, b));
+        i.conns.get_mut(a).unwrap().closed_locally = true;
+        let echoed = CloseReason {
+            err_type: ErrType::Application,
+            code: 0x1001,
+        };
+        on_conn_close(&mut i, a, echoed);
+        on_conn_close(&mut i, b, echoed);
+        let closes: Vec<_> = std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns))
+            .filter_map(|e| match e {
+                Event::ConnClosed(c, r) => Some((c, r)),
+                _ => None,
+            })
+            .collect();
+        let unknown = CloseReason {
+            err_type: ErrType::Unknown,
+            code: 0x1001,
+        };
+        assert_eq!(closes, vec![(conn_id(a), unknown), (conn_id(b), echoed)]);
     }
 
     #[test]

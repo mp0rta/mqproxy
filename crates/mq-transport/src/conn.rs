@@ -7,7 +7,7 @@ use crate::slots::ConnSlot;
 use crate::{Inner, Transport, clock};
 use core::ptr;
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, Error, PathError, PathId, PathStats, Time,
+    ConnConfig, ConnId, ConnStats, ConnectError, Error, PathError, PathId, PathStats, SlotId, Time,
 };
 use std::ffi::CString;
 use std::net::SocketAddr;
@@ -77,6 +77,7 @@ pub(crate) fn drive(t: &mut Transport, now: Time) {
                 else {
                     continue;
                 };
+                mark_closed_locally(inner, s, xqc);
                 xqc_conn_close_with_error(xqc, code);
                 // Build the CONNECTION_CLOSE now, not at the connection's next wakeup.
                 xqc_conn_continue_send_by_conn(xqc);
@@ -158,13 +159,36 @@ fn cid_of(t: &Transport, c: ConnId) -> Option<xqc_cid_t> {
     t.inner.conns.get(c.slot()).map(|s| s.cid)
 }
 
+/// spec §4.2: a locally initiated close reports `ErrType::Unknown`. xquic records the error
+/// type of every CONNECTION_CLOSE it receives, including the one an xquic peer sends back in
+/// answer to ours, so the transport remembers who closed first.
+///
+/// # Safety
+/// Inside `clock::enter`; `xqc` is null or the live connection of slot `s`.
+unsafe fn mark_closed_locally(inner: *mut Inner, s: SlotId, xqc: *mut xqc_connection_t) {
+    // SAFETY: a plain getter on a live connection.
+    if xqc.is_null() || unsafe { xqc_conn_get_err_type(xqc) } == XQC_CONN_ERR_TYPE_UNKNOWN {
+        // SAFETY: statement-sized borrow of the live Inner, no xquic call inside.
+        if let Some(c) = unsafe { (*inner).conns.get_mut(s) } {
+            c.closed_locally = true;
+        }
+    }
+}
+
 /// spec §4.2: a stale id is a no-op.
 pub(crate) fn close_conn(t: &mut Transport, now: Time, c: ConnId) {
     t.inner.last_now = now;
-    if let Some(cid) = cid_of(t, c) {
-        // SAFETY: the engine is live; xquic looks the cid up and ignores an unknown one.
-        t.with_engine(now, |_, engine| unsafe { xqc_conn_close(engine, &cid) });
-    }
+    let Some((cid, xqc)) = t.inner.conns.get(c.slot()).map(|s| (s.cid, s.xqc)) else {
+        return;
+    };
+    t.with_engine(now, |inner, engine| {
+        // SAFETY: the engine is live; xquic looks the cid up and ignores an unknown one; a
+        // live slot holds a valid (or not yet bound, null) connection pointer.
+        unsafe {
+            mark_closed_locally(inner, c.slot(), xqc);
+            xqc_conn_close(engine, &cid)
+        }
+    });
 }
 
 /// spec §4.2, §6.5. `paths_info` is heap memory the caller frees with libc `free`.

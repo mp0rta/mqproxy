@@ -301,6 +301,37 @@ mod tests {
         assert_eq!(s.cc_params.customize_on, 0, "cc_params zeroed, as in C");
     }
 
+    /// Ports `test_sched` (spec §8.3): each scheduler selects its own xquic callback table,
+    /// on both roles. (Parsing the `--scheduler` names belongs to the config crate.)
+    #[test]
+    fn sched_selects_callback() {
+        use Scheduler::*;
+        let server = Role::Server {
+            cert: "c".into(),
+            key: "k".into(),
+        };
+        // SAFETY: by-value reads of xquic's immutable statics.
+        let want = unsafe {
+            [
+                (MinRtt, xqc_minrtt_scheduler_cb),
+                (Backup, xqc_backup_scheduler_cb),
+                (Wlb, xqc_wlb_scheduler_cb),
+            ]
+        };
+        for role in [Role::Client, server] {
+            for (sched, cb) in &want {
+                let s = conn_settings(&cfg(role.clone(), CongestionControl::Bbr, *sched), None);
+                assert_eq!(bytes(&s.scheduler_callback), bytes(cb), "{sched:?}");
+            }
+        }
+        // The three tables are distinct, so no scheduler silently falls back to another.
+        for (i, (_, a)) in want.iter().enumerate() {
+            for (_, b) in &want[i + 1..] {
+                assert_ne!(bytes(a), bytes(b));
+            }
+        }
+    }
+
     #[test]
     fn settings_match_spec() {
         use CongestionControl::*;

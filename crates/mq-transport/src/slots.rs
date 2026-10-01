@@ -88,6 +88,9 @@ pub(crate) struct ConnSlot {
     pub provisional_deadline: Option<Time>,
     pub streams: u32,
     pub pending_close: Option<u64>,
+    /// We closed it before any peer CONNECTION_CLOSE arrived: its `ConnClosed` reports
+    /// `ErrType::Unknown` even if the peer echoes a close back (spec §4.2).
+    pub closed_locally: bool,
     pub mp_ready_queued: bool,
 }
 
@@ -102,6 +105,7 @@ impl ConnSlot {
             provisional_deadline: None,
             streams: 0,
             pending_close: None,
+            closed_locally: false,
             mp_ready_queued: false,
         }
     }

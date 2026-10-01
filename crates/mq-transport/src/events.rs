@@ -118,6 +118,7 @@ mod tests {
             provisional_deadline: None,
             streams: 0,
             pending_close: None,
+            closed_locally: false,
             mp_ready_queued: false,
         }
     }
