@@ -51,18 +51,15 @@ jobs:
         id: bssl-cache
         uses: actions/cache@v5
         with:
-          path: third_party/xquic/third_party/boringssl
-          key: bssl-9c95ec7-linux-gcc-fpic-v1
+          path: third_party/xquic/third_party/boringssl/build
+          key: bssl-0ce57bb-linux-v1
 
-      - name: Clone + build BoringSSL (pinned)
+      - name: Build BoringSSL (xquic submodule)
         if: steps.bssl-cache.outputs.cache-hit != 'true'
         run: |
-          git clone https://github.com/google/boringssl.git \
-            third_party/xquic/third_party/boringssl
           cd third_party/xquic/third_party/boringssl
-          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
           mkdir -p build && cd build
-          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
           make -j"$(nproc)" ssl crypto
 
       - name: Cache xquic (gcc Release, EVENT_LOG)
@@ -72,7 +69,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-9c95ec7-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v1
 
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
