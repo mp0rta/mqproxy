@@ -803,4 +803,23 @@ mod tests {
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::WouldBlock);
         assert!(gso);
     }
+
+    #[test]
+    fn empty_datagrams_are_charged_against_the_budget() {
+        let mut io = MioIo::new(Arc::new(super::super::io::StdResolver), false).unwrap();
+        let (u, addr) = io.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..40 {
+            tx.send_to(&[], addr).unwrap();
+        }
+        let mut b = RecvBatch::default();
+        // 16 bytes of budget: one batch of 16 empty datagrams spends it.
+        let r = io.recv_udp(u, &mut b, 16).unwrap();
+        assert!(matches!(r, RecvStop::Budget), "{r:?}");
+        assert_eq!(b.metas.len(), 16);
+        assert!(b.metas.iter().all(|m| m.range.is_empty()));
+        let r = io.recv_udp(u, &mut b, 1 << 20).unwrap();
+        assert!(matches!(r, RecvStop::Drained), "{r:?}");
+        assert_eq!(b.metas.len(), 40);
+    }
 }

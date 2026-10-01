@@ -125,7 +125,8 @@ impl UdpSocket {
 
     /// One `recvmmsg` pass into `buf` (up to 16 slots of 65535 bytes; `buf`
     /// must hold at least one slot). Appends one `RecvMeta` per datagram,
-    /// splitting GRO-coalesced payloads at the `UDP_GRO` segment size, and
+    /// splitting GRO-coalesced payloads at the `UDP_GRO` segment size (a
+    /// zero-length datagram gets one meta with an empty `range`), and
     /// returns the bytes received. `WouldBlock` when nothing is readable, with
     /// `out` unchanged. A single syscall, so a call either appends a whole
     /// batch or fails; an error the kernel hit after some messages is reported
@@ -179,7 +180,8 @@ impl UdpSocket {
             let stride = stride.unwrap_or(len).max(1);
             let base = i * SLOT;
             let mut off = 0;
-            while off < len {
+            // At least once: a zero-length datagram still gets its meta.
+            loop {
                 let end = (off + stride).min(len);
                 out.push(RecvMeta {
                     src,
@@ -187,6 +189,9 @@ impl UdpSocket {
                     range: base + off..base + end,
                 });
                 off = end;
+                if off >= len {
+                    break;
+                }
             }
             total += len;
         }

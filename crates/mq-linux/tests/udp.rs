@@ -75,6 +75,19 @@ fn gro_recv_reports_each_datagram_with_local_addr() {
 }
 
 #[test]
+fn zero_length_datagram_yields_empty_meta() {
+    let (a, b) = (loopback(), loopback());
+    let b_addr = b.local_addr().unwrap();
+    a.send_one(b_addr, &[]).unwrap();
+    a.send_one(b_addr, &[]).unwrap();
+    a.send_one(b_addr, b"x").unwrap();
+    let got = recv_n(&b, 3);
+    let lens: Vec<usize> = got.iter().map(|(_, d)| d.len()).collect();
+    assert_eq!(lens, [0, 0, 1]);
+    assert!(got.iter().all(|(m, _)| m.local == b_addr));
+}
+
+#[test]
 fn send_gso_rejects_more_than_64_segments_or_65507_bytes() {
     let (a, b) = (loopback(), loopback());
     let b_addr = b.local_addr().unwrap();
