@@ -511,6 +511,7 @@ fn stream_closed_after_both_fins_keeps_draining_tcp() {
 fn blocked_clears_writable_and_writable_event_resumes() {
     let (mut t, h, s) = setup();
     let mut r = relay(&h, s);
+    r.pump(&mut t, T, BIG); // the inherited read latch: Blocked clears it
     h.expect_stream_send(s, Err(StreamError::Blocked));
     let mut tcp = FakeTcp::new(b"abc");
     tcp.read(&mut r, &mut t);
@@ -702,6 +703,28 @@ fn prebuffer_runnable_without_tcp_event() {
 }
 
 #[test]
+fn start_hands_over_read_readiness() {
+    // spec §5.4: the app may have consumed the only StreamReadable.
+    let (mut t, h, s) = setup();
+    let mut r = relay(&h, s);
+    h.expect_stream_recv(s, Ok((b"left in xquic".to_vec(), false)));
+    assert!(r.is_runnable(), "no StreamReadable needed");
+    r.pump(&mut t, T, BIG);
+    assert_eq!(r.tcp_tx_data(), b"left in xquic");
+
+    // ...but not after the preread already carried FIN
+    let (_, h, s) = setup();
+    let fin = StreamPreread {
+        bytes: &[],
+        fin: true,
+    };
+    let mut r = start_with(&h, s, &[], false, &[], fin).unwrap();
+    assert!(r.take_owed_shutdown());
+    r.shutdown_done();
+    assert!(!r.is_runnable());
+}
+
+#[test]
 fn queued_reply_goes_out_before_preread() {
     let (_, h, s) = setup();
     let pre = StreamPreread {
@@ -755,6 +778,7 @@ fn preread_fin_recorded_and_shut_wr_owed() {
 fn rx_commit_forwards_immediately() {
     let (mut t, h, s) = setup();
     let mut r = relay(&h, s);
+    r.pump(&mut t, T, BIG); // the inherited read latch: Blocked clears it
     r.tcp_rx_space()[..3].copy_from_slice(b"abc");
     r.tcp_rx_commit(IoResult::Bytes(3), &mut t, T);
     assert_eq!(sends(&h), vec![(b"abc".to_vec(), false)]);

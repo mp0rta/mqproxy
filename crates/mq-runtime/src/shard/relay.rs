@@ -64,9 +64,10 @@ impl Relay {
     /// socket (its success reply), written before `preread`. Err if
     /// `to_tcp_queued + preread.bytes`, or `tcp_prebuf`, exceeds `RELAY_BUF`.
     ///
-    /// `stream_writable` starts set (spec §5.6); `stream_readable` starts clear:
-    /// the stream's next `StreamReadable` latches it (the shard routes the
-    /// stream's events to the relay from here on).
+    /// `stream_writable` starts set (spec §5.6). `stream_readable` starts set
+    /// unless `preread.fin` (spec §5.4): the app may have consumed a
+    /// `StreamReadable` and read only part of what xquic holds, and xquic will
+    /// not notify again.
     pub fn start(
         conn: ConnId,
         tcp: TcpId,
@@ -92,7 +93,7 @@ impl Relay {
             stream,
             to_quic,
             to_tcp,
-            stream_readable: false,
+            stream_readable: !preread.fin,
             stream_writable: true,
             fin_seen: preread.fin,
             stream_gone: false,
@@ -132,6 +133,8 @@ impl Relay {
     }
 
     /// spec §5.6 "runnable". The probe is the only condition needing no buffer room.
+    /// An owed SHUT_WR keeps the relay runnable until `take_owed_shutdown`
+    /// takes it, so the shard must call that after every pump (else it spins).
     pub fn is_runnable(&self) -> bool {
         self.open()
             && ((!self.to_quic.is_empty() && self.stream_writable)
@@ -142,8 +145,9 @@ impl Relay {
     }
 
     /// spec §5.6: (0) reset probe, (a) TCP → QUIC, (b) QUIC → TCP, (c) SHUT_WR
-    /// (taken by `take_owed_shutdown`). Each direction stops on `Blocked`, on a
-    /// result that moved nothing, or after `budget_per_dir` bytes.
+    /// (taken by `take_owed_shutdown`, which the shard calls after every pump).
+    /// Each direction stops on `Blocked`, on a result that moved nothing, or
+    /// after `budget_per_dir` bytes.
     pub fn pump(
         &mut self,
         t: &mut dyn TransportOps,
@@ -229,6 +233,8 @@ impl Relay {
             let cap = buf.len().min(left);
             match t.stream_recv(now, self.stream, &mut buf[..cap]) {
                 Ok((n, fin)) => {
+                    debug_assert!(n <= cap, "stream_recv returned more than offered");
+                    let n = n.min(cap);
                     self.to_tcp.commit(n);
                     left -= n;
                     progressed |= n > 0 || fin;
@@ -279,7 +285,10 @@ impl Relay {
             return;
         }
         match r {
-            IoResult::Bytes(n) => self.to_tcp.consume(n.min(self.to_tcp.len())),
+            IoResult::Bytes(n) => {
+                debug_assert!(n <= self.to_tcp.len(), "wrote more than tcp_tx_data");
+                self.to_tcp.consume(n.min(self.to_tcp.len()));
+            }
             IoResult::WouldBlock => {}
             IoResult::Eof | IoResult::Error(_) => self.abort(),
         }
