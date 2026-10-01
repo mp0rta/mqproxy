@@ -178,15 +178,23 @@ impl<'a> Cx<'a> {
         self.now
     }
 
+    /// The transport, for a call that may queue events (spec §5.2 step 5).
+    fn tm(&mut self) -> &mut (dyn TransportOps + 'a) {
+        self.st.touch();
+        self.t
+    }
+
     // --- Transport (spec §5.4) ---
 
     /// spec §5.4.
     pub fn connect(&mut self, cfg: &ConnConfig) -> Result<ConnId, ConnectError> {
-        self.t.connect(self.now, cfg)
+        let now = self.now;
+        self.tm().connect(now, cfg)
     }
     /// spec §5.4.
     pub fn open_stream(&mut self, conn: ConnId) -> Result<StreamId, Error> {
-        self.t.open_stream(self.now, conn)
+        let now = self.now;
+        self.tm().open_stream(now, conn)
     }
     /// spec §5.4.
     pub fn stream_send(
@@ -195,7 +203,8 @@ impl<'a> Cx<'a> {
         data: &[u8],
         fin: bool,
     ) -> Result<usize, StreamError> {
-        self.t.stream_send(self.now, s, data, fin)
+        let now = self.now;
+        self.tm().stream_send(now, s, data, fin)
     }
     /// spec §5.4. An empty `buf` is a reset probe.
     pub fn stream_recv(
@@ -203,11 +212,13 @@ impl<'a> Cx<'a> {
         s: StreamId,
         buf: &mut [u8],
     ) -> Result<(usize, bool), StreamError> {
-        self.t.stream_recv(self.now, s, buf)
+        let now = self.now;
+        self.tm().stream_recv(now, s, buf)
     }
     /// spec §5.4.
     pub fn stream_reset(&mut self, s: StreamId) {
-        self.t.stream_reset(self.now, s)
+        let now = self.now;
+        self.tm().stream_reset(now, s)
     }
     /// spec §5.4.
     pub fn stream_info(&self, s: StreamId) -> Result<StreamInfo, Error> {
@@ -215,7 +226,8 @@ impl<'a> Cx<'a> {
     }
     /// spec §5.4.
     pub fn close_conn(&mut self, conn: ConnId) {
-        self.t.close_conn(self.now, conn)
+        let now = self.now;
+        self.tm().close_conn(now, conn)
     }
     /// spec §5.4.
     pub fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error> {
@@ -230,19 +242,16 @@ impl<'a> Cx<'a> {
     }
     /// spec §5.4: request a UDP socket on an ephemeral port; completes in `on_udp_socket`.
     pub fn open_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
-        let op = self.st.new_socket_op();
-        self.st
-            .push_request(IoRequest::OpenUdpSocket { op, local_ip });
-        op
+        self.st.open_udp_socket(local_ip)
     }
     /// spec §5.4: the result, if any, is dropped and its socket closed.
     pub fn cancel_udp_socket(&mut self, op: SocketOpId) {
-        self.st.push_request(IoRequest::CancelUdpSocket { op });
+        self.st.cancel_udp_socket(op)
     }
-    /// spec §5.4: also removes the socket's path mappings.
+    /// spec §5.4: also removes the socket's path mappings. The primary
+    /// socket cannot be closed (ignored).
     pub fn close_udp_socket(&mut self, sock: UdpSocketId) {
-        self.st.unmap_socket(sock);
-        self.st.push_request(IoRequest::CloseUdpSocket { sock });
+        self.st.close_udp_socket(sock)
     }
     /// spec §5.4: creates the xquic path and maps it to `sock` in the same call.
     pub fn add_path(
@@ -251,7 +260,8 @@ impl<'a> Cx<'a> {
         sock: UdpSocketId,
         standby: bool,
     ) -> Result<PathId, PathError> {
-        let path = self.t.add_path(self.now, conn, standby)?;
+        let now = self.now;
+        let path = self.tm().add_path(now, conn, standby)?;
         self.st.map_path(conn, path, sock);
         Ok(path)
     }
@@ -292,24 +302,26 @@ impl<'a> Cx<'a> {
         stream: StreamId,
         preread: StreamPreread<'_>,
     ) -> Result<(), PrereadTooLarge> {
-        self.st.start_relay(tcp, stream, preread)
+        // The relay needs the stream's connection (spec §5.4 `ConnClosed` sweep).
+        let conn = self.t.stream_info(stream).ok().map(|i| i.conn);
+        let r = self.st.start_relay(tcp, stream, conn, preread);
+        if r.is_ok() && conn.is_none() {
+            // Stale stream: the socket was aborted; reset what is left of it.
+            let now = self.now;
+            self.tm().stream_reset(now, stream);
+        }
+        r
     }
 
     // --- Dial (spec §5.4) ---
 
     /// spec §5.4: completes in `on_dial_result` (`DialError::Limit` at the socket cap).
     pub fn dial(&mut self, target: Target, deadline: Duration) -> DialOpId {
-        let op = self.st.new_dial();
-        self.st.push_request(IoRequest::Dial {
-            op,
-            target,
-            deadline,
-        });
-        op
+        self.st.dial(target, deadline)
     }
     /// spec §5.4: the result, if any, is dropped and its socket closed.
     pub fn cancel_dial(&mut self, op: DialOpId) {
-        self.st.push_request(IoRequest::CancelDial { op });
+        self.st.cancel_dial(op)
     }
 
     // --- Timers (spec §5.4) ---
