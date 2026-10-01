@@ -664,3 +664,97 @@ fn usage_error_exits_2() {
         assert!(out.stdout.is_empty(), "{args:?}");
     }
 }
+
+// ---- spec §6.4: the running binary (valid fixtures, SIGTERM → exit 0) ----
+
+mod common;
+use common::{Proc, cert, free_tcp, free_udp};
+
+fn server_args(listen: &str, extra: &[&str]) -> Vec<String> {
+    let (c, k) = (cert("test.crt"), cert("test.key"));
+    let base = [
+        "server", "--listen", listen, "--token", "t", "--cert", &c, "--key", &k,
+    ];
+    base.iter().chain(extra).map(|s| s.to_string()).collect()
+}
+
+fn spawn(args: &[String]) -> Proc {
+    Proc::spawn(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+#[test]
+fn gateway_udp_off_line_logged() {
+    let mut p = spawn(&server_args(&format!("127.0.0.1:{}", free_udp()), &[]));
+    p.wait_line(
+        "[INFO] HTTP gateway and UDP relay are not available in this build; serving the TCP proxy only",
+    );
+    assert_eq!(p.term(), 0, "{:#?}", p.lines);
+}
+
+#[test]
+fn server_accepted_flags_start_and_exit_0_on_sigterm() {
+    let extra = ["--no-gateway", "--no-udp", "--udp-idle-timeout", "30"];
+    let mut p = spawn(&server_args(&format!("127.0.0.1:{}", free_udp()), &extra));
+    p.wait_line("[INFO] mqproxy server listening on");
+    assert_eq!(p.term(), 0, "{:#?}", p.lines);
+}
+
+#[test]
+fn client_accepted_flags_start_and_exit_0_on_sigterm() {
+    let socks = format!("127.0.0.1:{}", free_tcp());
+    let server = format!("127.0.0.1:{}", free_udp());
+    let mut p = Proc::spawn(&[
+        "client",
+        "--server",
+        &server,
+        "--token",
+        "t",
+        "--socks5",
+        &socks,
+        "--ca-cert",
+        "ca.pem",
+        "--ca-key",
+        "ca.key",
+        "--ignore-host",
+        "a.example",
+        "--ignore-hosts",
+        "b.example,.c.example",
+    ]);
+    p.wait_line("[INFO] mqproxy client: server=");
+    assert_eq!(p.term(), 0, "{:#?}", p.lines);
+}
+
+#[test]
+fn bad_cert_path_exits_1() {
+    let listen = format!("127.0.0.1:{}", free_udp());
+    let mut p = Proc::spawn(&[
+        "server",
+        "--listen",
+        &listen,
+        "--token",
+        "t",
+        "--cert",
+        "/nonexistent/test.crt",
+        "--key",
+        "/nonexistent/test.key",
+    ]);
+    assert_eq!(p.wait_exit(), 1, "{:#?}", p.lines);
+    assert!(
+        p.lines.iter().any(|l| l.starts_with("[ERROR] ")),
+        "{:#?}",
+        p.lines
+    );
+}
+
+#[test]
+fn listen_addr_in_use_exits_1() {
+    let busy = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let listen = busy.local_addr().unwrap().to_string();
+    let mut p = spawn(&server_args(&listen, &[]));
+    assert_eq!(p.wait_exit(), 1, "{:#?}", p.lines);
+    assert!(
+        p.lines.iter().any(|l| l.starts_with("[ERROR] ")),
+        "{:#?}",
+        p.lines
+    );
+}
