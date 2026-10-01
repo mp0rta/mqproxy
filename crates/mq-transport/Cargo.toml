@@ -12,7 +12,7 @@ log = { workspace = true }
 libc = { workspace = true }
 
 [features]
-test-support = []
+test-support = ["xquic-sys/test-hooks"]
 
 [dev-dependencies]
 static_assertions = { workspace = true }

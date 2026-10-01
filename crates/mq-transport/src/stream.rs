@@ -20,6 +20,32 @@ fn stream_err(r: isize) -> StreamError {
 /// spec §4.2: client only, at most 8192 stream slots per connection; the slot is allocated
 /// before `xqc_stream_create` and released if it fails (spec §4.8).
 pub(crate) fn open_stream(t: &mut Transport, now: Time, c: ConnId) -> Result<StreamId, Error> {
+    // SAFETY (closure): the engine is live; the cid outlives the call.
+    open_with(t, now, c, |engine, cid, ud| unsafe {
+        xqc_stream_create(engine, cid, ptr::null_mut(), ud)
+    })
+}
+
+/// `open_stream` with a caller-chosen QUIC id (spec §7, §8.4 sparse ids): tests only.
+#[cfg(feature = "test-support")]
+pub(crate) fn open_stream_with_id(
+    t: &mut Transport,
+    now: Time,
+    c: ConnId,
+    quic_id: u64,
+) -> Result<StreamId, Error> {
+    // SAFETY (closure): as in `open_stream`.
+    open_with(t, now, c, |engine, cid, ud| unsafe {
+        xqc_stream_create_with_id(engine, cid, quic_id, ud)
+    })
+}
+
+fn open_with(
+    t: &mut Transport,
+    now: Time,
+    c: ConnId,
+    create: impl FnOnce(*mut xqc_engine_t, &xqc_cid_t, *mut core::ffi::c_void) -> *mut xqc_stream_t,
+) -> Result<StreamId, Error> {
     t.inner.last_now = now;
     if matches!(t.inner.cfg.role, Role::Server { .. }) {
         return Err(Error::Role); // xqc_stream_create always makes a client-initiated id
@@ -37,12 +63,10 @@ pub(crate) fn open_stream(t: &mut Transport, now: Time, c: ConnId) -> Result<Str
         StreamKind::Bidi,
     ));
     let created = t.with_engine(now, |_, engine| {
-        // SAFETY: the engine is live; the cid outlives the call. The create notification
-        // binds the slot; the id is read before any other xquic call.
-        unsafe {
-            let xs = xqc_stream_create(engine, &cid, ptr::null_mut(), ud_of(s));
-            (!xs.is_null()).then(|| (xs, xqc_stream_id(xs)))
-        }
+        // The create notification binds the slot; the id is read before any other xquic call.
+        let xs = create(engine, &cid, ud_of(s));
+        // SAFETY: a live stream just returned by xquic.
+        (!xs.is_null()).then(|| (xs, unsafe { xqc_stream_id(xs) }))
     });
     let inner = &mut *t.inner;
     match (created, inner.streams.get_mut(s)) {

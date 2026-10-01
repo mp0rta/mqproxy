@@ -9,6 +9,10 @@ publish = false
 [dependencies]
 libc = { workspace = true }
 
+[features]
+# Builds xquic with -DXQC_ENABLE_TEST_HOOKS=ON and exposes its test-only entry points.
+test-hooks = []
+
 [build-dependencies]
 cc = { workspace = true }
 cmake = { workspace = true }

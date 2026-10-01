@@ -13,6 +13,9 @@ use xquic_sys::*;
 
 /// Connection settings (spec §4.9), built from a zeroed struct like C's `memset`.
 /// `idle` is the client's `--keepalive-idle`; the server passes `None`.
+/// spec §7: live skipped-id entries a peer may make xquic hold per connection.
+pub(crate) const MAX_IMPLICIT_STREAMS: u64 = 16384;
+
 pub(crate) fn conn_settings(cfg: &TransportConfig, idle: Option<Duration>) -> xqc_conn_settings_t {
     let server = matches!(cfg.role, Role::Server { .. });
     // SAFETY: a plain C struct of integers, floats, arrays and Option<fn> fields; all-zero is
@@ -23,6 +26,8 @@ pub(crate) fn conn_settings(cfg: &TransportConfig, idle: Option<Duration>) -> xq
     s.max_datagram_frame_size = 65535;
     s.enable_multipath = 1;
     s.mp_ping_on = 1;
+    // spec §7: cap on implicitly opened (skipped) peer stream ids; explicit, not xquic's 0=default.
+    s.max_implicit_streams = MAX_IMPLICIT_STREAMS;
     // SAFETY: by-value copies of immutable statics exported by xquic.
     s.cong_ctrl_callback = unsafe {
         match cfg.cc {
@@ -276,6 +281,7 @@ mod tests {
         assert_eq!(s.enable_multipath, 1);
         assert_eq!(s.mp_ping_on, 1);
         assert_eq!(s.max_datagram_frame_size, 65535);
+        assert_eq!(s.max_implicit_streams, 16384); // spec §7
         // SAFETY: by-value reads of xquic's immutable statics.
         let (want_cc, want_sched) = unsafe {
             (

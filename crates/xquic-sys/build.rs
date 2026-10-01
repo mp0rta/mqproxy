@@ -78,6 +78,9 @@ fn main() {
     if asan {
         x.define("ASAN", "ON"); // xquic's own option (CMakeLists.txt:116)
     }
+    if env::var_os("CARGO_FEATURE_TEST_HOOKS").is_some() {
+        x.define("XQC_ENABLE_TEST_HOOKS", "ON"); // spec §7: xqc_stream_create_with_id & co.
+    }
     let xq_build = x.build().join("build");
 
     // 3. sizes.c for the layout test

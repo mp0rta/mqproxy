@@ -235,4 +235,24 @@ impl Transport {
     pub fn pending_close(&self, c: ConnId) -> Option<u64> {
         self.inner.conns.get(c.slot()).and_then(|s| s.pending_close)
     }
+
+    /// `open_stream` with a chosen QUIC id, for sparse-id tests (spec §7, §8.4).
+    pub fn open_stream_with_id(
+        &mut self,
+        now: Time,
+        c: ConnId,
+        quic_id: u64,
+    ) -> Result<StreamId, mq_transport_api::Error> {
+        stream::open_stream_with_id(self, now, c, quic_id)
+    }
+
+    /// xquic's live count of implicitly opened stream ids on `c` (spec §7); 0 for a stale id
+    /// or a connection xquic no longer knows.
+    pub fn implicit_stream_count(&self, c: ConnId) -> u64 {
+        let Some(cid) = self.inner.conns.get(c.slot()).map(|s| s.cid) else {
+            return 0;
+        };
+        // SAFETY: the engine is live; the cid outlives the call; a plain getter, no callbacks.
+        unsafe { xquic_sys::xqc_conn_implicit_stream_count(self.inner.engine, &cid) }
+    }
 }
