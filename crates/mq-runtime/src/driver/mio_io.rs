@@ -4,7 +4,8 @@
 //! signal / shutdown self-pipes.
 
 use super::io::{
-    Io, IoEvent, ListenerKey, RecvBatch, RecvStop, Resolver, SockKey, TcpSock, UdpSock, Wait,
+    Io, IoEvent, ListenerKey, RecvBatch, RecvMeta, RecvStop, Resolver, SockKey, TcpSock, UdpSock,
+    Wait,
 };
 use crate::app::{AcceptMeta, IoResult, ListenKind};
 use crate::ids::DialOpId;
@@ -529,9 +530,10 @@ impl Io for MioIo {
             for m in self.scratch_metas.drain(..) {
                 let start = out.buf.len();
                 out.buf.extend_from_slice(&self.scratch[m.range]);
-                out.metas.push(mq_linux::RecvMeta {
+                out.metas.push(RecvMeta {
+                    src: m.src,
+                    local: m.local,
                     range: start..out.buf.len(),
-                    ..m
                 });
             }
             match r {

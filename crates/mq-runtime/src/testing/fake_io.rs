@@ -4,10 +4,9 @@
 
 use crate::app::{AcceptMeta, IoResult};
 use crate::driver::{
-    Io, IoEvent, ListenerKey, RecvBatch, RecvStop, SockKey, TcpSock, UdpSock, Wait,
+    Io, IoEvent, ListenerKey, RecvBatch, RecvMeta, RecvStop, SockKey, TcpSock, UdpSock, Wait,
 };
 use crate::ids::DialOpId;
-use mq_linux::RecvMeta;
 use mq_transport_api::{Time, Transmit};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind};
