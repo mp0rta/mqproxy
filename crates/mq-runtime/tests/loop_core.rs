@@ -568,6 +568,42 @@ fn late_connect_for_cancelled_op_closed() {
     assert!(h.dial_results().is_empty());
 }
 
+#[test]
+fn dial_deadline_beats_same_iteration_success() {
+    let mut h = setup();
+    h.io().set_auto_advance(false);
+    let op = h.dial(ip([10, 0, 0, 1], 80), SEC);
+    h.it();
+    h.ops();
+    // The deadline passes and the successful connect lands in the same wait.
+    h.io().set_now(Time::ZERO + SEC);
+    let s = h.io().connect_ok(op);
+    h.it();
+    assert_eq!(h.dial_results(), vec![(op, Err(DialError::Timeout))]);
+    let ops = h.ops();
+    assert!(ops.contains(&Op::CancelConnect(op)));
+    assert!(ops.contains(&Op::CloseTcp(s, false)));
+    h.it();
+    assert_eq!(h.dial_results().len(), 1);
+}
+
+#[test]
+fn dial_deadline_beats_same_iteration_resolve() {
+    let mut h = setup();
+    h.io().set_auto_advance(false);
+    let op = h.dial(domain("slow.example"), SEC);
+    h.it();
+    h.ops();
+    h.io().set_now(Time::ZERO + SEC);
+    h.io().resolve(op, Ok(vec![addr(443)]));
+    h.it();
+    assert_eq!(h.dial_results(), vec![(op, Err(DialError::Timeout))]);
+    assert!(connects(&h.ops()).is_empty());
+    assert_eq!(h.c.resolver().running(), 0);
+    h.it();
+    assert_eq!(h.dial_results().len(), 1);
+}
+
 // --- Listeners ---
 
 #[test]

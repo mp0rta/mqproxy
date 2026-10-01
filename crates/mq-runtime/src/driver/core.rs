@@ -214,8 +214,8 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
         // 2. UDP first, so ACKs are seen before new data is written.
         self.udp_rx(now);
 
-        // 3. Accepts, socket errors, dial results, socket-open results,
-        // expired driver deadlines, a shutdown signal.
+        // 3. Accepts, socket errors, expired driver deadlines, dial
+        // results, socket-open results, a shutdown signal.
         self.accepts(now);
         for tcp in errors {
             if let Some(&s) = self.tcp.get(&tcp) {
@@ -223,14 +223,17 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
                 self.shard.on_tcp_error(now, tcp, kind);
             }
         }
+        // spec §5.3: a deadline is reported at once, before any completion
+        // that arrived in the same wait; that completion then finds no dial
+        // (a late socket is closed, a late answer dropped).
+        for e in expired {
+            self.expired(now, e);
+        }
         for ev in results {
             self.dial_result(now, ev);
         }
         while let Some((op, r)) = self.held.pop_front() {
             self.udp_opened(now, op, r);
-        }
-        for e in expired {
-            self.expired(now, e);
         }
         if shutdown && !self.shutting_down {
             self.shutting_down = true;
