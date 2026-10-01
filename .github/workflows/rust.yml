@@ -43,3 +43,37 @@ jobs:
         with:
           tool: cross
       - run: cross build --workspace --target ${{ matrix.target }}
+
+  fuzz-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo install cargo-fuzz --locked
+      - name: Replay the C corpora
+        run: |
+          for pair in varint:varint auth_req:wire_auth_req auth_resp:wire_auth_resp connect_tcp_req:wire_connect_tcp_req connect_tcp_resp:wire_connect_tcp_resp; do
+            t=${pair%%:*}; c=${pair##*:}
+            mkdir -p crates/mq-wire/fuzz/corpus/$t
+            cargo +nightly fuzz run --fuzz-dir crates/mq-wire/fuzz $t crates/mq-wire/fuzz/corpus/$t fuzz/corpus/$c -- -runs=0
+          done
+
+  fuzz-explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo install cargo-fuzz --locked
+      - name: Explore 30 s per target
+        run: |
+          for pair in varint:varint auth_req:wire_auth_req auth_resp:wire_auth_resp connect_tcp_req:wire_connect_tcp_req connect_tcp_resp:wire_connect_tcp_resp; do
+            t=${pair%%:*}; c=${pair##*:}
+            mkdir -p crates/mq-wire/fuzz/corpus/$t
+            cargo +nightly fuzz run --fuzz-dir crates/mq-wire/fuzz $t crates/mq-wire/fuzz/corpus/$t fuzz/corpus/$c -- -max_total_time=30
+          done
