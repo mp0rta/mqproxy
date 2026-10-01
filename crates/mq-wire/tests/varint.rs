@@ -49,6 +49,12 @@ fn short_buffers() {
 }
 
 #[test]
+fn encode_short_nonempty_buffer() {
+    let mut buf = [0u8; 4];
+    assert_eq!(encode(&mut buf, 0x4000_0000), Err(Error::Short));
+}
+
+#[test]
 fn encode_rejects_value_above_62_bits() {
     let mut buf = [0u8; 8];
     assert_eq!(
@@ -69,7 +75,12 @@ fn decode_rejects_truncated_prefix() {
 
 proptest! {
     #[test]
-    fn proptest_roundtrip(v in 0..=MAX) {
+    fn proptest_roundtrip(v in prop_oneof![
+        0..=0x3Fu64,
+        0x40..=0x3FFFu64,
+        0x4000..=0x3FFF_FFFFu64,
+        0x4000_0000..=MAX,
+    ]) {
         let mut buf = [0u8; 8];
         let n = encode(&mut buf, v).unwrap();
         prop_assert_eq!(n, len(v));
