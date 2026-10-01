@@ -10,6 +10,7 @@
 
 mod clock;
 mod slots;
+mod txq;
 
 /// Stub; fleshed out in Tasks 4.5/4.6.
 pub(crate) struct Inner;
