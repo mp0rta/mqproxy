@@ -13,6 +13,10 @@ impl ShardState {
     pub fn path_socket(&self, conn: ConnId, path: PathId) -> Option<UdpSocketId> {
         self.paths.get(&(conn, path)).copied()
     }
+    /// A live UDP socket (the primary included).
+    pub(crate) fn udp_live(&self, sock: UdpSocketId) -> bool {
+        self.udp.contains_key(&sock)
+    }
     pub(crate) fn map_path(&mut self, conn: ConnId, path: PathId, sock: UdpSocketId) {
         self.paths.insert((conn, path), sock);
     }
@@ -42,6 +46,8 @@ impl ShardState {
             .map(|(_, s)| *s)
             .collect();
         self.paths.retain(|(c, _), _| *c != conn);
+        // ponytail: a socket also mapped by another connection is closed too
+        // (spec §5.2 says "each mapped socket"); refcount if sockets get shared.
         for sock in socks {
             self.close_udp_socket(sock);
         }
@@ -52,7 +58,11 @@ impl<T: TransportOps, A: App> Shard<T, A> {
     /// spec §5.2 step 3: stream events to the relay owning the stream, late
     /// events for a closed relay dropped, everything else to the app.
     /// `ConnClosed` first closes the connection's relays and sockets.
+    /// A dead stream's entry goes once its `StreamClosed` has been seen —
+    /// at the end of this pass, so a stray event behind it in the same pass
+    /// is still dropped.
     pub(super) fn dispatch_events(&mut self, now: Time) {
+        let mut closed = Vec::new();
         while let Some(ev) = self.transport.poll_event() {
             match &ev {
                 Event::StreamReadable(s) | Event::StreamWritable(s) | Event::StreamClosed(s) => {
@@ -61,14 +71,15 @@ impl<T: TransportOps, A: App> Shard<T, A> {
                             r.on_stream_event(&ev);
                         }
                         self.settle_relay(now, tcp);
+                    } else if !self.st.dead_streams.contains_key(s) {
+                        self.call_app(now, |a, cx| a.on_transport_event(cx, ev));
                         continue;
                     }
-                    if self.st.dead_streams.contains_key(s) {
-                        if matches!(ev, Event::StreamClosed(_)) {
-                            self.st.dead_streams.remove(s);
-                        }
-                        continue;
+                    // Relay-owned or late for a closed relay: never the app's.
+                    if matches!(ev, Event::StreamClosed(_)) {
+                        closed.push(*s);
                     }
+                    continue;
                 }
                 Event::ConnClosed(c, _) => {
                     let swept: Vec<TcpId> = self
@@ -92,6 +103,9 @@ impl<T: TransportOps, A: App> Shard<T, A> {
                 _ => {}
             }
             self.call_app(now, |a, cx| a.on_transport_event(cx, ev));
+        }
+        for s in closed {
+            self.st.dead_streams.remove(&s);
         }
     }
 

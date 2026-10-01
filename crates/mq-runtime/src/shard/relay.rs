@@ -356,6 +356,11 @@ impl Relay {
         self.check_clean();
     }
 
+    /// `StreamClosed` after both FINs was consumed: the stream gets no more events.
+    pub fn stream_gone(&self) -> bool {
+        self.stream_gone
+    }
+
     /// `Abort` ⇒ the shard resets the stream and aborts TCP; `Clean` ⇒ graceful close.
     pub fn end_reason(&self) -> Option<RelayEnd> {
         match self.state {

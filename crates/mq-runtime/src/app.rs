@@ -124,7 +124,8 @@ pub struct StreamPreread<'a> {
 }
 
 /// spec §5.4: `start_relay` failure — the preread does not fit behind what is
-/// already queued for TCP (or `tcp` is not a live app-owned socket).
+/// already queued for TCP (or `tcp` is not a live app-owned socket, or the
+/// stream is already relayed).
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct PrereadTooLarge;
 
@@ -169,6 +170,7 @@ pub struct Cx<'a> {
 
 impl<'a> Cx<'a> {
     /// spec §5.1/§5.4: built by the shard around each callback.
+    #[doc(hidden)] // apps get a `Cx` only from the shard; public for `tests/app.rs`
     pub fn new(t: &'a mut dyn TransportOps, now: Time, st: &'a mut ShardState) -> Cx<'a> {
         Cx { t, now, st }
     }
@@ -260,6 +262,9 @@ impl<'a> Cx<'a> {
         sock: UdpSocketId,
         standby: bool,
     ) -> Result<PathId, PathError> {
+        if !self.st.udp_live(sock) {
+            return Err(PathError::Stale); // no dangling mapping
+        }
         let now = self.now;
         let path = self.tm().add_path(now, conn, standby)?;
         self.st.map_path(conn, path, sock);

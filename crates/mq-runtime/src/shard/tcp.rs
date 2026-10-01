@@ -148,6 +148,9 @@ impl ShardState {
         conn: Option<ConnId>,
         preread: StreamPreread<'_>,
     ) -> Result<(), PrereadTooLarge> {
+        if self.streams.contains_key(&stream) {
+            return Err(PrereadTooLarge); // already bound to another relay
+        }
         let e = self.app_tcp(tcp).ok_or(PrereadTooLarge)?;
         if e.tx.len() + preread.bytes.len() > RELAY_BUF {
             return Err(PrereadTooLarge);
@@ -165,10 +168,6 @@ impl ShardState {
             &e.tx,
             preread,
         )?;
-        debug_assert!(
-            !self.streams.contains_key(&stream),
-            "stream already relayed"
-        );
         self.tcp.insert(tcp, TcpEntry::Relay(relay));
         self.streams.insert(stream, tcp);
         Ok(())

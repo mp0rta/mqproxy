@@ -282,7 +282,7 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         if shut {
             r.shutdown_done();
         }
-        let (end, stream, conn) = (r.end_reason(), r.stream, r.conn);
+        let (end, stream, conn, gone) = (r.end_reason(), r.stream, r.conn, r.stream_gone());
         if shut {
             self.st.push_request(IoRequest::TcpShutdownWrite { tcp });
         }
@@ -291,7 +291,11 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         };
         self.st.tcp.remove(&tcp);
         self.st.streams.remove(&stream);
-        self.st.dead_streams.insert(stream, conn);
+        // Late events are dropped until the stream's `StreamClosed`; if that
+        // was already consumed, none can follow and no entry is kept.
+        if !gone {
+            self.st.dead_streams.insert(stream, conn);
+        }
         let abort = end == RelayEnd::Abort;
         if abort {
             self.transport.stream_reset(now, stream);
@@ -349,6 +353,11 @@ impl<T: TransportOps, A: App> Shard<T, A> {
     #[cfg(feature = "test-support")]
     pub fn with_app<R>(&mut self, now: Time, f: impl FnOnce(&mut A, &mut Cx<'_>) -> R) -> R {
         self.call_app(now, f)
+    }
+    /// Closed relays' streams still awaiting their `StreamClosed`.
+    #[cfg(feature = "test-support")]
+    pub fn dead_stream_count(&self) -> usize {
+        self.st.dead_streams.len()
     }
     #[cfg(feature = "test-support")]
     pub fn app(&self) -> &A {

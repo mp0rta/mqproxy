@@ -9,8 +9,8 @@ use mq_runtime::{
     PrereadTooLarge, RELAY_BUF, Shard, StreamPreread, TCP_BUF, Target, TcpEnd, TcpId,
 };
 use mq_transport_api::{
-    CloseReason, ConnId, ErrType, Event, PathId, StreamError, StreamId, StreamInfo, StreamKind,
-    Time,
+    CloseReason, ConnId, ErrType, Event, PathError, PathId, StreamError, StreamId, StreamInfo,
+    StreamKind, Time,
 };
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -527,6 +527,7 @@ fn late_event_for_closed_relay_dropped() {
     h.sh.on_tcp_error(T0, tcp, ErrorKind::ConnectionReset);
     h.sh.drive(T0);
     assert!(h.t.log().contains(&Call::StreamReset(s)));
+    assert_eq!(h.sh.dead_stream_count(), 1, "kept until its StreamClosed");
     let recvs = |h: &H| {
         h.t.log()
             .iter()
@@ -547,6 +548,79 @@ fn late_event_for_closed_relay_dropped() {
         h.app.take(),
         [Recorded::TransportEvent(Event::StreamReadable(other))]
     );
+    assert_eq!(h.sh.dead_stream_count(), 0, "pruned by its StreamClosed");
+}
+
+#[test]
+fn late_event_behind_stream_closed_in_same_drive_dropped() {
+    let mut h = setup();
+    let (tcp, s) = h.relay();
+    h.sh.drive(T0);
+    h.reqs();
+    h.app.take();
+    // StreamClosed before both FINs ends the relay; a stray event behind it
+    // in the same poll loop is still the relay's, not the app's.
+    h.t.push_event(Event::StreamClosed(s));
+    h.t.push_event(Event::StreamReadable(s));
+    h.sh.drive(T0);
+    assert_eq!(h.reqs(), [IoRequest::TcpClose { tcp, abort: true }]);
+    assert!(h.app.take().is_empty());
+    assert_eq!(h.sh.dead_stream_count(), 0);
+}
+
+#[test]
+fn relay_ended_by_stream_closed_leaves_no_dead_entry() {
+    let mut h = setup();
+    // Abort: StreamClosed before both FINs.
+    let (_t1, s1) = h.relay();
+    h.t.push_event(Event::StreamClosed(s1));
+    h.sh.drive(T0);
+    assert_eq!(h.sh.dead_stream_count(), 0);
+    // Clean: StreamClosed after both FINs while QUIC → TCP still drains
+    // (the download case); the relay ends later, on the TCP side.
+    let (tcp, s) = h.relay();
+    h.sh.tcp_rx_commit(T0, tcp, IoResult::Eof); // FIN sent at once
+    h.t.expect_stream_recv(s, Ok((b"bye".to_vec(), true)));
+    h.sh.drive(T0);
+    h.t.push_event(Event::StreamClosed(s));
+    h.sh.drive(T0);
+    h.reqs();
+    assert_eq!(h.tx_all(tcp), b"bye");
+    assert_eq!(
+        h.reqs(),
+        [
+            IoRequest::TcpShutdownWrite { tcp },
+            IoRequest::TcpClose { tcp, abort: false }
+        ]
+    );
+    assert_eq!(
+        h.sh.dead_stream_count(),
+        0,
+        "its StreamClosed was already consumed"
+    );
+}
+
+#[test]
+fn add_path_needs_a_live_socket_and_a_stream_relays_once() {
+    let mut h = setup();
+    let c = h.conn();
+    let op = h.sh.with_app(T0, |_, cx| {
+        cx.open_udp_socket(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    });
+    let sock = h.sh.on_udp_socket(T0, op, Ok(addr(7000))).unwrap();
+    h.sh.with_app(T0, |_, cx| cx.close_udp_socket(sock));
+    assert_eq!(
+        h.sh.with_app(T0, |_, cx| cx.add_path(c, sock, false)),
+        Err(PathError::Stale)
+    );
+    assert!(!h.t.log().iter().any(|c| matches!(c, Call::AddPath { .. })));
+    let (_, s) = h.relay_on(c);
+    let t2 = h.accept();
+    assert_eq!(
+        h.sh.with_app(T0, |_, cx| cx.start_relay(t2, s, NO_PREREAD)),
+        Err(PrereadTooLarge)
+    );
+    assert!(h.sh.tcp_interest(t2).read, "still app-owned");
 }
 
 // --- interest ---
@@ -727,6 +801,8 @@ fn next_timeout_min_of_transport_and_timers() {
 
 #[test]
 fn budget_limits_bytes_per_drive() {
+    // The 64 KiB relay buffers bind before the 256 KiB budget does (each relay
+    // is pumped once per drive), so this checks the bound, not the exact budget.
     const BUDGET: usize = 256 * 1024;
     let mut h = setup();
     let (tcp, s) = h.relay();
