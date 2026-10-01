@@ -11,3 +11,6 @@ mq-linux = { path = "../mq-linux" }
 
 [features]
 test-support = []
+
+[dev-dependencies]
+mq-runtime = { path = ".", features = ["test-support"] }

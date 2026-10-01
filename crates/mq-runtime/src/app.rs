@@ -1,0 +1,340 @@
+//! The app interface (spec §5.4) and the shard's request/result types (spec §5.2, §5.3).
+
+use crate::ids::{DialOpId, SocketOpId, TcpId, TimerId, UdpSocketId};
+use crate::shard::{Rng, ShardState};
+use mq_transport_api::{
+    ConnConfig, ConnId, ConnStats, ConnectError, Error, Event, PathError, PathId, StreamError,
+    StreamId, StreamInfo, Time, TransportOps,
+};
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+
+/// spec §5.2: chosen by the binary; tells SOCKS5, HTTP CONNECT and transparent capture apart.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct ListenerTag(pub u32);
+
+/// spec §5.3: how the driver fills `AcceptMeta::original_dst`.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ListenKind {
+    /// No original destination.
+    Plain,
+    /// `SO_ORIGINAL_DST`.
+    Redirect,
+    /// `getsockname`.
+    Tproxy,
+}
+
+/// spec §5.2: what the driver knows about an accepted socket.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct AcceptMeta {
+    pub peer: SocketAddr,
+    pub original_dst: Option<SocketAddr>,
+}
+
+/// spec §5.2: the outcome of one TCP read or write.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum IoResult {
+    Bytes(usize),
+    /// A read returned zero (spec §5.4: the only source of EOF).
+    Eof,
+    WouldBlock,
+    Error(io::ErrorKind),
+}
+
+/// spec §5.2: why a dial failed.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum DialError {
+    Dns,
+    Refused,
+    Timeout,
+    /// The shard's socket cap; raised by the shard without reaching the driver.
+    Limit,
+    Other,
+}
+
+/// spec §5.2: a dial target's host.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub enum Host {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+/// spec §5.2: a dial target.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Target {
+    pub host: Host,
+    pub port: u16,
+}
+
+/// spec §5.2: work the driver carries out, in order, in the same iteration.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub enum IoRequest {
+    /// Resolve, then connect, under one deadline.
+    Dial {
+        op: DialOpId,
+        target: Target,
+        deadline: Duration,
+    },
+    CancelDial {
+        op: DialOpId,
+    },
+    /// Ephemeral port.
+    OpenUdpSocket {
+        op: SocketOpId,
+        local_ip: IpAddr,
+    },
+    CancelUdpSocket {
+        op: SocketOpId,
+    },
+    CloseUdpSocket {
+        sock: UdpSocketId,
+    },
+    TcpShutdownWrite {
+        tcp: TcpId,
+    },
+    /// `abort`: `SO_LINGER` 0 then close, so the peer sees `ECONNRESET`.
+    TcpClose {
+        tcp: TcpId,
+        abort: bool,
+    },
+}
+
+/// spec §5.2: the driver's read/write interest for a TCP socket.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct Interest {
+    pub read: bool,
+    pub write: bool,
+}
+
+/// spec §5.4: end of an app-owned socket.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum TcpEnd {
+    /// A read returned zero; the socket is still writable and may be relayed.
+    ReadEof,
+    /// Terminal: the shard has closed the socket and the id is dead.
+    Error(io::ErrorKind),
+}
+
+/// spec §5.4: stream bytes the app read before `start_relay`, and whether FIN was seen.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct StreamPreread<'a> {
+    pub bytes: &'a [u8],
+    pub fin: bool,
+}
+
+/// spec §5.4: `start_relay` failure — the preread does not fit behind what is
+/// already queued for TCP (or `tcp` is not a live app-owned socket).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct PrereadTooLarge;
+
+/// spec §5.4: `tcp_write` failure — the bytes do not fit in the 64 KiB send
+/// buffer (or `tcp` is not a live app-owned socket).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct SendBufFull;
+
+/// spec §5.4: the application driven by the shard. `Cx` is its only way to act.
+pub trait App {
+    /// spec §5.4: once, from `Shard::start`.
+    fn on_start(&mut self, cx: &mut Cx<'_>);
+    /// spec §5.4: every transport event not routed to a relay.
+    fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event);
+    /// spec §5.4: a new app-owned socket from a listener.
+    fn on_accepted(&mut self, cx: &mut Cx<'_>, l: ListenerTag, tcp: TcpId, meta: AcceptMeta);
+    /// spec §5.4: bytes arrived in an app-owned socket's receive buffer.
+    fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId);
+    /// spec §5.4: read EOF or error on an app-owned socket.
+    fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd);
+    /// spec §5.4: a dial completed (never delivered once cancelled).
+    fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>);
+    /// spec §5.4: a UDP socket open completed (never delivered once cancelled).
+    fn on_udp_socket(
+        &mut self,
+        cx: &mut Cx<'_>,
+        op: SocketOpId,
+        r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
+    );
+    /// spec §5.4: an app timer fired.
+    fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId);
+    /// spec §5.4: a shutdown signal arrived.
+    fn on_shutdown(&mut self, cx: &mut Cx<'_>);
+}
+
+/// spec §5.4: the app's handle on the shard for one callback. Carries `now`.
+pub struct Cx<'a> {
+    t: &'a mut dyn TransportOps,
+    now: Time,
+    st: &'a mut ShardState,
+}
+
+impl<'a> Cx<'a> {
+    /// spec §5.1/§5.4: built by the shard around each callback.
+    pub fn new(t: &'a mut dyn TransportOps, now: Time, st: &'a mut ShardState) -> Cx<'a> {
+        Cx { t, now, st }
+    }
+
+    /// spec §5.4: the current time.
+    pub fn now(&self) -> Time {
+        self.now
+    }
+
+    // --- Transport (spec §5.4) ---
+
+    /// spec §5.4.
+    pub fn connect(&mut self, cfg: &ConnConfig) -> Result<ConnId, ConnectError> {
+        self.t.connect(self.now, cfg)
+    }
+    /// spec §5.4.
+    pub fn open_stream(&mut self, conn: ConnId) -> Result<StreamId, Error> {
+        self.t.open_stream(self.now, conn)
+    }
+    /// spec §5.4.
+    pub fn stream_send(
+        &mut self,
+        s: StreamId,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<usize, StreamError> {
+        self.t.stream_send(self.now, s, data, fin)
+    }
+    /// spec §5.4. An empty `buf` is a reset probe.
+    pub fn stream_recv(
+        &mut self,
+        s: StreamId,
+        buf: &mut [u8],
+    ) -> Result<(usize, bool), StreamError> {
+        self.t.stream_recv(self.now, s, buf)
+    }
+    /// spec §5.4.
+    pub fn stream_reset(&mut self, s: StreamId) {
+        self.t.stream_reset(self.now, s)
+    }
+    /// spec §5.4.
+    pub fn stream_info(&self, s: StreamId) -> Result<StreamInfo, Error> {
+        self.t.stream_info(s)
+    }
+    /// spec §5.4.
+    pub fn close_conn(&mut self, conn: ConnId) {
+        self.t.close_conn(self.now, conn)
+    }
+    /// spec §5.4.
+    pub fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error> {
+        self.t.conn_stats(conn)
+    }
+
+    // --- Paths (spec §5.4) ---
+
+    /// spec §5.4: the primary UDP socket's local address.
+    pub fn primary_local(&self) -> SocketAddr {
+        self.st.primary_local()
+    }
+    /// spec §5.4: request a UDP socket on an ephemeral port; completes in `on_udp_socket`.
+    pub fn open_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
+        let op = self.st.new_socket_op();
+        self.st
+            .push_request(IoRequest::OpenUdpSocket { op, local_ip });
+        op
+    }
+    /// spec §5.4: the result, if any, is dropped and its socket closed.
+    pub fn cancel_udp_socket(&mut self, op: SocketOpId) {
+        self.st.push_request(IoRequest::CancelUdpSocket { op });
+    }
+    /// spec §5.4: also removes the socket's path mappings.
+    pub fn close_udp_socket(&mut self, sock: UdpSocketId) {
+        self.st.unmap_socket(sock);
+        self.st.push_request(IoRequest::CloseUdpSocket { sock });
+    }
+    /// spec §5.4: creates the xquic path and maps it to `sock` in the same call.
+    pub fn add_path(
+        &mut self,
+        conn: ConnId,
+        sock: UdpSocketId,
+        standby: bool,
+    ) -> Result<PathId, PathError> {
+        let path = self.t.add_path(self.now, conn, standby)?;
+        self.st.map_path(conn, path, sock);
+        Ok(path)
+    }
+
+    // --- TCP, app-owned phase (spec §5.4) ---
+
+    /// spec §5.4: unconsumed received bytes.
+    pub fn tcp_rx(&self, tcp: TcpId) -> &[u8] {
+        self.st.tcp_rx(tcp)
+    }
+    /// spec §5.4.
+    pub fn tcp_consume(&mut self, tcp: TcpId, n: usize) {
+        self.st.tcp_consume(tcp, n)
+    }
+    /// spec §5.4: queues into the 64 KiB send buffer; fails if it does not fit.
+    pub fn tcp_write(&mut self, tcp: TcpId, bytes: &[u8]) -> Result<(), SendBufFull> {
+        self.st.tcp_write(tcp, bytes)
+    }
+    /// spec §5.4: the app's read-interest flag.
+    pub fn tcp_set_read(&mut self, tcp: TcpId, on: bool) {
+        self.st.tcp_set_read(tcp, on)
+    }
+    /// spec §5.4: closes once the send buffer has drained.
+    pub fn tcp_close(&mut self, tcp: TcpId) {
+        self.st.tcp_close(tcp)
+    }
+    /// spec §5.4: resets the connection now.
+    pub fn tcp_abort(&mut self, tcp: TcpId) {
+        self.st.tcp_abort(tcp)
+    }
+
+    // --- Relay (spec §5.4, §5.6) ---
+
+    /// spec §5.4: hands `tcp` and `stream` to a relay.
+    pub fn start_relay(
+        &mut self,
+        tcp: TcpId,
+        stream: StreamId,
+        preread: StreamPreread<'_>,
+    ) -> Result<(), PrereadTooLarge> {
+        self.st.start_relay(tcp, stream, preread)
+    }
+
+    // --- Dial (spec §5.4) ---
+
+    /// spec §5.4: completes in `on_dial_result` (`DialError::Limit` at the socket cap).
+    pub fn dial(&mut self, target: Target, deadline: Duration) -> DialOpId {
+        let op = self.st.new_dial();
+        self.st.push_request(IoRequest::Dial {
+            op,
+            target,
+            deadline,
+        });
+        op
+    }
+    /// spec §5.4: the result, if any, is dropped and its socket closed.
+    pub fn cancel_dial(&mut self, op: DialOpId) {
+        self.st.push_request(IoRequest::CancelDial { op });
+    }
+
+    // --- Timers (spec §5.4) ---
+
+    /// spec §5.4: fires `on_timer` at `now + after`.
+    pub fn set_timer(&mut self, after: Duration) -> TimerId {
+        self.st.set_timer(self.now + after)
+    }
+    /// spec §5.4.
+    pub fn cancel_timer(&mut self, id: TimerId) {
+        self.st.cancel_timer(id)
+    }
+
+    // --- Listeners, process (spec §5.4) ---
+
+    /// spec §5.4: the listeners' accept interest (the socket cap still applies).
+    pub fn set_accepting(&mut self, on: bool) {
+        self.st.set_accepting(on)
+    }
+    /// spec §5.4: the driver stops with `code`.
+    pub fn request_exit(&mut self, code: i32) {
+        self.st.request_exit(code)
+    }
+    /// spec §5.2/§5.4: the shard's seeded RNG.
+    pub fn rng(&mut self) -> &mut Rng {
+        self.st.rng()
+    }
+}
