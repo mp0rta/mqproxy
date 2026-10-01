@@ -251,7 +251,7 @@ impl Client {
             tx,
             rx: Vec::new(),
         });
-        if !app_stream::flush(cx, s, &mut ctrl.tx) {
+        if !app_stream::flush(cx, s, &mut ctrl.tx, false) {
             log::error!("mq_client: send AUTH_REQUEST failed");
             self.close(cx);
         }
@@ -365,7 +365,7 @@ impl Client {
             tx: connect_request(t),
             rx: Vec::new(),
         };
-        if !app_stream::flush(cx, s, &mut open.tx) {
+        if !app_stream::flush(cx, s, &mut open.tx, false) {
             refuse(cx, tcp, kind, TcpErr::ConnRefused);
             return cx.stream_reset(s);
         }
@@ -492,13 +492,13 @@ impl App for Client {
             Event::StreamWritable(s) if self.ctrl_of(s) => {
                 let ctrl = self.conn.as_mut().and_then(|c| c.ctrl.as_mut());
                 let ctrl = ctrl.expect("ctrl_of");
-                if !app_stream::flush(cx, s, &mut ctrl.tx) {
+                if !app_stream::flush(cx, s, &mut ctrl.tx, false) {
                     self.close(cx);
                 }
             }
             Event::StreamWritable(s) => {
                 if let Some(o) = self.opens.get_mut(&s)
-                    && !app_stream::flush(cx, s, &mut o.tx)
+                    && !app_stream::flush(cx, s, &mut o.tx, false)
                 {
                     let o = self.opens.remove(&s).expect("present");
                     refuse(cx, o.tcp, o.kind, TcpErr::ConnRefused);

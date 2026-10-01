@@ -53,13 +53,14 @@ pub(crate) fn drain(cx: &mut Cx<'_>, s: StreamId) -> bool {
     }
 }
 
-/// spec §6.2 "Handshake writes": send what is left of `tx`; a partial or
-/// blocked write keeps the rest for `StreamWritable`. `false` on a hard error.
-pub(crate) fn flush(cx: &mut Cx<'_>, s: StreamId, tx: &mut Vec<u8>) -> bool {
+/// spec §6.2 "Handshake writes": send what is left of `tx` (with `fin`, which
+/// is committed with its last byte); a partial or blocked write keeps the rest
+/// for `StreamWritable`. `false` on a hard error.
+pub(crate) fn flush(cx: &mut Cx<'_>, s: StreamId, tx: &mut Vec<u8>, fin: bool) -> bool {
     if tx.is_empty() {
         return true;
     }
-    match cx.stream_send(s, tx, false) {
+    match cx.stream_send(s, tx, fin) {
         Ok(n) => {
             tx.drain(..n.min(tx.len()));
             true

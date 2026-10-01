@@ -146,9 +146,11 @@ name = "mq-proxy"
 version = "0.0.4"
 dependencies = [
  "log",
+ "mq-proxy",
  "mq-runtime",
  "mq-transport-api",
  "mq-wire",
+ "subtle",
 ]
 
 [[package]]
@@ -366,6 +368,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"

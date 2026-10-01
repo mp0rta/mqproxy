@@ -6,3 +6,4 @@ pub mod client;
 pub mod config;
 pub mod ingress;
 pub mod metrics;
+pub mod server;
