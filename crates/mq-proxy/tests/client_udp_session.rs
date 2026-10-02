@@ -720,3 +720,56 @@ fn local_close_resets_stream() {
     assert!(reqs.contains(&IoRequest::CloseUdpSocket { sock }));
     assert!(ended(&mut h, 1));
 }
+
+/// The captured `mq_udp_cli: stats` lines (`log_capture` prepends the level).
+fn stats_lines() -> Vec<String> {
+    log_capture::take()
+        .into_iter()
+        .filter(|l| l.contains("mq_udp_cli: stats"))
+        .collect()
+}
+
+#[test]
+fn client_stats_line_format() {
+    log_capture::install();
+    let mut h = H::new(cfg());
+    serving_udp(&mut h);
+    let sock = assoc(&mut h);
+    send(&mut h, sock, &to_v4(53, b"x"));
+    for (i, part) in [&b"aa"[..], b"bb"].into_iter().enumerate() {
+        inbound(&mut h, [hdr(1, 7, i as u8, 2), part.to_vec()].concat());
+    }
+    inbound(&mut h, [hdr(99, 0, 0, 1), b"y".to_vec()].concat());
+    log_capture::take();
+
+    // spec §6.5: one line per ConnClosed, the fields in spec order.
+    h.event(conn_closed(&h));
+    assert_eq!(
+        stats_lines(),
+        [
+            "INFO mq_udp_cli: stats frags_sent=0 frags_reassembled=1 drops_send_fail=0 \
+             drops_oversize=0 defrag_drops=0 drops_unknown_sid=1 sendq_evictions=0"
+        ]
+    );
+
+    // Per connection, as the server's line: the next one starts from zero.
+    reconnect(&mut h);
+    serving_udp(&mut h);
+    h.event(conn_closed(&h));
+    assert_eq!(
+        stats_lines(),
+        [
+            "INFO mq_udp_cli: stats frags_sent=0 frags_reassembled=0 drops_send_fail=0 \
+             drops_oversize=0 defrag_drops=0 drops_unknown_sid=0 sendq_evictions=0"
+        ]
+    );
+}
+
+#[test]
+fn no_stats_line_without_a_connection() {
+    log_capture::install();
+    log_capture::take();
+    // A synchronous connect failure is no ConnClosed: no connection existed.
+    let _h = H::start(cfg(), Some(ConnectError::Other(-1)));
+    assert!(stats_lines().is_empty());
+}

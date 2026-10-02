@@ -575,7 +575,12 @@ impl App for Client {
     fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
         match ev {
             Event::ConnEstablished(c) if self.current(c) => self.on_established(cx),
-            Event::ConnClosed(c, _) if self.current(c) => self.conn_gone(cx),
+            // spec §6.5: the stats line is per ConnClosed; a synchronous
+            // connect failure also reaches `conn_gone`, but has no connection.
+            Event::ConnClosed(c, _) if self.current(c) => {
+                self.udp_log_stats();
+                self.conn_gone(cx);
+            }
             Event::MpReady(c) if self.current(c) => self.paths.on_mp_ready(cx, c),
             // spec §6.2: the protocol has no server-initiated streams.
             Event::NewStream(_, s, _) => cx.stream_reset(s),

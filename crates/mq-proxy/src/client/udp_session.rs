@@ -351,6 +351,23 @@ impl Client {
         }
     }
 
+    /// spec §6.5: the stats line of the connection that just closed; the
+    /// counters restart for the next one, as the server's (§7.3).
+    pub(super) fn udp_log_stats(&mut self) {
+        let c = std::mem::take(&mut self.sess.counters);
+        log::info!(
+            "mq_udp_cli: stats frags_sent={} frags_reassembled={} drops_send_fail={} \
+             drops_oversize={} defrag_drops={} drops_unknown_sid={} sendq_evictions={}",
+            c.frags_sent,
+            c.frags_reassembled,
+            c.drops_send_fail,
+            c.drops_oversize,
+            c.defrag_drops,
+            c.drops_unknown_sid,
+            c.sendq_evictions
+        );
+    }
+
     /// spec §6.3 Inbound: drain the connection's datagrams to the associations.
     pub(super) fn udp_inbound(&mut self, cx: &mut Cx<'_>, conn: ConnId) {
         let mut buf = std::mem::take(&mut self.sess.rx);
