@@ -12,12 +12,9 @@ use std::time::Duration;
 fn unknown_type_reset() {
     let mut h = H::new(cfg());
     let (c, _) = h.authed();
-    // 0x02 UDP_SESSION is not served in SP1; 0x05 is unknown.
-    let udp = h.data(c);
-    h.feed(udp, &[0x02, 0x00, 0x00], false);
+    // 0x05 is unknown (0x02 UDP_SESSION: server_udp_open.rs).
     let unk = h.data(c);
     h.feed(unk, &[0x05, 0x00], false);
-    assert!(h.reset(udp));
     assert!(h.reset(unk));
     assert!(h.dial().is_none());
     assert_eq!(h.close_conn_count(c), 0);

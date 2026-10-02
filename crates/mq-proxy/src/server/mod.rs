@@ -11,27 +11,33 @@
 //!              │                 │      └─Err(e)──→ Retiring (ERROR+FIN, drained)
 //!              └──── Reset / StreamClosed / deadline / malformed → stream_reset (released)
 //! ```
+//! A `UDP_SESSION_OPEN` (type 0x02) takes the stream to `udp_session.rs` (SP2 spec §7.1).
 //! Each held stream (control included) takes one of the connection's 4096
 //! budget entries until it is released; relaying streams take none.
+
+mod udp_session;
 
 use crate::app_stream::{self, CHUNK, Recv};
 use crate::config::ServerConfig;
 use crate::metrics::format_metrics;
+use crate::udp::host_of;
 use mq_runtime::{
-    AcceptMeta, App, Cx, DialError, DialOpId, Host, ListenerTag, RELAY_BUF, SocketOpId,
-    StreamPreread, Target, TcpEnd, TcpId, TimerId, UdpSocketId,
+    AcceptMeta, App, Cx, DialError, DialOpId, ListenerTag, RELAY_BUF, SocketOpId, StreamPreread,
+    Target, TcpEnd, TcpId, TimerId, UdpSocketId,
 };
 use mq_transport_api::{ConnId, Event, StreamId, StreamInfo, StreamKind};
 use mq_wire::frames::{
-    AddrType, AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp, DecodeError, FEAT_UDP_RELAY,
-    MAX_FRAME, STATUS_ERROR, STATUS_OK, STREAM_TYPE_CONNECT_TCP, TcpErr,
+    AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp, DecodeError, FEAT_UDP_RELAY, MAX_FRAME,
+    STATUS_ERROR, STATUS_OK, STREAM_TYPE_CONNECT_TCP, STREAM_TYPE_UDP_SESSION, TcpErr,
+    UdpSessionOpen,
 };
 use mq_wire::varint;
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
+use udp_session::SrvSession;
 
 /// spec §6.3 "Auth accepted": as C `MQ_SERVER_ID`.
 const SERVER_ID: &[u8] = b"mqproxy-server";
@@ -78,6 +84,8 @@ struct Conn {
     /// spec §6.3: budget entries in use.
     held: usize,
     closing: bool,
+    /// SP2 spec §7.1: admitted UDP sessions by sid, at most 1024.
+    udp: HashMap<u32, SrvSession>,
 }
 
 impl Conn {
@@ -96,6 +104,8 @@ enum Phase {
     Responding(TcpId),
     /// The error response was sent with FIN; held until the peer finishes.
     Retiring,
+    /// SP2 spec §7.1: the stream of the connection's UDP session `sid`.
+    Udp(u32),
 }
 
 struct Data {
@@ -116,6 +126,9 @@ enum Parsed {
     /// A request whose target cannot be dialled: answered, not reset (as C).
     Undialable(usize),
     Dial(usize, Target),
+    /// SP2 spec §7.1: `UDP_SESSION_OPEN` — sid, target (`None`: undialable,
+    /// answered `DnsFailed` after the other gates), requested idle (ms).
+    UdpOpen(u32, Option<Target>, u64),
 }
 
 /// spec §6.3: the server app.
@@ -125,6 +138,9 @@ pub struct Server {
     conns: HashMap<ConnId, Conn>,
     data: HashMap<StreamId, Data>,
     dials: HashMap<DialOpId, StreamId>,
+    /// SP2 spec §7.1: in-flight resolves and socket opens of UDP sessions.
+    resolves: HashMap<DialOpId, (ConnId, u32)>,
+    socket_opens: HashMap<SocketOpId, (ConnId, u32)>,
     timers: HashMap<TimerId, Tm>,
     /// spec §6.5: the most recently accepted connection (C `last_conn`).
     active: Option<ConnId>,
@@ -156,7 +172,8 @@ fn map_dial_error(e: DialError) -> TcpErr {
     }
 }
 
-/// spec §6.3: stream type then `CONNECT_TCP_REQUEST`, as C `srv_data_header_readable`.
+/// spec §6.3: stream type then `CONNECT_TCP_REQUEST` (or, SP2 spec §7.1,
+/// `UDP_SESSION_OPEN`), as C `srv_data_header_readable`.
 fn parse_request(buf: &[u8], fin: bool) -> Parsed {
     // spec §6.2: a header (discriminator + frame) over 512 bytes never fits
     // C's 512-byte frame buffer, complete or not.
@@ -168,39 +185,35 @@ fn parse_request(buf: &[u8], fin: bool) -> Parsed {
     let Ok((ty, tl)) = varint::decode(buf) else {
         return wait;
     };
-    if ty != STREAM_TYPE_CONNECT_TCP {
-        return Parsed::Bad; // UDP_SESSION is not served in SP1
-    }
-    let (req, used) = match ConnectTcpReq::decode(&buf[tl..]) {
-        Ok(r) => r,
-        Err(DecodeError::Short) => return wait,
-        Err(_) => return Parsed::Bad,
-    };
-    let used = tl + used;
-    if used > MAX_FRAME {
-        return Parsed::Bad;
-    }
-    // C `srv_resolve_target`: a wrong address length or an unusable name is DNS_FAILED.
-    let host = match req.address_type {
-        AddrType::Ipv4 => <[u8; 4]>::try_from(req.host)
-            .ok()
-            .map(|a| Host::Ip(IpAddr::V4(Ipv4Addr::from(a)))),
-        AddrType::Ipv6 => <[u8; 16]>::try_from(req.host)
-            .ok()
-            .map(|a| Host::Ip(IpAddr::V6(Ipv6Addr::from(a)))),
-        AddrType::Domain => std::str::from_utf8(req.host)
-            .ok()
-            .map(|d| Host::Domain(d.to_owned())),
-    };
-    match host {
-        Some(host) => Parsed::Dial(
-            used,
-            Target {
-                host,
-                port: req.port,
-            },
-        ),
-        None => Parsed::Undialable(used),
+    match ty {
+        STREAM_TYPE_CONNECT_TCP => {
+            let (req, used) = match ConnectTcpReq::decode(&buf[tl..]) {
+                Ok((r, used)) if tl + used <= MAX_FRAME => (r, tl + used),
+                Err(DecodeError::Short) => return wait,
+                _ => return Parsed::Bad,
+            };
+            // C `srv_resolve_target`: a wrong address length or an unusable name is DNS_FAILED.
+            match host_of(req.address_type, req.host) {
+                Some(host) => Parsed::Dial(
+                    used,
+                    Target {
+                        host,
+                        port: req.port,
+                    },
+                ),
+                None => Parsed::Undialable(used),
+            }
+        }
+        STREAM_TYPE_UDP_SESSION => {
+            let o = match UdpSessionOpen::decode(&buf[tl..]) {
+                Ok((o, used)) if tl + used <= MAX_FRAME => o,
+                Err(DecodeError::Short) => return wait,
+                _ => return Parsed::Bad,
+            };
+            let target = host_of(o.address_type, o.host).map(|host| Target { host, port: o.port });
+            Parsed::UdpOpen(o.session_id, target, o.idle_timeout_ms)
+        }
+        _ => Parsed::Bad,
     }
 }
 
@@ -216,6 +229,8 @@ impl Server {
             conns: HashMap::new(),
             data: HashMap::new(),
             dials: HashMap::new(),
+            resolves: HashMap::new(),
+            socket_opens: HashMap::new(),
             timers: HashMap::new(),
             active: None,
             auth_attempts: 0,
@@ -283,6 +298,7 @@ impl Server {
                 timer: Some(timer),
                 held: 0,
                 closing: false,
+                udp: HashMap::new(),
             },
         );
         // spec §6.5: C sets `last_conn` at acceptance, before auth.
@@ -293,11 +309,8 @@ impl Server {
     }
 
     fn on_conn_closed(&mut self, cx: &mut Cx<'_>, c: ConnId) {
-        let Some(conn) = self.conns.remove(&c) else {
+        if !self.conns.contains_key(&c) {
             return;
-        };
-        if let Some(t) = conn.timer {
-            self.cancel(cx, t);
         }
         let gone: Vec<StreamId> = self
             .data
@@ -306,8 +319,13 @@ impl Server {
             .map(|(s, _)| *s)
             .collect();
         for s in gone {
-            // The streams died with the connection: no reset.
+            // The streams died with the connection: no reset. Before the
+            // connection goes: a UDP session's end needs its table.
             self.drop_data(cx, s, false);
+        }
+        let conn = self.conns.remove(&c).expect("present");
+        if let Some(t) = conn.timer {
+            self.cancel(cx, t);
         }
         if self.active == Some(c) {
             self.active = None;
@@ -455,6 +473,11 @@ impl Server {
                     };
                     app_stream::recv(cx, s, &mut d.rx, cap)
                 }
+                // SP2 spec §5 "Reading a session stream": bytes are discarded.
+                Phase::Udp(_) => {
+                    d.rx.clear();
+                    app_stream::recv(cx, s, &mut d.rx, CHUNK)
+                }
             };
             let (n, fin) = match r {
                 Recv::Blocked => return,
@@ -462,6 +485,11 @@ impl Server {
                 Recv::Data { n, fin } => (n, fin),
             };
             d.fin |= fin;
+            if let Phase::Udp(_) = d.phase
+                && fin
+            {
+                return self.drop_data(cx, s, true); // SP2 spec §7.1: the client ended it
+            }
             if let Phase::Request(_) = d.phase {
                 match parse_request(&d.rx, d.fin) {
                     Parsed::Wait => {}
@@ -471,12 +499,21 @@ impl Server {
                     }
                     Parsed::Undialable(used) => {
                         d.rx.drain(..used);
-                        self.respond_error(cx, s, TcpErr::DnsFailed);
+                        self.respond_error(cx, s, tcp_resp(STATUS_ERROR, TcpErr::DnsFailed));
                         continue;
                     }
                     Parsed::Dial(used, target) => {
                         d.rx.drain(..used);
                         self.dial(cx, s, target);
+                        continue;
+                    }
+                    // SP2 spec §7.1: a client never sends FIN with its OPEN.
+                    Parsed::UdpOpen(..) if d.fin => {
+                        log::warn!("mq_udp_srv: UDP_SESSION_OPEN with FIN, resetting");
+                        return self.drop_data(cx, s, true);
+                    }
+                    Parsed::UdpOpen(sid, target, idle) => {
+                        self.udp_open(cx, s, sid, target, idle);
                         continue;
                     }
                 }
@@ -496,15 +533,16 @@ impl Server {
         }
     }
 
-    /// spec §6.3: error response with FIN, never followed by a reset; the stream retires.
-    fn respond_error(&mut self, cx: &mut Cx<'_>, s: StreamId, e: TcpErr) {
+    /// spec §6.3: error response with FIN, never followed by a reset; the
+    /// stream retires. SP2 spec §7.1: a UDP session's error RESP too.
+    fn respond_error(&mut self, cx: &mut Cx<'_>, s: StreamId, resp: Vec<u8>) {
         let d = self.data.get_mut(&s).expect("present");
         if let Phase::Request(t) = std::mem::replace(&mut d.phase, Phase::Retiring) {
             self.cancel(cx, t);
         }
         let d = self.data.get_mut(&s).expect("present");
         d.rx = Vec::new();
-        d.tx = tcp_resp(STATUS_ERROR, e);
+        d.tx = resp;
         if !app_stream::flush(cx, s, &mut d.tx, true) {
             self.drop_data(cx, s, true);
         }
@@ -557,6 +595,7 @@ impl Server {
             }
             Phase::Responding(tcp) => cx.tcp_abort(tcp),
             Phase::Retiring => {}
+            Phase::Udp(sid) => self.end_session(cx, d.conn, sid),
         }
         if reset {
             cx.stream_reset(s);
@@ -568,6 +607,10 @@ impl Server {
             match d.phase {
                 Phase::Responding(_) => self.send_ok(cx, s),
                 Phase::Retiring if !app_stream::flush(cx, s, &mut d.tx, true) => {
+                    self.drop_data(cx, s, true);
+                }
+                // SP2 spec §7.1: the rest of the RESP OK; a failure reaps.
+                Phase::Udp(_) if !app_stream::flush(cx, s, &mut d.tx, false) => {
                     self.drop_data(cx, s, true);
                 }
                 _ => {}
@@ -653,28 +696,28 @@ impl App for Server {
             }
             Err(e) => {
                 log::warn!("mq_server: dial failed ({e:?})");
-                self.respond_error(cx, s, map_dial_error(e));
+                self.respond_error(cx, s, tcp_resp(STATUS_ERROR, map_dial_error(e)));
             }
         }
     }
 
     fn on_resolve_result(
         &mut self,
-        _cx: &mut Cx<'_>,
+        cx: &mut Cx<'_>,
         op: DialOpId,
         r: Result<SocketAddr, DialError>,
     ) {
-        // Wired with the UDP lane.
-        log::debug!("mq_server: resolve {op:?} -> {r:?}");
+        self.udp_resolved(cx, op, r);
     }
 
     fn on_udp_socket(
         &mut self,
-        _cx: &mut Cx<'_>,
-        _op: SocketOpId,
-        _r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
+        cx: &mut Cx<'_>,
+        op: SocketOpId,
+        r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
     ) {
-        // The server opens no path sockets.
+        // Only UDP session sockets: the server opens no path sockets.
+        self.udp_socket(cx, op, r);
     }
 
     fn on_udp_rx(&mut self, _cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {

@@ -5,7 +5,9 @@ pub mod preopen;
 pub mod send;
 pub mod socks5udp;
 
-use mq_wire::frames::UdpErr;
+use mq_runtime::Host;
+use mq_wire::frames::{AddrType, UdpErr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 pub use mq_wire::udp_msg::UDP_MSG_HDR;
@@ -23,6 +25,16 @@ pub const SESSION_RESP_WAIT: Duration = Duration::from_secs(10);
 pub const MSS_REFRESH: u32 = 64;
 /// Per association, live sessions and negative-cache entries together (C `MQ_UDP_ASSOC_MAX_DST`).
 pub const MAX_DST_PER_ASSOC: usize = 64;
+
+/// The host that wire address bytes name (C `srv_resolve_target`); `None` for a
+/// wrong address length or a non-UTF-8 name. An empty name is left to the caller.
+pub(crate) fn host_of(atype: AddrType, addr: &[u8]) -> Option<Host> {
+    Some(match atype {
+        AddrType::Ipv4 => Host::Ip(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(addr).ok()?))),
+        AddrType::Ipv6 => Host::Ip(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(addr).ok()?))),
+        AddrType::Domain => Host::Domain(std::str::from_utf8(addr).ok()?.to_owned()),
+    })
+}
 
 /// How a session ended, as seen by the owner of its DST mapping.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
