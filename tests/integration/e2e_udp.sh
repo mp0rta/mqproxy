@@ -65,18 +65,25 @@
 #   UDPSOCKS_BIN    the `udpsocks` binary.
 #   UDPECHO_BIN     the `udp_echo` binary.
 #   MQPROXY_CERT/KEY  tunnel TLS cert/key (CN=mqproxy-test).
-#   CASES           space-separated case numbers to run (default "1 2 3 4 5 6 7 8").
+#   CASES           whitespace-separated case numbers to run (default "1 2 3 4 5 6 7 8").
 #
 set -u
 
 SKIP=77
 note() { printf '%s\n' "e2e_udp: $*" >&2; }
 
-# CASES: space-separated case numbers to run (default: all). Lets the over-MTU
+# CASES: whitespace-separated case numbers to run (default: all). Lets the over-MTU
 # run do `CASES=2 e2e_udp.sh` and Task 7.3 pick single cases. Server A runs
 # when any of 1 2 3 5 7 is wanted, Server B only for 4, the NET_ADMIN tail
 # (tc shaping, Servers C/D) only for 6/8.
 CASES="${CASES:-1 2 3 4 5 6 7 8}"
+# One space between tokens (tabs/newlines too), so `want` can match " N ".
+set -- ${CASES}
+if [ $# -eq 0 ]; then
+    note "CASES names no case (valid: 1..8)"
+    exit 1
+fi
+CASES="$*"
 want() { case " ${CASES} " in *" $1 "*) return 0;; esac; return 1; }
 # A typo'd token would silently run nothing and pass.
 for c in ${CASES}; do
@@ -541,7 +548,14 @@ if want 6 || want 8; then
     if [ "${can_tc}" -ne 1 ]; then
         want 6 && note "case 6 skipped (no NET_ADMIN): 2-path smoke needs tc on lo."
         want 8 && note "case 8 skipped (no NET_ADMIN): backup-pin smoke needs tc on lo."
-        note "RESULT = PASS (cases ${CASES}; NET_ADMIN-gated ones skipped)."
+        ran=""; skipped=""
+        for c in ${CASES}; do
+            case "$c" in
+                6|8) skipped="${skipped} $c" ;;
+                *) ran="${ran} $c" ;;
+            esac
+        done
+        note "RESULT = PASS (cases${ran:- none} passed;${skipped} skipped, no NET_ADMIN)."
         exit 0
     fi
 
