@@ -4,8 +4,8 @@
 
 use super::pending::IngressKind;
 use super::{HTTP_CONNECT, SOCKS5, TRANSPARENT};
-use crate::ingress::{HttpConnectParser, Progress, Socks5Parser};
-use mq_runtime::{Cx, ListenerTag, Target, TcpId, TimerId};
+use crate::ingress::{HttpConnectParser, Progress, Socks5Parser, socks5_assoc_refused_reply};
+use mq_runtime::{AcceptMeta, Cx, ListenerTag, Target, TcpId, TimerId};
 
 /// spec §6.1: which ingress a listener tag is.
 pub(super) fn kind_of(l: ListenerTag) -> Option<IngressKind> {
@@ -26,11 +26,13 @@ enum Parser {
 enum Step {
     Need,
     Done(usize, Target),
+    Associate(usize),
     Reply(usize, Vec<u8>, bool),
     Close,
 }
 
-fn own(p: Progress<'_>) -> Step {
+/// `udp`: an ASSOCIATE may be served (SP2 spec §6.2: not while `Unavailable`).
+fn own(p: Progress<'_>, udp: bool) -> Step {
     match p {
         Progress::Need => Step::Need,
         Progress::Done { consumed, target } => Step::Done(consumed, target),
@@ -39,12 +41,10 @@ fn own(p: Progress<'_>) -> Step {
             bytes,
             close,
         } => Step::Reply(consumed, bytes.to_vec(), close),
-        // Refused with REP 0x07 until the association is wired (spec §6.2).
-        Progress::Associate { consumed } => Step::Reply(
-            consumed,
-            vec![0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0],
-            true,
-        ),
+        Progress::Associate { consumed } if udp => Step::Associate(consumed),
+        Progress::Associate { consumed } => {
+            Step::Reply(consumed, socks5_assoc_refused_reply().to_vec(), true)
+        }
         Progress::Close => Step::Close,
     }
 }
@@ -55,6 +55,8 @@ pub(super) enum Fed {
     Wait,
     /// Complete; read interest is off.
     Done(Target),
+    /// SP2 spec §6.1: a UDP ASSOCIATE, consumed; read interest stays on.
+    Associate,
     /// The socket was closed (protocol error, refusal, or the 8 KiB cap).
     Closed,
 }
@@ -65,11 +67,13 @@ pub(super) struct Ingress {
     parser: Parser,
     /// spec §6.1: the 10 s request deadline.
     pub(super) timer: TimerId,
+    /// SP2 spec §6.1: what an ASSOCIATE binds on and learns from.
+    pub(super) meta: AcceptMeta,
 }
 
 impl Ingress {
     /// `None` for transparent capture, which has no parser.
-    pub(super) fn new(kind: IngressKind, timer: TimerId) -> Option<Ingress> {
+    pub(super) fn new(kind: IngressKind, timer: TimerId, meta: AcceptMeta) -> Option<Ingress> {
         let parser = match kind {
             IngressKind::Socks5 => Parser::Socks5(Socks5Parser::default()),
             IngressKind::HttpConnect => Parser::Http(HttpConnectParser),
@@ -79,15 +83,17 @@ impl Ingress {
             kind,
             parser,
             timer,
+            meta,
         })
     }
 
-    /// spec §6.1: parse what is buffered, consuming and replying as the parser says.
-    pub(super) fn feed(&mut self, cx: &mut Cx<'_>, tcp: TcpId) -> Fed {
+    /// spec §6.1: parse what is buffered, consuming and replying as the parser
+    /// says; `udp` as for `own`.
+    pub(super) fn feed(&mut self, cx: &mut Cx<'_>, tcp: TcpId, udp: bool) -> Fed {
         loop {
             let step = match &mut self.parser {
-                Parser::Socks5(p) => own(p.feed(cx.tcp_rx(tcp))),
-                Parser::Http(p) => own(p.feed(cx.tcp_rx(tcp))),
+                Parser::Socks5(p) => own(p.feed(cx.tcp_rx(tcp)), udp),
+                Parser::Http(p) => own(p.feed(cx.tcp_rx(tcp)), udp),
             };
             match step {
                 Step::Need => return Fed::Wait,
@@ -95,6 +101,10 @@ impl Ingress {
                     cx.tcp_consume(tcp, consumed);
                     cx.tcp_set_read(tcp, false);
                     return Fed::Done(target);
+                }
+                Step::Associate(consumed) => {
+                    cx.tcp_consume(tcp, consumed);
+                    return Fed::Associate;
                 }
                 Step::Reply(consumed, bytes, close) => {
                     cx.tcp_consume(tcp, consumed);

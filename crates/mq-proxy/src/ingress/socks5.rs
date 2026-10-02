@@ -5,7 +5,7 @@ use super::Progress;
 use super::request::capped;
 use mq_runtime::{Host, Target};
 use mq_wire::frames::TcpErr;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const VER: u8 = 0x05;
 const CMD_CONNECT: u8 = 0x01;
@@ -132,6 +132,28 @@ fn request(b: &[u8]) -> Progress<'static> {
 /// spec §6.1: CONNECT succeeded (REP 0x00).
 pub fn socks5_success_reply() -> [u8; 10] {
     reply(0x00)
+}
+
+/// SP2 spec §6.2: UDP ASSOCIATE while UDP is unavailable (REP 0x07).
+pub fn socks5_assoc_refused_reply() -> [u8; 10] {
+    REP_CMD_UNSUPPORTED
+}
+
+/// SP2 spec §6.1: UDP ASSOCIATE served; REP 0x00 with `BND = bound`, the UDP socket.
+pub fn socks5_assoc_reply(bound: SocketAddr) -> Vec<u8> {
+    let mut b = vec![VER, 0x00, 0x00];
+    match bound.ip() {
+        IpAddr::V4(a) => {
+            b.push(0x01);
+            b.extend_from_slice(&a.octets());
+        }
+        IpAddr::V6(a) => {
+            b.push(0x04);
+            b.extend_from_slice(&a.octets());
+        }
+    }
+    b.extend_from_slice(&bound.port().to_be_bytes());
+    b
 }
 
 /// spec §6.1: CONNECT failed; REP from `mq_socks5_reply_code`, with `Ok` as general failure.

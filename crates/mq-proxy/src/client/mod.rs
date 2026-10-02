@@ -14,10 +14,11 @@ pub mod backoff;
 mod ingress_glue;
 mod paths;
 pub mod pending;
+mod udp_assoc;
 
 use crate::app_stream::{self, CHUNK, Recv};
 use crate::config::ClientConfig;
-use crate::ingress::{INGRESS_CAP, target_from_original_dst};
+use crate::ingress::{INGRESS_CAP, socks5_assoc_reply, target_from_original_dst};
 use crate::metrics::format_metrics;
 use backoff::Backoff;
 use ingress_glue::{Fed, Ingress, kind_of};
@@ -27,14 +28,15 @@ use mq_runtime::{
 };
 use mq_transport_api::{ConnConfig, ConnId, Event, StreamId};
 use mq_wire::frames::{
-    AddrType, AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp, DecodeError, MAX_FRAME,
-    STREAM_TYPE_CONNECT_TCP, TcpErr,
+    AddrType, AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp, DecodeError, FEAT_UDP_RELAY,
+    MAX_FRAME, STREAM_TYPE_CONNECT_TCP, TcpErr,
 };
 use paths::Paths;
 use pending::{IngressKind, Pending, PendingOpen};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use udp_assoc::Assoc;
 
 /// spec §6.1: the listener tags the binary registers.
 pub const SOCKS5: ListenerTag = ListenerTag(1);
@@ -87,6 +89,16 @@ struct Open {
     rx: Vec<u8>,
 }
 
+/// SP2 spec §6.2: whether UDP ASSOCIATE is served, per client.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum UdpAvail {
+    /// Before auth of the current connection; ASSOCIATE accepted optimistically.
+    Unknown,
+    Available,
+    /// ASSOCIATE refused with REP 0x07.
+    Unavailable,
+}
+
 /// spec §6.2: the client app.
 pub struct Client {
     cfg: ClientConfig,
@@ -103,6 +115,9 @@ pub struct Client {
     opens: HashMap<StreamId, Open>,
     paths: Paths,
     timers: HashMap<TimerId, Tm>,
+    udp: UdpAvail,
+    /// SP2 spec §6.3: the UDP associations, by control socket.
+    assocs: HashMap<TcpId, Assoc>,
 }
 
 /// spec §6.2: truncate to the wire limit with a warning (C truncates silently).
@@ -120,6 +135,12 @@ fn refuse(cx: &mut Cx<'_>, tcp: TcpId, kind: IngressKind, e: TcpErr) {
         let _ = cx.tcp_write(tcp, &b);
     }
     cx.tcp_close(tcp);
+}
+
+/// SP2 spec §6.1: bytes on an association's control socket are discarded.
+fn discard(cx: &mut Cx<'_>, tcp: TcpId) {
+    let n = cx.tcp_rx(tcp).len();
+    cx.tcp_consume(tcp, n);
 }
 
 /// spec §6.2: stream type `0x01` then `CONNECT_TCP_REQUEST` (flags 0), as C sends it.
@@ -161,8 +182,16 @@ impl Client {
             opens: HashMap::new(),
             paths: Paths::new(&cfg),
             timers: HashMap::new(),
+            udp: UdpAvail::Unknown,
+            assocs: HashMap::new(),
             cfg,
         }
+    }
+
+    /// SP2 spec §6.3: the source an association locked.
+    #[cfg(feature = "test-support")]
+    pub fn udp_learned(&self, control: TcpId) -> Option<SocketAddr> {
+        self.assocs.get(&control).and_then(|a| a.learned)
     }
 
     fn timer(&mut self, cx: &mut Cx<'_>, after: std::time::Duration, tm: Tm) -> TimerId {
@@ -273,7 +302,7 @@ impl Client {
             .ctrl
             .as_mut()
             .expect("ctrl_readable on the control stream");
-        let ok = loop {
+        let features = loop {
             match app_stream::recv(cx, s, &mut ctrl.rx, CHUNK) {
                 Recv::Blocked => return,
                 Recv::Failed => {
@@ -284,12 +313,12 @@ impl Client {
                     // spec §6.2: frames are at most 512 bytes, complete or not.
                     Ok((_, used)) if used > MAX_FRAME => {
                         log::warn!("mq_client: AUTH_RESPONSE malformed");
-                        break false;
+                        break None;
                     }
-                    Ok((r, _)) if r.is_ok() => break true,
+                    Ok((r, _)) if r.is_ok() => break Some(r.features),
                     Ok((r, _)) => {
                         log::warn!("mq_client: auth refused (error {})", r.error_code);
-                        break false;
+                        break None;
                     }
                     Err(DecodeError::Short) if !fin && ctrl.rx.len() < MAX_FRAME => {
                         if n == 0 {
@@ -298,18 +327,19 @@ impl Client {
                     }
                     Err(_) => {
                         log::warn!("mq_client: AUTH_RESPONSE malformed");
-                        break false;
+                        break None;
                     }
                 },
             }
         };
-        if !ok {
+        let Some(features) = features else {
             // spec §6.2 "Auth refused": pending requests fail, as in C.
+            self.set_udp(cx, UdpAvail::Unavailable);
             for o in self.pending.drain() {
                 refuse(cx, o.tcp, o.kind, TcpErr::ConnRefused);
             }
             return self.close(cx);
-        }
+        };
         // Serving.
         conn.authed = true;
         ctrl.rx = Vec::new();
@@ -319,6 +349,13 @@ impl Client {
         }
         self.backoff.on_serving(cx.now());
         log::info!("mq_client: authenticated");
+        // SP2 spec §6.2: the server relays UDP and datagrams fit on the connection.
+        let avail = if features & FEAT_UDP_RELAY != 0 && cx.datagram_mss(id) > 0 {
+            UdpAvail::Available
+        } else {
+            UdpAvail::Unavailable
+        };
+        self.set_udp(cx, avail);
         if !app_stream::drain(cx, s) {
             return self.close(cx);
         }
@@ -428,6 +465,28 @@ impl Client {
         }
     }
 
+    /// SP2 spec §6.1: UDP ASSOCIATE — an app UDP socket on the IP the control
+    /// connection arrived on; the reply waits for it. The control socket keeps
+    /// read interest and the 8 KiB `rx_limit` of `on_accepted`.
+    fn associate(&mut self, cx: &mut Cx<'_>, tcp: TcpId, meta: AcceptMeta) {
+        discard(cx, tcp);
+        // An IPv4 client of a `[::]` listener arrives v4-mapped.
+        let op = cx.open_app_udp_socket(meta.local.ip().to_canonical());
+        let peer_ip = meta.peer.ip().to_canonical();
+        self.assocs.insert(tcp, Assoc::new(op, peer_ip));
+    }
+
+    /// SP2 spec §6.2: `Unavailable` ends every association.
+    fn set_udp(&mut self, cx: &mut Cx<'_>, avail: UdpAvail) {
+        self.udp = avail;
+        if avail == UdpAvail::Unavailable {
+            for (tcp, a) in self.assocs.drain() {
+                a.release(cx);
+                cx.tcp_close(tcp);
+            }
+        }
+    }
+
     /// spec §6.2: every exit — handshake failure, auth timeout or refusal,
     /// control stream closed, tunnel lost — taken at `ConnClosed`.
     fn conn_gone(&mut self, cx: &mut Cx<'_>) {
@@ -440,9 +499,11 @@ impl Client {
         }
         self.paths.on_conn_closed(cx);
         if self.shutting_down {
+            self.set_udp(cx, UdpAvail::Unavailable);
             return cx.request_exit(0);
         }
         if self.cfg.reconnect {
+            self.set_udp(cx, UdpAvail::Unknown);
             let rnd = cx.rng().next_u64();
             let d = self.backoff.next_delay(cx.now(), rnd);
             log::info!(
@@ -453,6 +514,7 @@ impl Client {
         } else {
             log::warn!("mq_client: tunnel down; reconnect disabled");
             self.terminal = true;
+            self.set_udp(cx, UdpAvail::Unavailable);
             for o in self.pending.drain() {
                 refuse(cx, o.tcp, o.kind, TcpErr::ConnRefused);
             }
@@ -545,22 +607,28 @@ impl App for Client {
             };
         }
         let timer = self.timer(cx, self.cfg.ingress_deadline, Tm::Ingress(tcp));
-        let ing = Ingress::new(kind, timer).expect("not transparent");
+        let ing = Ingress::new(kind, timer, meta).expect("not transparent");
         self.ingress.insert(tcp, ing);
     }
 
     fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        if self.assocs.contains_key(&tcp) {
+            return discard(cx, tcp);
+        }
+        let udp = self.udp != UdpAvail::Unavailable;
         let Some(ing) = self.ingress.get_mut(&tcp) else {
             return; // read interest is off once the request is complete
         };
-        let fed = ing.feed(cx, tcp);
+        let fed = ing.feed(cx, tcp, udp);
         if matches!(fed, Fed::Wait) {
             return;
         }
         let ing = self.ingress.remove(&tcp).expect("present");
         self.cancel(cx, ing.timer);
-        if let Fed::Done(target) = fed {
-            self.request(cx, tcp, ing.kind, target);
+        match fed {
+            Fed::Done(target) => self.request(cx, tcp, ing.kind, target),
+            Fed::Associate => self.associate(cx, tcp, ing.meta),
+            Fed::Wait | Fed::Closed => {}
         }
     }
 
@@ -569,6 +637,14 @@ impl App for Client {
             self.cancel(cx, ing.timer);
             if end == TcpEnd::ReadEof {
                 cx.tcp_close(tcp); // the request can no longer complete
+            }
+            return;
+        }
+        // SP2 spec §6.1: the control connection's end is the association's (RFC 1928 §7).
+        if let Some(a) = self.assocs.remove(&tcp) {
+            a.release(cx);
+            if end == TcpEnd::ReadEof {
+                cx.tcp_close(tcp);
             }
             return;
         }
@@ -611,12 +687,32 @@ impl App for Client {
         op: SocketOpId,
         r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
     ) {
-        let conn = self.conn.as_ref().filter(|c| !c.closing).map(|c| c.id);
-        self.paths.on_udp_socket(cx, conn, op, r);
+        let assoc = self.assocs.iter_mut().find(|(_, a)| a.open_op == Some(op));
+        let Some((&tcp, a)) = assoc else {
+            let conn = self.conn.as_ref().filter(|c| !c.closing).map(|c| c.id);
+            return self.paths.on_udp_socket(cx, conn, op, r);
+        };
+        // SP2 spec §6.1: the ASSOCIATE reply.
+        a.open_op = None;
+        match r {
+            Ok((sock, local)) => {
+                a.sock = Some(sock);
+                let _ = cx.tcp_write(tcp, &socks5_assoc_reply(local));
+            }
+            Err(k) => {
+                log::warn!("mq_client: cannot open the UDP socket of an association: {k}");
+                self.assocs.remove(&tcp);
+                refuse(cx, tcp, IngressKind::Socks5, TcpErr::Ok); // REP 0x01
+            }
+        }
     }
 
-    fn on_udp_rx(&mut self, _cx: &mut Cx<'_>, _sock: UdpSocketId, _peer: SocketAddr, _d: &[u8]) {
-        // Wired with the UDP lane.
+    fn on_udp_rx(&mut self, _cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, _d: &[u8]) {
+        // ponytail: linear in associations; index them by socket if a client holds many.
+        if let Some(a) = self.assocs.values_mut().find(|a| a.sock == Some(sock)) {
+            // SP2 spec §6.3: the source check; what passes is relayed with the sessions.
+            a.accept_source(peer);
+        }
     }
 
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
