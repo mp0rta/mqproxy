@@ -9,6 +9,8 @@
 //!    └── malformed / FIN / duplicate sid ──→ stream_reset
 //! Resolving | Opening | Live: FIN, Err(Reset), StreamClosed, a failed
 //! RESP OK or (Live) idle expiry → drop_data → end_session, stream_reset
+//! ConnClosed → drop_data (no reset) of every stream → end_session each,
+//!   then the connection's one stats line (`log_stats`)
 //! ```
 //! The session stream stays in `Server::data` (phase `Udp(sid)`) and holds
 //! one of the connection's 4096 budget entries like any app-held stream.
@@ -17,7 +19,7 @@ use super::{Phase as Stream, Server, Tm};
 use crate::app_stream;
 use crate::udp::defrag::{Defrag, Feed};
 use crate::udp::send::send_packet;
-use crate::udp::{MAX_DGRAM, MAX_SESSIONS_PER_CONN, UDP_MSG_HDR};
+use crate::udp::{Counters, MAX_DGRAM, MAX_SESSIONS_PER_CONN, UDP_MSG_HDR};
 use mq_runtime::{Cx, DialError, DialOpId, SocketOpId, Target, TimerId, UdpSocketId};
 use mq_transport_api::{ConnId, StreamId, Time};
 use mq_wire::frames::{MAX_FRAME, STATUS_ERROR, STATUS_OK, UdpErr, UdpSessionResp};
@@ -56,6 +58,23 @@ pub(super) struct SrvSession {
     defrag: Defrag,
     /// The next target → client `packet_id` (C `next_packet_id`).
     packet_id: u16,
+}
+
+/// spec §7.3: the stats line of a connection that just closed, after its
+/// sessions were reaped. The C fields in C order, then `drops_empty`.
+pub(super) fn log_stats(c: &Counters) {
+    log::info!(
+        "mq_udp_srv: stats frags_sent={} frags_reassembled={} drops_send_fail={} \
+         drops_oversize={} defrag_drops={} preopen_evictions={} drops_preauth={} drops_empty={}",
+        c.frags_sent,
+        c.frags_reassembled,
+        c.drops_send_fail,
+        c.drops_oversize,
+        c.defrag_drops,
+        c.preopen_evictions,
+        c.drops_preauth,
+        c.drops_empty
+    );
 }
 
 /// spec §7.1: `UDP_SESSION_RESP`, no message — OK with the negotiated idle

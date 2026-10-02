@@ -343,6 +343,8 @@ impl Server {
             self.drop_data(cx, s, false);
         }
         let conn = self.conns.remove(&c).expect("present");
+        // SP2 spec §7.3: once per connection, after its sessions were reaped.
+        udp_session::log_stats(&conn.counters);
         if let Some(t) = conn.timer {
             self.cancel(cx, t);
         }
@@ -774,6 +776,8 @@ impl App for Server {
     }
 
     /// spec §6.6: close every connection; exit 0 once all reported `ConnClosed`.
+    /// SP2 spec §7.2: it reaps nothing itself — each `ConnClosed` reaps that
+    /// connection's UDP sessions and logs its stats line, once.
     fn on_shutdown(&mut self, cx: &mut Cx<'_>) {
         self.shutting_down = true;
         if self.conns.is_empty() {

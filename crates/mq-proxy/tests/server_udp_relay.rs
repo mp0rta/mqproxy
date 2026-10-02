@@ -1,14 +1,15 @@
 //! spec §7.2: the server's datagram paths — the auth gate, the pre-OPEN
 //! buffer and its flush, client → target with reassembly, target → client
-//! with the peer check and the fragment send policy, and the idle timer.
+//! with the peer check and the fragment send policy, the idle timer, and
+//! §7.2/§7.3 the reaps, `ConnClosed`, shutdown and the stats line.
 
 mod server_harness;
 
 use mq_proxy::config::ServerConfig;
 use mq_proxy::udp::{Counters, PREOPEN_BYTES};
-use mq_runtime::testing::log_capture;
+use mq_runtime::testing::{Call, log_capture};
 use mq_runtime::{DialError, IoRequest, UdpSocketId};
-use mq_transport_api::{ConnId, DatagramError, StreamId};
+use mq_transport_api::{ConnId, DatagramError, Event, StreamError, StreamId};
 use mq_wire::frames::AddrType;
 use mq_wire::udp_msg::UdpMsgHdr;
 use server_harness::*;
@@ -402,4 +403,232 @@ fn late_target_packet_after_reap_dropped() {
     assert!(h.reset(s));
     reply(&mut h, sock, target(), b"late");
     assert!(h.t.datagram_sends(c).is_empty());
+}
+
+/// The `mq_udp_srv` lines logged since the last call.
+fn srv_log() -> Vec<String> {
+    log_capture::take()
+        .into_iter()
+        .filter(|l| l.contains("mq_udp_srv"))
+        .collect()
+}
+
+/// What one reap of session `sid` (stream `s`, socket `sock`) did, once:
+/// the `closed` line, the socket close, one reset, the slot and budget freed.
+fn assert_reaped_once(h: &mut H, c: ConnId, sid: u32, s: StreamId, sock: UdpSocketId) {
+    assert_eq!(
+        srv_log(),
+        [format!("INFO mq_udp_srv: session {sid} closed")]
+    );
+    assert_eq!(h.reqs(), [IoRequest::CloseUdpSocket { sock }]);
+    assert_eq!(h.count(|x| *x == Call::StreamReset(s)), 1);
+    assert_eq!(h.sh.app().udp_sessions(c), Some(0));
+    assert_eq!(h.sh.app().held(c), Some(1), "only the control stream");
+}
+
+/// A `Live` session 7 with the log and request queues cleared.
+fn live_quiet(h: &mut H, c: ConnId) -> (StreamId, UdpSocketId) {
+    let r = live(h, c, 7, 0);
+    h.reqs();
+    srv_log();
+    r
+}
+
+#[test]
+fn client_fin_in_live_reaps() {
+    log_capture::install();
+    let mut h = H::new(cfg());
+    let (c, _) = h.authed();
+    let (s, sock) = live_quiet(&mut h, c);
+    h.feed(s, b"", true);
+    assert_reaped_once(&mut h, c, 7, s, sock);
+}
+
+#[test]
+fn client_reset_in_live_reaps() {
+    log_capture::install();
+    let mut h = H::new(cfg());
+    let (c, _) = h.authed();
+    let (s, sock) = live_quiet(&mut h, c);
+    h.t.expect_stream_recv(s, Err(StreamError::Reset));
+    h.event(Event::StreamReadable(s));
+    assert_reaped_once(&mut h, c, 7, s, sock);
+}
+
+#[test]
+fn stream_closed_in_live_reaps() {
+    log_capture::install();
+    let mut h = H::new(cfg());
+    let (c, _) = h.authed();
+    let (s, sock) = live_quiet(&mut h, c);
+    h.event(Event::StreamClosed(s));
+    assert_reaped_once(&mut h, c, 7, s, sock);
+}
+
+#[test]
+fn reap_is_idempotent_across_paths() {
+    log_capture::install();
+    let mut h = H::new(cfg());
+    let (c, _) = h.authed();
+    let (s7, sock7) = live(&mut h, c, 7, 2000);
+    let (s8, sock8) = live(&mut h, c, 8, 0);
+    h.reqs();
+    srv_log();
+    // Idle expiry reaps 7; the transport's late StreamClosed finds nothing.
+    h.advance(ms(2000));
+    h.event(Event::StreamClosed(s7));
+    h.event(Event::StreamReadable(s7));
+    // A client FIN reaps 8; the late StreamClosed too, then the connection.
+    h.feed(s8, b"", true);
+    h.event(Event::StreamClosed(s8));
+    h.closed(c);
+    let lines: Vec<String> = srv_log()
+        .into_iter()
+        .filter(|l| !l.contains("stats"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "INFO mq_udp_srv: session 7 idle-expired",
+            "INFO mq_udp_srv: session 7 closed",
+            "INFO mq_udp_srv: session 8 closed",
+        ]
+    );
+    assert_eq!(
+        h.reqs(),
+        [
+            IoRequest::CloseUdpSocket { sock: sock7 },
+            IoRequest::CloseUdpSocket { sock: sock8 }
+        ]
+    );
+    for s in [s7, s8] {
+        assert_eq!(h.count(|x| *x == Call::StreamReset(s)), 1, "{s:?}");
+    }
+}
+
+#[test]
+fn conn_closed_reaps_all_and_logs_stats_once() {
+    const STATS: &str = "INFO mq_udp_srv: stats frags_sent=3 frags_reassembled=1 \
+        drops_send_fail=2 drops_oversize=4 defrag_drops=5 preopen_evictions=6 \
+        drops_preauth=7 drops_empty=8";
+    log_capture::install();
+    let mut h = H::new(cfg());
+    let c = h.conn();
+    for i in 0..7 {
+        h.t.inject_datagram(c, dgram(9, i, 0, 1, b"early"));
+    }
+    h.drive();
+    h.ctrl(c, &auth_req(b"secret"), false);
+    h.t.set_datagram_mss(c, 10); // 1 payload byte per fragment
+    // One session per phase: Live, Opening, Resolving.
+    let (live_s, sock) = live(&mut h, c, 1, 0);
+    let opening = h.data(c);
+    h.feed(opening, &open_ip(2, 0), false);
+    let (open_op, _) = h.socket_open().unwrap();
+    let resolving = h.data(c);
+    h.feed(resolving, &open_domain(3), false);
+    let (resolve_op, ..) = h.resolve().unwrap();
+    // A different count for each counter, so a swapped field shows.
+    inbound(&mut h, c, dgram(1, 0, 0, 2, b"a"));
+    inbound(&mut h, c, dgram(1, 0, 1, 2, b"b")); // frags_reassembled
+    for i in 0..8 {
+        inbound(&mut h, c, dgram(1, 10 + i, 0, 1, b"")); // drops_empty
+    }
+    for i in 0..5 {
+        inbound(&mut h, c, dgram(1, 20 + i, 2, 2, b"x")); // defrag_drops
+    }
+    for i in 0..6 {
+        inbound(&mut h, c, dgram(99, i, 0, 1, &vec![0; PREOPEN_BYTES])); // preopen_evictions
+    }
+    for _ in 0..2 {
+        h.t.expect_datagram_send(c, Err(DatagramError::Blocked));
+        reply(&mut h, sock, target(), b"x"); // drops_send_fail
+    }
+    for _ in 0..4 {
+        reply(&mut h, sock, target(), &[0; 300]); // drops_oversize: 300 > 255 fragments
+    }
+    reply(&mut h, sock, target(), b"abc"); // frags_sent
+    assert_eq!(h.t.datagram_sends(c).len(), 3);
+    log_capture::take();
+
+    h.closed(c);
+    let lines = srv_log();
+    // Every session is reaped before the one stats line.
+    let (reaped, stats) = lines.split_at(3);
+    let mut reaped = reaped.to_vec();
+    reaped.sort();
+    assert_eq!(
+        reaped,
+        [
+            "INFO mq_udp_srv: session 1 closed",
+            "INFO mq_udp_srv: session 2 closed",
+            "INFO mq_udp_srv: session 3 closed",
+        ]
+    );
+    assert_eq!(stats, [STATS]);
+    let mut reqs = h.reqs();
+    reqs.sort_by_key(|r| format!("{r:?}"));
+    assert_eq!(
+        reqs,
+        [
+            IoRequest::CancelResolve { op: resolve_op },
+            IoRequest::CancelUdpSocket { op: open_op },
+            IoRequest::CloseUdpSocket { sock },
+        ]
+    );
+    for s in [live_s, opening, resolving] {
+        assert!(!h.reset(s), "died with the connection: {s:?}");
+    }
+
+    // Once: a repeated ConnClosed is unknown, and another connection counts
+    // from zero.
+    h.closed(c);
+    let (d, _) = h.authed();
+    h.closed(d);
+    assert_eq!(
+        srv_log(),
+        [
+            "INFO mq_udp_srv: stats frags_sent=0 frags_reassembled=0 drops_send_fail=0 \
+             drops_oversize=0 defrag_drops=0 preopen_evictions=0 drops_preauth=0 drops_empty=0"
+        ]
+    );
+}
+
+#[test]
+fn shutdown_logs_stats_once_per_conn() {
+    log_capture::install();
+    let mut h = H::new(cfg());
+    let (a, _) = h.authed();
+    let (s, sock) = live(&mut h, a, 7, 0);
+    inbound(&mut h, a, dgram(7, 0, 0, 1, b"")); // a's line: drops_empty=1
+    let b = h.conn(); // never authenticated
+    h.reqs();
+    srv_log();
+    h.sh.on_shutdown_signal(h.now);
+    // Shutdown only closes: no reap, no stats until each ConnClosed.
+    assert_eq!((h.close_conn_count(a), h.close_conn_count(b)), (1, 1));
+    assert!(srv_log().is_empty());
+    assert_eq!(h.sh.app().udp_sessions(a), Some(1));
+    assert_eq!(h.sh.exit_status(), None);
+    // The transport reports both closes in the next drive.
+    h.drive();
+    h.event(Event::ConnClosed(a, closed_reason())); // a repeat changes nothing
+    // One stats line per connection (their order is the transport's), a's
+    // after the reap of its session.
+    let lines = srv_log();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    let pos = |f: &dyn Fn(&String) -> bool| lines.iter().position(f);
+    let closed = pos(&|l| l.ends_with("session 7 closed")).expect("reaped");
+    let a_stats =
+        pos(&|l| l.starts_with("INFO mq_udp_srv: stats ") && l.ends_with("drops_empty=1"));
+    assert!(a_stats.expect("a's stats") > closed, "{lines:?}");
+    assert_eq!(
+        lines.iter().filter(|l| l.contains(": stats ")).count(),
+        2,
+        "{lines:?}"
+    );
+    assert_eq!(h.reqs(), [IoRequest::CloseUdpSocket { sock }]);
+    assert!(!h.reset(s));
+    assert_eq!((h.close_conn_count(a), h.close_conn_count(b)), (1, 1));
+    assert_eq!(h.sh.exit_status(), Some(0));
 }
