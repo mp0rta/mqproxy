@@ -65,11 +65,21 @@
 #   UDPSOCKS_BIN    the `udpsocks` binary.
 #   UDPECHO_BIN     the `udp_echo` binary.
 #   MQPROXY_CERT/KEY  tunnel TLS cert/key (CN=mqproxy-test).
+#   CASES           space-separated case numbers to run (default "1 2 3 4 5 6 7 8").
 #
 set -u
 
 SKIP=77
 note() { printf '%s\n' "e2e_udp: $*" >&2; }
+
+# CASES: space-separated case numbers to run (default: all). Lets the over-MTU
+# run do `CASES=2 e2e_udp.sh` and Task 7.3 pick single cases. Server A runs
+# when any of 1 2 3 5 7 is wanted, Server B only for 4, the NET_ADMIN tail
+# (tc shaping, Servers C/D) only for 6/8.
+CASES="${CASES:-1 2 3 4 5 6 7 8}"
+want() { case " ${CASES} " in *" $1 "*) return 0;; esac; return 1; }
+NEED_A=0
+for c in 1 2 3 5 7; do want "$c" && NEED_A=1; done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -264,25 +274,29 @@ ECHO2_PID="$(start_echo "${ECHO_PORT_2}" "${WORK}/echo2.log")" || exit "${SKIP}"
 # ── Server A group: cases 1, 2, 3, 5 (default idle timeout) ─────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
-SERVER_A_PID="$(start_server_at "${QUIC_PORT_A}" "${WORK}/server_a.log")"
-CLIENT_A_PID="$(start_client_at "${QUIC_PORT_A}" "${SOCKS_PORT_A}" "${WORK}/client_a.log")"
+if [ "${NEED_A}" -eq 1 ]; then
+    SERVER_A_PID="$(start_server_at "${QUIC_PORT_A}" "${WORK}/server_a.log")"
+    CLIENT_A_PID="$(start_client_at "${QUIC_PORT_A}" "${SOCKS_PORT_A}" "${WORK}/client_a.log")"
 
-wait_udp_ready "${SOCKS_PORT_A}" "${ECHO_PORT_1}" "${SERVER_A_PID}" "${CLIENT_A_PID}" || {
-    note "Server A group failed to become ready; logs:"
-    sed 's/^/  server_a| /' "${WORK}/server_a.log" >&2 2>/dev/null
-    sed 's/^/  client_a| /' "${WORK}/client_a.log" >&2 2>/dev/null
-    exit 1
-}
+    wait_udp_ready "${SOCKS_PORT_A}" "${ECHO_PORT_1}" "${SERVER_A_PID}" "${CLIENT_A_PID}" || {
+        note "Server A group failed to become ready; logs:"
+        sed 's/^/  server_a| /' "${WORK}/server_a.log" >&2 2>/dev/null
+        sed 's/^/  client_a| /' "${WORK}/client_a.log" >&2 2>/dev/null
+        exit 1
+    }
+fi
 
 # ── case 1: 64-byte packet, byte-exact echo ───────────────────────────────────
-if "${UDPSOCKS_BIN}" \
-        --proxy "127.0.0.1:${SOCKS_PORT_A}" \
-        --target "127.0.0.1:${ECHO_PORT_1}" \
-        --send 64 --count 1 --timeout-ms 3000 \
-        >/dev/null 2>"${WORK}/c1_udpsocks.err"; then
-    ok 1 "64-byte packet byte-exact echo"
-else
-    fail 1 "udpsocks exit non-zero; stderr: $(head -c 200 "${WORK}/c1_udpsocks.err")"
+if want 1; then
+    if "${UDPSOCKS_BIN}" \
+            --proxy "127.0.0.1:${SOCKS_PORT_A}" \
+            --target "127.0.0.1:${ECHO_PORT_1}" \
+            --send 64 --count 1 --timeout-ms 3000 \
+            >/dev/null 2>"${WORK}/c1_udpsocks.err"; then
+        ok 1 "64-byte packet byte-exact echo"
+    else
+        fail 1 "udpsocks exit non-zero; stderr: $(head -c 200 "${WORK}/c1_udpsocks.err")"
+    fi
 fi
 
 # ── case 2: 3000-byte packet, byte-exact echo (proves frag path ran) ─────────
@@ -291,41 +305,45 @@ fi
 # handled by udpsocks internally (exit 0 = all sent/received/matched).
 # The frags_reassembled > 0 assertion happens at Server A teardown below
 # (mq_udp_srv_free logs the stats line to server_a.log on conn close).
-if "${UDPSOCKS_BIN}" \
-        --proxy "127.0.0.1:${SOCKS_PORT_A}" \
-        --target "127.0.0.1:${ECHO_PORT_1}" \
-        --send 3000 --count 1 --timeout-ms 5000 \
-        >/dev/null 2>"${WORK}/c2_udpsocks.err"; then
-    ok 2 "3000-byte packet byte-exact echo (frag path; counter asserted at server teardown)"
-else
-    fail 2 "udpsocks exit non-zero; stderr: $(head -c 200 "${WORK}/c2_udpsocks.err")"
+if want 2; then
+    if "${UDPSOCKS_BIN}" \
+            --proxy "127.0.0.1:${SOCKS_PORT_A}" \
+            --target "127.0.0.1:${ECHO_PORT_1}" \
+            --send 3000 --count 1 --timeout-ms 5000 \
+            >/dev/null 2>"${WORK}/c2_udpsocks.err"; then
+        ok 2 "3000-byte packet byte-exact echo (frag path; counter asserted at server teardown)"
+    else
+        fail 2 "udpsocks exit non-zero; stderr: $(head -c 200 "${WORK}/c2_udpsocks.err")"
+    fi
 fi
 
 # ── case 3: two concurrent targets, both byte-exact ───────────────────────────
 # Run two udpsocks processes in background concurrently (one per echo port),
 # wait for both, assert both exit 0. This proves the session table handles
 # multiple independent sessions through one client connection.
-"${UDPSOCKS_BIN}" \
-    --proxy "127.0.0.1:${SOCKS_PORT_A}" \
-    --target "127.0.0.1:${ECHO_PORT_1}" \
-    --send 64 --count 3 --timeout-ms 3000 \
-    >/dev/null 2>"${WORK}/c3a_udpsocks.err" &
-C3A_PID=$!
+if want 3; then
+    "${UDPSOCKS_BIN}" \
+        --proxy "127.0.0.1:${SOCKS_PORT_A}" \
+        --target "127.0.0.1:${ECHO_PORT_1}" \
+        --send 64 --count 3 --timeout-ms 3000 \
+        >/dev/null 2>"${WORK}/c3a_udpsocks.err" &
+    C3A_PID=$!
 
-"${UDPSOCKS_BIN}" \
-    --proxy "127.0.0.1:${SOCKS_PORT_A}" \
-    --target "127.0.0.1:${ECHO_PORT_2}" \
-    --send 64 --count 3 --timeout-ms 3000 \
-    >/dev/null 2>"${WORK}/c3b_udpsocks.err" &
-C3B_PID=$!
+    "${UDPSOCKS_BIN}" \
+        --proxy "127.0.0.1:${SOCKS_PORT_A}" \
+        --target "127.0.0.1:${ECHO_PORT_2}" \
+        --send 64 --count 3 --timeout-ms 3000 \
+        >/dev/null 2>"${WORK}/c3b_udpsocks.err" &
+    C3B_PID=$!
 
-wait "${C3A_PID}"; C3A_RC=$?
-wait "${C3B_PID}"; C3B_RC=$?
+    wait "${C3A_PID}"; C3A_RC=$?
+    wait "${C3B_PID}"; C3B_RC=$?
 
-if [ "${C3A_RC}" -ne 0 ] || [ "${C3B_RC}" -ne 0 ]; then
-    fail 3 "concurrent 2-target echo failed: port1_rc=${C3A_RC} port2_rc=${C3B_RC}; err1: $(head -c 200 "${WORK}/c3a_udpsocks.err") err2: $(head -c 200 "${WORK}/c3b_udpsocks.err")"
+    if [ "${C3A_RC}" -ne 0 ] || [ "${C3B_RC}" -ne 0 ]; then
+        fail 3 "concurrent 2-target echo failed: port1_rc=${C3A_RC} port2_rc=${C3B_RC}; err1: $(head -c 200 "${WORK}/c3a_udpsocks.err") err2: $(head -c 200 "${WORK}/c3b_udpsocks.err")"
+    fi
+    ok 3 "two concurrent targets (ports ${ECHO_PORT_1} + ${ECHO_PORT_2}), both byte-exact"
 fi
-ok 3 "two concurrent targets (ports ${ECHO_PORT_1} + ${ECHO_PORT_2}), both byte-exact"
 
 # ── case 5: kill udpsocks mid-flight → server reaps session; health check ────
 # Start udpsocks with a large --count to keep the TCP control connection alive,
@@ -333,67 +351,70 @@ ok 3 "two concurrent targets (ports ${ECHO_PORT_1} + ${ECHO_PORT_2}), both byte-
 # closes the session. Then assert the server is still healthy by running a
 # fresh udpsocks invocation that must succeed.
 
-# Snapshot BEFORE launching so earlier cases' closed-session lines are excluded.
-C5_PRE=$(grep -c 'mq_udp_srv: session .* closed' "${WORK}/server_a.log" 2>/dev/null || true)
+if want 5; then
+    # Snapshot BEFORE launching so earlier cases' closed-session lines are excluded.
+    C5_PRE=$(grep -c 'mq_udp_srv: session .* closed' "${WORK}/server_a.log" 2>/dev/null || true)
 
-# Use --count 20000 so the process is still running when we kill it (~2s at
-# observed throughput; 0.5s sleep is well inside that window).
-"${UDPSOCKS_BIN}" \
-    --proxy "127.0.0.1:${SOCKS_PORT_A}" \
-    --target "127.0.0.1:${ECHO_PORT_1}" \
-    --send 64 --count 20000 --timeout-ms 30000 \
-    >/dev/null 2>"${WORK}/c5_bg.err" &
-C5_BG_PID=$!
-
-# Give it time to send a few packets (session established, traffic in flight).
-sleep 0.5
-
-# Kill the udpsocks process mid-flight (simulates abrupt client disconnect).
-kill -9 "${C5_BG_PID}" 2>/dev/null
-wait "${C5_BG_PID}" 2>/dev/null || true
-
-# Poll up to ~2 s for the count to EXCEED $C5_PRE (the kill-induced reap).
-# srv_reap_session fires on the TCP-EOF close-notify, which may be one
-# event-loop tick after the kill.
-C5_REAP_SEEN=0
-for _ in $(seq 1 20); do
-    C5_NOW=$(grep -c 'mq_udp_srv: session .* closed' "${WORK}/server_a.log" 2>/dev/null || true)
-    if [ "${C5_NOW}" -gt "${C5_PRE}" ]; then
-        C5_REAP_SEEN=1
-        break
-    fi
-    sleep 0.1
-done
-if [ "${C5_REAP_SEEN}" -ne 1 ]; then
-    fail 5 "kill-induced reap not seen: 'mq_udp_srv: session N closed' count did not increase (pre=${C5_PRE}) after udpsocks kill; log tail: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
-fi
-
-# Server health check: a fresh udpsocks invocation must succeed.
-if "${UDPSOCKS_BIN}" \
+    # Use --count 20000 so the process is still running when we kill it (~2s at
+    # observed throughput; 0.5s sleep is well inside that window).
+    "${UDPSOCKS_BIN}" \
         --proxy "127.0.0.1:${SOCKS_PORT_A}" \
         --target "127.0.0.1:${ECHO_PORT_1}" \
-        --send 64 --count 1 --timeout-ms 3000 \
-        >/dev/null 2>"${WORK}/c5_health.err"; then
-    ok 5 "kill udpsocks mid-flight → server reaps session (log confirmed); fresh send succeeds"
-else
-    fail 5 "server unhealthy after udpsocks kill; stderr: $(head -c 200 "${WORK}/c5_health.err"); server_a: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
+        --send 64 --count 20000 --timeout-ms 30000 \
+        >/dev/null 2>"${WORK}/c5_bg.err" &
+    C5_BG_PID=$!
+
+    # Give it time to send a few packets (session established, traffic in flight).
+    sleep 0.5
+
+    # Kill the udpsocks process mid-flight (simulates abrupt client disconnect).
+    kill -9 "${C5_BG_PID}" 2>/dev/null
+    wait "${C5_BG_PID}" 2>/dev/null || true
+
+    # Poll up to ~2 s for the count to EXCEED $C5_PRE (the kill-induced reap).
+    # srv_reap_session fires on the TCP-EOF close-notify, which may be one
+    # event-loop tick after the kill.
+    C5_REAP_SEEN=0
+    for _ in $(seq 1 20); do
+        C5_NOW=$(grep -c 'mq_udp_srv: session .* closed' "${WORK}/server_a.log" 2>/dev/null || true)
+        if [ "${C5_NOW}" -gt "${C5_PRE}" ]; then
+            C5_REAP_SEEN=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "${C5_REAP_SEEN}" -ne 1 ]; then
+        fail 5 "kill-induced reap not seen: 'mq_udp_srv: session N closed' count did not increase (pre=${C5_PRE}) after udpsocks kill; log tail: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
+    fi
+
+    # Server health check: a fresh udpsocks invocation must succeed.
+    if "${UDPSOCKS_BIN}" \
+            --proxy "127.0.0.1:${SOCKS_PORT_A}" \
+            --target "127.0.0.1:${ECHO_PORT_1}" \
+            --send 64 --count 1 --timeout-ms 3000 \
+            >/dev/null 2>"${WORK}/c5_health.err"; then
+        ok 5 "kill udpsocks mid-flight → server reaps session (log confirmed); fresh send succeeds"
+    else
+        fail 5 "server unhealthy after udpsocks kill; stderr: $(head -c 200 "${WORK}/c5_health.err"); server_a: $(tail -5 "${WORK}/server_a.log" | tr '\n' '|')"
+    fi
 fi
 
 # ── case 7: --listen forwarder mode — plain UDP client through the shim ──────
 # udpsocks binds 127.0.0.1:$FWD_PORT, wraps datagrams toward udp_echo via the
 # SOCKS5 UDP relay, unwraps replies back to the learned peer. A plain python
 # UDP client must get a byte-exact echo end-to-end.
-note "case 7: --listen forwarder mode"
-"${UDPSOCKS_BIN}" --proxy "127.0.0.1:${SOCKS_PORT_A}" \
-    --target "127.0.0.1:${ECHO_PORT_1}" \
-    --listen "${FWD_PORT}" >"${WORK}/fwd.log" 2>&1 &
-FWD_PID=$!
-sleep 0.5
-if ! kill -0 "${FWD_PID}" 2>/dev/null; then
-    cat "${WORK}/fwd.log" >&2
-    fail 7 "forwarder died at startup"
-else
-    if python3 - "${FWD_PORT}" <<'PY'
+if want 7; then
+    note "case 7: --listen forwarder mode"
+    "${UDPSOCKS_BIN}" --proxy "127.0.0.1:${SOCKS_PORT_A}" \
+        --target "127.0.0.1:${ECHO_PORT_1}" \
+        --listen "${FWD_PORT}" >"${WORK}/fwd.log" 2>&1 &
+    FWD_PID=$!
+    sleep 0.5
+    if ! kill -0 "${FWD_PID}" 2>/dev/null; then
+        cat "${WORK}/fwd.log" >&2
+        fail 7 "forwarder died at startup"
+    else
+        if python3 - "${FWD_PORT}" <<'PY'
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(5)
@@ -402,92 +423,98 @@ s.sendto(payload, ("127.0.0.1", int(sys.argv[1])))
 data, _ = s.recvfrom(65536)
 sys.exit(0 if data == payload else 1)
 PY
-    then
-        ok 7 "byte-exact echo through forwarder"
-    else
-        cat "${WORK}/fwd.log" >&2
-        fail 7 "echo through forwarder mismatched/timed out"
+        then
+            ok 7 "byte-exact echo through forwarder"
+        else
+            cat "${WORK}/fwd.log" >&2
+            fail 7 "echo through forwarder mismatched/timed out"
+        fi
     fi
+    kill "${FWD_PID}" 2>/dev/null; wait "${FWD_PID}" 2>/dev/null
+    FWD_PID=""
 fi
-kill "${FWD_PID}" 2>/dev/null; wait "${FWD_PID}" 2>/dev/null
-FWD_PID=""
 
 # ── Tear down Server A group + assert case 2 frags_reassembled > 0 ───────────
 # SIGTERM the client first (normal teardown), then the server.
 # mq_udp_srv_free → mq_udp_srv_dump_stats fires on server conn close, writing
 #   "mq_udp_srv: stats frags_sent=... frags_reassembled=... ..."
 # to server_a.log. We wait for this line to appear after server exit.
-stop_process "${CLIENT_A_PID}"; CLIENT_A_PID=""
-stop_process "${SERVER_A_PID}"; SERVER_A_PID=""
+if [ "${NEED_A}" -eq 1 ]; then
+    stop_process "${CLIENT_A_PID}"; CLIENT_A_PID=""
+    stop_process "${SERVER_A_PID}"; SERVER_A_PID=""
+fi
 
 # Wait up to 3s for the stats line to appear (the server may not flush
 # immediately; it writes on mq_udp_srv_free which runs at conn teardown).
-STATS_A=""
-for _ in $(seq 1 30); do
-    STATS_A="$(grep 'mq_udp_srv: stats ' "${WORK}/server_a.log" 2>/dev/null | tail -1)"
-    if [ -n "${STATS_A}" ]; then break; fi
-    sleep 0.1
-done
+if want 2; then
+    STATS_A=""
+    for _ in $(seq 1 30); do
+        STATS_A="$(grep 'mq_udp_srv: stats ' "${WORK}/server_a.log" 2>/dev/null | tail -1)"
+        if [ -n "${STATS_A}" ]; then break; fi
+        sleep 0.1
+    done
 
-if [ -z "${STATS_A}" ]; then
-    fail 2 "(frag assertion) no 'mq_udp_srv: stats' line in server_a.log after teardown; log tail: $(tail -10 "${WORK}/server_a.log" | tr '\n' '|')"
+    if [ -z "${STATS_A}" ]; then
+        fail 2 "(frag assertion) no 'mq_udp_srv: stats' line in server_a.log after teardown; log tail: $(tail -10 "${WORK}/server_a.log" | tr '\n' '|')"
+    fi
+
+    # Parse frags_reassembled=N from the stats line.
+    FRAGS_REASSEMBLED="$(printf '%s' "${STATS_A}" | grep -oE 'frags_reassembled=[0-9]+' | cut -d= -f2)"
+    if [ -z "${FRAGS_REASSEMBLED}" ]; then
+        fail 2 "(frag assertion) could not parse frags_reassembled from: ${STATS_A}"
+    fi
+    if [ "${FRAGS_REASSEMBLED}" -le 0 ]; then
+        fail 2 "(frag assertion) frags_reassembled=${FRAGS_REASSEMBLED} (want > 0); stats: ${STATS_A}"
+    fi
+    note "case 2 frag assertion: frags_reassembled=${FRAGS_REASSEMBLED} > 0 (stats: ${STATS_A})"
 fi
 
-# Parse frags_reassembled=N from the stats line.
-FRAGS_REASSEMBLED="$(printf '%s' "${STATS_A}" | grep -oE 'frags_reassembled=[0-9]+' | cut -d= -f2)"
-if [ -z "${FRAGS_REASSEMBLED}" ]; then
-    fail 2 "(frag assertion) could not parse frags_reassembled from: ${STATS_A}"
-fi
-if [ "${FRAGS_REASSEMBLED}" -le 0 ]; then
-    fail 2 "(frag assertion) frags_reassembled=${FRAGS_REASSEMBLED} (want > 0); stats: ${STATS_A}"
-fi
-note "case 2 frag assertion: frags_reassembled=${FRAGS_REASSEMBLED} > 0 (stats: ${STATS_A})"
-
-note "cases 1, 2, 3, 5, 7 PASS (${PASS_COUNT}/5 so far)."
+[ "${NEED_A}" -eq 1 ] && note "Server A group PASS (${PASS_COUNT} checks so far)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── Server B group: case 4 (--udp-idle-timeout 1) ────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-SERVER_B_PID="$(start_server_at "${QUIC_PORT_B}" "${WORK}/server_b.log" --udp-idle-timeout 1)"
-CLIENT_B_PID="$(start_client_at "${QUIC_PORT_B}" "${SOCKS_PORT_B}" "${WORK}/client_b.log")"
+if want 4; then
+    SERVER_B_PID="$(start_server_at "${QUIC_PORT_B}" "${WORK}/server_b.log" --udp-idle-timeout 1)"
+    CLIENT_B_PID="$(start_client_at "${QUIC_PORT_B}" "${SOCKS_PORT_B}" "${WORK}/client_b.log")"
 
-wait_udp_ready "${SOCKS_PORT_B}" "${ECHO_PORT_1}" "${SERVER_B_PID}" "${CLIENT_B_PID}" || {
-    note "Server B group failed to become ready"
-    sed 's/^/  server_b| /' "${WORK}/server_b.log" >&2 2>/dev/null
-    exit 1
-}
+    wait_udp_ready "${SOCKS_PORT_B}" "${ECHO_PORT_1}" "${SERVER_B_PID}" "${CLIENT_B_PID}" || {
+        note "Server B group failed to become ready"
+        sed 's/^/  server_b| /' "${WORK}/server_b.log" >&2 2>/dev/null
+        exit 1
+    }
 
-# ── case 4: idle-timeout expiry → re-OPEN path ───────────────────────────────
-# First send: proves the session opens.
-if ! "${UDPSOCKS_BIN}" \
-        --proxy "127.0.0.1:${SOCKS_PORT_B}" \
-        --target "127.0.0.1:${ECHO_PORT_1}" \
-        --send 64 --count 1 --timeout-ms 3000 \
-        >/dev/null 2>"${WORK}/c4a_udpsocks.err"; then
-    fail 4 "(initial send) udpsocks failed; stderr: $(head -c 200 "${WORK}/c4a_udpsocks.err")"
+    # ── case 4: idle-timeout expiry → re-OPEN path ───────────────────────────────
+    # First send: proves the session opens.
+    if ! "${UDPSOCKS_BIN}" \
+            --proxy "127.0.0.1:${SOCKS_PORT_B}" \
+            --target "127.0.0.1:${ECHO_PORT_1}" \
+            --send 64 --count 1 --timeout-ms 3000 \
+            >/dev/null 2>"${WORK}/c4a_udpsocks.err"; then
+        fail 4 "(initial send) udpsocks failed; stderr: $(head -c 200 "${WORK}/c4a_udpsocks.err")"
+    fi
+
+    # Sleep > 1s (the idle timeout) to let the session expire server-side.
+    sleep 1.5
+
+    # Second send: the session was reaped server-side (idle expiry) and the client
+    # will see the stream close → re-OPEN on next send. The negative-cache
+    # distinction (MQ_UDP_CLOSED not permanently cached) is what this proves.
+    if "${UDPSOCKS_BIN}" \
+            --proxy "127.0.0.1:${SOCKS_PORT_B}" \
+            --target "127.0.0.1:${ECHO_PORT_1}" \
+            --send 64 --count 1 --timeout-ms 5000 \
+            >/dev/null 2>"${WORK}/c4b_udpsocks.err"; then
+        ok 4 "idle-timeout 1s expiry → re-OPEN path succeeds on second send"
+    else
+        fail 4 "(re-OPEN send) udpsocks failed after idle expiry; stderr: $(head -c 200 "${WORK}/c4b_udpsocks.err"); server_b: $(grep 'idle-expired' "${WORK}/server_b.log" | tail -3 | tr '\n' '|')"
+    fi
+
+    stop_process "${CLIENT_B_PID}"; CLIENT_B_PID=""
+    stop_process "${SERVER_B_PID}"; SERVER_B_PID=""
 fi
 
-# Sleep > 1s (the idle timeout) to let the session expire server-side.
-sleep 1.5
-
-# Second send: the session was reaped server-side (idle expiry) and the client
-# will see the stream close → re-OPEN on next send. The negative-cache
-# distinction (MQ_UDP_CLOSED not permanently cached) is what this proves.
-if "${UDPSOCKS_BIN}" \
-        --proxy "127.0.0.1:${SOCKS_PORT_B}" \
-        --target "127.0.0.1:${ECHO_PORT_1}" \
-        --send 64 --count 1 --timeout-ms 5000 \
-        >/dev/null 2>"${WORK}/c4b_udpsocks.err"; then
-    ok 4 "idle-timeout 1s expiry → re-OPEN path succeeds on second send"
-else
-    fail 4 "(re-OPEN send) udpsocks failed after idle expiry; stderr: $(head -c 200 "${WORK}/c4b_udpsocks.err"); server_b: $(grep 'idle-expired' "${WORK}/server_b.log" | tail -3 | tr '\n' '|')"
-fi
-
-stop_process "${CLIENT_B_PID}"; CLIENT_B_PID=""
-stop_process "${SERVER_B_PID}"; SERVER_B_PID=""
-
-note "case 4 PASS (6/6 so far)."
-note "cases 1-5, 7 PASS (${PASS_COUNT}/6 checks)."
+want 4 && note "case 4 PASS (${PASS_COUNT} checks so far)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── case 6: 2-path aggregation smoke (NET_ADMIN-gated) ───────────────────────
@@ -496,147 +523,153 @@ note "cases 1-5, 7 PASS (${PASS_COUNT}/6 checks)."
 # (cases 1-5 already passed). With it: shape two equal-rate loopback paths,
 # start a client bound to both --path IPs, send a packet, SIGTERM the client,
 # and confirm BOTH paths carried bytes via `mq_conn_dump_stats` in client.log.
-RATE="50mbit"; DELAY="10ms"
-can_tc=0
-if [ "$(id -u)" -eq 0 ] && tc qdisc add dev lo root netem delay 1ms 2>/dev/null; then
-    tc qdisc del dev lo root 2>/dev/null
-    can_tc=1
+if want 6 || want 8; then
+    RATE="50mbit"; DELAY="10ms"
+    can_tc=0
+    if [ "$(id -u)" -eq 0 ] && tc qdisc add dev lo root netem delay 1ms 2>/dev/null; then
+        tc qdisc del dev lo root 2>/dev/null
+        can_tc=1
+    fi
+
+    if [ "${can_tc}" -ne 1 ]; then
+        want 6 && note "case 6 skipped (no NET_ADMIN): 2-path smoke needs tc on lo."
+        want 8 && note "case 8 skipped (no NET_ADMIN): backup-pin smoke needs tc on lo."
+        note "RESULT = PASS (cases ${CASES}; NET_ADMIN-gated ones skipped)."
+        exit 0
+    fi
+
+    # Apply tc shaping: same pattern as e2e_gateway case 8 and e2e_multipath.
+    tc qdisc del dev lo root 2>/dev/null || true
+    tc qdisc add dev lo root handle 1: htb default 1
+    tc class add dev lo parent 1: classid 1:1  htb rate 10gbit ceil 10gbit
+    tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}" quantum 1514
+    tc class add dev lo parent 1: classid 1:11 htb rate "${RATE}" ceil "${RATE}" quantum 1514
+    tc qdisc add dev lo parent 1:10 handle 10: netem delay "${DELAY}" limit 20000
+    tc qdisc add dev lo parent 1:11 handle 11: netem delay "${DELAY}" limit 20000
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip src "${PATH_A_IP}/32" flowid 1:10
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip dst "${PATH_A_IP}/32" flowid 1:10
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip src "${PATH_B_IP}/32" flowid 1:11
+    tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip dst "${PATH_B_IP}/32" flowid 1:11
+    TC_ON=1
+    note "case 6: tc shaping applied (RATE=${RATE} DELAY=${DELAY} per path)."
+
+    if want 6; then
+        SERVER_C_PID="$(start_server_at "${QUIC_PORT_C}" "${WORK}/server_c.log")"
+        CLIENT_C_PID="$(start_client_at "${QUIC_PORT_C}" "${SOCKS_PORT_C}" "${WORK}/client_c.log" \
+            "${PATH_A_IP}" "${PATH_B_IP}")"
+
+        # Give the second path time to come up (mirrors e2e_gateway case-8 sleep).
+        sleep 2
+
+        wait_udp_ready "${SOCKS_PORT_C}" "${ECHO_PORT_1}" "${SERVER_C_PID}" "${CLIENT_C_PID}" || {
+            note "case 6 FAIL: 2-path server/client not ready"
+            exit 1
+        }
+
+        # Send a burst of 64-byte packets to exercise both paths.
+        if ! "${UDPSOCKS_BIN}" \
+                --proxy "127.0.0.1:${SOCKS_PORT_C}" \
+                --target "127.0.0.1:${ECHO_PORT_1}" \
+                --send 64 --count 20 --timeout-ms 5000 \
+                >/dev/null 2>"${WORK}/c6_udpsocks.err"; then
+            note "case 6 FAIL: udpsocks failed in 2-path mode; stderr: $(head -c 200 "${WORK}/c6_udpsocks.err")"
+            exit 1
+        fi
+
+        # SIGTERM the client → it dumps mq_conn_dump_stats per-path counters to client_c.log.
+        stop_process "${CLIENT_C_PID}"; CLIENT_C_PID=""
+
+        # Assert both paths carried bytes: "mq.path id=<id> ... sent=<n> recv=<n> ..." lines
+        # where (sent > 0 OR recv > 0). The client logs these at INFO on SIGTERM via
+        # mq_conn_dump_stats (same pattern as e2e_multipath and e2e_gateway case 8).
+        PATHS_WITH_BYTES="$(grep -E 'mq\.path id=' \
+                "${WORK}/client_c.log" 2>/dev/null \
+            | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
+            | awk '($2+0 > 0 || $3+0 > 0) { print $1 }' \
+            | sort -u | wc -l)"
+        note "case 6: gateway paths carrying bytes = ${PATHS_WITH_BYTES} (need >= 2)"
+        if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
+            note "case 6 FAIL: fewer than 2 paths carried bytes."
+            note "  per-path stats in ${WORK}/client_c.log:"
+            grep -E 'mq\.path id=' "${WORK}/client_c.log" >&2 2>/dev/null
+            exit 1
+        fi
+        ok 6 "2-path: both paths carried bytes (${PATHS_WITH_BYTES} paths)"
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # ── case 8: --scheduler backup pins >=95% of bytes to one path ───────────────
+    # ─────────────────────────────────────────────────────────────────────────────
+    # tc shaping is already active from case 6 (same two loopback paths).
+    # We start a fresh server+client pair with --scheduler backup on BOTH sides,
+    # send a substantial burst, SIGTERM the client to flush mq_conn_dump_stats,
+    # then assert that the busiest single path holds >=95% of total bytes.
+    # The 5% headroom covers path-validation / mp-ping control traffic on the
+    # secondary path, which the backup scheduler still uses for keepalives.
+    # The pin is enforced by the backup scheduler TOGETHER WITH the STANDBY
+    # marking of extra paths in mq_conn_add_path / mq_h3_conn_add_path — without
+    # the standby marking, backup degenerates to minrtt-with-spill under
+    # saturating load (it pins only while the best path has cwnd headroom).
+    # Inverse of case 6: same shaped 2-path topology, but case 6 asserts the
+    # default scheduler SPREADS across both paths while this asserts backup PINS
+    # to one.
+    if want 8; then
+        note "case 8: --scheduler backup primary-pin smoke"
+
+        SERVER_D_PID="$(start_server_at "${QUIC_PORT_D}" "${WORK}/server_d.log" \
+            --scheduler backup)"
+
+        # Launch client inline: start_client_at slurps ALL extra args as --path IPs,
+        # so we cannot pass --scheduler through it. Replicate the helper's invocation;
+        # start_client_at would slurp --scheduler as a path IP.
+        "${MQPROXY_BIN}" client \
+            --server "${SERVER_IP}:${QUIC_PORT_D}" \
+            --token "${TOKEN}" \
+            --socks5 "127.0.0.1:${SOCKS_PORT_D}" \
+            --scheduler backup \
+            --path "${PATH_A_IP}" \
+            --path "${PATH_B_IP}" \
+            >"${WORK}/client_d.log" 2>&1 &
+        CLIENT_D_PID=$!
+
+        # Give the second path time to come up (mirrors case 6 sleep).
+        sleep 2
+
+        wait_udp_ready "${SOCKS_PORT_D}" "${ECHO_PORT_1}" "${SERVER_D_PID}" "${CLIENT_D_PID}" || {
+            note "case 8 FAIL: backup-scheduler server/client not ready"
+            exit 1
+        }
+
+        # Send a substantial burst so the path counters are meaningful.
+        if ! "${UDPSOCKS_BIN}" \
+                --proxy "127.0.0.1:${SOCKS_PORT_D}" \
+                --target "127.0.0.1:${ECHO_PORT_1}" \
+                --send 1000 --count 200 --timeout-ms 30000 \
+                >/dev/null 2>"${WORK}/c8_udpsocks.err"; then
+            note "case 8 FAIL: udpsocks failed; stderr: $(head -c 200 "${WORK}/c8_udpsocks.err")"
+            exit 1
+        fi
+
+        # SIGTERM the client → flushes mq_conn_dump_stats per-path counters.
+        stop_process "${CLIENT_D_PID}"; CLIENT_D_PID=""
+
+        # primary-pin assertion: with --scheduler backup, >=95% of bytes on one path.
+        SPLIT="$(grep -E 'mq\.path id=' "${WORK}/client_d.log" \
+            | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
+            | awk '{ tot[$1] += $2 + $3; sum += $2 + $3 }
+                   END { max = 0; for (p in tot) if (tot[p] > max) max = tot[p];
+                         if (sum == 0) { print "0"; exit }
+                         printf "%.3f", max / sum }')"
+        note "case 8: busiest-path share = ${SPLIT} (need >= 0.95)"
+        if ! awk -v s="${SPLIT}" 'BEGIN { exit !(s+0 >= 0.95) }'; then
+            grep -E 'mq\.path id=' "${WORK}/client_d.log" >&2 || true
+            fail 8 "backup scheduler did not pin to one path (share=${SPLIT})"
+        fi
+        ok 8 "backup pinned ${SPLIT} of bytes to one path"
+
+        stop_process "${SERVER_D_PID}"; SERVER_D_PID=""
+    fi
 fi
 
-if [ "${can_tc}" -ne 1 ]; then
-    note "case 6 skipped (no NET_ADMIN): 2-path smoke needs tc on lo."
-    note "case 8 skipped (no NET_ADMIN): backup-pin smoke needs tc on lo."
-    note "RESULT = PASS (cases 1-5, 7; cases 6 and 8 skipped)."
-    exit 0
-fi
-
-# Apply tc shaping: same pattern as e2e_gateway case 8 and e2e_multipath.
-tc qdisc del dev lo root 2>/dev/null || true
-tc qdisc add dev lo root handle 1: htb default 1
-tc class add dev lo parent 1: classid 1:1  htb rate 10gbit ceil 10gbit
-tc class add dev lo parent 1: classid 1:10 htb rate "${RATE}" ceil "${RATE}" quantum 1514
-tc class add dev lo parent 1: classid 1:11 htb rate "${RATE}" ceil "${RATE}" quantum 1514
-tc qdisc add dev lo parent 1:10 handle 10: netem delay "${DELAY}" limit 20000
-tc qdisc add dev lo parent 1:11 handle 11: netem delay "${DELAY}" limit 20000
-tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip src "${PATH_A_IP}/32" flowid 1:10
-tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip dst "${PATH_A_IP}/32" flowid 1:10
-tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip src "${PATH_B_IP}/32" flowid 1:11
-tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip dst "${PATH_B_IP}/32" flowid 1:11
-TC_ON=1
-note "case 6: tc shaping applied (RATE=${RATE} DELAY=${DELAY} per path)."
-
-SERVER_C_PID="$(start_server_at "${QUIC_PORT_C}" "${WORK}/server_c.log")"
-CLIENT_C_PID="$(start_client_at "${QUIC_PORT_C}" "${SOCKS_PORT_C}" "${WORK}/client_c.log" \
-    "${PATH_A_IP}" "${PATH_B_IP}")"
-
-# Give the second path time to come up (mirrors e2e_gateway case-8 sleep).
-sleep 2
-
-wait_udp_ready "${SOCKS_PORT_C}" "${ECHO_PORT_1}" "${SERVER_C_PID}" "${CLIENT_C_PID}" || {
-    note "case 6 FAIL: 2-path server/client not ready"
-    exit 1
-}
-
-# Send a burst of 64-byte packets to exercise both paths.
-if ! "${UDPSOCKS_BIN}" \
-        --proxy "127.0.0.1:${SOCKS_PORT_C}" \
-        --target "127.0.0.1:${ECHO_PORT_1}" \
-        --send 64 --count 20 --timeout-ms 5000 \
-        >/dev/null 2>"${WORK}/c6_udpsocks.err"; then
-    note "case 6 FAIL: udpsocks failed in 2-path mode; stderr: $(head -c 200 "${WORK}/c6_udpsocks.err")"
-    exit 1
-fi
-
-# SIGTERM the client → it dumps mq_conn_dump_stats per-path counters to client_c.log.
-stop_process "${CLIENT_C_PID}"; CLIENT_C_PID=""
-
-# Assert both paths carried bytes: "mq.path id=<id> ... sent=<n> recv=<n> ..." lines
-# where (sent > 0 OR recv > 0). The client logs these at INFO on SIGTERM via
-# mq_conn_dump_stats (same pattern as e2e_multipath and e2e_gateway case 8).
-PATHS_WITH_BYTES="$(grep -E 'mq\.path id=' \
-        "${WORK}/client_c.log" 2>/dev/null \
-    | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
-    | awk '($2+0 > 0 || $3+0 > 0) { print $1 }' \
-    | sort -u | wc -l)"
-note "case 6: gateway paths carrying bytes = ${PATHS_WITH_BYTES} (need >= 2)"
-if [ "${PATHS_WITH_BYTES}" -lt 2 ]; then
-    note "case 6 FAIL: fewer than 2 paths carried bytes."
-    note "  per-path stats in ${WORK}/client_c.log:"
-    grep -E 'mq\.path id=' "${WORK}/client_c.log" >&2 2>/dev/null
-    exit 1
-fi
-ok 6 "2-path: both paths carried bytes (${PATHS_WITH_BYTES} paths)"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ── case 8: --scheduler backup pins >=95% of bytes to one path ───────────────
-# ─────────────────────────────────────────────────────────────────────────────
-# tc shaping is already active from case 6 (same two loopback paths).
-# We start a fresh server+client pair with --scheduler backup on BOTH sides,
-# send a substantial burst, SIGTERM the client to flush mq_conn_dump_stats,
-# then assert that the busiest single path holds >=95% of total bytes.
-# The 5% headroom covers path-validation / mp-ping control traffic on the
-# secondary path, which the backup scheduler still uses for keepalives.
-# The pin is enforced by the backup scheduler TOGETHER WITH the STANDBY
-# marking of extra paths in mq_conn_add_path / mq_h3_conn_add_path — without
-# the standby marking, backup degenerates to minrtt-with-spill under
-# saturating load (it pins only while the best path has cwnd headroom).
-# Inverse of case 6: same shaped 2-path topology, but case 6 asserts the
-# default scheduler SPREADS across both paths while this asserts backup PINS
-# to one.
-note "case 8: --scheduler backup primary-pin smoke"
-
-SERVER_D_PID="$(start_server_at "${QUIC_PORT_D}" "${WORK}/server_d.log" \
-    --scheduler backup)"
-
-# Launch client inline: start_client_at slurps ALL extra args as --path IPs,
-# so we cannot pass --scheduler through it. Replicate the helper's invocation;
-# start_client_at would slurp --scheduler as a path IP.
-"${MQPROXY_BIN}" client \
-    --server "${SERVER_IP}:${QUIC_PORT_D}" \
-    --token "${TOKEN}" \
-    --socks5 "127.0.0.1:${SOCKS_PORT_D}" \
-    --scheduler backup \
-    --path "${PATH_A_IP}" \
-    --path "${PATH_B_IP}" \
-    >"${WORK}/client_d.log" 2>&1 &
-CLIENT_D_PID=$!
-
-# Give the second path time to come up (mirrors case 6 sleep).
-sleep 2
-
-wait_udp_ready "${SOCKS_PORT_D}" "${ECHO_PORT_1}" "${SERVER_D_PID}" "${CLIENT_D_PID}" || {
-    note "case 8 FAIL: backup-scheduler server/client not ready"
-    exit 1
-}
-
-# Send a substantial burst so the path counters are meaningful.
-if ! "${UDPSOCKS_BIN}" \
-        --proxy "127.0.0.1:${SOCKS_PORT_D}" \
-        --target "127.0.0.1:${ECHO_PORT_1}" \
-        --send 1000 --count 200 --timeout-ms 30000 \
-        >/dev/null 2>"${WORK}/c8_udpsocks.err"; then
-    note "case 8 FAIL: udpsocks failed; stderr: $(head -c 200 "${WORK}/c8_udpsocks.err")"
-    exit 1
-fi
-
-# SIGTERM the client → flushes mq_conn_dump_stats per-path counters.
-stop_process "${CLIENT_D_PID}"; CLIENT_D_PID=""
-
-# primary-pin assertion: with --scheduler backup, >=95% of bytes on one path.
-SPLIT="$(grep -E 'mq\.path id=' "${WORK}/client_d.log" \
-    | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
-    | awk '{ tot[$1] += $2 + $3; sum += $2 + $3 }
-           END { max = 0; for (p in tot) if (tot[p] > max) max = tot[p];
-                 if (sum == 0) { print "0"; exit }
-                 printf "%.3f", max / sum }')"
-note "case 8: busiest-path share = ${SPLIT} (need >= 0.95)"
-if ! awk -v s="${SPLIT}" 'BEGIN { exit !(s+0 >= 0.95) }'; then
-    grep -E 'mq\.path id=' "${WORK}/client_d.log" >&2 || true
-    fail 8 "backup scheduler did not pin to one path (share=${SPLIT})"
-fi
-ok 8 "backup pinned ${SPLIT} of bytes to one path"
-
-stop_process "${SERVER_D_PID}"; SERVER_D_PID=""
-
-note "RESULT = PASS (cases 1-8)."
+note "RESULT = PASS (cases ${CASES})."
 exit 0
