@@ -78,7 +78,10 @@ note() { printf '%s\n' "e2e_udp: $*" >&2; }
 # (tc shaping, Servers C/D) only for 6/8.
 CASES="${CASES:-1 2 3 4 5 6 7 8}"
 # One space between tokens (tabs/newlines too), so `want` can match " N ".
+# No pathname expansion: `CASES='[1-8]'` must not pick up files in the cwd.
+set -f
 set -- ${CASES}
+set +f
 if [ $# -eq 0 ]; then
     note "CASES names no case (valid: 1..8)"
     exit 1
@@ -86,7 +89,7 @@ fi
 CASES="$*"
 want() { case " ${CASES} " in *" $1 "*) return 0;; esac; return 1; }
 # A typo'd token would silently run nothing and pass.
-for c in ${CASES}; do
+for c in "$@"; do
     case "$c" in
         [1-8]) ;;
         *) note "unknown CASES token '$c' (valid: 1..8)"; exit 1 ;;
