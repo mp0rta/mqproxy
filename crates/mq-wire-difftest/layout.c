@@ -1,7 +1,8 @@
-// spec §8.2: sizeof/offsetof of the mq_wire.h structs, checked against the
-// #[repr(C)] mirrors in src/lib.rs (rust_layout()).
+// spec §8.2: sizeof/offsetof of the mq_wire.h and mq_udp_msg.h structs, checked
+// against the #[repr(C)] mirrors in src/lib.rs (rust_layout()).
 #include <stddef.h>
 
+#include "wire/mq_udp_msg.h"
 #include "wire/mq_wire.h"
 
 static const size_t layout[] = {
@@ -28,6 +29,27 @@ static const size_t layout[] = {
     offsetof(mq_connect_tcp_resp_t, message_len),
     sizeof(mq_status_t),
     sizeof(mq_addr_type_t),
+    sizeof(mq_udp_session_open_t),
+    offsetof(mq_udp_session_open_t, session_id),
+    offsetof(mq_udp_session_open_t, flags),
+    offsetof(mq_udp_session_open_t, address_type),
+    offsetof(mq_udp_session_open_t, host),
+    offsetof(mq_udp_session_open_t, host_len),
+    offsetof(mq_udp_session_open_t, port),
+    offsetof(mq_udp_session_open_t, idle_timeout_ms),
+    sizeof(mq_udp_session_resp_t),
+    offsetof(mq_udp_session_resp_t, status),
+    offsetof(mq_udp_session_resp_t, error_code),
+    offsetof(mq_udp_session_resp_t, message),
+    offsetof(mq_udp_session_resp_t, message_len),
+    offsetof(mq_udp_session_resp_t, idle_timeout_ms),
+    sizeof(mq_udp_msg_hdr_t),
+    offsetof(mq_udp_msg_hdr_t, session_id),
+    offsetof(mq_udp_msg_hdr_t, packet_id),
+    offsetof(mq_udp_msg_hdr_t, flags),
+    offsetof(mq_udp_msg_hdr_t, frag_id),
+    offsetof(mq_udp_msg_hdr_t, frag_count),
+    sizeof(mq_udp_err_t),
 };
 
 const size_t *
