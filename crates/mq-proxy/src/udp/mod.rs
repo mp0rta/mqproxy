@@ -2,6 +2,7 @@
 
 pub mod defrag;
 pub mod preopen;
+pub mod send;
 pub mod socks5udp;
 
 use mq_wire::frames::UdpErr;
