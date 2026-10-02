@@ -31,6 +31,7 @@ fn addr(port: u16) -> SocketAddr {
 fn meta() -> AcceptMeta {
     AcceptMeta {
         peer: addr(5000),
+        local: addr(1080),
         original_dst: None,
     }
 }
@@ -155,6 +156,7 @@ fn accepted_socket_is_app_owned() {
     let l7 = h.sh.add_listener(ListenerTag(7));
     let m = AcceptMeta {
         peer: addr(6000),
+        local: addr(1080),
         original_dst: Some(addr(80)),
     };
     let tcp = h.sh.on_accepted(T0, l7, m).unwrap();

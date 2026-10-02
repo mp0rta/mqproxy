@@ -29,6 +29,8 @@ pub enum ListenKind {
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct AcceptMeta {
     pub peer: SocketAddr,
+    /// The accepted socket's own address (`getsockname`); not unmapped (spec §4.3).
+    pub local: SocketAddr,
     pub original_dst: Option<SocketAddr>,
 }
 

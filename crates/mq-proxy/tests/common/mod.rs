@@ -80,6 +80,7 @@ pub fn addr(port: u16) -> SocketAddr {
 pub fn meta(original_dst: Option<SocketAddr>) -> AcceptMeta {
     AcceptMeta {
         peer: addr(5000),
+        local: addr(1080),
         original_dst,
     }
 }

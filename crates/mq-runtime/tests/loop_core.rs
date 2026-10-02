@@ -33,6 +33,7 @@ fn addr(port: u16) -> SocketAddr {
 fn meta() -> AcceptMeta {
     AcceptMeta {
         peer: addr(5000),
+        local: addr(1080),
         original_dst: None,
     }
 }

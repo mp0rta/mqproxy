@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 fn meta(original_dst: Option<SocketAddr>) -> AcceptMeta {
     AcceptMeta {
         peer: "10.0.0.2:5555".parse().unwrap(),
+        local: "10.0.0.1:1080".parse().unwrap(),
         original_dst,
     }
 }

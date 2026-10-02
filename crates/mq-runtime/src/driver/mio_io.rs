@@ -483,16 +483,24 @@ impl Io for MioIo {
         let kind = *kind;
         let (s, peer) = retry(|| lst.accept())?;
         s.set_nonblocking(true)?;
+        let local = s.local_addr()?;
         // spec §5.3: by listener kind.
         let original_dst = match kind {
             ListenKind::Plain => None,
             ListenKind::Redirect => mq_linux::original_dst(&s)
                 .inspect_err(|e| log::debug!("SO_ORIGINAL_DST: {e}"))
                 .ok(),
-            ListenKind::Tproxy => s.local_addr().ok(),
+            ListenKind::Tproxy => Some(local),
         };
         let key = self.insert(Sock::Tcp(TcpStream::from_std(s)))?;
-        Ok((TcpSock(key), AcceptMeta { peer, original_dst }))
+        Ok((
+            TcpSock(key),
+            AcceptMeta {
+                peer,
+                local,
+                original_dst,
+            },
+        ))
     }
 
     fn read(&mut self, s: TcpSock, buf: &mut [u8]) -> IoResult {

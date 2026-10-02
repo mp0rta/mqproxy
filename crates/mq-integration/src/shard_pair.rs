@@ -337,9 +337,15 @@ impl<A: App> Node<A> {
         let l = self.listeners[&tag];
         self.peers += 1;
         let peer = SocketAddr::from(([127, 0, 0, 1], 30000 + self.peers));
-        self.core
-            .io_mut()
-            .push_accept(l, AcceptMeta { peer, original_dst })
+        let local = SocketAddr::from(([127, 0, 0, 1], 1080));
+        self.core.io_mut().push_accept(
+            l,
+            AcceptMeta {
+                peer,
+                local,
+                original_dst,
+            },
+        )
     }
 
     fn step(&mut self, now: Time, inbound: Vec<Packet>) -> Out {
