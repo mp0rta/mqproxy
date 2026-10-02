@@ -15,6 +15,7 @@ mod ingress_glue;
 mod paths;
 pub mod pending;
 mod udp_assoc;
+mod udp_session;
 
 use crate::app_stream::{self, CHUNK, Recv};
 use crate::config::ClientConfig;
@@ -37,6 +38,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use udp_assoc::Assoc;
+use udp_session::Sessions;
 
 /// spec §6.1: the listener tags the binary registers.
 pub const SOCKS5: ListenerTag = ListenerTag(1);
@@ -58,6 +60,9 @@ enum Tm {
     Metrics,
     Ingress(TcpId),
     Pending,
+    /// SP2 spec §6.3: a UDP session's RESP deadline, by sid.
+    #[allow(dead_code)] // read by the expiry (spec §6.4, task 5.4)
+    UdpResp(u32),
 }
 
 /// spec §6.2: the control stream.
@@ -118,6 +123,8 @@ pub struct Client {
     udp: UdpAvail,
     /// SP2 spec §6.3: the UDP associations, by control socket.
     assocs: HashMap<TcpId, Assoc>,
+    /// SP2 spec §6.3: the UDP sessions.
+    sess: Sessions,
 }
 
 /// spec §6.2: truncate to the wire limit with a warning (C truncates silently).
@@ -184,6 +191,7 @@ impl Client {
             timers: HashMap::new(),
             udp: UdpAvail::Unknown,
             assocs: HashMap::new(),
+            sess: Sessions::new(),
             cfg,
         }
     }
@@ -192,6 +200,19 @@ impl Client {
     #[cfg(feature = "test-support")]
     pub fn udp_learned(&self, control: TcpId) -> Option<SocketAddr> {
         self.assocs.get(&control).and_then(|a| a.learned)
+    }
+
+    /// SP2 spec §6.5: the client's UDP counters.
+    #[cfg(feature = "test-support")]
+    pub fn udp_counters(&self) -> crate::udp::Counters {
+        self.sess.counters
+    }
+
+    /// SP2 spec §6.3: DST entries carrying a `failed_at` (the negative cache).
+    #[cfg(feature = "test-support")]
+    pub fn udp_negcache_len(&self) -> usize {
+        let entries = self.assocs.values().flat_map(|a| a.dsts.values());
+        entries.filter(|e| e.failed_at.is_some()).count()
     }
 
     fn timer(&mut self, cx: &mut Cx<'_>, after: std::time::Duration, tm: Tm) -> TimerId {
@@ -361,6 +382,9 @@ impl Client {
         }
         for o in self.pending.drain() {
             self.open(cx, id, o.tcp, o.kind, &o.target);
+        }
+        if avail == UdpAvail::Available {
+            self.udp_available(cx);
         }
     }
 
@@ -555,12 +579,16 @@ impl App for Client {
             Event::NewStream(_, s, _) => cx.stream_reset(s),
             Event::StreamReadable(s) if self.ctrl_of(s) => self.ctrl_readable(cx, s),
             Event::StreamReadable(s) => self.open_readable(cx, s),
+            Event::DatagramReadable(c) if self.current(c) => self.udp_inbound(cx, c),
             Event::StreamWritable(s) if self.ctrl_of(s) => {
                 let ctrl = self.conn.as_mut().and_then(|c| c.ctrl.as_mut());
                 let ctrl = ctrl.expect("ctrl_of");
                 if !app_stream::flush(cx, s, &mut ctrl.tx, false) {
                     self.close(cx);
                 }
+            }
+            Event::StreamWritable(s) if self.sess.by_stream.contains_key(&s) => {
+                self.session_writable(cx, s)
             }
             Event::StreamWritable(s) => {
                 if let Some(o) = self.opens.get_mut(&s)
@@ -707,11 +735,14 @@ impl App for Client {
         }
     }
 
-    fn on_udp_rx(&mut self, _cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, _d: &[u8]) {
+    fn on_udp_rx(&mut self, cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, d: &[u8]) {
         // ponytail: linear in associations; index them by socket if a client holds many.
-        if let Some(a) = self.assocs.values_mut().find(|a| a.sock == Some(sock)) {
-            // SP2 spec §6.3: the source check; what passes is relayed with the sessions.
-            a.accept_source(peer);
+        let assoc = self.assocs.iter_mut().find(|(_, a)| a.sock == Some(sock));
+        // SP2 spec §6.3: the source check, then the sessions.
+        if let Some((&tcp, a)) = assoc
+            && a.accept_source(peer)
+        {
+            self.udp_outbound(cx, tcp, d);
         }
     }
 
@@ -749,6 +780,7 @@ impl App for Client {
                     refuse(cx, o.tcp, o.kind, TcpErr::Timeout);
                 }
             }
+            Tm::UdpResp(_) => {} // SP2 spec §6.4 deadline expiry: task 5.4
         }
     }
 

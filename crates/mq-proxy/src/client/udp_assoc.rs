@@ -11,10 +11,10 @@ use std::net::{IpAddr, SocketAddr};
 pub(super) type SessionKey = u32;
 
 /// spec §6.3: one DST of an association: its live session and its negative cache.
-#[allow(dead_code)] // the sessions fill it (spec §6.3, task 5.3)
 pub(super) struct DstEntry {
     pub(super) session: Option<SessionKey>,
-    /// The `Dst` as the client sent it; replies carry it back (spec §5).
+    /// `socks5udp::build` of the `Dst` as the client sent it: every reply
+    /// starts with it (spec §5).
     pub(super) dst_bytes: Vec<u8>,
     /// The last RESP error (spec §6.4).
     pub(super) failed_at: Option<Time>,
@@ -29,7 +29,7 @@ pub(super) struct Assoc {
     peer_ip: IpAddr,
     /// spec §6.3: the first-packet source lock.
     pub(super) learned: Option<SocketAddr>,
-    dsts: HashMap<Target, DstEntry>,
+    pub(super) dsts: HashMap<Target, DstEntry>,
 }
 
 impl Assoc {
@@ -59,7 +59,6 @@ impl Assoc {
     /// spec §6.3: the entry of a DST not in the table. When the table is full an
     /// entry without a session and outside the negative cache is reclaimed;
     /// `None` when there is none (the datagram is dropped).
-    #[allow(dead_code)] // the sessions use it (spec §6.3, task 5.3)
     pub(super) fn insert_dst(
         &mut self,
         target: Target,
