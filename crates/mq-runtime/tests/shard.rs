@@ -5,15 +5,16 @@ use mq_runtime::testing::{
     Call, RecordHandle, Recorded, RecordingApp, ScriptedHandle, ScriptedTransport,
 };
 use mq_runtime::{
-    AcceptMeta, DialError, Host, Interest, IoRequest, IoResult, ListenerId, ListenerTag,
-    PrereadTooLarge, RELAY_BUF, Shard, StreamPreread, TCP_BUF, Target, TcpEnd, TcpId,
+    AcceptMeta, Cx, DialError, Host, Interest, IoRequest, IoResult, ListenerId, ListenerTag,
+    PrereadTooLarge, RELAY_BUF, SendBufFull, Shard, StreamPreread, TCP_BUF, Target, TcpEnd, TcpId,
+    UdpSocketId,
 };
 use mq_transport_api::{
     CloseReason, ConnId, ErrType, Event, PathError, PathId, StreamError, StreamId, StreamInfo,
-    StreamKind, Time,
+    StreamKind, Time, Transmit,
 };
 use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
 type S = Shard<ScriptedTransport, RecordingApp>;
@@ -31,6 +32,7 @@ fn addr(port: u16) -> SocketAddr {
 fn meta() -> AcceptMeta {
     AcceptMeta {
         peer: addr(5000),
+        local: addr(1080),
         original_dst: None,
     }
 }
@@ -118,6 +120,36 @@ impl H {
             .filter(|c| matches!(c, Call::Drive(_)))
             .count()
     }
+    /// An app-owned UDP socket, opened and completed as the driver would.
+    fn app_udp(&mut self) -> UdpSocketId {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let op = self.sh.with_app(T0, |_, cx| cx.open_app_udp_socket(ip));
+        assert_eq!(self.reqs(), [IoRequest::OpenUdpSocket { op, local_ip: ip }]);
+        let sock = self.sh.on_udp_socket(T0, op, Ok(addr(7000))).unwrap();
+        assert_eq!(
+            self.app.take(),
+            [Recorded::UdpSocket(op, Ok((sock, addr(7000))))]
+        );
+        sock
+    }
+    fn udp_send(
+        &mut self,
+        sock: UdpSocketId,
+        dst: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), SendBufFull> {
+        self.sh.with_app(T0, |_, cx| cx.udp_send(sock, dst, bytes))
+    }
+    /// The driver's send loop for `sock`: one datagram per peek, each committed.
+    fn drain_udp(&mut self, sock: UdpSocketId) -> Vec<(SocketAddr, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Some(t) = self.sh.peek_transmit(sock) {
+            assert_eq!(t.segment_size, t.payload.len(), "exactly one datagram");
+            out.push((t.dst, t.payload.to_vec()));
+            self.sh.transmit_done(sock, 1);
+        }
+        out
+    }
     fn app_saw_stream(&self, s: StreamId) -> bool {
         self.app.records().iter().any(|r| {
             matches!(r, Recorded::TransportEvent(
@@ -155,6 +187,7 @@ fn accepted_socket_is_app_owned() {
     let l7 = h.sh.add_listener(ListenerTag(7));
     let m = AcceptMeta {
         peer: addr(6000),
+        local: addr(1080),
         original_dst: Some(addr(80)),
     };
     let tcp = h.sh.on_accepted(T0, l7, m).unwrap();
@@ -778,6 +811,347 @@ fn cancelled_dial_and_socket_results_return_none() {
     assert_eq!(h.sh.on_dial_result(T0, d2, Ok(addr(80))), None);
 }
 
+// --- resolve-only request (SP2 spec §4.2) ---
+
+fn ip_target(a: SocketAddr) -> Target {
+    Target {
+        host: Host::Ip(a.ip()),
+        port: a.port(),
+    }
+}
+
+#[test]
+fn resolve_ip_completes_without_driver() {
+    let mut h = setup();
+    let a = addr(53);
+    let op =
+        h.sh.with_app(T0, |_, cx| cx.resolve(ip_target(a), Duration::from_secs(5)));
+    assert!(h.reqs().is_empty(), "never reaches the driver");
+    assert!(h.app.records().is_empty(), "completes in drive, not inline");
+    assert!(h.sh.has_runnable_work());
+    h.sh.drive(T0);
+    assert_eq!(h.app.take(), [Recorded::ResolveResult(op, Ok(a))]);
+    assert!(!h.sh.has_runnable_work());
+}
+
+#[test]
+fn cancelled_ip_resolve_never_delivers() {
+    let mut h = setup();
+    let (a, b) = h.sh.with_app(T0, |_, cx| {
+        let t = ip_target(addr(53));
+        (
+            cx.resolve(t.clone(), Duration::from_secs(5)),
+            cx.resolve(t, Duration::from_secs(5)),
+        )
+    });
+    h.sh.with_app(T0, |_, cx| cx.cancel_resolve(a));
+    assert!(h.reqs().is_empty(), "nothing was ever sent to cancel");
+    // `b`'s result cancels nothing; `a`'s is gone.
+    h.sh.drive(T0);
+    assert_eq!(h.app.take(), [Recorded::ResolveResult(b, Ok(addr(53)))]);
+}
+
+#[test]
+fn ip_resolve_cancelled_from_a_sibling_callback_never_delivers() {
+    let mut h = setup();
+    let t = ip_target(addr(53));
+    let (a, b) = h.sh.with_app(T0, |_, cx| {
+        (
+            cx.resolve(t.clone(), Duration::from_secs(5)),
+            cx.resolve(t, Duration::from_secs(5)),
+        )
+    });
+    h.app.on(move |r, cx| {
+        if matches!(r, Recorded::ResolveResult(op, _) if *op == a) {
+            cx.cancel_resolve(b);
+        }
+    });
+    h.sh.drive(T0);
+    assert_eq!(h.app.take(), [Recorded::ResolveResult(a, Ok(addr(53)))]);
+    assert!(h.reqs().is_empty());
+}
+
+#[test]
+fn resolve_domain_goes_to_driver_and_is_delivered_once() {
+    let mut h = setup();
+    let socks: Vec<TcpId> = (0..CAP).map(|_| h.accept()).collect();
+    h.app.take();
+    // No socket is allocated, so the cap does not apply.
+    let op =
+        h.sh.with_app(T0, |_, cx| cx.resolve(target(), Duration::from_secs(5)));
+    assert_eq!(
+        h.reqs(),
+        [IoRequest::Resolve {
+            op,
+            target: target(),
+            deadline: Duration::from_secs(5)
+        }]
+    );
+    assert_eq!(socks.len(), CAP);
+    assert!(
+        !h.sh.accepting(),
+        "still at the cap: the resolve took no slot"
+    );
+    h.sh.on_resolve_result(T0, op, Ok(addr(443)));
+    assert_eq!(h.app.take(), [Recorded::ResolveResult(op, Ok(addr(443)))]);
+    // A second result for the same op is stale.
+    h.sh.on_resolve_result(T0, op, Err(DialError::Dns));
+    assert!(h.app.take().is_empty());
+}
+
+#[test]
+fn cancelled_resolve_result_is_dropped() {
+    let mut h = setup();
+    let op =
+        h.sh.with_app(T0, |_, cx| cx.resolve(target(), Duration::from_secs(5)));
+    h.reqs();
+    h.sh.with_app(T0, |_, cx| cx.cancel_resolve(op));
+    assert_eq!(h.reqs(), [IoRequest::CancelResolve { op }]);
+    h.sh.on_resolve_result(T0, op, Ok(addr(443)));
+    assert!(
+        h.app.take().is_empty(),
+        "cancelled results are not delivered"
+    );
+    // Cancelling again, or an unknown op, sends nothing.
+    h.sh.with_app(T0, |_, cx| cx.cancel_resolve(op));
+    assert!(h.reqs().is_empty());
+}
+
+// --- app-owned UDP sockets (SP2 spec §4.1) ---
+
+#[test]
+fn app_udp_rx_reaches_app() {
+    let mut h = setup();
+    let sock = h.app_udp();
+    h.sh.on_udp_rx(T0, sock, addr(9), b"hello");
+    assert_eq!(
+        h.app.take(),
+        [Recorded::UdpRx {
+            sock,
+            peer: addr(9),
+            data: b"hello".to_vec()
+        }]
+    );
+    assert!(
+        !h.t.log()
+            .iter()
+            .any(|c| matches!(c, Call::RecvDatagram { .. }))
+    );
+}
+
+#[test]
+fn transport_udp_rx_unchanged() {
+    let mut h = setup();
+    let op = h.sh.with_app(T0, |_, cx| {
+        cx.open_udp_socket(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    });
+    let sock = h.sh.on_udp_socket(T0, op, Ok(addr(7000))).unwrap();
+    h.app.take();
+    h.sh.on_udp_rx(T0, sock, addr(9), b"pkt");
+    assert!(h.t.log().contains(&Call::RecvDatagram {
+        now: T0,
+        local: addr(7000),
+        peer: addr(9),
+        data: b"pkt".to_vec()
+    }));
+    assert!(h.app.take().is_empty(), "never the app's");
+}
+
+#[test]
+fn udp_send_surfaces_one_record_per_peek() {
+    let mut h = setup();
+    let sock = h.app_udp();
+    for (port, bytes) in [(9, &b"a"[..]), (10, b"bb"), (11, b"ccc")] {
+        h.udp_send(sock, addr(port), bytes).unwrap();
+    }
+    assert_eq!(h.sh.pending_transmit().collect::<Vec<_>>(), [sock]);
+    let first = Transmit {
+        dst: addr(9),
+        segment_size: 1,
+        payload: b"a",
+    };
+    assert_eq!(h.sh.peek_transmit(sock), Some(first));
+    h.sh.transmit_done(sock, 0);
+    assert_eq!(h.sh.peek_transmit(sock), Some(first), "0 consumes nothing");
+    h.sh.transmit_done(sock, 1);
+    assert_eq!(
+        h.drain_udp(sock),
+        [(addr(10), b"bb".to_vec()), (addr(11), b"ccc".to_vec())]
+    );
+    assert!(h.sh.peek_transmit(sock).is_none());
+    assert_eq!(h.sh.pending_transmit().count(), 0);
+}
+
+#[test]
+fn udp_send_full_at_256k() {
+    let mut h = setup();
+    let sock = h.app_udp();
+    let mut n = 0;
+    while h.udp_send(sock, addr(9), &[n as u8; 1000]).is_ok() {
+        n += 1;
+    }
+    // 256 KiB of 1000-byte datagrams and their record headers.
+    assert!((250..=262).contains(&n), "{n}");
+    let sent = h.drain_udp(sock);
+    assert_eq!(sent.len(), n, "nothing written beyond the last record");
+    for (i, (dst, bytes)) in sent.into_iter().enumerate() {
+        assert_eq!((dst, bytes), (addr(9), vec![i as u8; 1000]));
+    }
+    assert_eq!(
+        h.udp_send(sock, addr(9), b"x"),
+        Ok(()),
+        "drained: room again"
+    );
+}
+
+#[test]
+fn udp_send_rejects_65536_untouched() {
+    let mut h = setup();
+    let sock = h.app_udp();
+    h.udp_send(sock, addr(9), b"first").unwrap();
+    assert_eq!(
+        h.udp_send(sock, addr(9), &vec![0; 65_536]),
+        Err(SendBufFull)
+    );
+    assert_eq!(h.drain_udp(sock), [(addr(9), b"first".to_vec())]);
+    // The u16 length's maximum fits.
+    h.udp_send(sock, addr(9), &vec![7; 65_535]).unwrap();
+    assert_eq!(h.drain_udp(sock), [(addr(9), vec![7; 65_535])]);
+}
+
+#[test]
+fn udp_send_empty_is_discarded() {
+    let mut h = setup();
+    let sock = h.app_udp();
+    assert_eq!(h.udp_send(sock, addr(9), b""), Ok(()));
+    assert_eq!(h.sh.pending_transmit().count(), 0);
+    assert!(h.sh.peek_transmit(sock).is_none());
+}
+
+#[test]
+fn udp_send_keeps_v6_scope_id() {
+    let mut h = setup();
+    let sock = h.app_udp();
+    let dst = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 9, 0, 7));
+    h.udp_send(sock, dst, b"v6").unwrap();
+    let t = h.sh.peek_transmit(sock).unwrap();
+    assert!(matches!(t.dst, SocketAddr::V6(a) if a.scope_id() == 7));
+    assert_eq!((t.dst, t.payload), (dst, &b"v6"[..]));
+}
+
+#[test]
+fn app_udp_counts_toward_cap_and_reserves() {
+    let mut h = setup();
+    for _ in 0..CAP - 1 {
+        h.accept();
+    }
+    h.app.take();
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let first = h.sh.with_app(T0, |_, cx| cx.open_app_udp_socket(ip));
+    assert_eq!(
+        h.reqs(),
+        [IoRequest::OpenUdpSocket {
+            op: first,
+            local_ip: ip
+        }]
+    );
+    assert!(!h.sh.accepting(), "the in-flight open holds the last slot");
+    let second = h.sh.with_app(T0, |_, cx| cx.open_app_udp_socket(ip));
+    assert!(h.reqs().is_empty(), "never reaches the driver");
+    assert!(h.app.records().is_empty(), "completes in drive, not inline");
+    assert!(h.sh.has_runnable_work());
+    h.sh.drive(T0);
+    assert_eq!(
+        h.app.take(),
+        [Recorded::UdpSocket(second, Err(ErrorKind::Other))]
+    );
+    assert!(!h.sh.has_runnable_work());
+    // A refused open cancelled before the drive is never delivered.
+    h.sh.with_app(T0, |_, cx| {
+        let o = cx.open_app_udp_socket(ip);
+        cx.cancel_udp_socket(o);
+    });
+    assert!(h.reqs().is_empty());
+    h.sh.drive(T0);
+    assert!(h.app.take().is_empty());
+    // Cancelling the first releases its slot.
+    h.sh.with_app(T0, |_, cx| cx.cancel_udp_socket(first));
+    assert_eq!(h.reqs(), [IoRequest::CancelUdpSocket { op: first }]);
+    assert!(h.sh.accepting());
+    let third = h.sh.with_app(T0, |_, cx| cx.open_app_udp_socket(ip));
+    assert_eq!(
+        h.reqs(),
+        [IoRequest::OpenUdpSocket {
+            op: third,
+            local_ip: ip
+        }]
+    );
+    // So does a failed open.
+    assert_eq!(
+        h.sh.on_udp_socket(T0, third, Err(ErrorKind::AddrInUse)),
+        None
+    );
+    assert!(h.sh.accepting());
+}
+
+#[test]
+fn live_app_udp_counts_toward_cap() {
+    let mut h = setup();
+    for _ in 0..CAP - 1 {
+        h.accept();
+    }
+    h.app.take();
+    let sock = h.app_udp();
+    assert!(!h.sh.accepting());
+    assert_eq!(h.sh.on_accepted(T0, h.l, meta()), None);
+    let op =
+        h.sh.with_app(T0, |_, cx| cx.dial(target(), Duration::from_secs(1)));
+    assert!(h.reqs().is_empty());
+    h.sh.drive(T0);
+    assert_eq!(
+        h.app.take(),
+        [Recorded::DialResult(op, Err(DialError::Limit))]
+    );
+    // Closing the app socket frees the slot.
+    h.sh.with_app(T0, |_, cx| cx.close_udp_socket(sock));
+    assert_eq!(h.reqs(), [IoRequest::CloseUdpSocket { sock }]);
+    assert!(h.sh.accepting());
+    h.accept();
+}
+
+#[test]
+fn close_app_udp_drops_ring() {
+    let mut h = setup();
+    let sock = h.app_udp();
+    h.udp_send(sock, addr(9), b"queued").unwrap();
+    h.sh.with_app(T0, |_, cx| cx.close_udp_socket(sock));
+    assert_eq!(h.reqs(), [IoRequest::CloseUdpSocket { sock }]);
+    assert_eq!(h.sh.pending_transmit().count(), 0);
+    assert!(h.sh.peek_transmit(sock).is_none());
+    assert_eq!(
+        h.udp_send(sock, addr(9), b"late"),
+        Err(SendBufFull),
+        "not a live app socket"
+    );
+    h.sh.on_udp_rx(T0, sock, addr(9), b"late");
+    assert!(h.app.take().is_empty());
+    // Nor is a transport socket.
+    let primary = h.sh.primary_udp();
+    assert_eq!(h.udp_send(primary, addr(9), b"x"), Err(SendBufFull));
+}
+
+#[test]
+fn add_path_on_app_socket_is_stale() {
+    let mut h = setup();
+    let c = h.conn();
+    let sock = h.app_udp();
+    assert_eq!(
+        h.sh.with_app(T0, |_, cx| cx.add_path(c, sock, false)),
+        Err(PathError::Stale)
+    );
+    assert!(!h.t.log().iter().any(|c| matches!(c, Call::AddPath { .. })));
+}
+
 // --- loop contract ---
 
 #[test]
@@ -878,6 +1252,66 @@ fn drive_again_when_steps_touched_transport() {
     h.relay();
     h.sh.drive(T0);
     assert_eq!(h.drives(), 5, "step 4 touched the transport");
+}
+
+/// Transport drives after one drive pass whose step 3 runs `f` (spec §5.2 step 5).
+fn drives_after_app_call(f: impl Fn(&mut Cx<'_>, ConnId) + Send + 'static) -> usize {
+    let mut h = setup();
+    let c = h.conn();
+    let s = h.t.new_stream_id();
+    h.app.on(move |r, cx| {
+        if let Recorded::TransportEvent(Event::StreamWritable(_)) = r {
+            f(cx, c);
+        }
+    });
+    h.t.push_event(Event::StreamWritable(s));
+    h.sh.drive(T0);
+    h.drives()
+}
+
+#[test]
+fn datagram_send_and_recv_redrive_but_mss_does_not() {
+    // spec §3.1: send/recv go through `tm()`; `datagram_mss` is a query like `conn_stats`
+    assert_eq!(drives_after_app_call(|cx, c| _ = cx.datagram_mss(c)), 1);
+    assert_eq!(
+        drives_after_app_call(|cx, c| _ = cx.datagram_send(c, b"x")),
+        2
+    );
+    assert_eq!(
+        drives_after_app_call(|cx, c| _ = cx.datagram_recv(c, &mut [0; 8])),
+        2
+    );
+}
+
+#[test]
+fn cx_datagram_send_sets_touched() {
+    // The observable of the step-5 re-drive: `touched` stays set after the drive
+    // (the transport may have queued events nobody has dispatched yet).
+    let mut h = setup();
+    let c = h.conn();
+    h.sh.drive(T0);
+    h.sh.with_app(T0, |_, cx| _ = cx.datagram_mss(c));
+    assert!(!h.sh.has_runnable_work(), "mss is a query");
+    h.sh.with_app(T0, |_, cx| _ = cx.datagram_send(c, b"x"));
+    assert!(h.sh.has_runnable_work(), "send may queue events");
+    h.sh.drive(T0);
+    assert!(!h.sh.has_runnable_work(), "a drive clears it");
+    h.sh.with_app(T0, |_, cx| _ = cx.datagram_recv(c, &mut [0; 8]));
+    assert!(h.sh.has_runnable_work(), "recv may queue events");
+}
+
+#[test]
+fn datagram_readable_routed_to_app() {
+    let mut h = setup();
+    let c = h.conn();
+    // Two datagrams coalesce into one level event.
+    h.t.inject_datagram(c, b"one".to_vec());
+    h.t.inject_datagram(c, b"two".to_vec());
+    h.sh.drive(T0);
+    assert_eq!(
+        h.app.take(),
+        [Recorded::TransportEvent(Event::DatagramReadable(c))]
+    );
 }
 
 #[test]

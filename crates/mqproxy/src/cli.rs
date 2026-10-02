@@ -5,6 +5,7 @@ use crate::config::{self, FileConfig};
 use clap::error::ErrorKind;
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 use mq_proxy::config::{ClientConfig, ServerConfig};
+use mq_proxy::udp::DEFAULT_IDLE;
 use mq_runtime::ListenKind;
 use mq_transport_api::{CongestionControl, Scheduler};
 use std::net::{IpAddr, SocketAddr};
@@ -35,7 +36,7 @@ pub struct Resolved {
     pub scheduler: Scheduler,
     /// To log as warnings at startup.
     pub warnings: Vec<String>,
-    /// To log as info at startup (the server's "gateway/UDP off" line).
+    /// To log as info at startup (the server's "gateway off" line).
     pub startup_lines: Vec<String>,
 }
 
@@ -125,10 +126,10 @@ struct ServerArgs {
     /// (accepted, no effect: the gateway is off in this build) Disable the HTTP gateway origin bridge (enabled by default; the server still serves the TCP-proxy core).
     #[arg(long)]
     no_gateway: bool,
-    /// (accepted, no effect: UDP relay is off in this build) Idle timeout for UDP relay sessions in seconds (default: 60; must be > 0).
+    /// Idle timeout for UDP relay sessions in seconds (default: 60; must be > 0).
     #[arg(long, value_name = "sec", allow_hyphen_values = true, value_parser = clap::value_parser!(u64).range(1..))]
     udp_idle_timeout: Option<u64>,
-    /// (accepted, no effect: UDP relay is off in this build) Disable UDP relay (do not advertise MQ_FEAT_UDP_RELAY).
+    /// Disable UDP relay (do not advertise MQ_FEAT_UDP_RELAY).
     #[arg(long)]
     no_udp: bool,
     /// Write xquic qlog (EXTRA importance) to <dir>/server.qlog.
@@ -177,7 +178,7 @@ struct ClientArgs {
     /// Shared auth token (required).
     #[arg(long, value_name = "token", allow_hyphen_values = true)]
     token: Option<String>,
-    /// Local TCP address for the SOCKS5 ingress (UDP ASSOCIATE is not available in this build).
+    /// Local TCP address for the SOCKS5 ingress (UDP ASSOCIATE supported).
     #[arg(long, value_name = "ip:port", allow_hyphen_values = true)]
     socks5: Option<String>,
     /// Local TCP address for the HTTP CONNECT ingress.
@@ -307,8 +308,8 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
     if a.request_metrics || f.request_metrics {
         return Err(unavailable("--request-metrics ([Metrics] PerRequest)"));
     }
-    // Accepted, no effect: --no-gateway, --no-udp, --udp-idle-timeout (validated only).
-    let _ = (a.no_gateway, a.no_udp, a.udp_idle_timeout);
+    // Accepted, no effect: --no-gateway.
+    let _ = a.no_gateway;
     let mut warnings = f.warnings;
     // Warning, ignored: the feature was removed.
     if a.cache_max_bytes.or(f.cache_max_bytes).is_some() {
@@ -333,6 +334,12 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
             config: ServerConfig {
                 token,
                 metrics_interval: metrics_interval(a.metrics_interval, f.metrics_interval),
+                // `--no-udp` only ever turns the file's value off (C: it clears the flag).
+                udp_enabled: !a.no_udp && f.udp_enabled.unwrap_or(true),
+                udp_idle_timeout: a
+                    .udp_idle_timeout
+                    .or(f.udp_idle_timeout)
+                    .map_or(DEFAULT_IDLE, Duration::from_secs),
                 ..ServerConfig::default()
             },
             listen,
@@ -345,11 +352,8 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
         cc,
         scheduler,
         warnings,
-        // spec §6.4: C has both default-on; SP1 has neither (Task 9.3 logs this).
-        startup_lines: vec![
-            "HTTP gateway and UDP relay are not available in this build; serving the TCP proxy only"
-                .into(),
-        ],
+        // spec §8: C has the gateway default-on; this build has none.
+        startup_lines: vec!["HTTP gateway is not available in this build".into()],
     })
 }
 
@@ -377,7 +381,9 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
     let tproxy = a.tproxy.or(f.tproxy);
     if socks5.is_none() && http_connect.is_none() && tproxy.is_none() {
         return Err(
-            "at least one ingress is required (--socks5, --http-connect, or --tproxy)".into(),
+            "at least one ingress is required (--socks5, --http-connect, --tproxy, \
+             or --gateway; --gateway is not available in this build)"
+                .into(),
         );
     }
     let opt = |flag, s: Option<String>| s.map(|s| ip_port(flag, &s)).transpose();

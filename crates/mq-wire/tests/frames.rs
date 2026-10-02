@@ -593,6 +593,322 @@ fn constants() {
     assert_eq!((STATUS_OK, STATUS_ERROR, MAX_FRAME), (0, 1, 512));
 }
 
+// ---- UDP_SESSION_OPEN / UDP_SESSION_RESP (spec §2.1; unlike the TCP frames, both
+// sides validate semantics as src/wire/mq_wire.c does) ----
+fn udp_open(at: AddrType, host: &[u8]) -> UdpSessionOpen<'_> {
+    UdpSessionOpen {
+        session_id: 0xDEAD_BEEF,
+        flags: 0,
+        address_type: at,
+        host,
+        port: 5353,
+        idle_timeout_ms: 30_000,
+    }
+}
+
+fn udp_resp(status: u8, code: u64, message: &[u8]) -> UdpSessionResp<'_> {
+    UdpSessionResp {
+        status,
+        error_code: code,
+        message,
+        idle_timeout_ms: 60_000,
+    }
+}
+
+#[test]
+fn udp_open_roundtrip() {
+    let v6 = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ];
+    for (at, host) in [
+        (AddrType::Ipv4, &[192, 168, 0, 1][..]),
+        (AddrType::Domain, &b"example.com"[..]),
+        (AddrType::Ipv6, &v6[..]),
+    ] {
+        let f = udp_open(at, host);
+        let (buf, n) = enc(&|b| f.encode(b));
+        assert_eq!(UdpSessionOpen::decode(&buf[..n]), Ok((f, n)));
+    }
+}
+
+#[test]
+fn udp_open_rejects_sid_over_u32() {
+    // session_id as a varint | flags 0 | Ipv4 | 1.2.3.4 | port 80 | idle 0 | pad 0
+    let rest = [0x00, 0x01, 0x04, 1, 2, 3, 4, 0x00, 0x50, 0x00, 0x00];
+    let frame = |sid: u64| {
+        let mut buf = [0u8; 32];
+        let n = varint::encode(&mut buf, sid).unwrap();
+        buf[n..n + rest.len()].copy_from_slice(&rest);
+        (buf, n + rest.len())
+    };
+    let (buf, n) = frame(1 << 32);
+    assert_eq!(UdpSessionOpen::decode(&buf[..n]), Err(DecodeError::Invalid));
+    let (buf, n) = frame(u32::MAX as u64);
+    let (f, _) = UdpSessionOpen::decode(&buf[..n]).unwrap();
+    assert_eq!(f.session_id, u32::MAX);
+}
+
+#[test]
+fn udp_open_rejects_unknown_atype() {
+    for t in [0x00u8, 0x02, 0x05, 0xFF] {
+        // sid 1 | flags 0 | atype t | host 1.2.3.4 | port 80 | idle 0 | pad 0
+        let buf = [0x01, 0x00, t, 0x04, 1, 2, 3, 4, 0x00, 0x50, 0x00, 0x00];
+        assert_eq!(UdpSessionOpen::decode(&buf), Err(DecodeError::Invalid));
+    }
+}
+
+#[test]
+fn udp_resp_roundtrip() {
+    let long = [b'm'; 255];
+    for (status, err, msg) in [
+        (STATUS_OK, None, &b"ok"[..]),
+        (STATUS_OK, None, &b""[..]),
+        (STATUS_ERROR, Some(UdpErr::DnsFailed), &b"dns failed"[..]),
+        (STATUS_ERROR, Some(UdpErr::SocketFailed), &b"socket"[..]),
+        (STATUS_ERROR, Some(UdpErr::PolicyDenied), &b"denied"[..]),
+        (STATUS_ERROR, Some(UdpErr::SessionLimit), &long[..]),
+    ] {
+        let f = udp_resp(status, err.map_or(0, |e| e as u64), msg);
+        let (buf, n) = enc(&|b| f.encode(b));
+        let (out, m) = UdpSessionResp::decode(&buf[..n]).unwrap();
+        assert_eq!((out, m), (f, n));
+        assert_eq!(out.error(), err);
+        assert_eq!(out.is_ok(), status == STATUS_OK);
+    }
+}
+
+#[test]
+fn udp_resp_rejects_code_5() {
+    // status ERROR | code 5 | msg "" | idle 0 | pad 0
+    assert_eq!(
+        UdpSessionResp::decode(&[0x01, 0x05, 0x00, 0x00, 0x00]),
+        Err(DecodeError::Invalid)
+    );
+    // status OK with code 5, and a code beyond one byte
+    assert_eq!(
+        UdpSessionResp::decode(&[0x00, 0x05, 0x00, 0x00, 0x00]),
+        Err(DecodeError::Invalid)
+    );
+    assert_eq!(
+        UdpSessionResp::decode(&[0x01, 0x40, 0x64, 0x00, 0x00, 0x00]),
+        Err(DecodeError::Invalid)
+    );
+    // C checks the pairing before the message: Invalid wins over a truncated or over-long message.
+    assert_eq!(
+        UdpSessionResp::decode(&[0x01, 0x05]),
+        Err(DecodeError::Invalid)
+    );
+    assert_eq!(
+        UdpSessionResp::decode(&[0x01, 0x05, 0x41, 0x00]),
+        Err(DecodeError::Invalid)
+    );
+}
+
+#[test]
+fn udp_resp_rejects_ok_with_code() {
+    for code in 1..=4u8 {
+        assert_eq!(
+            UdpSessionResp::decode(&[0x00, code, 0x00, 0x00, 0x00]),
+            Err(DecodeError::Invalid)
+        );
+    }
+}
+
+#[test]
+fn udp_resp_rejects_error_with_code_0() {
+    assert_eq!(
+        UdpSessionResp::decode(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+        Err(DecodeError::Invalid)
+    );
+    // an unknown status is neither OK nor ERROR
+    for st in [0x02u8, 0x7F, 0xFF] {
+        for code in 0..=4u8 {
+            assert_eq!(
+                UdpSessionResp::decode(&[st, code, 0x00, 0x00, 0x00]),
+                Err(DecodeError::Invalid)
+            );
+        }
+    }
+}
+
+#[test]
+fn udp_resp_rejects_message_256() {
+    // status ERROR | code 1 | declared message len 256 (0x41 0x00), no bytes supplied
+    assert_eq!(
+        UdpSessionResp::decode(&[0x01, 0x01, 0x41, 0x00]),
+        Err(DecodeError::BadValue)
+    );
+}
+
+#[test]
+fn udp_resp_encode_rejects_inconsistent() {
+    let mut b = [0u8; MAX_FRAME];
+    let e = Err(EncodeError::BadValue);
+    assert_eq!(udp_resp(STATUS_OK, 1, b"").encode(&mut b), e);
+    assert_eq!(udp_resp(STATUS_OK, 5, b"").encode(&mut b), e);
+    assert_eq!(udp_resp(STATUS_ERROR, 0, b"").encode(&mut b), e);
+    assert_eq!(udp_resp(STATUS_ERROR, 5, b"").encode(&mut b), e);
+    assert_eq!(udp_resp(0x02, 1, b"").encode(&mut b), e);
+    assert_eq!(udp_resp(0x02, 0, b"").encode(&mut b), e);
+    // a code that is not a valid varint is rejected the same way
+    assert_eq!(udp_resp(STATUS_ERROR, BIG, b"").encode(&mut b), e);
+    // the semantic check precedes the buffer check, as in C
+    assert_eq!(udp_resp(STATUS_OK, 1, b"").encode(&mut b[..0]), e);
+}
+
+#[test]
+fn udp_frames_encode_limits() {
+    let z = [0u8; 256];
+    let mut b = [0u8; MAX_FRAME];
+    assert_eq!(
+        udp_open(AddrType::Domain, &z).encode(&mut b),
+        Err(EncodeError::TooLong)
+    );
+    assert!(udp_open(AddrType::Domain, &z[..255]).encode(&mut b).is_ok());
+    assert_eq!(
+        udp_resp(STATUS_OK, 0, &z).encode(&mut b),
+        Err(EncodeError::TooLong)
+    );
+    let big = UdpSessionOpen {
+        flags: BIG,
+        ..udp_open(AddrType::Ipv4, &[1, 2, 3, 4])
+    };
+    assert_eq!(big.encode(&mut b), Err(EncodeError::BadValue));
+    let big = UdpSessionOpen {
+        idle_timeout_ms: BIG,
+        ..big
+    };
+    assert_eq!(big.encode(&mut b), Err(EncodeError::BadValue));
+    let big = UdpSessionResp {
+        idle_timeout_ms: BIG,
+        ..udp_resp(STATUS_OK, 0, b"")
+    };
+    assert_eq!(big.encode(&mut b), Err(EncodeError::BadValue));
+}
+
+#[test]
+fn udp_frames_skip_padding() {
+    let o = udp_open(AddrType::Ipv4, &[1, 2, 3, 4]);
+    let r = udp_resp(STATUS_ERROR, 2, b"m");
+    let (b, n) = padded(&|d| o.encode(d));
+    assert_eq!(UdpSessionOpen::decode(&b[..n + 1]), Ok((o, n)));
+    let (b, n) = padded(&|d| r.encode(d));
+    assert_eq!(UdpSessionResp::decode(&b[..n + 1]), Ok((r, n)));
+    // padding_length beyond the buffer is truncation
+    assert_eq!(
+        UdpSessionOpen::decode(&[0x01, 0x00, 0x01, 0x01, 9, 0x00, 0x50, 0x00, 0x05, 0xEE]),
+        Err(DecodeError::Short)
+    );
+    assert_eq!(
+        UdpSessionResp::decode(&[0x00, 0x00, 0x00, 0x00, 0x05, 0xEE]),
+        Err(DecodeError::Short)
+    );
+}
+
+#[test]
+fn udp_frames_truncation_is_short() {
+    let o = udp_open(AddrType::Domain, b"example.com");
+    let (buf, n) = enc(&|b| o.encode(b));
+    for k in 0..n {
+        assert_eq!(
+            UdpSessionOpen::decode(&buf[..k]),
+            Err(DecodeError::Short),
+            "udp_open k={k}"
+        );
+    }
+    let r = udp_resp(STATUS_ERROR, 4, b"session limit");
+    let (buf, n) = enc(&|b| r.encode(b));
+    for k in 0..n {
+        assert_eq!(
+            UdpSessionResp::decode(&buf[..k]),
+            Err(DecodeError::Short),
+            "udp_resp k={k}"
+        );
+    }
+}
+
+#[test]
+fn udp_frames_encode_short_buffer() {
+    let o = udp_open(AddrType::Domain, b"example.com");
+    let r = udp_resp(STATUS_ERROR, 3, b"denied");
+    let encs: [Enc; 2] = [&|d| o.encode(d), &|d| r.encode(d)];
+    for e in encs {
+        let mut b = [0u8; 64];
+        let n = e(&mut b).unwrap();
+        for k in 0..n {
+            assert_eq!(e(&mut b[..k]), Err(EncodeError::Short), "k={k}");
+        }
+        assert_eq!(e(&mut b[..n]), Ok(n));
+    }
+}
+
+#[test]
+fn udp_frames_fit_512() {
+    let host = [b'h'; 255];
+    let o = UdpSessionOpen {
+        session_id: u32::MAX,
+        flags: varint::MAX,
+        address_type: AddrType::Domain,
+        host: &host,
+        port: u16::MAX,
+        idle_timeout_ms: varint::MAX,
+    };
+    let (_, n) = enc(&|b| o.encode(b));
+    assert!(n <= MAX_FRAME, "open {n}");
+    let r = UdpSessionResp {
+        status: STATUS_ERROR,
+        error_code: UdpErr::SessionLimit as u64,
+        message: &host,
+        idle_timeout_ms: varint::MAX,
+    };
+    let (_, n) = enc(&|b| r.encode(b));
+    assert!(n <= MAX_FRAME, "resp {n}");
+}
+
+#[test]
+fn udp_matches_c_golden_bytes() {
+    // varint sid | varint flags | u8 atype | string host | u16be port | varint idle | varint pad
+    let (b, n) = enc(&|b| {
+        UdpSessionOpen {
+            session_id: 7,
+            flags: 0,
+            address_type: AddrType::Domain,
+            host: b"ab",
+            port: 443,
+            idle_timeout_ms: 60_000,
+        }
+        .encode(b)
+    });
+    assert_eq!(
+        &b[..n],
+        &[
+            0x07, 0x00, 0x03, 0x02, b'a', b'b', 0x01, 0xBB, 0x80, 0x00, 0xEA, 0x60, 0x00
+        ]
+    );
+    // u8 status | varint code | string message | varint idle | varint pad
+    let (b, n) = enc(&|b| {
+        UdpSessionResp {
+            status: 1,
+            error_code: 3,
+            message: b"no",
+            idle_timeout_ms: 0,
+        }
+        .encode(b)
+    });
+    assert_eq!(&b[..n], &[0x01, 0x03, 0x02, b'n', b'o', 0x00, 0x00]);
+}
+
+#[test]
+fn udp_err_from_raw() {
+    assert_eq!(UdpErr::from_raw(0), None); // OK is not an error
+    assert_eq!(UdpErr::from_raw(1), Some(UdpErr::DnsFailed));
+    assert_eq!(UdpErr::from_raw(2), Some(UdpErr::SocketFailed));
+    assert_eq!(UdpErr::from_raw(3), Some(UdpErr::PolicyDenied));
+    assert_eq!(UdpErr::from_raw(4), Some(UdpErr::SessionLimit));
+    assert_eq!(UdpErr::from_raw(5), None); // MQ_UDP_CLOSED never goes on the wire
+    assert_eq!(FEAT_UDP_RELAY, 1);
+}
+
 fn addr() -> impl Strategy<Value = AddrType> {
     prop_oneof![
         Just(AddrType::Ipv4),
@@ -629,5 +945,23 @@ proptest! {
         let _ = AuthResp::decode(&bytes);
         let _ = ConnectTcpReq::decode(&bytes);
         let _ = ConnectTcpResp::decode(&bytes);
+        let _ = UdpSessionOpen::decode(&bytes);
+        let _ = UdpSessionResp::decode(&bytes);
+    }
+
+    #[test]
+    fn proptest_udp_roundtrip(
+        sid in any::<u32>(), a in 0..=varint::MAX, b in 0..=varint::MAX, port in any::<u16>(), at in addr(),
+        err in 0u64..=4,
+        s255 in proptest::collection::vec(any::<u8>(), 0..=255),
+    ) {
+        let mut buf = [0u8; MAX_FRAME];
+        let f = UdpSessionOpen { session_id: sid, flags: a, address_type: at, host: &s255, port, idle_timeout_ms: b };
+        let n = f.encode(&mut buf).unwrap();
+        prop_assert_eq!(UdpSessionOpen::decode(&buf[..n]), Ok((f, n)));
+        let status = if err == 0 { STATUS_OK } else { STATUS_ERROR };
+        let f = UdpSessionResp { status, error_code: err, message: &s255, idle_timeout_ms: b };
+        let n = f.encode(&mut buf).unwrap();
+        prop_assert_eq!(UdpSessionResp::decode(&buf[..n]), Ok((f, n)));
     }
 }

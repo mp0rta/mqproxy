@@ -376,6 +376,20 @@ fn driver_original_dst_absent_on_plain_listener() {
     stop(h);
 }
 
+#[test]
+fn accept_meta_has_local() {
+    let mut h = harness();
+    h.start();
+    let _c = TcpStream::connect(h.listen_addrs[0]).unwrap();
+    let Some(Recorded::Accepted { meta, .. }) =
+        h.wait_for(T, |r| matches!(r, Recorded::Accepted { .. }))
+    else {
+        panic!("no accept");
+    };
+    assert_eq!(meta.local, h.listen_addrs[0]);
+    stop(h);
+}
+
 /// Port of C `test_path_bind`.
 #[test]
 fn driver_path_bind() {

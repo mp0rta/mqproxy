@@ -125,22 +125,31 @@ fn http_pipelined_prebuf() {
     r.stop();
 }
 
+const ASSOCIATE: [u8; 10] = [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+
 /// ASSOCIATE DST 0.0.0.0:0 → REP 0x07 and close; no stream opened.
 fn associate_refused(r: &ClientRig, opened: usize) {
     let mut c = greeted(r.socks());
-    c.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .unwrap();
+    c.write_all(&ASSOCIATE).unwrap();
     let reply = read_n(&mut c, 10);
     assert_eq!(reply[..2], [0x05, 0x07], "command not supported");
     assert_eq!(read_to_eof(&mut c), b"");
     assert_eq!(r.opened(), opened);
 }
 
-/// C: a listener without the UDP boundary. Here: no tunnel at all.
+/// C: a listener without the UDP boundary. Here: no tunnel at all, so UDP
+/// availability is still unknown and the ASSOCIATE is accepted optimistically
+/// (SP2 spec §6.2) on a UDP socket bound on the control connection's local IP.
 #[test]
 fn assoc_refused_no_udp() {
     let r = ClientRig::spawn(false);
-    associate_refused(&r, 0);
+    let mut c = greeted(r.socks());
+    c.write_all(&ASSOCIATE).unwrap();
+    let reply = read_n(&mut c, 10);
+    assert_eq!(reply[..4], [0x05, 0x00, 0x00, 0x01], "succeeded, IPv4 BND");
+    assert_eq!(reply[4..8], [127, 0, 0, 1], "BND.ADDR");
+    assert_ne!(reply[8..], [0, 0], "BND.PORT");
+    assert_eq!(r.opened(), 0);
     r.stop();
 }
 

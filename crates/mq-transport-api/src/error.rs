@@ -13,6 +13,22 @@ pub enum StreamError {
     Conn,
 }
 
+/// `datagram_send` failure (spec §3.1). The caller treats every
+/// error as "dropped".
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DatagramError {
+    /// xquic would block (`-XQC_EAGAIN`).
+    Blocked,
+    /// Larger than the datagram MSS.
+    TooLarge,
+    /// The peer did not negotiate datagrams.
+    NotSupported,
+    /// The id's object is gone (spec §4.8).
+    Stale,
+    /// Connection-level failure (closing, or any other xquic error).
+    Conn,
+}
+
 /// `add_path` failure (spec §4.2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PathError {
@@ -51,4 +67,4 @@ macro_rules! debug_display {
         impl std::error::Error for $t {}
     )*};
 }
-debug_display!(StreamError, PathError, ConnectError, Error);
+debug_display!(StreamError, DatagramError, PathError, ConnectError, Error);

@@ -6,7 +6,7 @@ use mq_proxy::client::{Client, HTTP_CONNECT, SOCKS5, TRANSPARENT};
 use mq_proxy::config::ClientConfig;
 use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
 use mq_runtime::{AcceptMeta, IoRequest, IoResult, ListenerId, Shard, TcpId};
-use mq_transport_api::{ConnId, Event, StreamId, StreamInfo, StreamKind, Time};
+use mq_transport_api::{ConnId, ConnectError, Event, StreamId, StreamInfo, StreamKind, Time};
 use mq_wire::frames::{AuthResp, ConnectTcpResp};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -49,12 +49,16 @@ pub fn cfg() -> ClientConfig {
 }
 
 pub fn auth_resp(status: u8, code: u64) -> Vec<u8> {
+    auth_resp_features(status, code, 0)
+}
+
+pub fn auth_resp_features(status: u8, code: u64, features: u64) -> Vec<u8> {
     let mut b = [0u8; 512];
     let n = AuthResp {
         status,
         error_code: code,
         server_id: b"mqproxy-server",
-        features: 0,
+        features,
     }
     .encode(&mut b)
     .unwrap();
@@ -80,6 +84,7 @@ pub fn addr(port: u16) -> SocketAddr {
 pub fn meta(original_dst: Option<SocketAddr>) -> AcceptMeta {
     AcceptMeta {
         peer: addr(5000),
+        local: addr(1080),
         original_dst,
     }
 }
@@ -98,9 +103,14 @@ pub struct H {
 impl H {
     /// A client whose first `connect` returns `self.conn`; started at t = 1 s.
     pub fn new(cfg: ClientConfig) -> H {
+        H::start(cfg, None)
+    }
+
+    /// As `new`; with `fail`, the first `connect` fails synchronously with it.
+    pub fn start(cfg: ClientConfig, fail: Option<ConnectError>) -> H {
         let (transport, t) = ScriptedTransport::new();
         let conn = t.new_conn_id();
-        t.expect_connect(Ok(conn));
+        t.expect_connect(fail.map_or(Ok(conn), Err));
         let mut sh = Shard::new(transport, Client::new(cfg), addr(4433), SEED);
         let socks = sh.add_listener(SOCKS5);
         let http = sh.add_listener(HTTP_CONNECT);

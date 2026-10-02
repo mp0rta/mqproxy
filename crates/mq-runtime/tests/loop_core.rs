@@ -33,6 +33,7 @@ fn addr(port: u16) -> SocketAddr {
 fn meta() -> AcceptMeta {
     AcceptMeta {
         peer: addr(5000),
+        local: addr(1080),
         original_dst: None,
     }
 }
@@ -604,6 +605,130 @@ fn dial_deadline_beats_same_iteration_resolve() {
     assert_eq!(h.dial_results().len(), 1);
 }
 
+// --- Resolve-only requests (SP2 spec §4.2) ---
+
+impl H {
+    fn resolve_results(&self) -> Vec<(DialOpId, Result<SocketAddr, DialError>)> {
+        self.app
+            .records()
+            .into_iter()
+            .filter_map(|r| match r {
+                Recorded::ResolveResult(op, r) => Some((op, r)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn resolve_domain_round_trip() {
+    let mut h = setup();
+    let op = h.act(|cx| cx.resolve(domain("name.example"), 10 * SEC));
+    h.it();
+    assert_eq!(resolves(&h.ops()), vec![op]);
+    assert!(h.c.earliest_deadline().is_some());
+    let (a1, a2) = (addr(1001), addr(1002));
+    h.io().resolve(op, Ok(vec![a1, a2]));
+    h.it();
+    // The first address, and no connect: the op ends here.
+    assert_eq!(h.resolve_results(), vec![(op, Ok(a1))]);
+    assert!(connects(&h.ops()).is_empty());
+    assert_eq!(h.c.resolver().running(), 0);
+    assert_eq!(h.c.earliest_deadline(), None, "deadline cancelled");
+    assert!(h.dial_results().is_empty());
+}
+
+#[test]
+fn resolve_ip_target_completes_in_next_iteration() {
+    let mut h = setup();
+    let op = h.act(|cx| cx.resolve(ip([10, 0, 0, 1], 53), 10 * SEC));
+    h.it();
+    assert_eq!(
+        h.resolve_results(),
+        vec![(op, Ok(SocketAddr::from(([10, 0, 0, 1], 53))))]
+    );
+    let ops = h.ops();
+    assert!(resolves(&ops).is_empty() && connects(&ops).is_empty());
+    assert_eq!(h.c.earliest_deadline(), None);
+}
+
+#[test]
+fn resolve_dns_error() {
+    let mut h = setup();
+    let (a, b) = (
+        h.act(|cx| cx.resolve(domain("a.example"), 10 * SEC)),
+        h.act(|cx| cx.resolve(domain("b.example"), 10 * SEC)),
+    );
+    h.it();
+    h.ops();
+    h.io().resolve(a, Err(ErrorKind::NotFound.into()));
+    h.io().resolve(b, Ok(vec![])); // an empty answer is a failure too
+    h.it();
+    let mut res = h.resolve_results();
+    res.sort_by_key(|x| x.0);
+    let mut want = vec![(a, Err(DialError::Dns)), (b, Err(DialError::Dns))];
+    want.sort_by_key(|x| x.0);
+    assert_eq!(res, want);
+    assert_eq!(h.c.resolver().running(), 0);
+    assert_eq!(h.c.earliest_deadline(), None);
+}
+
+#[test]
+fn resolve_timeout() {
+    let mut h = setup();
+    h.io().set_auto_advance(false);
+    let op = h.act(|cx| cx.resolve(domain("slow.example"), SEC));
+    h.it();
+    h.ops();
+    h.io().set_now(Time::ZERO + SEC);
+    h.it();
+    assert_eq!(h.resolve_results(), vec![(op, Err(DialError::Timeout))]);
+    // The running resolution keeps its slot until it returns; its result is dropped.
+    assert_eq!(h.c.resolver().running(), 1);
+    h.io().resolve(op, Ok(vec![addr(443)]));
+    h.it();
+    assert_eq!(h.c.resolver().running(), 0);
+    assert_eq!(h.resolve_results().len(), 1);
+    assert!(connects(&h.ops()).is_empty());
+}
+
+#[test]
+fn resolve_cancelled_never_delivers() {
+    let mut h = setup();
+    let op = h.act(|cx| cx.resolve(domain("gone.example"), 10 * SEC));
+    h.it();
+    h.ops();
+    h.act(|cx| cx.cancel_resolve(op));
+    h.it();
+    assert_eq!(h.c.earliest_deadline(), None, "deadline cancelled");
+    // The abandoned resolution frees its slot when it returns; nothing is delivered.
+    assert_eq!(h.c.resolver().running(), 1);
+    h.io().resolve(op, Ok(vec![addr(443)]));
+    h.it();
+    assert_eq!(h.c.resolver().running(), 0);
+    assert!(h.resolve_results().is_empty());
+    assert!(connects(&h.ops()).is_empty());
+}
+
+#[test]
+fn queued_resolve_shares_the_dial_resolver_slots() {
+    let mut h = setup();
+    let ops: Vec<DialOpId> = (0..RESOLVER_SLOTS)
+        .map(|i| h.dial(domain(&format!("h{i}.example")), 60 * SEC))
+        .collect();
+    let r = h.act(|cx| cx.resolve(domain("late.example"), 60 * SEC));
+    h.it();
+    assert_eq!(h.c.resolver().waiting(), 1);
+    h.ops();
+    h.io().resolve(ops[0], Err(ErrorKind::NotFound.into()));
+    h.it();
+    assert_eq!(resolves(&h.ops()), vec![r]);
+    h.act(|cx| cx.cancel_resolve(r));
+    h.io().resolve(r, Ok(vec![addr(1)]));
+    h.it();
+    assert!(h.resolve_results().is_empty());
+}
+
 // --- Listeners ---
 
 #[test]
@@ -630,6 +755,39 @@ fn emfile_pauses_listener_and_retries_after_100ms() {
 }
 
 // --- Step 6/7: UDP send ---
+
+#[test]
+fn app_udp_socket_echoes_through_the_loop() {
+    // SP2 spec §4.1: step 2 hands the datagram to the app; step 6 sends its record.
+    let mut h = setup();
+    h.app.on(|r, cx| {
+        if let Recorded::UdpRx { sock, peer, data } = r {
+            cx.udp_send(*sock, *peer, data).unwrap();
+        }
+    });
+    h.act(|cx| cx.open_app_udp_socket(IpAddr::from([127, 0, 0, 1])));
+    h.it(); // step 8 opens
+    h.it(); // step 3 delivers
+    let id = h
+        .app
+        .records()
+        .into_iter()
+        .find_map(|r| match r {
+            Recorded::UdpSocket(_, Ok((id, _))) => Some(id),
+            _ => None,
+        })
+        .expect("opened");
+    let u = h.c.udp_sock(id).expect("mapped");
+    h.io().inject_udp(u, addr(9), b"ping");
+    h.it();
+    assert_eq!(h.io().take_sent_udp(u), [(addr(9), b"ping".to_vec())]);
+    assert_eq!(h.c.shard().pending_transmit().count(), 0);
+    assert!(
+        !h.tlog()
+            .iter()
+            .any(|c| matches!(c, Call::RecvDatagram { .. }))
+    );
+}
 
 #[test]
 fn udp_error_drops_and_commits() {

@@ -13,7 +13,9 @@ fn drive(data: &[u8], chunk: impl Fn(usize) -> usize) {
         match p.feed(&buf) {
             Progress::Need if pos == data.len() => return,
             Progress::Need => {}
-            Progress::Done { consumed, .. } => return assert!(consumed <= buf.len()),
+            Progress::Done { consumed, .. } | Progress::Associate { consumed } => {
+                return assert!(consumed <= buf.len());
+            }
             Progress::Reply {
                 consumed,
                 bytes,

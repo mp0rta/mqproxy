@@ -5,12 +5,12 @@
 use mq_proxy::config::ServerConfig;
 use mq_proxy::server::Server;
 use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
-use mq_runtime::{DialError, DialOpId, IoRequest, Shard, Target, TcpId};
+use mq_runtime::{DialError, DialOpId, IoRequest, Shard, SocketOpId, Target, TcpId, UdpSocketId};
 use mq_transport_api::{
     CloseReason, ConnId, ErrType, Event, StreamId, StreamInfo, StreamKind, Time,
 };
-use mq_wire::frames::{AuthReq, ConnectTcpResp};
-use std::net::{Ipv4Addr, SocketAddr};
+use mq_wire::frames::{AddrType, AuthReq, ConnectTcpResp, UdpSessionOpen, UdpSessionResp};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 /// Stream type 0x01 then C `mq_encode_connect_tcp_req` for example.com:443.
@@ -19,8 +19,14 @@ pub const CONNECT_REQ_C: &[u8] = &[
     0xBB, 0x00,
 ];
 
-/// C `mq_encode_auth_resp` for OK / ERROR+AUTH_FAILED, server_id "mqproxy-server", features 0.
+/// C `mq_encode_auth_resp` for OK / ERROR+AUTH_FAILED, server_id "mqproxy-server".
+/// `AUTH_OK_C` carries MQ_FEAT_UDP_RELAY (the default config); `AUTH_OK_NO_UDP_C`
+/// is the `udp_enabled = false` form (features 0).
 pub const AUTH_OK_C: &[u8] = &[
+    0x00, 0x00, 14, b'm', b'q', b'p', b'r', b'o', b'x', b'y', b'-', b's', b'e', b'r', b'v', b'e',
+    b'r', 0x01, 0x00,
+];
+pub const AUTH_OK_NO_UDP_C: &[u8] = &[
     0x00, 0x00, 14, b'm', b'q', b'p', b'r', b'o', b'x', b'y', b'-', b's', b'e', b'r', b'v', b'e',
     b'r', 0x00, 0x00,
 ];
@@ -61,6 +67,37 @@ pub fn connect_resp(status: u8, code: u64) -> Vec<u8> {
     b[..n].to_vec()
 }
 
+/// Stream type 0x02 then `UDP_SESSION_OPEN`.
+pub fn udp_open(sid: u32, atype: AddrType, host: &[u8], port: u16, idle_ms: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 512];
+    b[0] = 0x02;
+    let n = UdpSessionOpen {
+        session_id: sid,
+        flags: 0,
+        address_type: atype,
+        host,
+        port,
+        idle_timeout_ms: idle_ms,
+    }
+    .encode(&mut b[1..])
+    .unwrap();
+    b.truncate(1 + n);
+    b
+}
+
+pub fn udp_resp(status: u8, code: u64, idle_ms: u64) -> Vec<u8> {
+    let mut b = [0u8; 512];
+    let n = UdpSessionResp {
+        status,
+        error_code: code,
+        message: b"",
+        idle_timeout_ms: idle_ms,
+    }
+    .encode(&mut b)
+    .unwrap();
+    b[..n].to_vec()
+}
+
 pub fn origin() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 80))
 }
@@ -77,11 +114,18 @@ pub struct H {
     pub t: ScriptedHandle,
     pub now: Time,
     next_quic: u64,
+    /// The AUTH_RESPONSE this config answers a good AUTH_REQUEST with.
+    auth_ok: &'static [u8],
 }
 
 impl H {
     /// A server started at t = 1 s.
     pub fn new(cfg: ServerConfig) -> H {
+        let auth_ok = if cfg.udp_enabled {
+            AUTH_OK_C
+        } else {
+            AUTH_OK_NO_UDP_C
+        };
         let (transport, t) = ScriptedTransport::new();
         let mut sh = Shard::new(
             transport,
@@ -96,6 +140,7 @@ impl H {
             t,
             now,
             next_quic: 4,
+            auth_ok,
         }
     }
 
@@ -191,7 +236,7 @@ impl H {
     pub fn authed(&mut self) -> (ConnId, StreamId) {
         let c = self.conn();
         let s = self.ctrl(c, &auth_req(b"secret"), false);
-        assert_eq!(self.t.sent_bytes(s), AUTH_OK_C, "authenticated");
+        assert_eq!(self.t.sent_bytes(s), self.auth_ok, "authenticated");
         (c, s)
     }
     /// Queue `bytes` on `s` and signal readability.
@@ -233,6 +278,47 @@ impl H {
     pub fn dial_err(&mut self, op: DialOpId, e: DialError) {
         assert!(self.sh.on_dial_result(self.now, op, Err(e)).is_none());
         self.drive();
+    }
+    /// The single resolve requested since the last `reqs`.
+    pub fn resolve(&mut self) -> Option<(DialOpId, Target, Duration)> {
+        let mut r: Vec<_> = self
+            .reqs()
+            .into_iter()
+            .filter_map(|r| match r {
+                IoRequest::Resolve {
+                    op,
+                    target,
+                    deadline,
+                } => Some((op, target, deadline)),
+                _ => None,
+            })
+            .collect();
+        assert!(r.len() <= 1, "{r:?}");
+        r.pop()
+    }
+    pub fn resolve_ok(&mut self, op: DialOpId, addr: SocketAddr) {
+        self.sh.on_resolve_result(self.now, op, Ok(addr));
+        self.drive();
+    }
+    /// The single UDP socket open requested since the last `reqs`.
+    pub fn socket_open(&mut self) -> Option<(SocketOpId, IpAddr)> {
+        let mut o: Vec<_> = self
+            .reqs()
+            .into_iter()
+            .filter_map(|r| match r {
+                IoRequest::OpenUdpSocket { op, local_ip } => Some((op, local_ip)),
+                _ => None,
+            })
+            .collect();
+        assert!(o.len() <= 1, "{o:?}");
+        o.pop()
+    }
+    /// Completes an app socket open on an ephemeral port of 0.0.0.0.
+    pub fn socket_ok(&mut self, op: SocketOpId) -> UdpSocketId {
+        let local = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 40000));
+        let sock = self.sh.on_udp_socket(self.now, op, Ok(local)).unwrap();
+        self.drive();
+        sock
     }
     /// Bytes queued toward the origin socket (a relay's preread lands here).
     pub fn tcp_out(&mut self, tcp: TcpId) -> Vec<u8> {

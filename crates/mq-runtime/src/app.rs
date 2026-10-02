@@ -3,8 +3,8 @@
 use crate::ids::{DialOpId, SocketOpId, TcpId, TimerId, UdpSocketId};
 use crate::shard::{Rng, ShardState};
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, Error, Event, PathError, PathId, StreamError,
-    StreamId, StreamInfo, Time, TransportOps,
+    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Error, Event, PathError, PathId,
+    StreamError, StreamId, StreamInfo, Time, TransportOps,
 };
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -29,6 +29,8 @@ pub enum ListenKind {
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct AcceptMeta {
     pub peer: SocketAddr,
+    /// The accepted socket's own address (`getsockname`); not unmapped (spec §4.3).
+    pub local: SocketAddr,
     pub original_dst: Option<SocketAddr>,
 }
 
@@ -77,6 +79,16 @@ pub enum IoRequest {
         deadline: Duration,
     },
     CancelDial {
+        op: DialOpId,
+    },
+    /// SP2 spec §4.2: resolve to the first address under one deadline, no connect.
+    /// Shares the dial op-id space; the shard completes `Host::Ip` targets itself.
+    Resolve {
+        op: DialOpId,
+        target: Target,
+        deadline: Duration,
+    },
+    CancelResolve {
         op: DialOpId,
     },
     /// Ephemeral port.
@@ -130,7 +142,8 @@ pub struct StreamPreread<'a> {
 pub struct PrereadTooLarge;
 
 /// spec §5.4: `tcp_write` failure — the bytes do not fit in the 64 KiB send
-/// buffer (or `tcp` is not a live app-owned socket).
+/// buffer (or `tcp` is not a live app-owned socket); SP2 spec §4.1: also
+/// `udp_send`'s.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct SendBufFull;
 
@@ -148,6 +161,14 @@ pub trait App {
     fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd);
     /// spec §5.4: a dial completed (never delivered once cancelled).
     fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>);
+    /// SP2 spec §4.2: a resolve-only request completed (never delivered once
+    /// cancelled). `Dns` and `Timeout` are its only failures.
+    fn on_resolve_result(
+        &mut self,
+        cx: &mut Cx<'_>,
+        op: DialOpId,
+        r: Result<SocketAddr, DialError>,
+    );
     /// spec §5.4: a UDP socket open completed (never delivered once cancelled).
     fn on_udp_socket(
         &mut self,
@@ -155,6 +176,9 @@ pub trait App {
         op: SocketOpId,
         r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
     );
+    /// SP2 spec §4.1: a datagram on an app-owned UDP socket, borrowed from the
+    /// driver's receive batch: handle or drop it here.
+    fn on_udp_rx(&mut self, cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]);
     /// spec §5.4: an app timer fired.
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId);
     /// spec §5.4: a shutdown signal arrived.
@@ -236,6 +260,20 @@ impl<'a> Cx<'a> {
         self.t.conn_stats(conn)
     }
 
+    /// spec §3.1: every error means the datagram was dropped.
+    pub fn datagram_send(&mut self, conn: ConnId, data: &[u8]) -> Result<(), DatagramError> {
+        let now = self.now;
+        self.tm().datagram_send(now, conn, data)
+    }
+    /// spec §3.1: 0 = unsupported/unknown. Callers cache it (spec §5 `MSS_REFRESH`).
+    pub fn datagram_mss(&self, conn: ConnId) -> usize {
+        self.t.datagram_mss(conn)
+    }
+    /// spec §3.1: `buf.len() >= 65535`; `None` = ring empty / stale.
+    pub fn datagram_recv(&mut self, conn: ConnId, buf: &mut [u8]) -> Option<usize> {
+        self.tm().datagram_recv(conn, buf)
+    }
+
     // --- Paths (spec §5.4) ---
 
     /// spec §5.4: the primary UDP socket's local address.
@@ -246,6 +284,12 @@ impl<'a> Cx<'a> {
     pub fn open_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
         self.st.open_udp_socket(local_ip)
     }
+    /// SP2 spec §4.1: an app-owned UDP socket on an ephemeral port, read through
+    /// `on_udp_rx` and written with `udp_send`; completes in `on_udp_socket`
+    /// (`Err(Other)` at the socket cap, which it counts toward).
+    pub fn open_app_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
+        self.st.open_app_udp_socket(local_ip)
+    }
     /// spec §5.4: the result, if any, is dropped and its socket closed.
     pub fn cancel_udp_socket(&mut self, op: SocketOpId) {
         self.st.cancel_udp_socket(op)
@@ -255,14 +299,26 @@ impl<'a> Cx<'a> {
     pub fn close_udp_socket(&mut self, sock: UdpSocketId) {
         self.st.close_udp_socket(sock)
     }
+    /// SP2 spec §4.1: queues one datagram to `dst` on an app socket's 256 KiB
+    /// ring. Empty `bytes` are discarded; `SendBufFull` when `sock` is not a
+    /// live app socket, `bytes` is over 65 535 or the ring is full.
+    pub fn udp_send(
+        &mut self,
+        sock: UdpSocketId,
+        dst: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), SendBufFull> {
+        self.st.udp_send(sock, dst, bytes)
+    }
     /// spec §5.4: creates the xquic path and maps it to `sock` in the same call.
+    /// SP2 spec §4.1: `Stale` for an app socket.
     pub fn add_path(
         &mut self,
         conn: ConnId,
         sock: UdpSocketId,
         standby: bool,
     ) -> Result<PathId, PathError> {
-        if !self.st.udp_live(sock) {
+        if !self.st.transport_udp_live(sock) {
             return Err(PathError::Stale); // no dangling mapping
         }
         let now = self.now;
@@ -332,6 +388,16 @@ impl<'a> Cx<'a> {
     /// spec §5.4: the result, if any, is dropped and its socket closed.
     pub fn cancel_dial(&mut self, op: DialOpId) {
         self.st.cancel_dial(op)
+    }
+    /// SP2 spec §4.2: resolves `target` to its first address without
+    /// connecting; completes in `on_resolve_result`. No socket is allocated,
+    /// so the cap does not apply.
+    pub fn resolve(&mut self, target: Target, deadline: Duration) -> DialOpId {
+        self.st.resolve(target, deadline)
+    }
+    /// SP2 spec §4.2: as `cancel_dial`: the result, if any, is dropped.
+    pub fn cancel_resolve(&mut self, op: DialOpId) {
+        self.st.cancel_resolve(op)
     }
 
     // --- Timers (spec §5.4) ---

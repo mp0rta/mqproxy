@@ -1,7 +1,7 @@
 //! spec §5.1, §8.1: `ScriptedTransport` scripts every `TransportOps` result.
 
 use mq_runtime::testing::{Call, ScriptedTransport};
-use mq_transport_api::{ConnConfig, Event, PathId, StreamError, Time, TransportOps};
+use mq_transport_api::{ConnConfig, DatagramError, Event, PathId, StreamError, Time, TransportOps};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -166,4 +166,99 @@ fn peek_and_done_consume_scripted_transmits() {
     keys.clear();
     t.pending_transmit(&mut keys);
     assert!(keys.is_empty());
+}
+
+#[test]
+fn scripted_datagram_roundtrip() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    for d in [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()] {
+        h.inject_datagram(c, d);
+    }
+    // level flag: three injects, one event
+    assert_eq!(t.poll_event(), Some(Event::DatagramReadable(c)));
+    assert_eq!(t.poll_event(), None);
+    let mut buf = [0u8; 64];
+    assert_eq!(t.datagram_recv(c, &mut buf), Some(3));
+    assert_eq!(&buf[..3], b"one");
+    assert_eq!(t.datagram_recv(c, &mut buf), Some(3));
+    assert_eq!(&buf[..3], b"two");
+    assert_eq!(t.datagram_recv(c, &mut buf), Some(5));
+    assert_eq!(&buf[..5], b"three");
+    assert_eq!(t.datagram_recv(c, &mut buf), None);
+    // the flag cleared at the pop: a later inject queues a new event
+    h.inject_datagram(c, b"four".to_vec());
+    assert_eq!(t.poll_event(), Some(Event::DatagramReadable(c)));
+    assert_eq!(t.datagram_recv(c, &mut buf), Some(4));
+    assert_eq!(&buf[..4], b"four");
+}
+
+#[test]
+fn scripted_datagram_short_buf_drops_and_returns_zero() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    h.inject_datagram(c, vec![7; 10]);
+    h.inject_datagram(c, vec![8; 2]);
+    let mut buf = [0u8; 4];
+    // the real facade's contract (spec §3.1): too small to hold it -> drop, count, Some(0)
+    assert_eq!(t.datagram_recv(c, &mut buf), Some(0));
+    assert_eq!(h.datagram_rx_dropped(c), 1);
+    assert_eq!(t.datagram_recv(c, &mut buf), Some(2));
+    assert_eq!(&buf[..2], &[8, 8]);
+}
+
+#[test]
+fn scripted_datagram_send_scripted_error() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    h.expect_datagram_send(c, Err(DatagramError::Blocked));
+    assert_eq!(t.datagram_send(T, c, b"lost"), Err(DatagramError::Blocked));
+    assert!(h.datagram_sends(c).is_empty());
+    // queue drained: back to accepting
+    assert_eq!(t.datagram_send(T, c, b"kept"), Ok(()));
+    assert_eq!(h.datagram_sends(c), vec![b"kept".to_vec()]);
+    // the call log holds everything offered, like `StreamSend`
+    assert_eq!(
+        h.log(),
+        vec![
+            Call::DatagramSend {
+                conn: c,
+                bytes: b"lost".to_vec()
+            },
+            Call::DatagramSend {
+                conn: c,
+                bytes: b"kept".to_vec()
+            },
+        ]
+    );
+}
+
+#[test]
+fn scripted_datagram_ring_cap_drops_and_counts() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    h.set_datagram_ring_cap(c, 100);
+    h.inject_datagram(c, vec![1; 64]);
+    h.inject_datagram(c, vec![2; 64]);
+    assert_eq!(h.datagram_rx_dropped(c), 1);
+    let mut buf = [0u8; 128];
+    assert_eq!(t.datagram_recv(c, &mut buf), Some(64));
+    assert_eq!(buf[0], 1);
+    assert_eq!(t.datagram_recv(c, &mut buf), None);
+    // draining frees the room
+    h.inject_datagram(c, vec![3; 64]);
+    assert_eq!(h.datagram_rx_dropped(c), 1);
+    assert_eq!(t.datagram_recv(c, &mut buf), Some(64));
+}
+
+#[test]
+fn scripted_datagram_mss_calls_counted() {
+    let (t, h) = ScriptedTransport::new();
+    let (c, other) = (h.new_conn_id(), h.new_conn_id());
+    assert_eq!(t.datagram_mss(c), 1200);
+    h.set_datagram_mss(c, 900);
+    assert_eq!(t.datagram_mss(c), 900);
+    assert_eq!(t.datagram_mss(other), 1200);
+    assert_eq!(h.datagram_mss_calls(c), 2);
+    assert_eq!(h.datagram_mss_calls(other), 1);
 }

@@ -2,8 +2,9 @@
 //! be scripted (spec §5.1, §8.1).
 
 use mq_transport_api::{
-    CloseReason, ConnConfig, ConnId, ConnStats, ConnectError, ErrType, Error, Event, PathError,
-    PathId, SlotId, StreamError, StreamId, StreamInfo, Time, Transmit, TransportOps, TxKey,
+    CloseReason, ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, ErrType, Error, Event,
+    PathError, PathId, SlotId, StreamError, StreamId, StreamInfo, Time, Transmit, TransportOps,
+    TxKey,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -12,7 +13,7 @@ use std::time::Duration;
 
 /// One recorded `TransportOps` call, in call order (spec §8.1 "call log").
 /// Pure queries (`pending_transmit`, `resume_pending`, `poll_event`,
-/// `next_timeout`, `conn_stats`, `stream_info`) are not logged.
+/// `next_timeout`, `conn_stats`, `stream_info`, `datagram_mss`) are not logged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Call {
     RecvDatagram {
@@ -45,6 +46,11 @@ pub enum Call {
         standby: bool,
     },
     CloseConn(ConnId),
+    /// `bytes` is what was offered, whether or not the call succeeded.
+    DatagramSend {
+        conn: ConnId,
+        bytes: Vec<u8>,
+    },
 }
 
 type RecvChunk = Result<(Vec<u8>, bool), StreamError>;
@@ -53,6 +59,31 @@ type OpenRule = Box<dyn Fn(&ScriptedHandle, ConnId) -> Result<StreamId, Error> +
 type DriveRule = Box<dyn Fn(&ScriptedHandle, Time) + Send>;
 type SendRule =
     Box<dyn Fn(&ScriptedHandle, StreamId, &[u8], bool) -> Result<usize, StreamError> + Send>;
+
+/// Default inbound datagram ring size, like the real facade's (spec §3.2).
+const DGRAM_RING_CAP: usize = 16 << 20;
+
+/// One connection's inbound datagrams; `cap` bounds the stored payload bytes.
+struct DgramRx {
+    q: VecDeque<Vec<u8>>,
+    bytes: usize,
+    cap: usize,
+    dropped: u64,
+    /// A `DatagramReadable` is queued and not yet popped (spec §3.1).
+    readable_queued: bool,
+}
+
+impl Default for DgramRx {
+    fn default() -> Self {
+        DgramRx {
+            q: VecDeque::new(),
+            bytes: 0,
+            cap: DGRAM_RING_CAP,
+            dropped: 0,
+            readable_queued: false,
+        }
+    }
+}
 
 #[derive(Default)]
 struct ScriptState {
@@ -69,6 +100,9 @@ struct ScriptState {
     resume_pending: bool,
     next_timeout: Option<Time>,
     polling: bool,
+    /// `close_conn` queues no `ConnClosed`; the test pushes it (xquic raises it
+    /// after the closing period, so events still reach a closing connection).
+    hold_close: bool,
     /// Events queued by the transport itself (e.g. `close_conn`).
     events: VecDeque<Event>,
     /// Injection queue, drained after `events`.
@@ -79,6 +113,11 @@ struct ScriptState {
     on_drive: Option<DriveRule>,
     log: Vec<Call>,
     sent: HashMap<StreamId, Vec<u8>>,
+    dgram_send: HashMap<ConnId, VecDeque<Result<(), DatagramError>>>,
+    dgram_sent: HashMap<ConnId, Vec<Vec<u8>>>,
+    dgram_rx: HashMap<ConnId, DgramRx>,
+    dgram_mss: HashMap<ConnId, usize>,
+    dgram_mss_calls: HashMap<ConnId, usize>,
 }
 
 impl ScriptState {
@@ -96,7 +135,9 @@ pub struct ScriptedHandle(Arc<Mutex<ScriptState>>);
 /// Scripted `TransportOps` (spec §5.1). Unscripted defaults: `connect` /
 /// `open_stream` return fresh ids, `stream_send` accepts everything,
 /// `stream_recv` is `Blocked`, `add_path` returns sequential ids, `drive` only
-/// records `now`, `next_timeout` is `None`, `close_conn` queues `ConnClosed`.
+/// records `now`, `next_timeout` is `None`, `close_conn` queues `ConnClosed`
+/// (unless held), `datagram_send` accepts everything, `datagram_mss` is 1200,
+/// `datagram_recv` is `None`.
 pub struct ScriptedTransport {
     h: ScriptedHandle,
     last_now: Time,
@@ -147,6 +188,46 @@ impl ScriptedHandle {
     pub fn set_stream_info(&self, s: StreamId, info: StreamInfo) {
         self.st().stream_info.insert(s, info);
     }
+    /// Queued results for `datagram_send` on `c`; a failed send records no bytes.
+    pub fn expect_datagram_send(&self, c: ConnId, r: Result<(), DatagramError>) {
+        self.st().dgram_send.entry(c).or_default().push_back(r);
+    }
+    /// Default 1200.
+    pub fn set_datagram_mss(&self, c: ConnId, mss: usize) {
+        self.st().dgram_mss.insert(c, mss);
+    }
+    /// Bounds the stored payload bytes of `c`'s inbound ring (default 16 MiB); an
+    /// `inject_datagram` beyond it is dropped and counted.
+    pub fn set_datagram_ring_cap(&self, c: ConnId, bytes: usize) {
+        self.st().dgram_rx.entry(c).or_default().cap = bytes;
+    }
+    /// Queues one inbound datagram for `c`; `DatagramReadable` is pushed once,
+    /// coalesced until it is popped (spec §3.1).
+    pub fn inject_datagram(&self, c: ConnId, data: Vec<u8>) {
+        let mut st = self.st();
+        let rx = st.dgram_rx.entry(c).or_default();
+        if rx.bytes + data.len() > rx.cap {
+            rx.dropped += 1;
+            return;
+        }
+        rx.bytes += data.len();
+        rx.q.push_back(data);
+        if !std::mem::replace(&mut rx.readable_queued, true) {
+            st.injected.push_back(Event::DatagramReadable(c));
+        }
+    }
+    /// Datagrams dropped on `c`'s inbound side (ring full, or a `datagram_recv` buffer too small).
+    pub fn datagram_rx_dropped(&self, c: ConnId) -> u64 {
+        self.st().dgram_rx.get(&c).map_or(0, |rx| rx.dropped)
+    }
+    /// Datagrams accepted by `datagram_send` on `c`, in order.
+    pub fn datagram_sends(&self, c: ConnId) -> Vec<Vec<u8>> {
+        self.st().dgram_sent.get(&c).cloned().unwrap_or_default()
+    }
+    /// How often `datagram_mss(c)` was queried.
+    pub fn datagram_mss_calls(&self, c: ConnId) -> usize {
+        self.st().dgram_mss_calls.get(&c).copied().unwrap_or(0)
+    }
     pub fn set_conn_stats(&self, c: ConnId, st: ConnStats) {
         self.st().conn_stats.insert(c, st);
     }
@@ -159,6 +240,10 @@ impl ScriptedHandle {
     }
     pub fn set_next_timeout(&self, t: Option<Time>) {
         self.st().next_timeout = t;
+    }
+    /// See `ScriptState::hold_close`.
+    pub fn hold_conn_closed(&self, on: bool) {
+        self.st().hold_close = on;
     }
     /// Injection queue; safe to call from any thread or from a reactive rule.
     pub fn push_event(&self, e: Event) {
@@ -291,7 +376,13 @@ impl TransportOps for ScriptedTransport {
 
     fn poll_event(&mut self) -> Option<Event> {
         let mut st = self.st();
-        st.events.pop_front().or_else(|| st.injected.pop_front())
+        let e = st.events.pop_front().or_else(|| st.injected.pop_front())?;
+        if let Event::DatagramReadable(c) = e {
+            if let Some(rx) = st.dgram_rx.get_mut(&c) {
+                rx.readable_queued = false;
+            }
+        }
+        Some(e)
     }
 
     fn next_timeout(&self) -> Option<Time> {
@@ -417,6 +508,9 @@ impl TransportOps for ScriptedTransport {
         self.last_now = now;
         let mut st = self.st();
         st.log.push(Call::CloseConn(conn));
+        if st.hold_close {
+            return;
+        }
         st.events.push_back(Event::ConnClosed(
             conn,
             CloseReason {
@@ -432,5 +526,43 @@ impl TransportOps for ScriptedTransport {
 
     fn stream_info(&self, s: StreamId) -> Result<StreamInfo, Error> {
         self.st().stream_info.get(&s).copied().ok_or(Error::Stale)
+    }
+
+    fn datagram_send(&mut self, now: Time, conn: ConnId, data: &[u8]) -> Result<(), DatagramError> {
+        self.last_now = now;
+        let mut st = self.st();
+        st.log.push(Call::DatagramSend {
+            conn,
+            bytes: data.to_vec(),
+        });
+        let r = st
+            .dgram_send
+            .get_mut(&conn)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or(Ok(()));
+        if r.is_ok() {
+            st.dgram_sent.entry(conn).or_default().push(data.to_vec());
+        }
+        r
+    }
+
+    fn datagram_mss(&self, conn: ConnId) -> usize {
+        let mut st = self.st();
+        *st.dgram_mss_calls.entry(conn).or_default() += 1;
+        st.dgram_mss.get(&conn).copied().unwrap_or(1200)
+    }
+
+    fn datagram_recv(&mut self, conn: ConnId, buf: &mut [u8]) -> Option<usize> {
+        let mut st = self.st();
+        let rx = st.dgram_rx.get_mut(&conn)?;
+        let d = rx.q.pop_front()?;
+        rx.bytes -= d.len();
+        if d.len() > buf.len() {
+            // the real facade's clause (spec §3.1): drop, count, keep the caller's drain going
+            rx.dropped += 1;
+            return Some(0);
+        }
+        buf[..d.len()].copy_from_slice(&d);
+        Some(d.len())
     }
 }

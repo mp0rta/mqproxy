@@ -1,6 +1,7 @@
 //! Generational slot tables (spec §4.8): ids handed across the FFI boundary are
 //! `(index, generation)`; a stale id never resolves to a reused slot.
 
+use mq_transport_api::ringbuf::RingBuf;
 use mq_transport_api::{SlotId, StreamKind, Time};
 use xquic_sys::{xqc_cid_t, xqc_connection_t, xqc_stream_t};
 
@@ -92,6 +93,11 @@ pub(crate) struct ConnSlot {
     /// `ErrType::Unknown` even if the peer echoes a close back (spec §4.2).
     pub closed_locally: bool,
     pub mp_ready_queued: bool,
+    /// Received datagrams, `u16 len (LE) || bytes` each; allocated on the first (SP2 spec §3.2).
+    pub dgram_rx: Option<RingBuf>,
+    pub dgram_readable_queued: bool,
+    /// Datagrams dropped: ring full, or a `datagram_recv` buffer too short (SP2 spec §3.1).
+    pub dgram_rx_dropped: u64,
 }
 
 impl ConnSlot {
@@ -107,6 +113,9 @@ impl ConnSlot {
             pending_close: None,
             closed_locally: false,
             mp_ready_queued: false,
+            dgram_rx: None,
+            dgram_readable_queued: false,
+            dgram_rx_dropped: 0,
         }
     }
 }

@@ -6,12 +6,12 @@ mod server_harness;
 use mq_proxy::config::ServerConfig;
 use mq_runtime::testing::log_capture;
 use mq_transport_api::{Event, StreamError, StreamKind};
-use mq_wire::frames::AuthResp;
+use mq_wire::frames::{AuthResp, FEAT_UDP_RELAY};
 use server_harness::*;
 use std::time::Duration;
 
 #[test]
-fn auth_ok_sends_server_id_and_no_features() {
+fn auth_ok_advertises_udp_relay() {
     let mut h = H::new(cfg());
     let c = h.conn();
     let ctrl = h.ctrl(c, &auth_req(b"secret"), false);
@@ -21,13 +21,31 @@ fn auth_ok_sends_server_id_and_no_features() {
     assert!(r.is_ok());
     assert_eq!(r.error_code, 0);
     assert_eq!(r.server_id, b"mqproxy-server");
-    assert_eq!(r.features, 0, "no MQ_FEAT_UDP_RELAY in SP1");
+    assert_eq!(
+        r.features, FEAT_UDP_RELAY,
+        "spec §7.3: advertised by default"
+    );
     assert_eq!(h.send_fins(ctrl), [false], "control stream stays open");
     assert_eq!(h.sh.app().auth_attempts(), 1);
     // Authenticated: no close, not even after the auth deadline.
     h.advance(Duration::from_secs(20));
     assert_eq!(h.close_conn_count(c), 0);
     assert!(!h.reset(ctrl));
+}
+
+#[test]
+fn no_udp_clears_feature_bit() {
+    let mut h = H::new(ServerConfig {
+        udp_enabled: false,
+        ..cfg()
+    });
+    let c = h.conn();
+    let ctrl = h.ctrl(c, &auth_req(b"secret"), false);
+    let sent = h.t.sent_bytes(ctrl);
+    assert_eq!(sent, AUTH_OK_NO_UDP_C, "C bytes");
+    let (r, _) = AuthResp::decode(&sent).unwrap();
+    assert!(r.is_ok());
+    assert_eq!(r.features, 0, "spec §7.3: --no-udp is not advertised");
 }
 
 #[test]

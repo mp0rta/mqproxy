@@ -1,7 +1,8 @@
 //! Coalescing event queue (spec §4.2 "Event coalescing").
 //!
-//! `StreamReadable`/`StreamWritable`/`MpReady` are level flags: at most one is queued per
-//! object (tracked by the `*_queued` flag on the slot); lifecycle events never coalesce.
+//! `StreamReadable`/`StreamWritable`/`MpReady`/`DatagramReadable` are level flags: at most one
+//! is queued per object (tracked by the `*_queued` flag on the slot); lifecycle events never
+//! coalesce.
 //! Ids are invalidated inside notifications (spec §4.8), so a queued event may outlive its
 //! slot; `pop` returns it as-is and the consumer drops stale ones.
 
@@ -45,6 +46,16 @@ impl Events {
         }
     }
 
+    /// SP2 spec §3.1: as `push_mp_ready`, with the datagram-readable flag.
+    pub fn push_datagram_readable(&mut self, conns: &mut Slots<ConnSlot>, id: ConnId) {
+        if let Some(c) = conns.get_mut(id.slot()) {
+            if !c.dgram_readable_queued {
+                c.dgram_readable_queued = true;
+                self.queue.push_back(Event::DatagramReadable(id));
+            }
+        }
+    }
+
     /// Lifecycle events: unconditional, never coalesced.
     pub fn push(&mut self, e: Event) {
         self.queue.push_back(e);
@@ -72,6 +83,11 @@ impl Events {
             Event::MpReady(id) => {
                 if let Some(c) = conns.get_mut(id.slot()) {
                     c.mp_ready_queued = false;
+                }
+            }
+            Event::DatagramReadable(id) => {
+                if let Some(c) = conns.get_mut(id.slot()) {
+                    c.dgram_readable_queued = false;
                 }
             }
             _ => {}
@@ -109,18 +125,8 @@ mod tests {
     }
 
     fn conn() -> ConnSlot {
-        ConnSlot {
-            xqc: std::ptr::null_mut(),
-            cid: unsafe { std::mem::zeroed() }, // POD C struct
-            counted: false,
-            server: false,
-            provisional: false,
-            provisional_deadline: None,
-            streams: 0,
-            pending_close: None,
-            closed_locally: false,
-            mp_ready_queued: false,
-        }
+        // SAFETY: the cid is a POD C struct; all-zero is valid.
+        ConnSlot::new(false, std::ptr::null_mut(), unsafe { std::mem::zeroed() })
     }
 
     fn sid(streams: &mut Slots<StreamSlot>, abandoned: bool) -> StreamId {
@@ -161,6 +167,18 @@ mod tests {
         assert_eq!(ev.len(), 1);
         assert_eq!(ev.pop(&mut st, &mut cs), Some(Event::MpReady(id)));
         ev.push_mp_ready(&mut cs, id);
+        assert_eq!(ev.len(), 1);
+    }
+
+    #[test]
+    fn datagram_readable_coalesced() {
+        let (mut st, mut cs, mut ev) = (Slots::default(), Slots::default(), Events::default());
+        let id = ConnId::from_slot(cs.insert(conn())).unwrap();
+        ev.push_datagram_readable(&mut cs, id);
+        ev.push_datagram_readable(&mut cs, id);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev.pop(&mut st, &mut cs), Some(Event::DatagramReadable(id)));
+        ev.push_datagram_readable(&mut cs, id);
         assert_eq!(ev.len(), 1);
     }
 

@@ -161,10 +161,12 @@ fn run_server(r: &Resolved, s: &ServerArgs) -> Result<i32, String> {
     ready(
         r,
         format!(
-            "mqproxy server listening on {} (cc={}, sched={}, gateway=off, udp=off)",
+            "mqproxy server listening on {} (cc={}, sched={}, gateway=off, udp={}, udp-idle={}s)",
             s.listen,
             cc_name(r.cc),
-            sched_name(r.scheduler)
+            sched_name(r.scheduler),
+            if s.config.udp_enabled { "on" } else { "off" },
+            s.config.udp_idle_timeout.as_secs()
         ),
     );
     Ok(finish(d, shard))

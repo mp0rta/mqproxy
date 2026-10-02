@@ -7,22 +7,25 @@
 
 mod inputs;
 pub(crate) mod relay;
-pub(crate) mod ringbuf;
+pub(crate) use mq_transport_api::ringbuf;
 mod rng;
 mod routing;
 mod tcp;
 mod timers;
+mod tx_ring;
 
 pub use relay::{PumpOutcome, RELAY_BUF, Relay, RelayEnd, RelayState};
 pub use rng::Rng;
 
-use crate::app::{App, Cx, DialError, Interest, IoRequest, ListenerTag, Target};
+use crate::app::{App, Cx, DialError, Host, Interest, IoRequest, ListenerTag, Target};
 use crate::ids::{DialOpId, ListenerId, SocketOpId, TcpId, TimerId, UdpSocketId};
 use mq_transport_api::{ConnId, PathId, SlotId, StreamId, Time, TransportOps, TxKey};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tcp::TcpEntry;
+use tx_ring::TxRing;
 
 /// spec §5.4: the app-owned send buffer and the relay buffers are 64 KiB.
 pub const TCP_BUF: usize = 64 * 1024;
@@ -32,6 +35,22 @@ pub const SOCKET_CAP: usize = 4096;
 
 /// spec §5.2 `drive` step 4: bytes per relay per direction per `drive`.
 pub const RELAY_BUDGET: usize = 256 * 1024;
+
+/// SP2 spec §4.1: a live UDP socket.
+#[derive(Debug)]
+struct UdpEntry {
+    local: SocketAddr,
+    owner: UdpOwner,
+}
+
+/// SP2 spec §4.1: who reads and writes a UDP socket.
+#[derive(Debug)]
+enum UdpOwner {
+    /// The primary socket and `Cx::open_udp_socket`'s: QUIC.
+    Transport,
+    /// `Cx::open_app_udp_socket`'s: `App::on_udp_rx` and `Cx::udp_send`.
+    App(TxRing),
+}
 
 /// spec §5.2/§5.4: the shard state `Cx` reads and records onto.
 #[derive(Debug)]
@@ -55,9 +74,19 @@ pub struct ShardState {
     dials: HashSet<DialOpId>,
     /// spec §5.2: dials refused at the cap, delivered as `DialError::Limit` in `drive` step 3.
     limited: Vec<DialOpId>,
+    /// SP2 spec §4.2: resolves handed to the driver and not yet completed or cancelled.
+    resolves: HashSet<DialOpId>,
+    /// SP2 spec §4.2: `Host::Ip` resolves, delivered as `Ok` in `drive` step 3.
+    resolved: VecDeque<(DialOpId, SocketAddr)>,
     socket_ops: HashSet<SocketOpId>,
-    /// Live UDP sockets (the primary included) and their local addresses.
-    udp: HashMap<UdpSocketId, SocketAddr>,
+    /// SP2 spec §4.1: the `socket_ops` that open an app-owned socket; each
+    /// reserves a cap slot.
+    app_udp_ops: HashSet<SocketOpId>,
+    /// SP2 spec §4.1: app socket opens refused at the cap, delivered as
+    /// `Err(Other)` in `drive` step 3.
+    limited_udp: Vec<SocketOpId>,
+    /// Live UDP sockets (the primary included).
+    udp: HashMap<UdpSocketId, UdpEntry>,
     paths: HashMap<(ConnId, PathId), UdpSocketId>,
     /// spec §5.2 "UDP socket selection": the queue each socket served last.
     tx_cursor: HashMap<UdpSocketId, TxKey>,
@@ -84,8 +113,18 @@ impl ShardState {
             dead_streams: HashMap::new(),
             dials: HashSet::new(),
             limited: Vec::new(),
+            resolves: HashSet::new(),
+            resolved: VecDeque::new(),
             socket_ops: HashSet::new(),
-            udp: HashMap::from([(primary_udp, primary_local)]),
+            app_udp_ops: HashSet::new(),
+            limited_udp: Vec::new(),
+            udp: HashMap::from([(
+                primary_udp,
+                UdpEntry {
+                    local: primary_local,
+                    owner: UdpOwner::Transport,
+                },
+            )]),
             paths: HashMap::new(),
             tx_cursor: HashMap::new(),
             app_accepting: true,
@@ -126,9 +165,16 @@ impl ShardState {
         self.app_accepting && !self.at_cap()
     }
 
-    /// spec §5.2 "Socket cap".
+    /// spec §5.2 "Socket cap"; SP2 spec §4.1: app UDP sockets and their
+    /// in-flight opens count too.
     fn at_cap(&self) -> bool {
-        self.tcp.len() + self.dials.len() >= SOCKET_CAP
+        // ponytail: O(UDP sockets) scan per check; a counter if app sockets get numerous.
+        let app_udp = self
+            .udp
+            .values()
+            .filter(|e| matches!(e.owner, UdpOwner::App(_)))
+            .count();
+        self.tcp.len() + self.dials.len() + self.app_udp_ops.len() + app_udp >= SOCKET_CAP
     }
 
     pub(crate) fn push_request(&mut self, r: IoRequest) {
@@ -162,15 +208,57 @@ impl ShardState {
             self.limited.retain(|o| *o != op);
         }
     }
+    /// SP2 spec §4.2: an IP target completes in the next `drive` without
+    /// reaching the driver; a domain goes to the driver's resolver.
+    pub(crate) fn resolve(&mut self, target: Target, deadline: Duration) -> DialOpId {
+        let op = self.alloc(DialOpId::from_slot);
+        match target.host {
+            Host::Ip(ip) => self
+                .resolved
+                .push_back((op, SocketAddr::new(ip, target.port))),
+            Host::Domain(_) => {
+                self.resolves.insert(op);
+                self.push_request(IoRequest::Resolve {
+                    op,
+                    target,
+                    deadline,
+                });
+            }
+        }
+        op
+    }
+    /// SP2 spec §4.2: its result, if any, is dropped.
+    pub(crate) fn cancel_resolve(&mut self, op: DialOpId) {
+        if self.resolves.remove(&op) {
+            self.push_request(IoRequest::CancelResolve { op });
+        } else {
+            self.resolved.retain(|(o, _)| *o != op);
+        }
+    }
     pub(crate) fn open_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
         let op = self.alloc(SocketOpId::from_slot);
         self.socket_ops.insert(op);
         self.push_request(IoRequest::OpenUdpSocket { op, local_ip });
         op
     }
+    /// SP2 spec §4.1: reserves a cap slot until it completes; at the cap it
+    /// completes with `Err(Other)` in the next `drive`, without reaching the driver.
+    pub(crate) fn open_app_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
+        if self.at_cap() {
+            let op = self.alloc(SocketOpId::from_slot);
+            self.limited_udp.push(op);
+            return op;
+        }
+        let op = self.open_udp_socket(local_ip);
+        self.app_udp_ops.insert(op);
+        op
+    }
     pub(crate) fn cancel_udp_socket(&mut self, op: SocketOpId) {
         if self.socket_ops.remove(&op) {
+            self.app_udp_ops.remove(&op);
             self.push_request(IoRequest::CancelUdpSocket { op });
+        } else {
+            self.limited_udp.retain(|o| *o != op);
         }
     }
     pub(crate) fn set_accepting(&mut self, on: bool) {
@@ -238,6 +326,19 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         self.dispatch_events(now);
         for op in std::mem::take(&mut self.st.limited) {
             self.call_app(now, |a, cx| a.on_dial_result(cx, op, Err(DialError::Limit)));
+        }
+        // One at a time, over the count queued now: a callback may cancel a
+        // later one (spec §4.2 "never delivers"), whose entry is then gone.
+        for _ in 0..self.st.resolved.len() {
+            let Some((op, addr)) = self.st.resolved.pop_front() else {
+                break;
+            };
+            self.call_app(now, |a, cx| a.on_resolve_result(cx, op, Ok(addr)));
+        }
+        for op in std::mem::take(&mut self.st.limited_udp) {
+            self.call_app(now, |a, cx| {
+                a.on_udp_socket(cx, op, Err(io::ErrorKind::Other))
+            });
         }
         // 4. Runnable relays.
         self.pump_relays(now);
@@ -327,6 +428,8 @@ impl<T: TransportOps, A: App> Shard<T, A> {
     pub fn has_runnable_work(&self) -> bool {
         self.st.touched
             || !self.st.limited.is_empty()
+            || !self.st.limited_udp.is_empty()
+            || !self.st.resolved.is_empty()
             || self.transport.resume_pending()
             || self
                 .st
@@ -374,5 +477,18 @@ impl<T: TransportOps, A: App> Shard<T, A> {
     #[cfg(feature = "test-support")]
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+    /// SP2 spec §4.1: `sock` is a live app-owned UDP socket.
+    #[cfg(feature = "test-support")]
+    pub fn udp_is_app(&self, sock: UdpSocketId) -> bool {
+        (self.st.udp.get(&sock)).is_some_and(|e| matches!(e.owner, UdpOwner::App(_)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn size_constant() {
+        assert_eq!(super::TCP_BUF, 65536);
     }
 }

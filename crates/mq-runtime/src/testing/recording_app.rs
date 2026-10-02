@@ -21,7 +21,13 @@ pub enum Recorded {
     TcpData(TcpId),
     TcpEnd(TcpId, TcpEnd),
     DialResult(DialOpId, Result<TcpId, DialError>),
+    ResolveResult(DialOpId, Result<SocketAddr, DialError>),
     UdpSocket(SocketOpId, Result<(UdpSocketId, SocketAddr), io::ErrorKind>),
+    UdpRx {
+        sock: UdpSocketId,
+        peer: SocketAddr,
+        data: Vec<u8>,
+    },
     Timer(TimerId),
     Shutdown,
 }
@@ -106,6 +112,14 @@ impl App for RecordingApp {
     fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>) {
         self.rec(cx, Recorded::DialResult(op, r))
     }
+    fn on_resolve_result(
+        &mut self,
+        cx: &mut Cx<'_>,
+        op: DialOpId,
+        r: Result<SocketAddr, DialError>,
+    ) {
+        self.rec(cx, Recorded::ResolveResult(op, r))
+    }
     fn on_udp_socket(
         &mut self,
         cx: &mut Cx<'_>,
@@ -113,6 +127,10 @@ impl App for RecordingApp {
         r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
     ) {
         self.rec(cx, Recorded::UdpSocket(op, r))
+    }
+    fn on_udp_rx(&mut self, cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {
+        let data = data.to_vec();
+        self.rec(cx, Recorded::UdpRx { sock, peer, data })
     }
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         self.rec(cx, Recorded::Timer(id))

@@ -62,12 +62,12 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - name: Replay the C corpora
         run: |
-          for pair in varint:varint auth_req:wire_auth_req auth_resp:wire_auth_resp connect_tcp_req:wire_connect_tcp_req connect_tcp_resp:wire_connect_tcp_resp; do
+          for pair in varint:varint auth_req:wire_auth_req auth_resp:wire_auth_resp connect_tcp_req:wire_connect_tcp_req connect_tcp_resp:wire_connect_tcp_resp udp_session_open:wire_udp_session_open udp_session_resp:wire_udp_session_resp udp_msg_hdr:udp_msg_hdr; do
             t=${pair%%:*}; c=${pair##*:}
             mkdir -p crates/mq-wire/fuzz/corpus/$t
             cargo +nightly fuzz run --fuzz-dir crates/mq-wire/fuzz $t crates/mq-wire/fuzz/corpus/$t fuzz/corpus/$c -- -runs=0
           done
-          for pair in socks5:socks5_feed http_connect:http_connect; do
+          for pair in socks5:socks5_feed http_connect:http_connect socks5_udp_hdr:socks5_udp_hdr; do
             t=${pair%%:*}; c=${pair##*:}
             mkdir -p crates/mq-proxy/fuzz/corpus/$t
             cargo +nightly fuzz run --fuzz-dir crates/mq-proxy/fuzz $t crates/mq-proxy/fuzz/corpus/$t fuzz/corpus/$c -- -runs=0
@@ -84,12 +84,12 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - name: Explore 30 s per target
         run: |
-          for pair in varint:varint auth_req:wire_auth_req auth_resp:wire_auth_resp connect_tcp_req:wire_connect_tcp_req connect_tcp_resp:wire_connect_tcp_resp; do
+          for pair in varint:varint auth_req:wire_auth_req auth_resp:wire_auth_resp connect_tcp_req:wire_connect_tcp_req connect_tcp_resp:wire_connect_tcp_resp udp_session_open:wire_udp_session_open udp_session_resp:wire_udp_session_resp udp_msg_hdr:udp_msg_hdr; do
             t=${pair%%:*}; c=${pair##*:}
             mkdir -p crates/mq-wire/fuzz/corpus/$t
             cargo +nightly fuzz run --fuzz-dir crates/mq-wire/fuzz $t crates/mq-wire/fuzz/corpus/$t fuzz/corpus/$c -- -max_total_time=30
           done
-          for pair in socks5:socks5_feed http_connect:http_connect; do
+          for pair in socks5:socks5_feed http_connect:http_connect socks5_udp_hdr:socks5_udp_hdr; do
             t=${pair%%:*}; c=${pair##*:}
             mkdir -p crates/mq-proxy/fuzz/corpus/$t
             cargo +nightly fuzz run --fuzz-dir crates/mq-proxy/fuzz $t crates/mq-proxy/fuzz/corpus/$t fuzz/corpus/$c -- -max_total_time=30

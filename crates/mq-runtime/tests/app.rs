@@ -5,8 +5,8 @@ use mq_runtime::{
     StreamPreread, Target, TcpEnd, TcpId, TimerId, UdpSocketId,
 };
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, Error, Event, PathError, PathId, SlotId,
-    StreamError, StreamId, StreamInfo, Time, Transmit, TransportOps, TxKey,
+    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Error, Event, PathError, PathId,
+    SlotId, StreamError, StreamId, StreamInfo, Time, Transmit, TransportOps, TxKey,
 };
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -65,6 +65,15 @@ impl TransportOps for Null {
     fn stream_info(&self, _: StreamId) -> Result<StreamInfo, Error> {
         Err(Error::Stale)
     }
+    fn datagram_send(&mut self, _: Time, _: ConnId, _: &[u8]) -> Result<(), DatagramError> {
+        Err(DatagramError::Stale)
+    }
+    fn datagram_mss(&self, _: ConnId) -> usize {
+        0
+    }
+    fn datagram_recv(&mut self, _: ConnId, _: &mut [u8]) -> Option<usize> {
+        None
+    }
 }
 
 /// Toy app implementing every §5.4 callback.
@@ -82,6 +91,8 @@ impl App for Toy {
     fn on_tcp_data(&mut self, _: &mut Cx<'_>, _: TcpId) {}
     fn on_tcp_end(&mut self, _: &mut Cx<'_>, _: TcpId, _: TcpEnd) {}
     fn on_dial_result(&mut self, _: &mut Cx<'_>, _: DialOpId, _: Result<TcpId, DialError>) {}
+    fn on_resolve_result(&mut self, _: &mut Cx<'_>, _: DialOpId, _: Result<SocketAddr, DialError>) {
+    }
     fn on_udp_socket(
         &mut self,
         _: &mut Cx<'_>,
@@ -89,6 +100,7 @@ impl App for Toy {
         _: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
     ) {
     }
+    fn on_udp_rx(&mut self, _: &mut Cx<'_>, _: UdpSocketId, _: SocketAddr, _: &[u8]) {}
     fn on_timer(&mut self, _: &mut Cx<'_>, _: TimerId) {}
     fn on_shutdown(&mut self, _: &mut Cx<'_>) {}
 }

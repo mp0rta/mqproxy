@@ -226,13 +226,36 @@ fn client_implemented_flags_resolve() {
 
 #[test]
 fn server_accepted_no_effect_flags() {
-    let r = parse(
-        SERVER,
-        &["--no-gateway", "--no-udp", "--udp-idle-timeout", "5"],
-    )
-    .unwrap();
+    let r = parse(SERVER, &["--no-gateway"]).unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     assert_eq!(r, parse(SERVER, &[]).unwrap());
+}
+
+/// spec §8: `--no-udp` and `--udp-idle-timeout` reach `ServerConfig` (C defaults: on, 60 s).
+#[test]
+fn server_udp_flags_change_config() {
+    let d = parse(SERVER, &[]).unwrap();
+    assert!(server(&d).config.udp_enabled);
+    assert_eq!(server(&d).config.udp_idle_timeout, Duration::from_secs(60));
+    let r = parse(SERVER, &["--no-udp", "--udp-idle-timeout", "5"]).unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(!server(&r).config.udp_enabled);
+    assert_eq!(server(&r).config.udp_idle_timeout, Duration::from_secs(5));
+    // Each alone, and getopt's last-value-wins.
+    let r = parse(SERVER, &["--no-udp"]).unwrap();
+    assert!(!server(&r).config.udp_enabled);
+    assert_eq!(server(&r).config.udp_idle_timeout, Duration::from_secs(60));
+    let r = parse(
+        SERVER,
+        &["--udp-idle-timeout", "9", "--udp-idle-timeout", "1"],
+    )
+    .unwrap();
+    assert!(server(&r).config.udp_enabled);
+    assert_eq!(server(&r).config.udp_idle_timeout, Duration::from_secs(1));
+    // Must be > 0 (also in the exit-2 table below).
+    let e = exit(parse(SERVER, &["--udp-idle-timeout", "0"]));
+    assert_eq!(e.code, 2);
+    assert!(e.message.contains("--udp-idle-timeout"), "{}", e.message);
 }
 
 #[test]
@@ -292,7 +315,7 @@ fn cache_max_bytes_warns() {
 }
 
 #[test]
-fn server_gateway_udp_off_startup_line() {
+fn server_gateway_off_startup_line() {
     let r = parse(SERVER, &[]).unwrap();
     assert_eq!(r.startup_lines.len(), 1);
     assert!(
@@ -300,7 +323,7 @@ fn server_gateway_udp_off_startup_line() {
         "{:?}",
         r.startup_lines
     );
-    assert!(r.startup_lines[0].contains("UDP"), "{:?}", r.startup_lines);
+    assert!(!r.startup_lines[0].contains("UDP"), "{:?}", r.startup_lines);
     assert!(parse(CLIENT, &[]).unwrap().startup_lines.is_empty());
 }
 
@@ -394,7 +417,15 @@ fn no_ingress_rejected() {
         "t",
     ]));
     assert_eq!(e.code, 2);
-    assert!(e.message.contains("ingress"), "{}", e.message);
+    // C text, naming --gateway too (tests/test_cli_help.sh greps for it).
+    assert!(
+        e.message.contains(
+            "at least one ingress is required (--socks5, --http-connect, --tproxy, or --gateway; \
+             --gateway is not available in this build)"
+        ),
+        "{}",
+        e.message
+    );
     // Other missing required flags / unknown subcommand.
     for argv in [
         &[
@@ -685,9 +716,8 @@ fn spawn(args: &[String]) -> Proc {
 #[test]
 fn gateway_udp_off_line_logged() {
     let mut p = spawn(&server_args(&format!("127.0.0.1:{}", free_udp()), &[]));
-    p.wait_line(
-        "[INFO] HTTP gateway and UDP relay are not available in this build; serving the TCP proxy only",
-    );
+    p.wait_line("[INFO] HTTP gateway is not available in this build");
+    p.wait_line("gateway=off, udp=on, udp-idle=60s)");
     assert_eq!(p.term(), 0, "{:#?}", p.lines);
 }
 
@@ -696,6 +726,7 @@ fn server_accepted_flags_start_and_exit_0_on_sigterm() {
     let extra = ["--no-gateway", "--no-udp", "--udp-idle-timeout", "30"];
     let mut p = spawn(&server_args(&format!("127.0.0.1:{}", free_udp()), &extra));
     p.wait_line("[INFO] mqproxy server listening on");
+    p.wait_line("gateway=off, udp=off, udp-idle=30s)");
     assert_eq!(p.term(), 0, "{:#?}", p.lines);
 }
 

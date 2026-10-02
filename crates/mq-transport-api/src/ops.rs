@@ -2,7 +2,7 @@
 //! Object-safe, so `Cx` can hold `&mut dyn TransportOps`.
 
 use crate::config::{ConnConfig, ConnStats};
-use crate::error::{ConnectError, Error, PathError, StreamError};
+use crate::error::{ConnectError, DatagramError, Error, PathError, StreamError};
 use crate::event::{Event, StreamInfo, Transmit};
 use crate::ids::{ConnId, PathId, StreamId, TxKey};
 use crate::time::Time;
@@ -54,4 +54,12 @@ pub trait TransportOps {
     fn close_conn(&mut self, now: Time, conn: ConnId);
     fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error>;
     fn stream_info(&self, s: StreamId) -> Result<StreamInfo, Error>;
+
+    // datagrams (spec §3.1)
+    /// One QUIC DATAGRAM; every error means the datagram was dropped.
+    fn datagram_send(&mut self, now: Time, conn: ConnId, data: &[u8]) -> Result<(), DatagramError>;
+    /// Largest payload `datagram_send` takes now; 0 = unsupported/unknown.
+    fn datagram_mss(&self, conn: ConnId) -> usize;
+    /// Oldest received datagram into `buf` (`buf.len() >= 65535`); `None` = ring empty / stale.
+    fn datagram_recv(&mut self, conn: ConnId, buf: &mut [u8]) -> Option<usize>;
 }

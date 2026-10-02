@@ -218,58 +218,49 @@ fn request_domain_not_utf8_refused() {
     );
 }
 
-// ---- ASSOCIATE: refused with REP 0x07 in SP1 (spec §6.1), after the full request ----
+// ---- ASSOCIATE: parsed as a request, the DST ignored (spec §6.1) ----
 
 #[test]
 fn associate_ipv4_zero_dst() {
     let r = REQ_ASSOCIATE_V4_ZERO;
-    assert_eq!(
-        greeted().feed(r),
-        Progress::Reply {
-            consumed: r.len(),
-            bytes: &rep(0x07),
-            close: true
-        }
-    );
+    assert_eq!(greeted().feed(r), Progress::Associate { consumed: r.len() });
 }
 
 #[test]
 fn associate_ipv4_dst() {
     let r = REQ_ASSOCIATE_V4;
-    assert_eq!(
-        greeted().feed(r),
-        Progress::Reply {
-            consumed: r.len(),
-            bytes: &rep(0x07),
-            close: true
-        }
-    );
+    assert_eq!(greeted().feed(r), Progress::Associate { consumed: r.len() });
 }
 
 #[test]
 fn associate_domain_dst() {
     let r = REQ_ASSOCIATE_DOMAIN;
-    assert_eq!(
-        greeted().feed(r),
-        Progress::Reply {
-            consumed: r.len(),
-            bytes: &rep(0x07),
-            close: true
-        }
-    );
+    assert_eq!(greeted().feed(r), Progress::Associate { consumed: r.len() });
 }
 
 #[test]
 fn associate_ipv6_dst() {
     let r = REQ_ASSOCIATE_V6;
-    assert_eq!(
-        greeted().feed(r),
-        Progress::Reply {
-            consumed: r.len(),
-            bytes: &rep(0x07),
-            close: true
+    assert_eq!(greeted().feed(r), Progress::Associate { consumed: r.len() });
+}
+
+#[test]
+fn associate_truncated_needs_more() {
+    // Every prefix of an ASSOCIATE request, DST included, is incomplete.
+    for req in [
+        REQ_ASSOCIATE_V4_ZERO,
+        REQ_ASSOCIATE_V4,
+        REQ_ASSOCIATE_DOMAIN,
+        REQ_ASSOCIATE_V6,
+    ] {
+        for n in 0..req.len() {
+            assert_eq!(
+                greeted().feed(&req[..n]),
+                Progress::Need,
+                "prefix {n} of {req:?}"
+            );
         }
-    );
+    }
 }
 
 // ---- reply builders ----

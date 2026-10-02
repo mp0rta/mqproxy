@@ -3,8 +3,9 @@
 use crate::ids::{ConnId, StreamId};
 use std::net::SocketAddr;
 
-/// Transport output event (spec §4.2). `StreamReadable`, `StreamWritable` and
-/// `MpReady` are coalesced level flags; the rest occur once per object.
+/// Transport output event (spec §4.2). `StreamReadable`, `StreamWritable`,
+/// `MpReady` and `DatagramReadable` are coalesced level flags; the rest occur
+/// once per object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     ConnEstablished(ConnId),
@@ -19,6 +20,9 @@ pub enum Event {
     StreamClosed(StreamId),
     /// "A path can be created now"; may repeat.
     MpReady(ConnId),
+    /// A datagram is in the connection's receive ring; drain with
+    /// `datagram_recv` until `None` (spec §3.1).
+    DatagramReadable(ConnId),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

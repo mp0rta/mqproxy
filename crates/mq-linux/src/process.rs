@@ -42,3 +42,28 @@ pub fn set_rlimit_nofile_exact(n: u64) -> io::Result<u64> {
     cvt(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) })?;
     Ok(prev)
 }
+
+/// Pins glibc's `M_MMAP_THRESHOLD` so large allocations are always fresh
+/// mmaps. Setting it explicitly disables glibc's dynamic raise (to the size
+/// of the first freed mmapped chunk), after which large `calloc`s come from
+/// the heap and are memset in full. Returns whether the call took effect;
+/// always true on non-glibc targets (musl already mmaps large allocations).
+pub fn pin_mmap_threshold() -> bool {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: mallopt(3) only adjusts allocator tunables.
+        unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024) == 1 }
+    }
+    #[cfg(not(target_env = "gnu"))]
+    {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pin_mmap_threshold_takes_effect() {
+        assert!(super::pin_mmap_threshold());
+    }
+}

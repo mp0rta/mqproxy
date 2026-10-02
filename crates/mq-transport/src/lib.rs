@@ -8,6 +8,7 @@
 
 mod clock;
 mod conn;
+mod datagram;
 mod engine;
 mod events;
 mod ffi;
@@ -16,8 +17,8 @@ mod stream;
 mod txq;
 
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, Event, PathError, PathId, StreamError, StreamId,
-    StreamInfo, Time, Transmit, TransportConfig, TransportOps, TxKey,
+    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Event, PathError, PathId,
+    StreamError, StreamId, StreamInfo, Time, Transmit, TransportConfig, TransportOps, TxKey,
 };
 use slots::{ConnSlot, Slots, StreamSlot};
 use std::ffi::CString;
@@ -138,9 +139,10 @@ impl TransportOps for Transport {
         loop {
             let e = events.pop(streams, conns)?;
             let live = match &e {
-                Event::ConnEstablished(c) | Event::NewConn(c) | Event::MpReady(c) => {
-                    conns.is_live(c.slot())
-                }
+                Event::ConnEstablished(c)
+                | Event::NewConn(c)
+                | Event::MpReady(c)
+                | Event::DatagramReadable(c) => conns.is_live(c.slot()),
                 Event::NewStream(_, s, _) | Event::StreamReadable(s) | Event::StreamWritable(s) => {
                     streams.is_live(s.slot())
                 }
@@ -202,6 +204,18 @@ impl TransportOps for Transport {
     fn stream_info(&self, s: StreamId) -> Result<StreamInfo, mq_transport_api::Error> {
         stream::stream_info(self, s)
     }
+
+    fn datagram_send(&mut self, now: Time, c: ConnId, data: &[u8]) -> Result<(), DatagramError> {
+        datagram::datagram_send(self, now, c, data)
+    }
+
+    fn datagram_mss(&self, c: ConnId) -> usize {
+        datagram::datagram_mss(self, c)
+    }
+
+    fn datagram_recv(&mut self, c: ConnId, buf: &mut [u8]) -> Option<usize> {
+        datagram::ring_pop(self.inner.conns.get_mut(c.slot())?, buf)
+    }
 }
 
 /// Accessors for the fabric, shard-pair and loopback tests (spec §8.1).
@@ -229,6 +243,14 @@ impl Transport {
     /// Live stream slots of `c` (0 for a stale id).
     pub fn stream_count(&self, c: ConnId) -> u32 {
         self.inner.conns.get(c.slot()).map_or(0, |s| s.streams)
+    }
+
+    /// Datagrams `c`'s receive ring dropped (SP2 spec §3.1); 0 for a stale id.
+    pub fn dgram_rx_dropped(&self, c: ConnId) -> u64 {
+        self.inner
+            .conns
+            .get(c.slot())
+            .map_or(0, |s| s.dgram_rx_dropped)
     }
 
     /// The deferred close `drive` will apply (spec §4.2 ceiling).

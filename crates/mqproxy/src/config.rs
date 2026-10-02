@@ -24,8 +24,8 @@ const SECTIONS: &[&str] = &[
 ];
 
 /// What the file set; `None`/`false`/empty = not set. Accepted-no-effect keys
-/// (`[Gateway] Enabled`, `[UDP] *`, `[Mitm] CACert/CAKey/IgnoreHosts`) are
-/// recognised and dropped.
+/// (`[Gateway] Enabled`, `[Mitm] CACert/CAKey/IgnoreHosts`) are recognised and
+/// dropped.
 #[derive(Debug, Default)]
 pub struct FileConfig {
     pub warnings: Vec<String>,
@@ -45,6 +45,8 @@ pub struct FileConfig {
     pub masquerade: bool,
     pub cache_max_bytes: Option<u64>,
     pub request_metrics: bool,
+    pub udp_enabled: Option<bool>,
+    pub udp_idle_timeout: Option<u64>,
     // client
     pub server: Option<String>,
     pub client_id: Option<String>,
@@ -165,11 +167,14 @@ impl FileConfig {
                 }
             }
             ("Metrics", "perrequest") if s => self.request_metrics = bool_(v),
-            // Accepted, no effect: the gateway and UDP relay are off in SP1.
-            ("Gateway", "enabled") | ("UDP", "enabled") if s => {}
+            ("UDP", "enabled") if s => self.udp_enabled = Some(bool_(v)),
             ("UDP", "idletimeout") if s => {
-                self.num(at, k, v, 1, MAX);
+                if let Some(n) = self.num(at, k, v, 1, MAX) {
+                    self.udp_idle_timeout = Some(n as u64);
+                }
             }
+            // Accepted, no effect: the gateway is off in this build.
+            ("Gateway", "enabled") if s => {}
             // client
             ("Server", "address") if c => self.server = text(),
             ("Server", "clientid") if c => self.client_id = text(),

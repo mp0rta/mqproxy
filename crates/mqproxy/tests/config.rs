@@ -172,12 +172,25 @@ fn c_client_roundtrip() {
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 }
 
-/// C test_bool_variants: `yes`/`0` on the accepted-no-effect bool keys
-/// (SP1: `Masquerade = true` is exit 2).
+/// C test_bool_variants: `yes`/`0` on the bool keys (`[UDP] Enabled` takes
+/// effect; `[Gateway] Enabled` is accepted, no effect; SP1: `Masquerade = true`
+/// is exit 2). C `parse_bool` is exact `true`/`yes`/`1`; anything else is false.
 #[test]
 fn c_bool_variants() {
     let r = srv("[Gateway]\nEnabled = yes\n[UDP]\nEnabled = 0\n").unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(!server(&r).config.udp_enabled);
+    for (v, on) in [
+        ("true", true),
+        ("yes", true),
+        ("1", true),
+        ("false", false),
+        ("no", false),
+        ("YES", false),
+    ] {
+        let r = srv(&format!("[UDP]\nEnabled = {v}\n")).unwrap();
+        assert_eq!(server(&r).config.udp_enabled, on, "Enabled = {v}");
+    }
     assert_eq!(exit(srv("[Gateway]\nMasquerade = true\n")).code, 2);
 }
 
@@ -436,8 +449,52 @@ fn client_implemented_keys_resolve() {
 
 #[test]
 fn server_accepted_no_effect_keys() {
-    let r = srv("[Gateway]\nEnabled = false\n[UDP]\nEnabled = false\nIdleTimeout = 30\n").unwrap();
+    let r = srv("[Gateway]\nEnabled = false\n").unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+}
+
+/// spec §8: `[UDP] Enabled` / `IdleTimeout` reach `ServerConfig`, and the CLI
+/// overrides them (defaults < file < CLI).
+#[test]
+fn server_udp_keys_take_effect() {
+    let r = srv("").unwrap();
+    assert!(server(&r).config.udp_enabled);
+    assert_eq!(server(&r).config.udp_idle_timeout, Duration::from_secs(60));
+
+    let r = srv("[UDP]\nEnabled = false\nIdleTimeout = 30\n").unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(!server(&r).config.udp_enabled);
+    assert_eq!(server(&r).config.udp_idle_timeout, Duration::from_secs(30));
+
+    // C LONGV: below 1 warns and keeps the previous value.
+    for v in ["0", "-3", "x"] {
+        let r = srv(&format!("[UDP]\nIdleTimeout = 7\nIdleTimeout = {v}\n")).unwrap();
+        assert!(warned(&r, "IdleTimeout"), "{v}: {:?}", r.warnings);
+        assert_eq!(server(&r).config.udp_idle_timeout, Duration::from_secs(7));
+    }
+
+    let ini = Ini::new(&format!("{SRV}[UDP]\nIdleTimeout = 5\n"));
+    let r = run("server", &ini, &["--udp-idle-timeout", "7"]).unwrap();
+    assert_eq!(server(&r).config.udp_idle_timeout, Duration::from_secs(7));
+    let r = run("server", &ini, &[]).unwrap();
+    assert_eq!(server(&r).config.udp_idle_timeout, Duration::from_secs(5));
+    // The CLI's `--udp-idle-timeout 0` is a usage error even over a good file value.
+    assert_eq!(
+        exit(run("server", &ini, &["--udp-idle-timeout", "0"])).code,
+        2
+    );
+    // `--no-udp` turns the file's `Enabled = true` off; it cannot turn it on.
+    let ini = Ini::new(&format!("{SRV}[UDP]\nEnabled = true\n"));
+    assert!(
+        !server(&run("server", &ini, &["--no-udp"]).unwrap())
+            .config
+            .udp_enabled
+    );
+    assert!(
+        server(&run("server", &ini, &[]).unwrap())
+            .config
+            .udp_enabled
+    );
 }
 
 #[test]

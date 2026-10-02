@@ -7,5 +7,8 @@ mod transparent;
 
 pub use http_connect::{HttpConnectParser, http_error_reply, http_success_reply};
 pub use request::{INGRESS_CAP, Progress};
-pub use socks5::{Socks5Parser, socks5_error_reply, socks5_success_reply};
+pub use socks5::{
+    Socks5Parser, socks5_assoc_refused_reply, socks5_assoc_reply, socks5_error_reply,
+    socks5_success_reply,
+};
 pub use transparent::target_from_original_dst;
