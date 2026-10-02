@@ -132,12 +132,14 @@ impl Client {
             _ => {}
         }
         if self.sess.by_sid.len() >= MAX_SESSIONS_PER_CONN {
+            self.sess.counters.drops_session_limit += 1;
             return; // spec §6.3: no OPEN past 1024 sessions
         }
         if !a.dsts.contains_key(&target) {
             let mut reply_hdr = Vec::new();
             socks5udp::build(&mut reply_hdr, &dst);
             if a.insert_dst(target.clone(), reply_hdr, now).is_none() {
+                self.sess.counters.drops_dst_limit += 1;
                 return; // spec §6.3: 64 DSTs, none reclaimable
             }
         }

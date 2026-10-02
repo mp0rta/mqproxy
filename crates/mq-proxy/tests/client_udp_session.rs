@@ -195,6 +195,22 @@ fn cap_1024_drops_new_dst() {
     send(&mut h, sock, &to_v4(53, b"x"));
     assert_eq!(h.opens(), 1 + 1024, "no OPEN for the 1025th session");
     assert_eq!(dgrams(&h).len(), 1024);
+    let c = h.sh.app().udp_counters();
+    assert_eq!((c.drops_session_limit, c.drops_dst_limit), (1, 0));
+}
+
+#[test]
+fn dst_cap_64_drops_new_dst() {
+    let mut h = H::new(cfg());
+    serving_udp(&mut h);
+    let sock = assoc(&mut h);
+    for port in 0..65 {
+        send(&mut h, sock, &to_v4(port, b"x"));
+    }
+    assert_eq!(h.opens(), 1 + 64, "no OPEN for the 65th DST");
+    assert_eq!(dgrams(&h).len(), 64);
+    let c = h.sh.app().udp_counters();
+    assert_eq!((c.drops_session_limit, c.drops_dst_limit), (0, 1));
 }
 
 #[test]

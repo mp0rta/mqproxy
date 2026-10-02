@@ -48,7 +48,8 @@ pub enum SessionEnd {
 }
 
 /// The fields of the `mq_udp_srv:` (§7.3) and `mq_udp_cli:` (§6.5) stats lines; `u32` as C `%u`.
-/// The first eight are the server line, the last two exist on the client only.
+/// The first eight are the server line, the next two exist on the client only, and the
+/// last two (spec §6.3 admission-limit drops) are on neither line.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Counters {
     pub frags_sent: u32,
@@ -61,4 +62,8 @@ pub struct Counters {
     pub drops_empty: u32,
     pub drops_unknown_sid: u32,
     pub sendq_evictions: u32,
+    /// A new DST at 1024 sessions.
+    pub drops_session_limit: u32,
+    /// A new DST with 64 DST entries and none reclaimable.
+    pub drops_dst_limit: u32,
 }
