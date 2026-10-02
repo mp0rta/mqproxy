@@ -1,5 +1,6 @@
 //! spec §5: shared UDP lane pieces — constants, `SessionEnd`, `Counters`.
 
+pub mod defrag;
 pub mod socks5udp;
 
 use mq_wire::frames::UdpErr;
