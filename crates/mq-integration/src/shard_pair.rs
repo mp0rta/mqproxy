@@ -943,6 +943,7 @@ impl App for RawClient {
                 }
             }
             Event::NewConn(_) | Event::MpReady(_) => {}
+            Event::DatagramReadable(_) => {} // wired with the UDP lane
         }
     }
 

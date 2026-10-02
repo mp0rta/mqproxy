@@ -614,6 +614,7 @@ impl App for Server {
             }
             // Client-only events.
             Event::ConnEstablished(_) | Event::MpReady(_) => {}
+            Event::DatagramReadable(_) => {} // wired with the UDP lane
         }
     }
 

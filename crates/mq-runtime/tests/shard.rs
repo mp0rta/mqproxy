@@ -5,7 +5,7 @@ use mq_runtime::testing::{
     Call, RecordHandle, Recorded, RecordingApp, ScriptedHandle, ScriptedTransport,
 };
 use mq_runtime::{
-    AcceptMeta, DialError, Host, Interest, IoRequest, IoResult, ListenerId, ListenerTag,
+    AcceptMeta, Cx, DialError, Host, Interest, IoRequest, IoResult, ListenerId, ListenerTag,
     PrereadTooLarge, RELAY_BUF, Shard, StreamPreread, TCP_BUF, Target, TcpEnd, TcpId,
 };
 use mq_transport_api::{
@@ -878,6 +878,35 @@ fn drive_again_when_steps_touched_transport() {
     h.relay();
     h.sh.drive(T0);
     assert_eq!(h.drives(), 5, "step 4 touched the transport");
+}
+
+/// Transport drives after one drive pass whose step 3 runs `f` (spec §5.2 step 5).
+fn drives_after_app_call(f: impl Fn(&mut Cx<'_>, ConnId) + Send + 'static) -> usize {
+    let mut h = setup();
+    let c = h.conn();
+    let s = h.t.new_stream_id();
+    h.app.on(move |r, cx| {
+        if let Recorded::TransportEvent(Event::StreamWritable(_)) = r {
+            f(cx, c);
+        }
+    });
+    h.t.push_event(Event::StreamWritable(s));
+    h.sh.drive(T0);
+    h.drives()
+}
+
+#[test]
+fn datagram_send_and_recv_redrive_but_mss_does_not() {
+    // spec §3.1: send/recv go through `tm()`; `datagram_mss` is a query like `conn_stats`
+    assert_eq!(drives_after_app_call(|cx, c| _ = cx.datagram_mss(c)), 1);
+    assert_eq!(
+        drives_after_app_call(|cx, c| _ = cx.datagram_send(c, b"x")),
+        2
+    );
+    assert_eq!(
+        drives_after_app_call(|cx, c| _ = cx.datagram_recv(c, &mut [0; 8])),
+        2
+    );
 }
 
 #[test]

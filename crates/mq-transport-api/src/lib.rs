@@ -11,7 +11,7 @@ mod time;
 pub use config::{
     CongestionControl, ConnConfig, ConnStats, PathStats, Role, Scheduler, TransportConfig,
 };
-pub use error::{ConnectError, Error, PathError, StreamError};
+pub use error::{ConnectError, DatagramError, Error, PathError, StreamError};
 pub use event::{CloseReason, ErrType, Event, StreamInfo, StreamKind, Transmit};
 pub use ids::{ConnId, PathId, SlotId, StreamId, TxKey};
 pub use ops::TransportOps;

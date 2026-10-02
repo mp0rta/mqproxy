@@ -16,8 +16,8 @@ mod stream;
 mod txq;
 
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, Event, PathError, PathId, StreamError, StreamId,
-    StreamInfo, Time, Transmit, TransportConfig, TransportOps, TxKey,
+    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Event, PathError, PathId,
+    StreamError, StreamId, StreamInfo, Time, Transmit, TransportConfig, TransportOps, TxKey,
 };
 use slots::{ConnSlot, Slots, StreamSlot};
 use std::ffi::CString;
@@ -138,9 +138,10 @@ impl TransportOps for Transport {
         loop {
             let e = events.pop(streams, conns)?;
             let live = match &e {
-                Event::ConnEstablished(c) | Event::NewConn(c) | Event::MpReady(c) => {
-                    conns.is_live(c.slot())
-                }
+                Event::ConnEstablished(c)
+                | Event::NewConn(c)
+                | Event::MpReady(c)
+                | Event::DatagramReadable(c) => conns.is_live(c.slot()),
                 Event::NewStream(_, s, _) | Event::StreamReadable(s) | Event::StreamWritable(s) => {
                     streams.is_live(s.slot())
                 }
@@ -201,6 +202,19 @@ impl TransportOps for Transport {
 
     fn stream_info(&self, s: StreamId) -> Result<StreamInfo, mq_transport_api::Error> {
         stream::stream_info(self, s)
+    }
+
+    // Stubs until the datagram facade lands (spec §3.1).
+    fn datagram_send(&mut self, _: Time, _: ConnId, _: &[u8]) -> Result<(), DatagramError> {
+        Err(DatagramError::Stale)
+    }
+
+    fn datagram_mss(&self, _: ConnId) -> usize {
+        0
+    }
+
+    fn datagram_recv(&mut self, _: ConnId, _: &mut [u8]) -> Option<usize> {
+        None
     }
 }
 

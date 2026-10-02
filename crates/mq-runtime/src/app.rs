@@ -3,8 +3,8 @@
 use crate::ids::{DialOpId, SocketOpId, TcpId, TimerId, UdpSocketId};
 use crate::shard::{Rng, ShardState};
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, Error, Event, PathError, PathId, StreamError,
-    StreamId, StreamInfo, Time, TransportOps,
+    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Error, Event, PathError, PathId,
+    StreamError, StreamId, StreamInfo, Time, TransportOps,
 };
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -234,6 +234,20 @@ impl<'a> Cx<'a> {
     /// spec §5.4.
     pub fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error> {
         self.t.conn_stats(conn)
+    }
+
+    /// spec §3.1: every error means the datagram was dropped.
+    pub fn datagram_send(&mut self, conn: ConnId, data: &[u8]) -> Result<(), DatagramError> {
+        let now = self.now;
+        self.tm().datagram_send(now, conn, data)
+    }
+    /// spec §3.1: 0 = unsupported/unknown. Callers cache it (spec §5 `MSS_REFRESH`).
+    pub fn datagram_mss(&self, conn: ConnId) -> usize {
+        self.t.datagram_mss(conn)
+    }
+    /// spec §3.1: `buf.len() >= 65535`; `None` = ring empty / stale.
+    pub fn datagram_recv(&mut self, conn: ConnId, buf: &mut [u8]) -> Option<usize> {
+        self.tm().datagram_recv(conn, buf)
     }
 
     // --- Paths (spec §5.4) ---

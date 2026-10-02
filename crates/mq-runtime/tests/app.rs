@@ -5,8 +5,8 @@ use mq_runtime::{
     StreamPreread, Target, TcpEnd, TcpId, TimerId, UdpSocketId,
 };
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, Error, Event, PathError, PathId, SlotId,
-    StreamError, StreamId, StreamInfo, Time, Transmit, TransportOps, TxKey,
+    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Error, Event, PathError, PathId,
+    SlotId, StreamError, StreamId, StreamInfo, Time, Transmit, TransportOps, TxKey,
 };
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -64,6 +64,15 @@ impl TransportOps for Null {
     }
     fn stream_info(&self, _: StreamId) -> Result<StreamInfo, Error> {
         Err(Error::Stale)
+    }
+    fn datagram_send(&mut self, _: Time, _: ConnId, _: &[u8]) -> Result<(), DatagramError> {
+        Err(DatagramError::Stale)
+    }
+    fn datagram_mss(&self, _: ConnId) -> usize {
+        0
+    }
+    fn datagram_recv(&mut self, _: ConnId, _: &mut [u8]) -> Option<usize> {
+        None
     }
 }
 
