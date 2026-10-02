@@ -199,7 +199,9 @@ fn ring_full_counts_drops() {
     let drops = dropped(&p.server, p.srv_conn);
     assert!(drops > 0);
     assert_eq!(got.len() + drops as usize, count, "kept + dropped = sent");
-    assert!(got.len() * (n + 2) <= 16 * MIB);
+    // Records are `u16 len || bytes`, all `n + 2` long, in a linear 16 MiB ring that nothing
+    // drains during the burst: exactly the first ⌊16 MiB / (n + 2)⌋ fit, then none.
+    assert_eq!(got.len(), 16 * MIB / (n + 2), "the ring holds 16 MiB");
     assert!(
         got.iter().enumerate().all(|(i, d)| *d == payload(i, n)),
         "the first datagrams are intact"
