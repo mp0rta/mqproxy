@@ -605,6 +605,10 @@ impl App for Client {
         self.paths.on_udp_socket(cx, conn, op, r);
     }
 
+    fn on_udp_rx(&mut self, _cx: &mut Cx<'_>, _sock: UdpSocketId, _peer: SocketAddr, _d: &[u8]) {
+        // Wired with the UDP lane.
+    }
+
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         let Some(tm) = self.timers.remove(&id) else {
             return;

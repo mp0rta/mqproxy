@@ -637,7 +637,9 @@ impl Io for MioIo {
 /// everything after. Ok(n) = datagrams sent, `n < total` only on WouldBlock;
 /// Err(WouldBlock) when none were sent. Any other error is returned as is:
 /// the caller drops and commits the whole transmit (sent prefix included) and
-/// counts it (`LoopCore` owns the send-error counter).
+/// counts it (`LoopCore` owns the send-error counter). SP2 spec §4.1: a
+/// single datagram is always a plain send, since `UDP_SEGMENT` rejects a
+/// segment above the egress MTU (`EMSGSIZE`) that a plain send fragments.
 fn send_split(
     gso: &mut bool,
     t: &Transmit<'_>,
@@ -645,6 +647,9 @@ fn send_split(
     mut send_one: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<usize> {
     let seg = t.segment_size.max(1);
+    if t.payload.len() <= seg {
+        return send_one(t.payload).map(|()| 1);
+    }
     let per_call = (MAX_GSO_BYTES / seg).clamp(1, MAX_GSO_SEGMENTS);
     let wb = |e: &io::Error| e.kind() == ErrorKind::WouldBlock;
     let partial = |sent: usize, e: io::Error| if sent > 0 { Ok(sent) } else { Err(e) };
@@ -686,6 +691,7 @@ mod tests {
     use std::cell::RefCell;
 
     const EINVAL: i32 = 22;
+    const EMSGSIZE: i32 = 90;
 
     fn tx(seg: usize, n: usize) -> Vec<u8> {
         vec![7u8; seg * n]
@@ -762,9 +768,29 @@ mod tests {
     }
 
     #[test]
-    fn oversized_batch_is_caller_bug_not_gso_off() {
-        // One segment above the 65507-byte limit: no split can make it legal.
+    fn oversized_single_datagram_error_is_returned_gso_stays_on() {
+        // SP2 spec §4.1: one datagram goes through `send_one`; its error is the caller's.
         let p = vec![0u8; 70_000];
+        let t = Transmit {
+            dst: "127.0.0.1:9".parse().unwrap(),
+            segment_size: 70_000,
+            payload: &p,
+        };
+        let mut gso = true;
+        let r = send_split(
+            &mut gso,
+            &t,
+            |_, _| panic!("a single datagram bypasses GSO"),
+            |_| Err(io::Error::from_raw_os_error(EMSGSIZE)),
+        );
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(EMSGSIZE));
+        assert!(gso, "GSO stays on");
+    }
+
+    #[test]
+    fn oversized_batch_is_caller_bug_not_gso_off() {
+        // Two segments, each above the 65507-byte limit: no split can make them legal.
+        let p = vec![0u8; 2 * 70_000];
         let t = Transmit {
             dst: "127.0.0.1:9".parse().unwrap(),
             segment_size: 70_000,
@@ -779,6 +805,55 @@ mod tests {
         );
         assert_eq!(r.unwrap_err().raw_os_error(), Some(EINVAL));
         assert!(gso, "GSO stays on");
+    }
+
+    #[test]
+    fn send_split_single_datagram_uses_send_one() {
+        // SP2 spec §4.1: `UDP_SEGMENT` rejects a segment above the egress MTU.
+        let p = vec![1u8; 3_000];
+        let t = Transmit {
+            dst: "127.0.0.1:9".parse().unwrap(),
+            segment_size: 3_000,
+            payload: &p,
+        };
+        let mut gso = true;
+        let singles = RefCell::new(0);
+        let r = send_split(
+            &mut gso,
+            &t,
+            |_, _| panic!("send_gso never"),
+            |d| {
+                assert_eq!(d.len(), 3_000);
+                *singles.borrow_mut() += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(r.unwrap(), 1);
+        assert_eq!(*singles.borrow(), 1);
+        assert!(gso);
+    }
+
+    #[test]
+    fn send_split_multi_still_gso() {
+        let p = tx(1_200, 2);
+        let t = Transmit {
+            dst: "127.0.0.1:9".parse().unwrap(),
+            segment_size: 1_200,
+            payload: &p,
+        };
+        let calls = RefCell::new(Vec::new());
+        let mut gso = true;
+        let r = send_split(
+            &mut gso,
+            &t,
+            |c, seg| {
+                calls.borrow_mut().push((c.len(), seg));
+                Ok(())
+            },
+            |_| panic!("two segments go through GSO"),
+        );
+        assert_eq!(r.unwrap(), 2);
+        assert_eq!(*calls.borrow(), vec![(2_400, 1_200)]);
     }
 
     #[test]

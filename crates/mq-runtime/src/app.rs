@@ -132,7 +132,8 @@ pub struct StreamPreread<'a> {
 pub struct PrereadTooLarge;
 
 /// spec §5.4: `tcp_write` failure — the bytes do not fit in the 64 KiB send
-/// buffer (or `tcp` is not a live app-owned socket).
+/// buffer (or `tcp` is not a live app-owned socket); SP2 spec §4.1: also
+/// `udp_send`'s.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct SendBufFull;
 
@@ -157,6 +158,9 @@ pub trait App {
         op: SocketOpId,
         r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
     );
+    /// SP2 spec §4.1: a datagram on an app-owned UDP socket, borrowed from the
+    /// driver's receive batch: handle or drop it here.
+    fn on_udp_rx(&mut self, cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]);
     /// spec §5.4: an app timer fired.
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId);
     /// spec §5.4: a shutdown signal arrived.
@@ -262,6 +266,12 @@ impl<'a> Cx<'a> {
     pub fn open_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
         self.st.open_udp_socket(local_ip)
     }
+    /// SP2 spec §4.1: an app-owned UDP socket on an ephemeral port, read through
+    /// `on_udp_rx` and written with `udp_send`; completes in `on_udp_socket`
+    /// (`Err(Other)` at the socket cap, which it counts toward).
+    pub fn open_app_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
+        self.st.open_app_udp_socket(local_ip)
+    }
     /// spec §5.4: the result, if any, is dropped and its socket closed.
     pub fn cancel_udp_socket(&mut self, op: SocketOpId) {
         self.st.cancel_udp_socket(op)
@@ -271,14 +281,26 @@ impl<'a> Cx<'a> {
     pub fn close_udp_socket(&mut self, sock: UdpSocketId) {
         self.st.close_udp_socket(sock)
     }
+    /// SP2 spec §4.1: queues one datagram to `dst` on an app socket's 256 KiB
+    /// ring. Empty `bytes` are discarded; `SendBufFull` when `sock` is not a
+    /// live app socket, `bytes` is over 65 535 or the ring is full.
+    pub fn udp_send(
+        &mut self,
+        sock: UdpSocketId,
+        dst: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), SendBufFull> {
+        self.st.udp_send(sock, dst, bytes)
+    }
     /// spec §5.4: creates the xquic path and maps it to `sock` in the same call.
+    /// SP2 spec §4.1: `Stale` for an app socket.
     pub fn add_path(
         &mut self,
         conn: ConnId,
         sock: UdpSocketId,
         standby: bool,
     ) -> Result<PathId, PathError> {
-        if !self.st.udp_live(sock) {
+        if !self.st.transport_udp_live(sock) {
             return Err(PathError::Stale); // no dangling mapping
         }
         let now = self.now;

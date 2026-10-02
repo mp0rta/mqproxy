@@ -182,6 +182,9 @@ impl<A: App> App for Tap<A> {
         }
         self.inner.on_udp_socket(cx, op, r)
     }
+    fn on_udp_rx(&mut self, cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {
+        self.inner.on_udp_rx(cx, sock, peer, data)
+    }
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         self.inner.on_timer(cx, id)
     }
@@ -966,6 +969,7 @@ impl App for RawClient {
         _r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
     ) {
     }
+    fn on_udp_rx(&mut self, _cx: &mut Cx<'_>, _s: UdpSocketId, _p: SocketAddr, _d: &[u8]) {}
     fn on_timer(&mut self, _cx: &mut Cx<'_>, _id: TimerId) {}
     fn on_shutdown(&mut self, cx: &mut Cx<'_>) {
         cx.request_exit(0);

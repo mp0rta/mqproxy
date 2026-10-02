@@ -22,6 +22,11 @@ pub enum Recorded {
     TcpEnd(TcpId, TcpEnd),
     DialResult(DialOpId, Result<TcpId, DialError>),
     UdpSocket(SocketOpId, Result<(UdpSocketId, SocketAddr), io::ErrorKind>),
+    UdpRx {
+        sock: UdpSocketId,
+        peer: SocketAddr,
+        data: Vec<u8>,
+    },
     Timer(TimerId),
     Shutdown,
 }
@@ -113,6 +118,10 @@ impl App for RecordingApp {
         r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
     ) {
         self.rec(cx, Recorded::UdpSocket(op, r))
+    }
+    fn on_udp_rx(&mut self, cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {
+        let data = data.to_vec();
+        self.rec(cx, Recorded::UdpRx { sock, peer, data })
     }
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         self.rec(cx, Recorded::Timer(id))

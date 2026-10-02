@@ -633,6 +633,39 @@ fn emfile_pauses_listener_and_retries_after_100ms() {
 // --- Step 6/7: UDP send ---
 
 #[test]
+fn app_udp_socket_echoes_through_the_loop() {
+    // SP2 spec §4.1: step 2 hands the datagram to the app; step 6 sends its record.
+    let mut h = setup();
+    h.app.on(|r, cx| {
+        if let Recorded::UdpRx { sock, peer, data } = r {
+            cx.udp_send(*sock, *peer, data).unwrap();
+        }
+    });
+    h.act(|cx| cx.open_app_udp_socket(IpAddr::from([127, 0, 0, 1])));
+    h.it(); // step 8 opens
+    h.it(); // step 3 delivers
+    let id = h
+        .app
+        .records()
+        .into_iter()
+        .find_map(|r| match r {
+            Recorded::UdpSocket(_, Ok((id, _))) => Some(id),
+            _ => None,
+        })
+        .expect("opened");
+    let u = h.c.udp_sock(id).expect("mapped");
+    h.io().inject_udp(u, addr(9), b"ping");
+    h.it();
+    assert_eq!(h.io().take_sent_udp(u), [(addr(9), b"ping".to_vec())]);
+    assert_eq!(h.c.shard().pending_transmit().count(), 0);
+    assert!(
+        !h.tlog()
+            .iter()
+            .any(|c| matches!(c, Call::RecvDatagram { .. }))
+    );
+}
+
+#[test]
 fn udp_error_drops_and_commits() {
     let mut h = setup();
     let udp = h.udp;

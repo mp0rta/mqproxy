@@ -662,6 +662,11 @@ impl App for Server {
         // The server opens no path sockets.
     }
 
+    fn on_udp_rx(&mut self, _cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {
+        // Wired with the UDP lane.
+        log::debug!("mq_server: {} bytes from {peer} on {sock:?}", data.len());
+    }
+
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         let Some(tm) = self.timers.remove(&id) else {
             return;

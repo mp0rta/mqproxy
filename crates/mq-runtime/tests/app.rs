@@ -98,6 +98,7 @@ impl App for Toy {
         _: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
     ) {
     }
+    fn on_udp_rx(&mut self, _: &mut Cx<'_>, _: UdpSocketId, _: SocketAddr, _: &[u8]) {}
     fn on_timer(&mut self, _: &mut Cx<'_>, _: TimerId) {}
     fn on_shutdown(&mut self, _: &mut Cx<'_>) {}
 }

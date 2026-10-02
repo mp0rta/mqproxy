@@ -2,20 +2,53 @@
 //! socket selection (spec §5.2 "UDP socket selection").
 
 use super::tcp::TcpEntry;
-use super::{Shard, ShardState};
-use crate::app::{App, IoRequest};
+use super::{Shard, ShardState, TxRing, UdpEntry, UdpOwner};
+use crate::app::{App, IoRequest, SendBufFull};
 use crate::ids::{TcpId, UdpSocketId};
 use mq_transport_api::{ConnId, Event, PathId, Time, Transmit, TransportOps, TxKey};
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 
 impl ShardState {
     /// spec §5.2 "UDP socket selection": the socket mapped to (conn, path), if any.
     pub fn path_socket(&self, conn: ConnId, path: PathId) -> Option<UdpSocketId> {
         self.paths.get(&(conn, path)).copied()
     }
-    /// A live UDP socket (the primary included).
-    pub(crate) fn udp_live(&self, sock: UdpSocketId) -> bool {
-        self.udp.contains_key(&sock)
+    /// A live transport-owned UDP socket (the primary included).
+    pub(crate) fn transport_udp_live(&self, sock: UdpSocketId) -> bool {
+        matches!(
+            self.udp.get(&sock),
+            Some(UdpEntry {
+                owner: UdpOwner::Transport,
+                ..
+            })
+        )
+    }
+    fn app_ring(&mut self, sock: UdpSocketId) -> Option<&mut TxRing> {
+        match self.udp.get_mut(&sock) {
+            Some(UdpEntry {
+                owner: UdpOwner::App(ring),
+                ..
+            }) => Some(ring),
+            _ => None,
+        }
+    }
+    /// SP2 spec §4.1: one record on an app socket's ring; `SendBufFull` (ring
+    /// untouched) when `sock` is not a live app socket, `bytes` is over 65 535
+    /// or the record does not fit.
+    pub(crate) fn udp_send(
+        &mut self,
+        sock: UdpSocketId,
+        dst: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), SendBufFull> {
+        let ring = self.app_ring(sock).ok_or(SendBufFull)?;
+        if bytes.is_empty() {
+            // `udp_tx` neither sends nor consumes a zero-length record.
+            // ponytail: zero-length target send dropped; teach udp_tx a one-empty-datagram record if a user needs it
+            return Ok(());
+        }
+        ring.push(dst, bytes)
     }
     pub(crate) fn map_path(&mut self, conn: ConnId, path: PathId, sock: UdpSocketId) {
         self.paths.insert((conn, path), sock);
@@ -27,7 +60,8 @@ impl ShardState {
             .unwrap_or(self.primary_udp)
     }
     /// spec §5.4 `close_udp_socket`: drops the socket's mappings and asks the
-    /// driver to close it. The primary socket and unknown ids are ignored.
+    /// driver to close it; an app socket's ring goes with it (SP2 spec §4.1).
+    /// The primary socket and unknown ids are ignored.
     pub(crate) fn close_udp_socket(&mut self, sock: UdpSocketId) {
         if sock == self.primary_udp || self.udp.remove(&sock).is_none() {
             return;
@@ -115,19 +149,36 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         keys
     }
 
-    /// spec §5.2: the sockets with something to send.
+    /// spec §5.2: the sockets with something to send; SP2 spec §4.1: app
+    /// sockets whose ring is not empty.
     pub fn pending_transmit(&self) -> impl Iterator<Item = UdpSocketId> + '_ {
-        let socks: BTreeSet<UdpSocketId> = self
+        let mut socks: BTreeSet<UdpSocketId> = self
             .tx_keys()
             .into_iter()
             .map(|k| self.st.socket_for(k))
             .collect();
+        socks.extend(self.st.udp.iter().filter_map(|(s, e)| match &e.owner {
+            UdpOwner::App(ring) if !ring.is_empty() => Some(*s),
+            _ => None,
+        }));
         socks.into_iter()
     }
 
     /// spec §5.2: the next transmit for `sock`, serving the queues mapped to
-    /// it in turn.
+    /// it in turn. SP2 spec §4.1: an app socket's oldest record, as exactly one datagram.
     pub fn peek_transmit(&mut self, sock: UdpSocketId) -> Option<Transmit<'_>> {
+        if let Some(UdpEntry {
+            owner: UdpOwner::App(ring),
+            ..
+        }) = self.st.udp.get(&sock)
+        {
+            // ponytail: one record per peek; coalesce same-dst same-len runs (≤ MTU) into a GSO batch if the UDP bench shows the syscall rate matters
+            return ring.peek().map(|(dst, payload)| Transmit {
+                dst,
+                segment_size: payload.len(),
+                payload,
+            });
+        }
         let mut keys: Vec<TxKey> = self
             .tx_keys()
             .into_iter()
@@ -143,9 +194,14 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         self.transport.peek_transmit(key)
     }
 
-    /// spec §5.2: `datagrams` of the last peeked transmit of `sock` were sent.
+    /// spec §5.2: `datagrams` of the last peeked transmit of `sock` were sent
+    /// (SP2 spec §4.1: 0 or 1 records of an app socket).
     pub fn transmit_done(&mut self, sock: UdpSocketId, datagrams: usize) {
-        if let Some(&key) = self.st.tx_cursor.get(&sock) {
+        if let Some(ring) = self.st.app_ring(sock) {
+            for _ in 0..datagrams {
+                ring.pop();
+            }
+        } else if let Some(&key) = self.st.tx_cursor.get(&sock) {
             self.transport.transmit_done(key, datagrams);
         }
     }

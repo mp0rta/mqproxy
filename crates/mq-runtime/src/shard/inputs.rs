@@ -1,7 +1,7 @@
 //! The shard's inputs, called by the driver (spec §5.2 "Inputs").
 
-use super::Shard;
 use super::tcp::TcpEntry;
+use super::{Shard, TxRing, UdpEntry, UdpOwner};
 use crate::app::{AcceptMeta, App, DialError, IoResult, TcpEnd};
 use crate::ids::{DialOpId, ListenerId, SocketOpId, TcpId, UdpSocketId};
 use mq_transport_api::{Time, TransportOps};
@@ -9,11 +9,19 @@ use std::io;
 use std::net::SocketAddr;
 
 impl<T: TransportOps, A: App> Shard<T, A> {
-    /// spec §5.2: a datagram on `sock`, fed to the transport with that socket's local address.
+    /// spec §5.2: a datagram on `sock`, fed to the transport with that socket's
+    /// local address; SP2 spec §4.1: an app socket's goes to `App::on_udp_rx`.
     pub fn on_udp_rx(&mut self, now: Time, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {
-        if let Some(&local) = self.st.udp.get(&sock) {
-            self.transport.recv_datagram(now, local, peer, data);
-            self.st.touch();
+        match self.st.udp.get(&sock) {
+            Some(UdpEntry {
+                local,
+                owner: UdpOwner::Transport,
+            }) => {
+                self.transport.recv_datagram(now, *local, peer, data);
+                self.st.touch();
+            }
+            Some(_) => self.call_app(now, |a, cx| a.on_udp_rx(cx, sock, peer, data)),
+            None => {}
         }
     }
 
@@ -141,7 +149,8 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         }
     }
 
-    /// spec §5.2: `None` when the open had been cancelled (or failed).
+    /// spec §5.2: `None` when the open had been cancelled (or failed). SP2
+    /// spec §4.1: an app open's cap reservation becomes the socket or is released.
     pub fn on_udp_socket(
         &mut self,
         now: Time,
@@ -151,10 +160,16 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         if !self.st.socket_ops.remove(&op) {
             return None;
         }
+        let app = self.st.app_udp_ops.remove(&op);
         match r {
             Ok(local) => {
                 let sock = self.st.alloc(UdpSocketId::from_slot);
-                self.st.udp.insert(sock, local);
+                let owner = if app {
+                    UdpOwner::App(TxRing::new())
+                } else {
+                    UdpOwner::Transport
+                };
+                self.st.udp.insert(sock, UdpEntry { local, owner });
                 self.call_app(now, |a, cx| a.on_udp_socket(cx, op, Ok((sock, local))));
                 Some(sock)
             }
