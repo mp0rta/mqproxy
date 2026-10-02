@@ -1,5 +1,6 @@
 //! spec §6.2, §6.3, §6.5: client and server settings; the CLI maps onto these (Task 9.1).
 
+use crate::udp::DEFAULT_IDLE;
 use mq_transport_api::Scheduler;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -64,6 +65,10 @@ pub struct ServerConfig {
     pub request_deadline: Duration,
     /// `--metrics-interval`; `None` is off.
     pub metrics_interval: Option<Duration>,
+    /// `--no-udp` clears it: advertise `MQ_FEAT_UDP_RELAY` (spec §7.3).
+    pub udp_enabled: bool,
+    /// `--udp-idle-timeout`: a UDP session idle this long is closed.
+    pub udp_idle_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -74,6 +79,8 @@ impl Default for ServerConfig {
             auth_deadline: Duration::from_secs(10),
             request_deadline: Duration::from_secs(10),
             metrics_interval: None,
+            udp_enabled: true,
+            udp_idle_timeout: DEFAULT_IDLE,
         }
     }
 }

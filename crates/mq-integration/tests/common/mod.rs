@@ -12,7 +12,7 @@ use mq_runtime::driver::DriverConfig;
 use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
 use mq_runtime::{ListenKind, Shard};
 use mq_transport_api::{ConnId, Event, StreamId, StreamInfo, StreamKind};
-use mq_wire::frames::{AuthReq, AuthResp, ConnectTcpResp};
+use mq_wire::frames::{AuthReq, AuthResp, ConnectTcpResp, FEAT_UDP_RELAY};
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -41,13 +41,18 @@ pub const CONNECT_REQ_C: &[u8] = &[
     0xBB, 0x00,
 ];
 
+/// An `AUTH_RESPONSE` without capabilities (what a no-UDP server sends the client under test).
 pub fn auth_resp(status: u8, code: u64) -> Vec<u8> {
+    auth_resp_features(status, code, 0)
+}
+
+pub fn auth_resp_features(status: u8, code: u64, features: u64) -> Vec<u8> {
     let mut b = [0u8; 512];
     let n = AuthResp {
         status,
         error_code: code,
         server_id: b"mqproxy-server",
-        features: 0, // no MQ_FEAT_UDP_RELAY: the server has no UDP in SP1
+        features,
     }
     .encode(&mut b)
     .unwrap();
@@ -280,7 +285,7 @@ impl ServerRig {
         self.t.push_event(Event::NewConn(c));
         let ctrl = self.push_stream(c, 0);
         feed(&self.t, ctrl, &auth_req(b"secret"), false);
-        let ok = auth_resp(0, 0);
+        let ok = auth_resp_features(0, 0, FEAT_UDP_RELAY); // the default server config
         assert!(
             wait(T, || self.t.sent_bytes(ctrl) == ok),
             "not authenticated: {:?}",

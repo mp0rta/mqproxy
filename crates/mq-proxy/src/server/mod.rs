@@ -23,8 +23,8 @@ use mq_runtime::{
 };
 use mq_transport_api::{ConnId, Event, StreamId, StreamInfo, StreamKind};
 use mq_wire::frames::{
-    AddrType, AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp, DecodeError, MAX_FRAME,
-    STATUS_ERROR, STATUS_OK, STREAM_TYPE_CONNECT_TCP, TcpErr,
+    AddrType, AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp, DecodeError, FEAT_UDP_RELAY,
+    MAX_FRAME, STATUS_ERROR, STATUS_OK, STREAM_TYPE_CONNECT_TCP, TcpErr,
 };
 use mq_wire::varint;
 use std::collections::HashMap;
@@ -397,7 +397,12 @@ impl Server {
             status: if ok { STATUS_OK } else { STATUS_ERROR },
             error_code: u64::from(!ok), // AUTH_FAILED
             server_id: SERVER_ID,
-            features: 0, // spec §6.3: no MQ_FEAT_UDP_RELAY in SP1
+            // spec §7.3: as C, only an accepted auth advertises the capability.
+            features: if ok && self.cfg.udp_enabled {
+                FEAT_UDP_RELAY
+            } else {
+                0
+            },
         }
         .encode(&mut tx)
         .expect("fits");

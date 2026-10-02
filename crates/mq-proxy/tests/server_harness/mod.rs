@@ -19,8 +19,14 @@ pub const CONNECT_REQ_C: &[u8] = &[
     0xBB, 0x00,
 ];
 
-/// C `mq_encode_auth_resp` for OK / ERROR+AUTH_FAILED, server_id "mqproxy-server", features 0.
+/// C `mq_encode_auth_resp` for OK / ERROR+AUTH_FAILED, server_id "mqproxy-server".
+/// `AUTH_OK_C` carries MQ_FEAT_UDP_RELAY (the default config); `AUTH_OK_NO_UDP_C`
+/// is the `udp_enabled = false` form (features 0).
 pub const AUTH_OK_C: &[u8] = &[
+    0x00, 0x00, 14, b'm', b'q', b'p', b'r', b'o', b'x', b'y', b'-', b's', b'e', b'r', b'v', b'e',
+    b'r', 0x01, 0x00,
+];
+pub const AUTH_OK_NO_UDP_C: &[u8] = &[
     0x00, 0x00, 14, b'm', b'q', b'p', b'r', b'o', b'x', b'y', b'-', b's', b'e', b'r', b'v', b'e',
     b'r', 0x00, 0x00,
 ];
@@ -77,11 +83,18 @@ pub struct H {
     pub t: ScriptedHandle,
     pub now: Time,
     next_quic: u64,
+    /// The AUTH_RESPONSE this config answers a good AUTH_REQUEST with.
+    auth_ok: &'static [u8],
 }
 
 impl H {
     /// A server started at t = 1 s.
     pub fn new(cfg: ServerConfig) -> H {
+        let auth_ok = if cfg.udp_enabled {
+            AUTH_OK_C
+        } else {
+            AUTH_OK_NO_UDP_C
+        };
         let (transport, t) = ScriptedTransport::new();
         let mut sh = Shard::new(
             transport,
@@ -96,6 +109,7 @@ impl H {
             t,
             now,
             next_quic: 4,
+            auth_ok,
         }
     }
 
@@ -191,7 +205,7 @@ impl H {
     pub fn authed(&mut self) -> (ConnId, StreamId) {
         let c = self.conn();
         let s = self.ctrl(c, &auth_req(b"secret"), false);
-        assert_eq!(self.t.sent_bytes(s), AUTH_OK_C, "authenticated");
+        assert_eq!(self.t.sent_bytes(s), self.auth_ok, "authenticated");
         (c, s)
     }
     /// Queue `bytes` on `s` and signal readability.
