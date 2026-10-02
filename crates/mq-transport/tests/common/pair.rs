@@ -3,8 +3,8 @@
 
 use super::lockstep::{Datagram, Peer, cfg, server_role};
 use mq_transport_api::{
-    ConnConfig, ConnId, Event, Role, StreamError, StreamId, StreamInfo, Time, TransportConfig,
-    TransportOps,
+    ConnConfig, ConnId, Event, PathError, PathId, Role, StreamError, StreamId, StreamInfo, Time,
+    TransportConfig, TransportOps,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub const T0: Time = Time(1_000_000);
 pub const MS: Duration = Duration::from_millis(1);
+pub const ACTIVE: u32 = 2; // XQC_PATH_STATE_ACTIVE
 
 pub fn srv_addr() -> SocketAddr {
     "10.0.0.1:4433".parse().unwrap()
@@ -212,6 +213,25 @@ impl Pair {
             .call(self.now, move |t, now| t.open_stream(now, c))
             .expect("open_stream")
     }
+}
+
+pub fn mp_ready_count(p: &Pair) -> usize {
+    p.cev
+        .iter()
+        .filter(|e| **e == Event::MpReady(p.conn))
+        .count()
+}
+
+pub fn add_path(p: &Pair) -> Result<PathId, PathError> {
+    let c = p.conn;
+    p.client
+        .call(p.now, move |t, now| t.add_path(now, c, false))
+}
+
+pub fn path_state(p: &Pair, id: u64) -> Option<u32> {
+    let c = p.conn;
+    let st = p.client.call(p.now, move |t, _| t.conn_stats(c)).unwrap();
+    st.paths.iter().find(|x| x.id == id).map(|x| x.state)
 }
 
 pub fn closed(ev: &[Event], c: ConnId) -> Option<mq_transport_api::CloseReason> {

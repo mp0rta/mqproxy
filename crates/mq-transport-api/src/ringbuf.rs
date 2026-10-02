@@ -1,4 +1,5 @@
-//! The relay's byte buffer (spec §5.6): a port of `src/util/mq_buf.c`.
+//! The relay's byte buffer (SP0/SP1 spec §5.6), also the transport's datagram receive ring
+//! (SP2 spec §3.2): a port of `src/util/mq_buf.c`.
 //!
 //! Linear, not wrapping: `space()` is the tail room after the write cursor, and
 //! both cursors return to 0 when everything written has been consumed.
@@ -55,26 +56,22 @@ impl RingBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::TCP_BUF;
+
+    const CAP: usize = 64 * 1024;
 
     fn src() -> Vec<u8> {
         (1..=100).collect()
     }
     fn written() -> RingBuf {
-        let mut b = RingBuf::new(TCP_BUF);
+        let mut b = RingBuf::new(CAP);
         b.write_slice()[..100].copy_from_slice(&src());
         b.commit(100);
         b
     }
 
     #[test]
-    fn size_constant() {
-        assert_eq!(TCP_BUF, 65536);
-    }
-
-    #[test]
     fn fresh_buf() {
-        let b = RingBuf::new(TCP_BUF);
+        let b = RingBuf::new(CAP);
         assert_eq!(b.len(), 0);
         assert!(b.is_empty());
         assert_eq!(b.space(), 65536);
@@ -109,7 +106,7 @@ mod tests {
 
     #[test]
     fn fill_to_capacity() {
-        let mut b = RingBuf::new(TCP_BUF);
+        let mut b = RingBuf::new(CAP);
         b.commit(65536);
         assert_eq!(b.len(), 65536);
         assert_eq!(b.space(), 0);

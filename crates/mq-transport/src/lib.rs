@@ -8,6 +8,7 @@
 
 mod clock;
 mod conn;
+mod datagram;
 mod engine;
 mod events;
 mod ffi;
@@ -204,17 +205,16 @@ impl TransportOps for Transport {
         stream::stream_info(self, s)
     }
 
-    // Stubs until the datagram facade lands (spec §3.1).
-    fn datagram_send(&mut self, _: Time, _: ConnId, _: &[u8]) -> Result<(), DatagramError> {
-        Err(DatagramError::Stale)
+    fn datagram_send(&mut self, now: Time, c: ConnId, data: &[u8]) -> Result<(), DatagramError> {
+        datagram::datagram_send(self, now, c, data)
     }
 
-    fn datagram_mss(&self, _: ConnId) -> usize {
-        0
+    fn datagram_mss(&self, c: ConnId) -> usize {
+        datagram::datagram_mss(self, c)
     }
 
-    fn datagram_recv(&mut self, _: ConnId, _: &mut [u8]) -> Option<usize> {
-        None
+    fn datagram_recv(&mut self, c: ConnId, buf: &mut [u8]) -> Option<usize> {
+        datagram::ring_pop(self.inner.conns.get_mut(c.slot())?, buf)
     }
 }
 
@@ -243,6 +243,14 @@ impl Transport {
     /// Live stream slots of `c` (0 for a stale id).
     pub fn stream_count(&self, c: ConnId) -> u32 {
         self.inner.conns.get(c.slot()).map_or(0, |s| s.streams)
+    }
+
+    /// Datagrams `c`'s receive ring dropped (SP2 spec §3.1); 0 for a stale id.
+    pub fn dgram_rx_dropped(&self, c: ConnId) -> u64 {
+        self.inner
+            .conns
+            .get(c.slot())
+            .map_or(0, |s| s.dgram_rx_dropped)
     }
 
     /// The deferred close `drive` will apply (spec §4.2 ceiling).

@@ -9,7 +9,7 @@
 use super::{from_sockaddr, guard};
 use crate::slots::{ConnSlot, StreamSlot};
 use crate::txq::Refusal;
-use crate::{Inner, clock, stream};
+use crate::{Inner, clock, datagram, stream};
 use core::ffi::{c_int, c_uchar, c_void};
 use libc::{sockaddr, socklen_t};
 use mq_transport_api::{
@@ -156,6 +156,10 @@ pub(crate) fn on_conn_close(inner: &mut Inner, s: SlotId, reason: CloseReason) {
     } else {
         reason
     };
+    if slot.dgram_rx_dropped > 0 {
+        let n = slot.dgram_rx_dropped;
+        log::info!("mq_transport: conn {} dgram_rx_dropped={n}", id.index());
+    }
     inner.events.push(Event::ConnClosed(id, reason));
     if slot.counted {
         inner.n_counted -= 1;
@@ -217,6 +221,19 @@ pub(crate) fn on_stream_close(inner: &mut Inner, s: SlotId) {
         c.streams -= 1;
     }
     inner.events.push(Event::StreamClosed(stream_id(s)));
+}
+
+/// SP2 spec §3.2: into the connection's receive ring; a stale slot drops it, a full ring
+/// counts the drop.
+pub(crate) fn on_datagram_read(inner: &mut Inner, s: SlotId, data: &[u8]) {
+    let Some(c) = inner.conns.get_mut(s) else {
+        return;
+    };
+    if datagram::ring_push(c, data) {
+        inner
+            .events
+            .push_datagram_readable(&mut inner.conns, conn_id(s));
+    }
 }
 
 /// spec §4.4: `strict` callbacks of a live connection may refuse (EAGAIN + blocked);
@@ -398,8 +415,11 @@ pub(super) unsafe extern "C" fn conn_create_notify(
     if !with_inner(false, |i| on_conn_create(i, conn, cid, s)) {
         return -1;
     }
-    // SAFETY: a plain setter on the connection being created.
-    unsafe { xqc_conn_set_alp_user_data(conn, ud_of(s)) };
+    // SAFETY: plain setters on the connection being created.
+    unsafe {
+        xqc_conn_set_alp_user_data(conn, ud_of(s));
+        xqc_datagram_set_user_data(conn, ud_of(s));
+    }
     0
 }
 
@@ -511,6 +531,27 @@ pub(super) unsafe extern "C" fn stream_close_notify(
         with_inner((), |i| on_stream_close(i, s));
     }
     0
+}
+
+/// `ud` is the datagram user data: the connection's slot, set on creation (SP2 spec §3.2).
+pub(super) unsafe extern "C" fn datagram_read_notify(
+    _conn: *mut xqc_connection_t,
+    ud: *mut c_void,
+    data: *const c_void,
+    len: usize,
+    _recv_ts: u64,
+) {
+    let s = slot_of(ud);
+    if s.is_none() {
+        return; // spec §4.8: null user data is not ours
+    }
+    let data = if data.is_null() || len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: xquic passes `len` readable bytes for this call; copied before return.
+        unsafe { core::slice::from_raw_parts(data.cast::<u8>(), len) }
+    };
+    with_inner((), |i| on_datagram_read(i, s, data))
 }
 
 #[cfg(test)]
@@ -700,6 +741,15 @@ mod tests {
             std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns)).collect();
         assert_eq!(evs.last(), Some(&Event::StreamClosed(stream_id(s))));
         assert_eq!(evs.len(), 3); // NewConn, NewStream, StreamClosed
+    }
+
+    #[test]
+    fn datagram_for_released_slot_is_dropped() {
+        let mut i = inner(0);
+        let c = accept(&mut i);
+        on_server_refuse(&mut i, c);
+        on_datagram_read(&mut i, c, b"x");
+        assert!(i.events.pop(&mut i.streams, &mut i.conns).is_none());
     }
 
     #[test]

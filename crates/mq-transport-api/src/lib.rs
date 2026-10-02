@@ -6,6 +6,7 @@ mod error;
 mod event;
 mod ids;
 mod ops;
+pub mod ringbuf;
 mod time;
 
 pub use config::{

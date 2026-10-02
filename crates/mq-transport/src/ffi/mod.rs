@@ -49,7 +49,8 @@ pub(crate) fn transport_callbacks() -> xqc_transport_callbacks_t {
     }
 }
 
-/// ALPN callbacks (`"mqproxy-tcp/1"`). Datagram callbacks come with SP2.
+/// ALPN callbacks (`"mqproxy-tcp/1"`). Of the datagram callbacks only read and write are
+/// registered (SP2 spec §3.3).
 pub(crate) fn app_proto_callbacks() -> xqc_app_proto_callbacks_t {
     xqc_app_proto_callbacks_t {
         conn_cbs: xqc_conn_callbacks_t {
@@ -65,8 +66,13 @@ pub(crate) fn app_proto_callbacks() -> xqc_app_proto_callbacks_t {
             stream_close_notify: Some(stream_close_notify),
             stream_closing_notify: None,
         },
-        // SAFETY: all-None is a valid value of a struct of Option<fn> fields.
-        dgram_cbs: unsafe { core::mem::zeroed() },
+        dgram_cbs: xqc_datagram_callbacks_t {
+            datagram_read_notify: Some(datagram_read_notify),
+            datagram_write_notify: Some(datagram_write_notify),
+            datagram_acked_notify: None,
+            datagram_lost_notify: None,
+            datagram_mss_updated_notify: None,
+        },
     }
 }
 
@@ -81,6 +87,10 @@ unsafe extern "C" fn cert_verify(
 ) -> c_int {
     0
 }
+
+/// SP2 spec §3.3: nothing waits for writability (failed sends are dropped); registered so
+/// the facade does not rely on the fork's null check.
+unsafe extern "C" fn datagram_write_notify(_conn: *mut xqc_connection_t, _ud: *mut c_void) {}
 
 /// No resumption store, as in C.
 unsafe extern "C" fn save_token(_token: *const c_uchar, _len: u32, _ud: *mut c_void) {}

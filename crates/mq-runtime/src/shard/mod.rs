@@ -7,7 +7,7 @@
 
 mod inputs;
 pub(crate) mod relay;
-pub(crate) mod ringbuf;
+pub(crate) use mq_transport_api::ringbuf;
 mod rng;
 mod routing;
 mod tcp;
@@ -374,5 +374,13 @@ impl<T: TransportOps, A: App> Shard<T, A> {
     #[cfg(feature = "test-support")]
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn size_constant() {
+        assert_eq!(super::TCP_BUF, 65536);
     }
 }

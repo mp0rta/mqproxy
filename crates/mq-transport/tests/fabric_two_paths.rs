@@ -2,29 +2,11 @@
 //! spec §4.2 "MpReady may repeat".
 mod common;
 
-use common::pair::{MS, Opts, Pair, cli_addr, new_streams, read_all, send, srv_addr};
-use mq_transport_api::{Event, PathError, PathId, TransportOps};
-
-const ACTIVE: u32 = 2; // XQC_PATH_STATE_ACTIVE
-
-fn mp_ready_count(p: &Pair) -> usize {
-    p.cev
-        .iter()
-        .filter(|e| **e == Event::MpReady(p.conn))
-        .count()
-}
-
-fn add_path(p: &Pair) -> Result<PathId, PathError> {
-    let c = p.conn;
-    p.client
-        .call(p.now, move |t, now| t.add_path(now, c, false))
-}
-
-fn path_state(p: &Pair, id: u64) -> Option<u32> {
-    let c = p.conn;
-    let st = p.client.call(p.now, move |t, _| t.conn_stats(c)).unwrap();
-    st.paths.iter().find(|x| x.id == id).map(|x| x.state)
-}
+use common::pair::{
+    ACTIVE, MS, Opts, Pair, add_path, cli_addr, mp_ready_count, new_streams, path_state, read_all,
+    send, srv_addr,
+};
+use mq_transport_api::{PathError, PathId, TransportOps};
 
 /// Echoes `n` bytes over a new stream; returns the echoed bytes.
 fn echo(p: &mut Pair, n: usize) -> Vec<u8> {
