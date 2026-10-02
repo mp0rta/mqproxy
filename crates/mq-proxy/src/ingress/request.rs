@@ -13,6 +13,8 @@ pub enum Progress<'a> {
     Need,
     /// A complete request for `target`.
     Done { consumed: usize, target: Target },
+    /// A complete SOCKS5 UDP ASSOCIATE request; its DST is ignored (RFC 1928).
+    Associate { consumed: usize },
     /// Write `bytes`; then close if `close`, else drop `consumed` bytes and feed again.
     Reply {
         consumed: usize,

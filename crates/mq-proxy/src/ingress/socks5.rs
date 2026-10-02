@@ -1,5 +1,5 @@
-//! spec §6.1: SOCKS5 (RFC 1928, no-auth, CONNECT only) — port of `src/ingress/mq_socks5.c`
-//! plus the reply choices of `mq_listener.c:drive_socks5`.
+//! spec §6.1: SOCKS5 (RFC 1928, no-auth, CONNECT and UDP ASSOCIATE) — port of
+//! `src/ingress/mq_socks5.c` plus the reply choices of `mq_listener.c:drive_socks5`.
 
 use super::Progress;
 use super::request::capped;
@@ -105,12 +105,8 @@ fn request(b: &[u8]) -> Progress<'static> {
         return Progress::Need;
     }
     if cmd == CMD_ASSOCIATE {
-        // spec §6.1: UDP ASSOCIATE is refused with REP 0x07 in SP1 (parsed in full, as C).
-        return Progress::Reply {
-            consumed: total,
-            bytes: &REP_CMD_UNSUPPORTED,
-            close: true,
-        };
+        // spec §6.1: parsed in full, the DST ignored (as C and RFC 1928 allow).
+        return Progress::Associate { consumed: total };
     }
     let addr = &b[off..off + len];
     let host = match atyp {

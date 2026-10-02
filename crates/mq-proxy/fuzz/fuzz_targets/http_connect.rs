@@ -21,6 +21,7 @@ fn drive(data: &[u8], chunk: impl Fn(usize) -> usize) {
             } => {
                 return assert!(consumed <= buf.len() && !bytes.is_empty() && close);
             }
+            Progress::Associate { .. } => unreachable!("HTTP CONNECT has no ASSOCIATE"),
             Progress::Close => return,
         }
     }

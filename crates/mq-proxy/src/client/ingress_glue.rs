@@ -39,6 +39,12 @@ fn own(p: Progress<'_>) -> Step {
             bytes,
             close,
         } => Step::Reply(consumed, bytes.to_vec(), close),
+        // Refused with REP 0x07 until the association is wired (spec §6.2).
+        Progress::Associate { consumed } => Step::Reply(
+            consumed,
+            vec![0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0],
+            true,
+        ),
         Progress::Close => Step::Close,
     }
 }
