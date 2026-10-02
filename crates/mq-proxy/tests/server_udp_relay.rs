@@ -210,6 +210,30 @@ fn live_reassembly_to_target() {
     assert_eq!(counters(&h, c).frags_reassembled, 1);
 }
 
+/// spec §7.1: relay in `Live` does not wait for the RESP OK tail.
+#[test]
+fn relay_while_resp_ok_tail_pending() {
+    let mut h = H::new(cfg());
+    let (c, _) = h.authed();
+    let s = h.data(c);
+    h.feed(s, &open_ip(7, 0), false);
+    let (op, _) = h.socket_open().unwrap();
+    h.t.expect_stream_send(s, Ok(2));
+    let sock = h.socket_ok(op);
+    h.t.expect_stream_send(s, Err(StreamError::Blocked));
+    h.event(Event::StreamWritable(s));
+    let resp = udp_resp(0, 0, 60_000);
+    assert_eq!(h.t.sent_bytes(s), resp[..2], "the tail is pending");
+    inbound(&mut h, c, dgram(7, 0, 0, 1, b"ping"));
+    assert_eq!(udp_out(&mut h, sock), [(target(), b"ping".to_vec())]);
+    reply(&mut h, sock, target(), b"pong");
+    assert_eq!(h.t.datagram_sends(c), [dgram(7, 0, 0, 1, b"pong")]);
+    h.event(Event::StreamWritable(s));
+    assert_eq!(h.t.sent_bytes(s), resp, "the rest");
+    assert!(h.send_fins(s).iter().all(|f| !f));
+    assert!(!h.reset(s));
+}
+
 #[test]
 fn empty_payload_to_target_dropped_counted_no_rearm() {
     let mut h = H::new(cfg());
