@@ -67,7 +67,7 @@ jobs:
             mkdir -p crates/mq-wire/fuzz/corpus/$t
             cargo +nightly fuzz run --fuzz-dir crates/mq-wire/fuzz $t crates/mq-wire/fuzz/corpus/$t fuzz/corpus/$c -- -runs=0
           done
-          for pair in socks5:socks5_feed http_connect:http_connect; do
+          for pair in socks5:socks5_feed http_connect:http_connect socks5_udp_hdr:socks5_udp_hdr; do
             t=${pair%%:*}; c=${pair##*:}
             mkdir -p crates/mq-proxy/fuzz/corpus/$t
             cargo +nightly fuzz run --fuzz-dir crates/mq-proxy/fuzz $t crates/mq-proxy/fuzz/corpus/$t fuzz/corpus/$c -- -runs=0
@@ -89,7 +89,7 @@ jobs:
             mkdir -p crates/mq-wire/fuzz/corpus/$t
             cargo +nightly fuzz run --fuzz-dir crates/mq-wire/fuzz $t crates/mq-wire/fuzz/corpus/$t fuzz/corpus/$c -- -max_total_time=30
           done
-          for pair in socks5:socks5_feed http_connect:http_connect; do
+          for pair in socks5:socks5_feed http_connect:http_connect socks5_udp_hdr:socks5_udp_hdr; do
             t=${pair%%:*}; c=${pair##*:}
             mkdir -p crates/mq-proxy/fuzz/corpus/$t
             cargo +nightly fuzz run --fuzz-dir crates/mq-proxy/fuzz $t crates/mq-proxy/fuzz/corpus/$t fuzz/corpus/$c -- -max_total_time=30

@@ -30,3 +30,10 @@ path = "fuzz_targets/http_connect.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "socks5_udp_hdr"
+path = "fuzz_targets/socks5_udp_hdr.rs"
+test = false
+doc = false
+bench = false
