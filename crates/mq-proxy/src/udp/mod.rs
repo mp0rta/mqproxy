@@ -25,6 +25,8 @@ pub const SESSION_RESP_WAIT: Duration = Duration::from_secs(10);
 pub const MSS_REFRESH: u32 = 64;
 /// Per association, live sessions and negative-cache entries together (C `MQ_UDP_ASSOC_MAX_DST`).
 pub const MAX_DST_PER_ASSOC: usize = 64;
+/// The largest UDP datagram: the `datagram_recv` scratch, and the bound of a reply.
+pub(crate) const MAX_DGRAM: usize = 65_535;
 
 /// The host that wire address bytes name (C `srv_resolve_target`); `None` for a
 /// wrong address length or a non-UTF-8 name. An empty name is left to the caller.

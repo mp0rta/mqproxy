@@ -8,8 +8,8 @@ use crate::udp::defrag::{Defrag, Feed};
 use crate::udp::send::{MssCache, send_packet};
 use crate::udp::socks5udp::{self, Dst};
 use crate::udp::{
-    Counters, MAX_SESSIONS_PER_CONN, NEG_CACHE, PREAUTH_SENDQ_BYTES, PREAUTH_SENDQ_DGRAMS,
-    SESSION_RESP_WAIT, SessionEnd, UDP_MSG_HDR,
+    Counters, MAX_DGRAM, MAX_SESSIONS_PER_CONN, NEG_CACHE, PREAUTH_SENDQ_BYTES,
+    PREAUTH_SENDQ_DGRAMS, SESSION_RESP_WAIT, SessionEnd, UDP_MSG_HDR,
 };
 use mq_runtime::{Cx, Target, TcpId, TimerId};
 use mq_transport_api::{ConnId, Error, StreamId};
@@ -18,9 +18,6 @@ use mq_wire::frames::{
 };
 use mq_wire::udp_msg::UdpMsgHdr;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-
-/// The largest UDP datagram: the receive scratch, and the bound of a reply.
-const MAX_DGRAM: usize = 65_535;
 
 enum Phase {
     /// Opened while UDP is `Unknown`: datagrams wait for auth, at most 8 / 8 KiB.

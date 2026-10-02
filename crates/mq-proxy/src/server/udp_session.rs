@@ -1,23 +1,27 @@
 //! spec §7.1: the server's UDP sessions — the OPEN's admission gates, the
-//! resolve, the app socket and the RESP; spec §7.2 `end_session`.
+//! resolve, the app socket and the RESP; spec §7.2 the datagram paths, the
+//! pre-OPEN buffer, the idle timer and `end_session`.
 //!
 //! ```text
 //! Request ──OPEN──→ Resolving ──Ok──→ Opening ──Ok──→ Live (RESP OK)
 //!    │                  └──Err──────────┴──Err──→ Retiring (error RESP+FIN)
 //!    ├── --no-udp / 1024 sessions / undialable ──→ Retiring
 //!    └── malformed / FIN / duplicate sid ──→ stream_reset
-//! Resolving | Opening | Live: FIN, Err(Reset), StreamClosed or a failed
-//! RESP OK → drop_data → end_session, stream_reset
+//! Resolving | Opening | Live: FIN, Err(Reset), StreamClosed, a failed
+//! RESP OK or (Live) idle expiry → drop_data → end_session, stream_reset
 //! ```
 //! The session stream stays in `Server::data` (phase `Udp(sid)`) and holds
 //! one of the connection's 4096 budget entries like any app-held stream.
 
-use super::{Phase as Stream, Server};
+use super::{Phase as Stream, Server, Tm};
 use crate::app_stream;
-use crate::udp::MAX_SESSIONS_PER_CONN;
-use mq_runtime::{Cx, DialError, DialOpId, SocketOpId, Target, UdpSocketId};
-use mq_transport_api::{ConnId, StreamId};
+use crate::udp::defrag::{Defrag, Feed};
+use crate::udp::send::send_packet;
+use crate::udp::{MAX_DGRAM, MAX_SESSIONS_PER_CONN, UDP_MSG_HDR};
+use mq_runtime::{Cx, DialError, DialOpId, SocketOpId, Target, TimerId, UdpSocketId};
+use mq_transport_api::{ConnId, StreamId, Time};
 use mq_wire::frames::{MAX_FRAME, STATUS_ERROR, STATUS_OK, UdpErr, UdpSessionResp};
+use mq_wire::udp_msg::UdpMsgHdr;
 use mq_wire::varint;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -32,10 +36,13 @@ pub(super) enum Phase {
         op: SocketOpId,
         target: SocketAddr,
     },
+    /// spec §7.2: `idle` expires the session once `idle_len` has passed
+    /// since `active`, the last activity (`udp_idle`).
     Live {
         sock: UdpSocketId,
-        #[allow(dead_code)] // read by the §7.2 datagram paths (Task 6.3)
         target: SocketAddr,
+        idle: TimerId,
+        active: Time,
     },
 }
 
@@ -45,6 +52,10 @@ pub(super) struct SrvSession {
     pub(super) phase: Phase,
     /// The negotiated idle timeout, fixed at admission (spec §7.2).
     pub(super) idle_len: Duration,
+    /// Client → target reassembly (spec §2.3).
+    defrag: Defrag,
+    /// The next target → client `packet_id` (C `next_packet_id`).
+    packet_id: u16,
 }
 
 /// spec §7.1: `UDP_SESSION_RESP`, no message — OK with the negotiated idle
@@ -94,6 +105,12 @@ impl Server {
     #[cfg(feature = "test-support")]
     pub fn udp_sessions(&self, c: ConnId) -> Option<usize> {
         self.conns.get(&c).map(|k| k.udp.len())
+    }
+
+    /// spec §7.3: the UDP counters of `c`.
+    #[cfg(feature = "test-support")]
+    pub fn udp_counters(&self, c: ConnId) -> Option<crate::udp::Counters> {
+        self.conns.get(&c).map(|k| k.counters)
     }
 
     /// spec §7.2: session `sid`'s canonical target, once resolved.
@@ -148,6 +165,8 @@ impl Server {
             stream: s,
             phase: Phase::Resolving(op),
             idle_len: Duration::from_millis(idle),
+            defrag: Defrag::new(),
+            packet_id: 0,
         };
         self.conns
             .get_mut(&c)
@@ -186,6 +205,7 @@ impl Server {
 
     /// spec §7.1: `Opening` → `Live` and the RESP OK, or `SocketFailed`. An
     /// unaccepted RESP tail is retried on `StreamWritable` (`on_writable`).
+    /// spec §7.2: the idle timer starts, then the pre-OPEN entries flush.
     pub(super) fn udp_socket(
         &mut self,
         cx: &mut Cx<'_>,
@@ -202,11 +222,19 @@ impl Server {
                 return self.refuse(cx, c, sid, UdpErr::SocketFailed);
             }
         };
+        let (now, len) = (cx.now(), self.session(c, sid).idle_len);
+        let idle = self.timer(cx, len, Tm::UdpIdle(c, sid));
+        self.udp_socks.insert(sock, (c, sid));
         let sess = self.session(c, sid);
         let Phase::Opening { target, .. } = sess.phase else {
             unreachable!("socket_opens holds Opening sessions");
         };
-        sess.phase = Phase::Live { sock, target };
+        sess.phase = Phase::Live {
+            sock,
+            target,
+            idle,
+            active: now,
+        };
         // Exact: `idle_len` was built from these milliseconds.
         let (s, idle) = (sess.stream, sess.idle_len.as_millis() as u64);
         log::info!("mq_udp_srv: session {sid} OPEN ok (idle={idle}ms)");
@@ -214,23 +242,35 @@ impl Server {
         d.tx = udp_resp(Ok(idle));
         if !app_stream::flush(cx, s, &mut d.tx, false) {
             log::warn!("mq_udp_srv: session {sid} UDP_SESSION_RESP send failed");
-            self.drop_data(cx, s, true);
+            return self.drop_data(cx, s, true);
+        }
+        let k = self.conns.get_mut(&c).expect("admitted");
+        for d in k.preopen.take(now, sid) {
+            self.udp_deliver(cx, c, &d);
         }
     }
 
     /// spec §7.1: a session refused after admission frees its sid and slot;
     /// its stream retires with the error RESP.
     fn refuse(&mut self, cx: &mut Cx<'_>, c: ConnId, sid: u32, e: UdpErr) {
-        let k = self.conns.get_mut(&c).expect("admitted");
-        let sess = k.udp.remove(&sid).expect("admitted");
+        let sess = self.take_session(c, sid).expect("admitted");
         self.respond_error(cx, sess.stream, udp_resp(Err(e)));
     }
 
+    /// Free `sid`, its slot, its defrag and its pre-OPEN entries (spec §7.2);
+    /// the caller disposes of the phase. `None` once freed.
+    fn take_session(&mut self, c: ConnId, sid: u32) -> Option<SrvSession> {
+        let k = self.conns.get_mut(&c)?;
+        let sess = k.udp.remove(&sid)?;
+        k.preopen.discard(sid);
+        Some(sess)
+    }
+
     /// spec §7.2 `end_session`, run by `drop_data` (which resets and forgets
-    /// the stream): dispose of the socket or the pending resolve / open, and
-    /// free the sid and its slot.
+    /// the stream): dispose of the socket and idle timer or the pending
+    /// resolve / open, and free the session (`take_session`).
     pub(super) fn end_session(&mut self, cx: &mut Cx<'_>, c: ConnId, sid: u32) {
-        let Some(sess) = self.conns.get_mut(&c).and_then(|k| k.udp.remove(&sid)) else {
+        let Some(sess) = self.take_session(c, sid) else {
             return;
         };
         match sess.phase {
@@ -242,8 +282,135 @@ impl Server {
                 self.socket_opens.remove(&op);
                 cx.cancel_udp_socket(op);
             }
-            Phase::Live { sock, .. } => cx.close_udp_socket(sock),
+            Phase::Live { sock, idle, .. } => {
+                self.udp_socks.remove(&sock);
+                cx.close_udp_socket(sock);
+                self.cancel(cx, idle);
+            }
         }
         log::info!("mq_udp_srv: session {sid} closed");
+    }
+
+    /// spec §7.2 Inbound: drain `c`'s datagrams until `None`.
+    pub(super) fn udp_inbound(&mut self, cx: &mut Cx<'_>, c: ConnId) {
+        let mut buf = std::mem::take(&mut self.rx);
+        buf.resize(MAX_DGRAM, 0);
+        while let Some(n) = cx.datagram_recv(c, &mut buf) {
+            self.udp_deliver(cx, c, &buf[..n]);
+        }
+        self.rx = buf;
+    }
+
+    /// spec §7.2 Inbound: one tunnel datagram (or a flushed pre-OPEN entry)
+    /// past the auth gate → a `Live` session's defrag → its target, or the
+    /// pre-OPEN buffer.
+    fn udp_deliver(&mut self, cx: &mut Cx<'_>, c: ConnId, d: &[u8]) {
+        let enabled = self.cfg.udp_enabled;
+        let Some(k) = self.conns.get_mut(&c) else {
+            return;
+        };
+        // C design §9.2: the only auth boundary for DATAGRAM frames.
+        if !enabled || !k.authed() {
+            k.counters.drops_preauth += 1;
+            return;
+        }
+        let Some(h) = UdpMsgHdr::decode(d) else {
+            return; // short: silent, as C
+        };
+        let sid = h.session_id;
+        let Some(SrvSession {
+            phase:
+                Phase::Live {
+                    sock,
+                    target,
+                    active,
+                    ..
+                },
+            defrag,
+            ..
+        }) = k.udp.get_mut(&sid)
+        else {
+            // Resolving, Opening or an unknown sid.
+            k.counters.preopen_evictions += k.preopen.push(cx.now(), sid, d);
+            return;
+        };
+        let p = match defrag.feed(&h, &d[UDP_MSG_HDR..]) {
+            Feed::Complete(p) => p,
+            Feed::Pending => return,
+            Feed::Rejected => {
+                k.counters.defrag_drops += 1;
+                return;
+            }
+        };
+        if h.frag_count > 1 {
+            k.counters.frags_reassembled += 1;
+        }
+        // spec §4.1: the runtime cannot send an empty datagram.
+        if p.is_empty() {
+            k.counters.drops_empty += 1;
+            return;
+        }
+        if cx.udp_send(*sock, *target, &p).is_err() {
+            k.counters.drops_send_fail += 1;
+            return;
+        }
+        *active = cx.now();
+    }
+
+    /// spec §7.2 Outbound: a datagram on a session socket from its target
+    /// (both canonical: the driver reports a peer unmapped) → the client,
+    /// under the fragment send policy (spec §5).
+    pub(super) fn udp_reply(
+        &mut self,
+        cx: &mut Cx<'_>,
+        sock: UdpSocketId,
+        peer: SocketAddr,
+        data: &[u8],
+    ) {
+        let Some(&(c, sid)) = self.udp_socks.get(&sock) else {
+            return;
+        };
+        let k = self.conns.get_mut(&c).expect("admitted");
+        let Some(SrvSession {
+            phase: Phase::Live { target, active, .. },
+            packet_id,
+            ..
+        }) = k.udp.get_mut(&sid)
+        else {
+            unreachable!("udp_socks holds Live sessions");
+        };
+        if peer != *target {
+            return;
+        }
+        let out = send_packet(cx, c, &mut k.mss, sid, *packet_id, data, &mut k.counters);
+        if out.frags_ok + out.failed > 0 {
+            *packet_id = packet_id.wrapping_add(1); // the split ran (C)
+        }
+        if out.frags_ok > 0 {
+            *active = cx.now();
+        }
+    }
+
+    /// spec §7.2: the idle timer of `Live` session `sid` fired. Activity only
+    /// stamps `active`, so the timer re-arms itself for the rest of
+    /// `active + idle_len` — the deadline a re-arm per packet would set — and
+    /// reaps once that has passed.
+    pub(super) fn udp_idle(&mut self, cx: &mut Cx<'_>, c: ConnId, sid: u32) {
+        let now = cx.now();
+        let sess = self.session(c, sid);
+        let Phase::Live { active, .. } = sess.phase else {
+            unreachable!("only a Live session arms it");
+        };
+        let due = active + sess.idle_len;
+        if due > now {
+            let t = self.timer(cx, due - now, Tm::UdpIdle(c, sid));
+            if let Phase::Live { idle, .. } = &mut self.session(c, sid).phase {
+                *idle = t;
+            }
+            return;
+        }
+        log::info!("mq_udp_srv: session {sid} idle-expired");
+        let s = self.session(c, sid).stream;
+        self.drop_data(cx, s, true);
     }
 }

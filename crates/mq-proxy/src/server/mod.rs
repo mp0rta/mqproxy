@@ -20,7 +20,9 @@ mod udp_session;
 use crate::app_stream::{self, CHUNK, Recv};
 use crate::config::ServerConfig;
 use crate::metrics::format_metrics;
-use crate::udp::host_of;
+use crate::udp::preopen::PreOpen;
+use crate::udp::send::MssCache;
+use crate::udp::{Counters, host_of};
 use mq_runtime::{
     AcceptMeta, App, Cx, DialError, DialOpId, ListenerTag, RELAY_BUF, SocketOpId, StreamPreread,
     Target, TcpEnd, TcpId, TimerId, UdpSocketId,
@@ -57,6 +59,8 @@ enum Tm {
     Conn(ConnId),
     Request(StreamId),
     Metrics,
+    /// SP2 spec §7.2: a UDP session's idle timer (sids are per connection).
+    UdpIdle(ConnId, u32),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -86,6 +90,12 @@ struct Conn {
     closing: bool,
     /// SP2 spec §7.1: admitted UDP sessions by sid, at most 1024.
     udp: HashMap<u32, SrvSession>,
+    /// SP2 spec §7.2: datagrams for sids not yet `Live`.
+    preopen: PreOpen,
+    /// SP2 spec §5: the connection's datagram MSS reading.
+    mss: MssCache,
+    /// SP2 spec §7.3: this connection's UDP counters.
+    counters: Counters,
 }
 
 impl Conn {
@@ -141,6 +151,10 @@ pub struct Server {
     /// SP2 spec §7.1: in-flight resolves and socket opens of UDP sessions.
     resolves: HashMap<DialOpId, (ConnId, u32)>,
     socket_opens: HashMap<SocketOpId, (ConnId, u32)>,
+    /// SP2 spec §7.2: the socket of each `Live` session.
+    udp_socks: HashMap<UdpSocketId, (ConnId, u32)>,
+    /// SP2 spec §7.2: the `datagram_recv` scratch.
+    rx: Vec<u8>,
     timers: HashMap<TimerId, Tm>,
     /// spec §6.5: the most recently accepted connection (C `last_conn`).
     active: Option<ConnId>,
@@ -231,6 +245,8 @@ impl Server {
             dials: HashMap::new(),
             resolves: HashMap::new(),
             socket_opens: HashMap::new(),
+            udp_socks: HashMap::new(),
+            rx: Vec::new(),
             timers: HashMap::new(),
             active: None,
             auth_attempts: 0,
@@ -299,6 +315,9 @@ impl Server {
                 held: 0,
                 closing: false,
                 udp: HashMap::new(),
+                preopen: PreOpen::default(),
+                mss: MssCache::new(),
+                counters: Counters::default(),
             },
         );
         // spec §6.5: C sets `last_conn` at acceptance, before auth.
@@ -662,7 +681,7 @@ impl App for Server {
             }
             // Client-only events.
             Event::ConnEstablished(_) | Event::MpReady(_) => {}
-            Event::DatagramReadable(_) => {} // wired with the UDP lane
+            Event::DatagramReadable(c) => self.udp_inbound(cx, c),
         }
     }
 
@@ -720,9 +739,8 @@ impl App for Server {
         self.udp_socket(cx, op, r);
     }
 
-    fn on_udp_rx(&mut self, _cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {
-        // Wired with the UDP lane.
-        log::debug!("mq_server: {} bytes from {peer} on {sock:?}", data.len());
+    fn on_udp_rx(&mut self, cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {
+        self.udp_reply(cx, sock, peer, data);
     }
 
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
@@ -751,6 +769,7 @@ impl App for Server {
                 // spec §6.5: silent without a connection, as C `srv_metrics_tick`.
                 self.dump_metrics(cx);
             }
+            Tm::UdpIdle(c, sid) => self.udp_idle(cx, c, sid),
         }
     }
 
