@@ -1,18 +1,21 @@
 //! spec §6.3: the client's UDP sessions — sid allocation, the 1024 cap, the
-//! `PendingAuth` queue, the optimistic OPEN and both datagram paths.
+//! `PendingAuth` queue, the optimistic OPEN and both datagram paths; spec §6.4
+//! the session stream's RESP and every session end.
 
 use super::{Client, Tm, UdpAvail};
-use crate::app_stream;
+use crate::app_stream::{self, CHUNK, Recv};
 use crate::udp::defrag::{Defrag, Feed};
 use crate::udp::send::{MssCache, send_packet};
 use crate::udp::socks5udp::{self, Dst};
 use crate::udp::{
     Counters, MAX_SESSIONS_PER_CONN, NEG_CACHE, PREAUTH_SENDQ_BYTES, PREAUTH_SENDQ_DGRAMS,
-    SESSION_RESP_WAIT, UDP_MSG_HDR,
+    SESSION_RESP_WAIT, SessionEnd, UDP_MSG_HDR,
 };
 use mq_runtime::{Cx, Target, TcpId, TimerId};
 use mq_transport_api::{ConnId, Error, StreamId};
-use mq_wire::frames::{MAX_FRAME, STREAM_TYPE_UDP_SESSION, UdpSessionOpen};
+use mq_wire::frames::{
+    DecodeError, MAX_FRAME, STREAM_TYPE_UDP_SESSION, UdpSessionOpen, UdpSessionResp,
+};
 use mq_wire::udp_msg::UdpMsgHdr;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -22,9 +25,10 @@ const MAX_DGRAM: usize = 65_535;
 enum Phase {
     /// Opened while UDP is `Unknown`: datagrams wait for auth, at most 8 / 8 KiB.
     PendingAuth { queue: VecDeque<Vec<u8>> },
-    /// OPEN sent; its RESP is due before `deadline` (spec §5 `SESSION_RESP_WAIT`).
-    AwaitResp { deadline: TimerId },
-    #[allow(dead_code)] // set by the RESP (spec §6.4, task 5.4)
+    /// OPEN sent; its RESP (`rx`, the bytes so far) is due before `deadline`
+    /// (spec §5 `SESSION_RESP_WAIT`).
+    AwaitResp { deadline: TimerId, rx: Vec<u8> },
+    /// RESP OK: stream bytes are discarded (spec §6.4).
     Open,
 }
 
@@ -44,7 +48,8 @@ struct Session {
 pub(super) struct Sessions {
     /// Per client: it survives connections, as C `next_sid`.
     next_sid: u32,
-    /// By sid; ordered, so a post-auth flush runs in creation order.
+    /// By sid; ordered, so a post-auth flush runs in sid order (creation
+    /// order until the counter wraps).
     by_sid: BTreeMap<u32, Session>,
     pub(super) by_stream: HashMap<StreamId, u32>,
     mss: MssCache,
@@ -199,7 +204,7 @@ impl Client {
             Ok(st) => st,
             Err(e) => {
                 log::warn!("mq_udp_cli: open 0x02 stream failed ({e})");
-                self.end_session(cx, sid);
+                self.end_session(cx, sid, SessionEnd::Closed, true);
                 return false;
             }
         };
@@ -208,12 +213,13 @@ impl Client {
         self.sess.by_stream.insert(st, sid);
         if !app_stream::flush(cx, st, &mut s.tx, false) {
             log::warn!("mq_udp_cli: send UDP_SESSION_OPEN failed");
-            self.end_session(cx, sid);
+            self.end_session(cx, sid, SessionEnd::Closed, true);
             return false;
         }
         let deadline = self.timer(cx, SESSION_RESP_WAIT, Tm::UdpResp(sid));
         let s = self.sess.by_sid.get_mut(&sid).expect("live");
-        let queued = match std::mem::replace(&mut s.phase, Phase::AwaitResp { deadline }) {
+        let rx = Vec::new();
+        let queued = match std::mem::replace(&mut s.phase, Phase::AwaitResp { deadline, rx }) {
             Phase::PendingAuth { queue } => queue,
             _ => VecDeque::new(),
         };
@@ -247,26 +253,101 @@ impl Client {
         let tx = &mut self.sess.by_sid.get_mut(&sid).expect("mirrored").tx;
         if !app_stream::flush(cx, st, tx, false) {
             log::warn!("mq_udp_cli: send UDP_SESSION_OPEN failed");
-            self.end_session(cx, sid);
+            self.end_session(cx, sid, SessionEnd::Closed, true);
         }
     }
 
+    /// spec §5/§6.4: read a session stream until `Blocked`, FIN or reset; each
+    /// read is its bytes, then its FIN. `AwaitResp` collects the RESP, `Open`
+    /// discards.
+    pub(super) fn session_readable(&mut self, cx: &mut Cx<'_>, st: StreamId) {
+        let sid = self.sess.by_stream[&st];
+        let mut scratch = Vec::with_capacity(CHUNK);
+        let (end, live) = loop {
+            let s = self.sess.by_sid.get_mut(&sid).expect("mirrored");
+            let buf = match &mut s.phase {
+                Phase::AwaitResp { rx, .. } => rx,
+                _ => {
+                    scratch.clear();
+                    &mut scratch
+                }
+            };
+            let fin = match app_stream::recv(cx, st, buf, CHUNK) {
+                Recv::Data { n: 0, fin: false } | Recv::Blocked => return,
+                Recv::Data { fin, .. } => fin,
+                Recv::Failed => break (SessionEnd::Closed, false), // `recv` reset it
+            };
+            let Phase::AwaitResp { deadline, rx } = &s.phase else {
+                if fin {
+                    break (SessionEnd::Closed, true); // defensive: neither server sends one
+                }
+                continue;
+            };
+            let deadline = *deadline;
+            match UdpSessionResp::decode(rx) {
+                Err(DecodeError::Short) if !fin && rx.len() < MAX_FRAME => {}
+                // With a FIN in the same read the server has already ended it.
+                Ok((r, used)) if r.is_ok() && used <= MAX_FRAME && !fin => {
+                    let idle = r.idle_timeout_ms;
+                    log::debug!("mq_udp_cli: session {sid} open (server idle {idle} ms)");
+                    s.phase = Phase::Open;
+                    self.cancel(cx, deadline);
+                }
+                Ok((r, used)) if !r.is_ok() && used <= MAX_FRAME => {
+                    let end = r.error().map_or(SessionEnd::Closed, SessionEnd::Refused);
+                    break (end, true);
+                }
+                // Malformed or over 512 bytes, OK with FIN, or FIN before a RESP.
+                _ => break (SessionEnd::Closed, true),
+            }
+        };
+        self.end_session(cx, sid, end, live);
+    }
+
     /// spec §5/§6.4: every session end — cancel the deadline, clear the DST's
-    /// session (the entry stays), reset and forget the stream.
-    pub(super) fn end_session(&mut self, cx: &mut Cx<'_>, sid: u32) {
+    /// session (the entry stays; a refusal sets its `failed_at`), reset the
+    /// stream if the facade still holds it (`live`) and forget it.
+    pub(super) fn end_session(&mut self, cx: &mut Cx<'_>, sid: u32, end: SessionEnd, live: bool) {
         let Some(s) = self.sess.by_sid.remove(&sid) else {
             return;
         };
-        if let Phase::AwaitResp { deadline } = s.phase {
+        log::debug!("mq_udp_cli: session {sid} ended ({end:?})");
+        if let Phase::AwaitResp { deadline, .. } = s.phase {
             self.cancel(cx, deadline);
         }
         let a = self.assocs.get_mut(&s.assoc);
         if let Some(e) = a.and_then(|a| a.dsts.get_mut(&s.target)) {
             e.session = None;
+            if let SessionEnd::Refused(_) = end {
+                e.failed_at = Some(cx.now());
+            }
         }
         if let Some(st) = s.stream {
             self.sess.by_stream.remove(&st);
-            cx.stream_reset(st);
+            if live {
+                cx.stream_reset(st);
+            }
+        }
+    }
+
+    /// spec §6.1/§6.4: an association ends locally: its sessions end
+    /// `Closed`, their streams reset, and its UDP socket goes.
+    pub(super) fn end_assoc(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        let Some(a) = self.assocs.remove(&tcp) else {
+            return;
+        };
+        a.release(cx);
+        for sid in a.dsts.values().filter_map(|e| e.session) {
+            self.end_session(cx, sid, SessionEnd::Closed, true);
+        }
+    }
+
+    /// spec §6.4: the connection is gone with its streams; every session
+    /// ends `Closed`, `PendingAuth` ones included. Associations stay.
+    pub(super) fn udp_conn_gone(&mut self, cx: &mut Cx<'_>) {
+        let all: Vec<u32> = self.sess.by_sid.keys().copied().collect();
+        for sid in all {
+            self.end_session(cx, sid, SessionEnd::Closed, false);
         }
     }
 

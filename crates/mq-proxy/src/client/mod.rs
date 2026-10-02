@@ -21,6 +21,7 @@ use crate::app_stream::{self, CHUNK, Recv};
 use crate::config::ClientConfig;
 use crate::ingress::{INGRESS_CAP, socks5_assoc_reply, target_from_original_dst};
 use crate::metrics::format_metrics;
+use crate::udp::SessionEnd;
 use backoff::Backoff;
 use ingress_glue::{Fed, Ingress, kind_of};
 use mq_runtime::{
@@ -61,7 +62,6 @@ enum Tm {
     Ingress(TcpId),
     Pending,
     /// SP2 spec §6.3: a UDP session's RESP deadline, by sid.
-    #[allow(dead_code)] // read by the expiry (spec §6.4, task 5.4)
     UdpResp(u32),
 }
 
@@ -500,12 +500,13 @@ impl Client {
         self.assocs.insert(tcp, Assoc::new(op, peer_ip));
     }
 
-    /// SP2 spec §6.2: `Unavailable` ends every association.
+    /// SP2 spec §6.2: `Unavailable` ends every association, sessions included.
     fn set_udp(&mut self, cx: &mut Cx<'_>, avail: UdpAvail) {
         self.udp = avail;
         if avail == UdpAvail::Unavailable {
-            for (tcp, a) in self.assocs.drain() {
-                a.release(cx);
+            let all: Vec<TcpId> = self.assocs.keys().copied().collect();
+            for tcp in all {
+                self.end_assoc(cx, tcp);
                 cx.tcp_close(tcp);
             }
         }
@@ -521,6 +522,7 @@ impl Client {
         for (_, o) in self.opens.drain() {
             refuse(cx, o.tcp, o.kind, TcpErr::ConnRefused);
         }
+        self.udp_conn_gone(cx);
         self.paths.on_conn_closed(cx);
         if self.shutting_down {
             self.set_udp(cx, UdpAvail::Unavailable);
@@ -578,6 +580,9 @@ impl App for Client {
             // spec §6.2: the protocol has no server-initiated streams.
             Event::NewStream(_, s, _) => cx.stream_reset(s),
             Event::StreamReadable(s) if self.ctrl_of(s) => self.ctrl_readable(cx, s),
+            Event::StreamReadable(s) if self.sess.by_stream.contains_key(&s) => {
+                self.session_readable(cx, s)
+            }
             Event::StreamReadable(s) => self.open_readable(cx, s),
             Event::DatagramReadable(c) if self.current(c) => self.udp_inbound(cx, c),
             Event::StreamWritable(s) if self.ctrl_of(s) => {
@@ -602,6 +607,11 @@ impl App for Client {
             Event::StreamClosed(s) if self.ctrl_of(s) => {
                 log::warn!("mq_client: control stream closed");
                 self.close(cx);
+            }
+            // SP2 spec §6.4: the facade released it; nothing to reset.
+            Event::StreamClosed(s) if self.sess.by_stream.contains_key(&s) => {
+                let sid = self.sess.by_stream[&s];
+                self.end_session(cx, sid, SessionEnd::Closed, false);
             }
             Event::StreamClosed(s) => {
                 // spec §6.2: closed before the response → CONN_REFUSED, as in C.
@@ -669,8 +679,8 @@ impl App for Client {
             return;
         }
         // SP2 spec §6.1: the control connection's end is the association's (RFC 1928 §7).
-        if let Some(a) = self.assocs.remove(&tcp) {
-            a.release(cx);
+        if self.assocs.contains_key(&tcp) {
+            self.end_assoc(cx, tcp);
             if end == TcpEnd::ReadEof {
                 cx.tcp_close(tcp);
             }
@@ -780,7 +790,10 @@ impl App for Client {
                     refuse(cx, o.tcp, o.kind, TcpErr::Timeout);
                 }
             }
-            Tm::UdpResp(_) => {} // SP2 spec §6.4 deadline expiry: task 5.4
+            Tm::UdpResp(sid) => {
+                log::warn!("mq_udp_cli: session {sid}: no UDP_SESSION_RESP in time");
+                self.end_session(cx, sid, SessionEnd::Closed, true);
+            }
         }
     }
 
@@ -788,6 +801,8 @@ impl App for Client {
     fn on_shutdown(&mut self, cx: &mut Cx<'_>) {
         self.shutting_down = true;
         cx.set_accepting(false);
+        // SP2 spec §6.4: associations close like a control-socket EOF.
+        self.set_udp(cx, UdpAvail::Unavailable);
         if let Some(t) = self.reconnect.take() {
             self.cancel(cx, t);
         }
