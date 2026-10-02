@@ -50,6 +50,15 @@ fn readable(ev: &[Event], c: ConnId) -> usize {
         .count()
 }
 
+/// Transmit queues of `p` with something to send.
+fn pending(p: &Peer) -> usize {
+    p.call(Time::ZERO, |t, _| {
+        let mut keys = Vec::new();
+        t.pending_transmit(&mut keys);
+        keys.len()
+    })
+}
+
 /// Client → server, then drive the sender and exchange.
 fn send_c2s(p: &mut Pair, data: &[u8]) {
     assert_eq!(dsend(&p.client, p.now, p.conn, data.to_vec()), Ok(()));
@@ -109,6 +118,25 @@ fn datagram_echo_small() {
     assert_eq!(readable(&p.cev[seen..], p.conn), 1, "{:?}", p.cev);
     assert_eq!(drecv(&p.client, p.conn, 65535), Some(data));
     assert_eq!(drecv(&p.client, p.conn, 65535), None);
+}
+
+/// SP2 spec §3.3: with `defer_send_flush` a lone send only queues; the 1 µs wakeup it asked
+/// for is the backstop that flushes it when nothing else drives the transport.
+#[test]
+fn deferred_flush_backstop() {
+    let mut p = Pair::new();
+    assert_eq!(pending(&p.client), 0, "quiet before the send");
+    let data = payload(1, 64);
+    assert_eq!(dsend(&p.client, p.now, p.conn, data.clone()), Ok(()));
+    assert_eq!(pending(&p.client), 0, "the send was deferred, not flushed");
+    let at = p.now + Duration::from_micros(1);
+    assert_eq!(p.client.next_timeout(), Some(at));
+
+    p.now = at;
+    p.client.drive(p.now);
+    assert_eq!(pending(&p.client), 1, "the wakeup flushed the datagram");
+    p.exchange();
+    assert_eq!(drecv(&p.server, p.srv_conn, 65535), Some(data));
 }
 
 #[test]

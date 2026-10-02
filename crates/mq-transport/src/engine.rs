@@ -24,6 +24,8 @@ pub(crate) fn conn_settings(cfg: &TransportConfig, idle: Option<Duration>) -> xq
     s.proto_version = XQC_VERSION_V1;
     s.pacing_on = 1;
     s.max_datagram_frame_size = 65535;
+    // SP2 spec §3.3: a datagram send queues and arms a 1 µs wakeup; the next drive flushes the run.
+    s.defer_send_flush = 1;
     s.enable_multipath = 1;
     s.mp_ping_on = 1;
     // spec §7: cap on implicitly opened (skipped) peer stream ids; explicit, not xquic's 0=default.
@@ -281,6 +283,7 @@ mod tests {
         assert_eq!(s.enable_multipath, 1);
         assert_eq!(s.mp_ping_on, 1);
         assert_eq!(s.max_datagram_frame_size, 65535);
+        assert_eq!(s.defer_send_flush, 1); // SP2 spec §3.3
         assert_eq!(s.max_implicit_streams, 16384); // spec §7
         // SAFETY: by-value reads of xquic's immutable statics.
         let (want_cc, want_sched) = unsafe {
@@ -336,6 +339,17 @@ mod tests {
                 assert_ne!(bytes(a), bytes(b));
             }
         }
+    }
+
+    /// SP2 spec §3.3: of the datagram callbacks only read and write are registered.
+    #[test]
+    fn datagram_callbacks_match_spec() {
+        let d = app_proto_callbacks().dgram_cbs;
+        assert!(d.datagram_read_notify.is_some());
+        assert!(d.datagram_write_notify.is_some());
+        assert!(d.datagram_acked_notify.is_none());
+        assert!(d.datagram_lost_notify.is_none());
+        assert!(d.datagram_mss_updated_notify.is_none());
     }
 
     #[test]
