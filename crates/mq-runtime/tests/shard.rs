@@ -1284,6 +1284,37 @@ fn datagram_send_and_recv_redrive_but_mss_does_not() {
 }
 
 #[test]
+fn cx_datagram_send_sets_touched() {
+    // The observable of the step-5 re-drive: `touched` stays set after the drive
+    // (the transport may have queued events nobody has dispatched yet).
+    let mut h = setup();
+    let c = h.conn();
+    h.sh.drive(T0);
+    h.sh.with_app(T0, |_, cx| _ = cx.datagram_mss(c));
+    assert!(!h.sh.has_runnable_work(), "mss is a query");
+    h.sh.with_app(T0, |_, cx| _ = cx.datagram_send(c, b"x"));
+    assert!(h.sh.has_runnable_work(), "send may queue events");
+    h.sh.drive(T0);
+    assert!(!h.sh.has_runnable_work(), "a drive clears it");
+    h.sh.with_app(T0, |_, cx| _ = cx.datagram_recv(c, &mut [0; 8]));
+    assert!(h.sh.has_runnable_work(), "recv may queue events");
+}
+
+#[test]
+fn datagram_readable_routed_to_app() {
+    let mut h = setup();
+    let c = h.conn();
+    // Two datagrams coalesce into one level event.
+    h.t.inject_datagram(c, b"one".to_vec());
+    h.t.inject_datagram(c, b"two".to_vec());
+    h.sh.drive(T0);
+    assert_eq!(
+        h.app.take(),
+        [Recorded::TransportEvent(Event::DatagramReadable(c))]
+    );
+}
+
+#[test]
 fn rng_reproducible() {
     let draw = |seed| {
         let mut h = setup_seeded(seed);
