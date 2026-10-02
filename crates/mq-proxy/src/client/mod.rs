@@ -595,6 +595,16 @@ impl App for Client {
         // The client never dials.
     }
 
+    fn on_resolve_result(
+        &mut self,
+        _cx: &mut Cx<'_>,
+        op: DialOpId,
+        _r: Result<SocketAddr, DialError>,
+    ) {
+        // The client never resolves.
+        log::debug!("mq_client: unexpected resolve result {op:?}");
+    }
+
     fn on_udp_socket(
         &mut self,
         cx: &mut Cx<'_>,

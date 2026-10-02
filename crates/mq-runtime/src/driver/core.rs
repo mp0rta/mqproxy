@@ -75,6 +75,9 @@ enum DialState {
     Resolving,
     /// `start_connect` issued (to the first resolved address).
     Connecting(SocketAddr),
+    /// A resolve-only request (SP2 spec §4.2), queued or running in the
+    /// resolver; it never connects.
+    ResolveOnly,
 }
 
 /// spec §5.3: the loop core.
@@ -354,15 +357,20 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
                 if !self.resolver.finished(&mut self.io, op) {
                     return; // abandoned: its slot is freed, the result dropped
                 }
-                if !matches!(self.dials.get(&op), Some(DialState::Resolving)) {
-                    return;
-                }
-                match r.ok().and_then(|v| v.first().copied()) {
-                    Some(a) => {
+                let first = r.ok().and_then(|v| v.first().copied());
+                match (self.dials.get(&op).copied(), first) {
+                    (Some(DialState::Resolving), Some(a)) => {
                         self.dials.insert(op, DialState::Connecting(a));
                         self.io.start_connect(op, a);
                     }
-                    None => self.fail_dial(now, op, DialError::Dns),
+                    (Some(DialState::Resolving), None) => self.fail_dial(now, op, DialError::Dns),
+                    (Some(DialState::ResolveOnly), first) => {
+                        self.dials.remove(&op);
+                        self.deadlines.cancel(Expired::Dial(op));
+                        let r = first.ok_or(DialError::Dns);
+                        self.shard.on_resolve_result(now, op, r);
+                    }
+                    _ => {}
                 }
             }
             IoEvent::Connected { op, r } => match (self.dials.get(&op).copied(), r) {
@@ -414,6 +422,12 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
                     // The resolver slot stays occupied until the result returns.
                     Some(DialState::Resolving) => self.resolver.cancel(op),
                     Some(DialState::Connecting(_)) => self.io.cancel_connect(op),
+                    Some(DialState::ResolveOnly) => {
+                        self.resolver.cancel(op);
+                        self.shard
+                            .on_resolve_result(now, op, Err(DialError::Timeout));
+                        return;
+                    }
                     None => return,
                 }
                 self.shard.on_dial_result(now, op, Err(DialError::Timeout));
@@ -540,10 +554,23 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
                     }
                 }
             }
-            IoRequest::CancelDial { op } => {
+            IoRequest::Resolve {
+                op,
+                target,
+                deadline,
+            } => {
+                let Host::Domain(h) = target.host else {
+                    unreachable!("the shard completes IP targets itself (spec §4.2)");
+                };
+                self.deadlines.set(Expired::Dial(op), now + deadline);
+                self.dials.insert(op, DialState::ResolveOnly);
+                self.resolver.submit(&mut self.io, op, h, target.port);
+            }
+            // The two share the op-id space and the cleanup.
+            IoRequest::CancelDial { op } | IoRequest::CancelResolve { op } => {
                 self.deadlines.cancel(Expired::Dial(op));
                 match self.dials.remove(&op) {
-                    Some(DialState::Resolving) => self.resolver.cancel(op),
+                    Some(DialState::Resolving | DialState::ResolveOnly) => self.resolver.cancel(op),
                     Some(DialState::Connecting(_)) => self.io.cancel_connect(op),
                     None => {}
                 }

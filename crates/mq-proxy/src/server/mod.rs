@@ -653,6 +653,16 @@ impl App for Server {
         }
     }
 
+    fn on_resolve_result(
+        &mut self,
+        _cx: &mut Cx<'_>,
+        op: DialOpId,
+        r: Result<SocketAddr, DialError>,
+    ) {
+        // Wired with the UDP lane.
+        log::debug!("mq_server: resolve {op:?} -> {r:?}");
+    }
+
     fn on_udp_socket(
         &mut self,
         _cx: &mut Cx<'_>,

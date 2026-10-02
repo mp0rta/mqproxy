@@ -17,7 +17,7 @@ mod tx_ring;
 pub use relay::{PumpOutcome, RELAY_BUF, Relay, RelayEnd, RelayState};
 pub use rng::Rng;
 
-use crate::app::{App, Cx, DialError, Interest, IoRequest, ListenerTag, Target};
+use crate::app::{App, Cx, DialError, Host, Interest, IoRequest, ListenerTag, Target};
 use crate::ids::{DialOpId, ListenerId, SocketOpId, TcpId, TimerId, UdpSocketId};
 use mq_transport_api::{ConnId, PathId, SlotId, StreamId, Time, TransportOps, TxKey};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -74,6 +74,10 @@ pub struct ShardState {
     dials: HashSet<DialOpId>,
     /// spec §5.2: dials refused at the cap, delivered as `DialError::Limit` in `drive` step 3.
     limited: Vec<DialOpId>,
+    /// SP2 spec §4.2: resolves handed to the driver and not yet completed or cancelled.
+    resolves: HashSet<DialOpId>,
+    /// SP2 spec §4.2: `Host::Ip` resolves, delivered as `Ok` in `drive` step 3.
+    resolved: VecDeque<(DialOpId, SocketAddr)>,
     socket_ops: HashSet<SocketOpId>,
     /// SP2 spec §4.1: the `socket_ops` that open an app-owned socket; each
     /// reserves a cap slot.
@@ -109,6 +113,8 @@ impl ShardState {
             dead_streams: HashMap::new(),
             dials: HashSet::new(),
             limited: Vec::new(),
+            resolves: HashSet::new(),
+            resolved: VecDeque::new(),
             socket_ops: HashSet::new(),
             app_udp_ops: HashSet::new(),
             limited_udp: Vec::new(),
@@ -202,6 +208,33 @@ impl ShardState {
             self.limited.retain(|o| *o != op);
         }
     }
+    /// SP2 spec §4.2: an IP target completes in the next `drive` without
+    /// reaching the driver; a domain goes to the driver's resolver.
+    pub(crate) fn resolve(&mut self, target: Target, deadline: Duration) -> DialOpId {
+        let op = self.alloc(DialOpId::from_slot);
+        match target.host {
+            Host::Ip(ip) => self
+                .resolved
+                .push_back((op, SocketAddr::new(ip, target.port))),
+            Host::Domain(_) => {
+                self.resolves.insert(op);
+                self.push_request(IoRequest::Resolve {
+                    op,
+                    target,
+                    deadline,
+                });
+            }
+        }
+        op
+    }
+    /// SP2 spec §4.2: its result, if any, is dropped.
+    pub(crate) fn cancel_resolve(&mut self, op: DialOpId) {
+        if self.resolves.remove(&op) {
+            self.push_request(IoRequest::CancelResolve { op });
+        } else {
+            self.resolved.retain(|(o, _)| *o != op);
+        }
+    }
     pub(crate) fn open_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
         let op = self.alloc(SocketOpId::from_slot);
         self.socket_ops.insert(op);
@@ -293,6 +326,14 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         self.dispatch_events(now);
         for op in std::mem::take(&mut self.st.limited) {
             self.call_app(now, |a, cx| a.on_dial_result(cx, op, Err(DialError::Limit)));
+        }
+        // One at a time, over the count queued now: a callback may cancel a
+        // later one (spec §4.2 "never delivers"), whose entry is then gone.
+        for _ in 0..self.st.resolved.len() {
+            let Some((op, addr)) = self.st.resolved.pop_front() else {
+                break;
+            };
+            self.call_app(now, |a, cx| a.on_resolve_result(cx, op, Ok(addr)));
         }
         for op in std::mem::take(&mut self.st.limited_udp) {
             self.call_app(now, |a, cx| {
@@ -388,6 +429,7 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         self.st.touched
             || !self.st.limited.is_empty()
             || !self.st.limited_udp.is_empty()
+            || !self.st.resolved.is_empty()
             || self.transport.resume_pending()
             || self
                 .st

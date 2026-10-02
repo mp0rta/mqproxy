@@ -811,6 +811,112 @@ fn cancelled_dial_and_socket_results_return_none() {
     assert_eq!(h.sh.on_dial_result(T0, d2, Ok(addr(80))), None);
 }
 
+// --- resolve-only request (SP2 spec §4.2) ---
+
+fn ip_target(a: SocketAddr) -> Target {
+    Target {
+        host: Host::Ip(a.ip()),
+        port: a.port(),
+    }
+}
+
+#[test]
+fn resolve_ip_completes_without_driver() {
+    let mut h = setup();
+    let a = addr(53);
+    let op =
+        h.sh.with_app(T0, |_, cx| cx.resolve(ip_target(a), Duration::from_secs(5)));
+    assert!(h.reqs().is_empty(), "never reaches the driver");
+    assert!(h.app.records().is_empty(), "completes in drive, not inline");
+    assert!(h.sh.has_runnable_work());
+    h.sh.drive(T0);
+    assert_eq!(h.app.take(), [Recorded::ResolveResult(op, Ok(a))]);
+    assert!(!h.sh.has_runnable_work());
+}
+
+#[test]
+fn cancelled_ip_resolve_never_delivers() {
+    let mut h = setup();
+    let (a, b) = h.sh.with_app(T0, |_, cx| {
+        let t = ip_target(addr(53));
+        (
+            cx.resolve(t.clone(), Duration::from_secs(5)),
+            cx.resolve(t, Duration::from_secs(5)),
+        )
+    });
+    h.sh.with_app(T0, |_, cx| cx.cancel_resolve(a));
+    assert!(h.reqs().is_empty(), "nothing was ever sent to cancel");
+    // `b`'s result cancels nothing; `a`'s is gone.
+    h.sh.drive(T0);
+    assert_eq!(h.app.take(), [Recorded::ResolveResult(b, Ok(addr(53)))]);
+}
+
+#[test]
+fn ip_resolve_cancelled_from_a_sibling_callback_never_delivers() {
+    let mut h = setup();
+    let t = ip_target(addr(53));
+    let (a, b) = h.sh.with_app(T0, |_, cx| {
+        (
+            cx.resolve(t.clone(), Duration::from_secs(5)),
+            cx.resolve(t, Duration::from_secs(5)),
+        )
+    });
+    h.app.on(move |r, cx| {
+        if matches!(r, Recorded::ResolveResult(op, _) if *op == a) {
+            cx.cancel_resolve(b);
+        }
+    });
+    h.sh.drive(T0);
+    assert_eq!(h.app.take(), [Recorded::ResolveResult(a, Ok(addr(53)))]);
+    assert!(h.reqs().is_empty());
+}
+
+#[test]
+fn resolve_domain_goes_to_driver_and_is_delivered_once() {
+    let mut h = setup();
+    let socks: Vec<TcpId> = (0..CAP).map(|_| h.accept()).collect();
+    h.app.take();
+    // No socket is allocated, so the cap does not apply.
+    let op =
+        h.sh.with_app(T0, |_, cx| cx.resolve(target(), Duration::from_secs(5)));
+    assert_eq!(
+        h.reqs(),
+        [IoRequest::Resolve {
+            op,
+            target: target(),
+            deadline: Duration::from_secs(5)
+        }]
+    );
+    assert_eq!(socks.len(), CAP);
+    assert!(
+        !h.sh.accepting(),
+        "still at the cap: the resolve took no slot"
+    );
+    h.sh.on_resolve_result(T0, op, Ok(addr(443)));
+    assert_eq!(h.app.take(), [Recorded::ResolveResult(op, Ok(addr(443)))]);
+    // A second result for the same op is stale.
+    h.sh.on_resolve_result(T0, op, Err(DialError::Dns));
+    assert!(h.app.take().is_empty());
+}
+
+#[test]
+fn cancelled_resolve_result_is_dropped() {
+    let mut h = setup();
+    let op =
+        h.sh.with_app(T0, |_, cx| cx.resolve(target(), Duration::from_secs(5)));
+    h.reqs();
+    h.sh.with_app(T0, |_, cx| cx.cancel_resolve(op));
+    assert_eq!(h.reqs(), [IoRequest::CancelResolve { op }]);
+    h.sh.on_resolve_result(T0, op, Ok(addr(443)));
+    assert!(
+        h.app.take().is_empty(),
+        "cancelled results are not delivered"
+    );
+    // Cancelling again, or an unknown op, sends nothing.
+    h.sh.with_app(T0, |_, cx| cx.cancel_resolve(op));
+    assert!(h.reqs().is_empty());
+}
+
 // --- app-owned UDP sockets (SP2 spec §4.1) ---
 
 #[test]

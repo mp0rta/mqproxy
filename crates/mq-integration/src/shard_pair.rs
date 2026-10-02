@@ -171,6 +171,14 @@ impl<A: App> App for Tap<A> {
     fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>) {
         self.inner.on_dial_result(cx, op, r)
     }
+    fn on_resolve_result(
+        &mut self,
+        cx: &mut Cx<'_>,
+        op: DialOpId,
+        r: Result<SocketAddr, DialError>,
+    ) {
+        self.inner.on_resolve_result(cx, op, r)
+    }
     fn on_udp_socket(
         &mut self,
         cx: &mut Cx<'_>,
@@ -962,6 +970,13 @@ impl App for RawClient {
     fn on_tcp_data(&mut self, _cx: &mut Cx<'_>, _tcp: TcpId) {}
     fn on_tcp_end(&mut self, _cx: &mut Cx<'_>, _tcp: TcpId, _end: TcpEnd) {}
     fn on_dial_result(&mut self, _cx: &mut Cx<'_>, _op: DialOpId, _r: Result<TcpId, DialError>) {}
+    fn on_resolve_result(
+        &mut self,
+        _cx: &mut Cx<'_>,
+        _op: DialOpId,
+        _r: Result<SocketAddr, DialError>,
+    ) {
+    }
     fn on_udp_socket(
         &mut self,
         _cx: &mut Cx<'_>,

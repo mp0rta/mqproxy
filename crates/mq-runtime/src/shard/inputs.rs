@@ -149,6 +149,14 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         }
     }
 
+    /// SP2 spec §4.2: a driver-run resolution finished; dropped when the op
+    /// had been cancelled.
+    pub fn on_resolve_result(&mut self, now: Time, op: DialOpId, r: Result<SocketAddr, DialError>) {
+        if self.st.resolves.remove(&op) {
+            self.call_app(now, |a, cx| a.on_resolve_result(cx, op, r));
+        }
+    }
+
     /// spec §5.2: `None` when the open had been cancelled (or failed). SP2
     /// spec §4.1: an app open's cap reservation becomes the socket or is released.
     pub fn on_udp_socket(

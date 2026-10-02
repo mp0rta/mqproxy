@@ -81,6 +81,16 @@ pub enum IoRequest {
     CancelDial {
         op: DialOpId,
     },
+    /// SP2 spec §4.2: resolve to the first address under one deadline, no connect.
+    /// Shares the dial op-id space; the shard completes `Host::Ip` targets itself.
+    Resolve {
+        op: DialOpId,
+        target: Target,
+        deadline: Duration,
+    },
+    CancelResolve {
+        op: DialOpId,
+    },
     /// Ephemeral port.
     OpenUdpSocket {
         op: SocketOpId,
@@ -151,6 +161,14 @@ pub trait App {
     fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd);
     /// spec §5.4: a dial completed (never delivered once cancelled).
     fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>);
+    /// SP2 spec §4.2: a resolve-only request completed (never delivered once
+    /// cancelled). `Dns` and `Timeout` are its only failures.
+    fn on_resolve_result(
+        &mut self,
+        cx: &mut Cx<'_>,
+        op: DialOpId,
+        r: Result<SocketAddr, DialError>,
+    );
     /// spec §5.4: a UDP socket open completed (never delivered once cancelled).
     fn on_udp_socket(
         &mut self,
@@ -370,6 +388,16 @@ impl<'a> Cx<'a> {
     /// spec §5.4: the result, if any, is dropped and its socket closed.
     pub fn cancel_dial(&mut self, op: DialOpId) {
         self.st.cancel_dial(op)
+    }
+    /// SP2 spec §4.2: resolves `target` to its first address without
+    /// connecting; completes in `on_resolve_result`. No socket is allocated,
+    /// so the cap does not apply.
+    pub fn resolve(&mut self, target: Target, deadline: Duration) -> DialOpId {
+        self.st.resolve(target, deadline)
+    }
+    /// SP2 spec §4.2: as `cancel_dial`: the result, if any, is dropped.
+    pub fn cancel_resolve(&mut self, op: DialOpId) {
+        self.st.cancel_resolve(op)
     }
 
     // --- Timers (spec §5.4) ---

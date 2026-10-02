@@ -91,6 +91,8 @@ impl App for Toy {
     fn on_tcp_data(&mut self, _: &mut Cx<'_>, _: TcpId) {}
     fn on_tcp_end(&mut self, _: &mut Cx<'_>, _: TcpId, _: TcpEnd) {}
     fn on_dial_result(&mut self, _: &mut Cx<'_>, _: DialOpId, _: Result<TcpId, DialError>) {}
+    fn on_resolve_result(&mut self, _: &mut Cx<'_>, _: DialOpId, _: Result<SocketAddr, DialError>) {
+    }
     fn on_udp_socket(
         &mut self,
         _: &mut Cx<'_>,
