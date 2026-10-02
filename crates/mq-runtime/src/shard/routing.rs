@@ -151,6 +151,7 @@ impl<T: TransportOps, A: App> Shard<T, A> {
 
     /// spec §5.2: the sockets with something to send; SP2 spec §4.1: app
     /// sockets whose ring is not empty.
+    // ponytail: O(UDP sockets) per call, and the driver calls it twice per loop iteration; keep a dirty set of non-empty app rings if ~1k server sessions make it measurable.
     pub fn pending_transmit(&self) -> impl Iterator<Item = UdpSocketId> + '_ {
         let mut socks: BTreeSet<UdpSocketId> = self
             .tx_keys()
