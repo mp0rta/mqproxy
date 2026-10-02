@@ -78,6 +78,13 @@ note() { printf '%s\n' "e2e_udp: $*" >&2; }
 # (tc shaping, Servers C/D) only for 6/8.
 CASES="${CASES:-1 2 3 4 5 6 7 8}"
 want() { case " ${CASES} " in *" $1 "*) return 0;; esac; return 1; }
+# A typo'd token would silently run nothing and pass.
+for c in ${CASES}; do
+    case "$c" in
+        [1-8]) ;;
+        *) note "unknown CASES token '$c' (valid: 1..8)"; exit 1 ;;
+    esac
+done
 NEED_A=0
 for c in 1 2 3 5 7; do want "$c" && NEED_A=1; done
 
