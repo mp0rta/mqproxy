@@ -100,6 +100,9 @@ struct ScriptState {
     resume_pending: bool,
     next_timeout: Option<Time>,
     polling: bool,
+    /// `close_conn` queues no `ConnClosed`; the test pushes it (xquic raises it
+    /// after the closing period, so events still reach a closing connection).
+    hold_close: bool,
     /// Events queued by the transport itself (e.g. `close_conn`).
     events: VecDeque<Event>,
     /// Injection queue, drained after `events`.
@@ -132,9 +135,9 @@ pub struct ScriptedHandle(Arc<Mutex<ScriptState>>);
 /// Scripted `TransportOps` (spec §5.1). Unscripted defaults: `connect` /
 /// `open_stream` return fresh ids, `stream_send` accepts everything,
 /// `stream_recv` is `Blocked`, `add_path` returns sequential ids, `drive` only
-/// records `now`, `next_timeout` is `None`, `close_conn` queues `ConnClosed`,
-/// `datagram_send` accepts everything, `datagram_mss` is 1200, `datagram_recv`
-/// is `None`.
+/// records `now`, `next_timeout` is `None`, `close_conn` queues `ConnClosed`
+/// (unless held), `datagram_send` accepts everything, `datagram_mss` is 1200,
+/// `datagram_recv` is `None`.
 pub struct ScriptedTransport {
     h: ScriptedHandle,
     last_now: Time,
@@ -237,6 +240,10 @@ impl ScriptedHandle {
     }
     pub fn set_next_timeout(&self, t: Option<Time>) {
         self.st().next_timeout = t;
+    }
+    /// See `ScriptState::hold_close`.
+    pub fn hold_conn_closed(&self, on: bool) {
+        self.st().hold_close = on;
     }
     /// Injection queue; safe to call from any thread or from a reactive rule.
     pub fn push_event(&self, e: Event) {
@@ -501,6 +508,9 @@ impl TransportOps for ScriptedTransport {
         self.last_now = now;
         let mut st = self.st();
         st.log.push(Call::CloseConn(conn));
+        if st.hold_close {
+            return;
+        }
         st.events.push_back(Event::ConnClosed(
             conn,
             CloseReason {

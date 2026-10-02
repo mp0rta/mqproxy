@@ -370,8 +370,10 @@ impl Client {
         }
         self.backoff.on_serving(cx.now());
         log::info!("mq_client: authenticated");
-        // SP2 spec §6.2: the server relays UDP and datagrams fit on the connection.
-        let avail = if features & FEAT_UDP_RELAY != 0 && cx.datagram_mss(id) > 0 {
+        // SP2 spec §6.2: the server relays UDP and datagrams fit on the connection;
+        // shutting down, the AUTH_RESPONSE of the closing connection admits nothing.
+        let relay = features & FEAT_UDP_RELAY != 0 && cx.datagram_mss(id) > 0;
+        let avail = if relay && !self.shutting_down {
             UdpAvail::Available
         } else {
             UdpAvail::Unavailable
@@ -658,7 +660,7 @@ impl App for Client {
         if self.assocs.contains_key(&tcp) {
             return discard(cx, tcp);
         }
-        let udp = self.udp != UdpAvail::Unavailable;
+        let udp = self.udp != UdpAvail::Unavailable && !self.shutting_down;
         let Some(ing) = self.ingress.get_mut(&tcp) else {
             return; // read interest is off once the request is complete
         };

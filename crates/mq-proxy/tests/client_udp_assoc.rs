@@ -213,6 +213,21 @@ fn auth_refused_is_unavailable() {
 }
 
 #[test]
+fn shutdown_while_authing_stays_unavailable() {
+    let mut h = H::new(cfg());
+    let ctrl = h.establish();
+    let tcp = h.accept(h.socks, meta(None));
+    h.t.hold_conn_closed(true); // the closing period: events still arrive
+    h.sh.on_shutdown_signal(h.now);
+    // An AUTH_RESPONSE xquic had already buffered, read while the conn closes.
+    let resp = auth_resp_features(0, 0, FEAT_UDP_RELAY);
+    h.t.expect_stream_recv(ctrl, Ok((resp, false)));
+    h.event(Event::StreamReadable(ctrl));
+    h.rx(tcp, &[SOCKS_GREETING, ASSOCIATE].concat());
+    refused(&mut h, tcp);
+}
+
+#[test]
 fn control_eof_tears_down() {
     let mut h = H::new(cfg());
     let (tcp, sock) = bound(&mut h, meta(None), "127.0.0.1:40000");
