@@ -51,3 +51,24 @@ path = "fuzz_targets/varint.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "udp_session_open"
+path = "fuzz_targets/udp_session_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_session_resp"
+path = "fuzz_targets/udp_session_resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_msg_hdr"
+path = "fuzz_targets/udp_msg_hdr.rs"
+test = false
+doc = false
+bench = false
