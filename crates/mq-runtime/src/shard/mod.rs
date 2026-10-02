@@ -478,6 +478,11 @@ impl<T: TransportOps, A: App> Shard<T, A> {
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
+    /// SP2 spec §4.1: `sock` is a live app-owned UDP socket.
+    #[cfg(feature = "test-support")]
+    pub fn udp_is_app(&self, sock: UdpSocketId) -> bool {
+        (self.st.udp.get(&sock)).is_some_and(|e| matches!(e.owner, UdpOwner::App(_)))
+    }
 }
 
 #[cfg(test)]

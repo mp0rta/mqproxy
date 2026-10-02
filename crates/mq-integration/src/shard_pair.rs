@@ -4,9 +4,9 @@
 //! (`Transport` is `!Send`: one engine per thread, spec §4.6). The test thread
 //! owns the clock and the `Fabric`. `Pair::step` runs one
 //! `LoopCore::iteration` on the server, then one on the client, carrying the
-//! UDP each side sent through the fabric into the other side's `FakeIo`
-//! (`take_sent_udp` → `Fabric::push` → `pop_ready` → `inject_udp`). Only one
-//! side runs at a time, so a run is deterministic.
+//! UDP each side sent on its transport sockets through the fabric into the
+//! other side's `FakeIo` (`take_sent_udp` → `Fabric::push` → `pop_ready` →
+//! `inject_udp`). Only one side runs at a time, so a run is deterministic.
 //!
 //! App code outside a callback runs only through `Shard::with_app` on the
 //! shard's thread, between steps (`Node::with_app`, sent over the side's
@@ -14,10 +14,14 @@
 //! transport events it saw and the UDP sockets it opened. The harness plays
 //! the TCP endpoints through `FakeIo`: the origin on the server side
 //! (`Origin`), the local applications on the client side (`Node::accept`).
+//! App-owned UDP sockets (SP2 spec §4.1) stay off the fabric: the server's
+//! UDP target is an echo on them (`Node::udp_echo`), the client's SOCKS5 UDP
+//! application is `SocksUdpApp`.
 
 use mq_proxy::client::{Client, SOCKS5, TRANSPARENT};
 use mq_proxy::config::{ClientConfig, ServerConfig};
 use mq_proxy::server::Server;
+use mq_proxy::udp::socks5udp::{self, Dst};
 use mq_runtime::driver::{Io, ListenerKey, LoopConfig, LoopCore, Next, TcpSock, UdpSock, Wait};
 use mq_runtime::testing::{FakeIo, Op};
 use mq_runtime::{
@@ -292,7 +296,13 @@ type Core<A> = LoopCore<FakeIo, Transport, Tap<A>>;
 /// One side: its `LoopCore`, the UDP sockets it has, its listeners, its origin.
 pub struct Node<A: App> {
     core: Core<A>,
+    /// The transport's UDP sockets (the primary first): the fabric carries theirs.
     socks: Vec<(UdpSock, SocketAddr)>,
+    /// The app's UDP sockets.
+    app_socks: Vec<(UdpSock, SocketAddr)>,
+    /// The UDP target: every datagram sent on an app socket comes back from
+    /// the address it went to.
+    udp_echo: bool,
     udp_seen: usize,
     listeners: HashMap<ListenerTag, ListenerKey>,
     peers: u16,
@@ -322,6 +332,10 @@ impl<A: App> Node<A> {
     }
     pub fn shard(&self) -> &Shard<Transport, Tap<A>> {
         self.core.shard()
+    }
+    /// The shard itself, for harnesses that drive it without the `LoopCore`.
+    pub fn shard_mut(&mut self) -> &mut Shard<Transport, Tap<A>> {
+        self.core.shard_mut()
     }
     pub fn transport(&self) -> &Transport {
         self.core.shard().transport()
@@ -371,12 +385,25 @@ impl<A: App> Node<A> {
                 self.exit = Some(c);
             }
         }
-        let acted = self.origin.step(self.core.io_mut());
+        let mut acted = self.origin.step(self.core.io_mut());
         let opened = self.tap().udp[self.udp_seen..].to_vec();
         self.udp_seen += opened.len();
         for (id, local) in opened {
             if let Some(s) = self.core.udp_sock(id) {
-                self.socks.push((s, local));
+                if self.shard().udp_is_app(id) {
+                    self.app_socks.push((s, local));
+                } else {
+                    self.socks.push((s, local));
+                }
+            }
+        }
+        if self.udp_echo {
+            let io = self.core.io_mut();
+            for &(s, _) in &self.app_socks {
+                for (to, data) in io.take_sent_udp(s) {
+                    io.inject_udp(s, to, &data);
+                    acted = true;
+                }
             }
         }
         let mut packets = Vec::new();
@@ -443,6 +470,8 @@ impl<A: App + 'static> Side<A> {
             let mut node = Node {
                 core,
                 socks: vec![(primary, local)],
+                app_socks: Vec::new(),
+                udp_echo: false,
                 udp_seen: 0,
                 listeners: keyed,
                 peers: 0,
@@ -700,6 +729,11 @@ impl<C: App + 'static> Pair<Server, C> {
         self.with_server(move |n| n.origin.mode = mode);
     }
 
+    /// The server's UDP target echoes from now on.
+    pub fn udp_echo(&self) {
+        self.with_server(|n| n.udp_echo = true);
+    }
+
     /// The origin sockets connected so far.
     pub fn origin_socks(&self) -> Vec<TcpSock> {
         self.with_server(|n| n.origin.socks.clone())
@@ -782,6 +816,63 @@ impl<S: App + 'static> Pair<S, RawClient> {
         let rx = self.raw_stream(s).rx;
         let (st, code, n) = connect_response(&rx).expect("complete");
         (st, code, rx[n..].to_vec())
+    }
+}
+
+// --- SOCKS5 UDP app ---
+
+/// Where the SOCKS5 UDP application sends from: the control connection's IP
+/// (`Node::accept`), so the association locks onto it (SP2 spec §6.3).
+fn udp_app_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 6000))
+}
+
+/// A SOCKS5 UDP application (RFC 1928 §7) on the client's `FakeIo`: its
+/// control connection and the association's UDP socket.
+pub struct SocksUdpApp {
+    pub control: TcpSock,
+    sock: UdpSock,
+}
+
+impl SocksUdpApp {
+    /// The greeting and an ASSOCIATE on the SOCKS5 listener; runs until the reply.
+    pub fn associate<S: App + 'static>(p: &mut Pair<S, Client>) -> SocksUdpApp {
+        let control = p.with_client(|n| {
+            let s = n.accept(SOCKS5, None);
+            n.io_mut().tcp_feed(s, &SOCKS5_ASSOCIATE);
+            s
+        });
+        let replied = p.run_until(5 * SEC, move |p| p.app_written(control).len() >= 12);
+        let r = p.app_written(control);
+        assert!(
+            replied && r[..6] == [5, 0, 5, 0, 0, 1],
+            "ASSOCIATE reply {r:?}"
+        );
+        let ip = Ipv4Addr::new(r[6], r[7], r[8], r[9]);
+        let relay = SocketAddr::from((ip, u16::from_be_bytes([r[10], r[11]])));
+        let sock = p.with_client(move |n| n.app_socks.iter().find(|s| s.1 == relay).map(|s| s.0));
+        SocksUdpApp {
+            control,
+            sock: sock.expect("the association's socket"),
+        }
+    }
+
+    /// `socks_udp(dst, payload)` from `udp_app_addr()` to the association.
+    pub fn send<S: App + 'static>(&self, p: &Pair<S, Client>, dst: SocketAddr, payload: &[u8]) {
+        let (sock, b) = (self.sock, socks_udp(dst, payload));
+        p.with_client(move |n| n.io_mut().inject_udp(sock, udp_app_addr(), &b));
+    }
+
+    /// The datagrams the client sent the application since the last call.
+    pub fn recv<S: App + 'static>(&self, p: &Pair<S, Client>) -> Vec<Vec<u8>> {
+        let sock = self.sock;
+        let sent = p.with_client(move |n| n.io_mut().take_sent_udp(sock));
+        (sent.into_iter())
+            .map(|(to, d)| {
+                assert_eq!(to, udp_app_addr(), "to the learned source");
+                d
+            })
+            .collect()
     }
 }
 
@@ -1054,6 +1145,27 @@ pub fn socks5_connect(target: SocketAddr) -> Vec<u8> {
 
 /// The greeting reply then the SOCKS5 success reply.
 pub const SOCKS5_OK: [u8; 12] = [5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+
+/// SOCKS5 greeting (no auth) and a UDP ASSOCIATE from 0.0.0.0:0, in one write.
+pub const SOCKS5_ASSOCIATE: [u8; 13] = [5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0];
+
+/// `socks5udp::build` of an IPv4 `dst`, then `payload`: a datagram between
+/// the SOCKS5 UDP application and the client, either way.
+pub fn socks_udp(dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let SocketAddr::V4(a) = dst else {
+        panic!("IPv4 dst");
+    };
+    let mut b = Vec::new();
+    let ip = a.ip().octets();
+    let d = Dst {
+        atype: AddrType::Ipv4,
+        addr: &ip,
+        port: a.port(),
+    };
+    socks5udp::build(&mut b, &d);
+    b.extend_from_slice(payload);
+    b
+}
 
 /// Deterministic payload (C bulk origin: byte i is `i & 0xff`).
 pub fn bulk(n: usize) -> Vec<u8> {
