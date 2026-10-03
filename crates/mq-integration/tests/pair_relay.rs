@@ -168,3 +168,61 @@ fn pair_blocked_path_quota_and_resume() {
     assert_eq!(p.with_server(move |n| n.io().tcp_written(o)), want);
     assert_eq!(queued(&p), 0);
 }
+
+/// A black-holed path is removed by xquic after the idle timeout (30 s) while the
+/// connection lives on the other path; once the black hole lifts the client re-adds a
+/// path from the same address (a fresh socket for an extra path, the primary socket for
+/// the primary) and both paths are active again.
+fn blackhole_one_path_then_recover(ip: std::net::IpAddr, dead: u64) {
+    const CLOSED: u32 = 4; // XQC_PATH_STATE_CLOSED
+    let (mut p, c) = two_paths();
+    let paths = move |p: &Pair<Server, Client>| {
+        let st = p.with_client(move |n| n.transport().conn_stats(c)).unwrap();
+        st.paths.iter().map(|x| (x.id, x.state)).collect::<Vec<_>>()
+    };
+    let active = move |p: &Pair<Server, Client>| paths(p).iter().filter(|x| x.1 == ACTIVE).count();
+    let live = |p: &Pair<Server, Client>| {
+        p.with_client(|n| {
+            let io = n.io();
+            n.udp_socks()
+                .into_iter()
+                .filter(|s| !io.udp_closed(s.0))
+                .collect::<Vec<_>>()
+        })
+    };
+    let before = live(&p);
+    p.blackhole_ip = Some(ip);
+    assert!(
+        p.run_until(45 * SEC, |p| paths(p).contains(&(dead, CLOSED))),
+        "the dead path was never removed: {:?}",
+        paths(&p)
+    );
+    assert_eq!(active(&p), 1);
+    assert_eq!(p.client_conns(), [c], "the connection survives");
+    p.blackhole_ip = None;
+    assert!(
+        p.run_until(10 * SEC, |p| active(p) == 2),
+        "no path re-added: {:?}",
+        paths(&p)
+    );
+    assert_eq!(p.client_conns(), [c]);
+    // One live socket per address: the dead extra path's socket was replaced, the
+    // primary's reused.
+    let after = live(&p);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert!(after.iter().any(|s| s.1.ip() == CLIENT_IP2));
+    assert_eq!(after[0], before[0], "the primary socket is kept");
+    if dead != 0 {
+        assert_ne!(after[1], before[1], "the extra path got a fresh socket");
+    }
+}
+
+#[test]
+fn pair_blackholed_extra_path_is_readded() {
+    blackhole_one_path_then_recover(CLIENT_IP2, 1);
+}
+
+#[test]
+fn pair_blackholed_primary_path_is_readded() {
+    blackhole_one_path_then_recover(client_addr().ip(), 0);
+}

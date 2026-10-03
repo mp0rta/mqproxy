@@ -70,6 +70,13 @@ impl ShardState {
         self.tx_cursor.remove(&sock);
         self.push_request(IoRequest::CloseUdpSocket { sock });
     }
+    /// On `PathRemoved`: drop the path's mapping and close its socket unless
+    /// it is the primary.
+    fn close_path_socket(&mut self, conn: ConnId, path: PathId) {
+        if let Some(sock) = self.paths.remove(&(conn, path)) {
+            self.close_udp_socket(sock);
+        }
+    }
     /// spec §5.2: on `ConnClosed`, remove the connection's mappings and close
     /// each mapped socket other than the primary.
     fn close_conn_sockets(&mut self, conn: ConnId) {
@@ -134,6 +141,7 @@ impl<T: TransportOps, A: App> Shard<T, A> {
                     self.st.dead_streams.retain(|_, conn| conn != c);
                     self.st.close_conn_sockets(*c);
                 }
+                Event::PathRemoved(c, path) => self.st.close_path_socket(*c, *path),
                 _ => {}
             }
             self.call_app(now, |a, cx| a.on_transport_event(cx, ev));

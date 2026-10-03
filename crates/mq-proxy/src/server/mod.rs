@@ -682,7 +682,7 @@ impl App for Server {
                 }
             }
             // Client-only events.
-            Event::ConnEstablished(_) | Event::MpReady(_) => {}
+            Event::ConnEstablished(_) | Event::MpReady(_) | Event::PathRemoved(..) => {}
             Event::DatagramReadable(c) => self.udp_inbound(cx, c),
         }
     }
