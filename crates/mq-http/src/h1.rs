@@ -59,7 +59,7 @@ fn trim_ows(mut v: &[u8]) -> &[u8] {
 }
 
 /// Strict decimal in `0..=i64::MAX` (leading zeros accepted, as C).
-fn parse_content_length(v: &[u8]) -> Option<u64> {
+pub fn parse_content_length(v: &[u8]) -> Option<u64> {
     if v.is_empty() {
         return None;
     }

@@ -177,13 +177,6 @@ pub fn forwarded_headers(head: &Head, c: &Checked) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Spec §5.6: `HTTP/1.1 <code> \r\nX-Mq-Error: <xmq>\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the download and end paths (Tasks 4.4/4.5) call it"
-    )
-)]
 pub fn synth_error(code: u16, xmq: &str) -> Vec<u8> {
     let mut o = Vec::with_capacity(96);
     h1::write_status(&mut o, code, "");
