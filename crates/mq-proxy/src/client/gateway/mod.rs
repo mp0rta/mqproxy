@@ -11,7 +11,7 @@ use head::Head;
 use mq_http::h1::{self, HEAD_MAX, Progress};
 use mq_http::headers::{Reject, reject_status, reject_xmq};
 use mq_runtime::{AcceptMeta, Cx, SocketOpId, TCP_BUF, TcpEnd, TcpId, TimerId, UdpSocketId};
-use mq_transport_api::{ConnConfig, ConnId, ConnProto, Event, H3Header, H3ReqId};
+use mq_transport_api::{ConnConfig, ConnId, ConnProto, Event, H3Header, H3ReqId, StreamError};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -196,7 +196,12 @@ impl Gateway {
                 self.by_h3.remove(&r);
             }
             // Only the gateway holds H3 requests on the client (§5.8).
-            Event::H3Readable(_) | Event::H3Writable(_) => {}
+            Event::H3Writable(r) => {
+                if let Some(&tcp) = self.by_h3.get(&r) {
+                    self.upload(cx, tcp);
+                }
+            }
+            Event::H3Readable(_) => {}
             ev => return Some(ev),
         }
         None
@@ -293,14 +298,21 @@ impl Gateway {
     }
 
     /// SP3 spec §5.3: send what `tcp_rx` holds, up to the remaining length,
-    /// the FIN riding the last byte. (Blocked/EOF/error handling: Task 4.3.)
+    /// the FIN riding the last byte; bytes beyond it are discarded. `Blocked`
+    /// consumes nothing and waits for `H3Writable`; any other error aborts.
     fn upload(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
         let Some(GwReq::Open { h3, upload }) = self.reqs.get_mut(&tcp) else {
             return;
         };
+        let h3 = *h3;
         let mut buf = [0u8; DL_CHUNK];
         loop {
             let rx = cx.tcp_rx(tcp);
+            if upload.remaining == 0 {
+                let extra = rx.len();
+                cx.tcp_consume(tcp, extra);
+                return;
+            }
             let take = usize::try_from(upload.remaining)
                 .unwrap_or(usize::MAX)
                 .min(rx.len())
@@ -310,24 +322,55 @@ impl Gateway {
             }
             buf[..take].copy_from_slice(&rx[..take]);
             let fin = take as u64 == upload.remaining;
-            match cx.h3_send_body(*h3, &buf[..take], fin) {
-                Ok(n) if n > 0 => {
+            match cx.h3_send_body(h3, &buf[..take], fin) {
+                Ok(0) | Err(StreamError::Blocked) => return,
+                Ok(n) => {
                     cx.tcp_consume(tcp, n);
                     upload.remaining -= n as u64;
                 }
-                _ => return,
+                Err(_) => return self.abort(cx, tcp),
             }
         }
     }
 
-    /// SP3 spec §5.2: an end before the head is complete closes silently.
+    /// Remove the request; `h3_reset` while its H3 side is live (in `by_h3`
+    /// until `H3Closed`, §5.5).
+    fn remove(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        if let Some(GwReq::Open { h3, .. }) = self.reqs.remove(&tcp)
+            && self.by_h3.remove(&h3).is_some()
+        {
+            cx.h3_reset(h3);
+        }
+    }
+
+    /// SP3 spec §5.5 abort (truncation visible): `tcp_abort`, `h3_reset` if
+    /// live, remove.
+    fn abort(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        cx.tcp_abort(tcp);
+        self.remove(cx, tcp);
+    }
+
+    /// SP3 spec §5.2 (an end before the head is complete closes silently)
+    /// and §5.3 (EOF rule; `Error` resets and removes — the shard already
+    /// closed the socket).
     pub fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
-        if let Some(&GwReq::Head { timer }) = self.reqs.get(&tcp) {
-            self.reqs.remove(&tcp);
-            self.cancel(cx, timer);
-            if end == TcpEnd::ReadEof {
-                cx.tcp_close(tcp);
+        match (self.reqs.get(&tcp), end) {
+            (Some(&GwReq::Head { timer }), _) => {
+                self.reqs.remove(&tcp);
+                self.cancel(cx, timer);
+                if end == TcpEnd::ReadEof {
+                    cx.tcp_close(tcp);
+                }
             }
+            (Some(GwReq::Open { .. }), TcpEnd::Error(_)) => self.remove(cx, tcp),
+            // The tail may still sit in `tcp_rx` behind a `Blocked` H3 side:
+            // only a shortfall is a truncation (never a fake FIN).
+            (Some(GwReq::Open { upload, .. }), TcpEnd::ReadEof)
+                if (cx.tcp_rx(tcp).len() as u64) < upload.remaining =>
+            {
+                self.abort(cx, tcp)
+            }
+            _ => {}
         }
     }
 
