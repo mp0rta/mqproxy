@@ -19,8 +19,9 @@
 #
 # Output: ci_bench_results/gateway_<timestamp>.json
 # Exit:   non-zero when any cell's throughput ratio is below GATE (0.95), when a
-#         transfer failed or a process died, or when a cell moved nothing. bits/CPU-s is reported,
-#         not gated.
+#         transfer failed, a worker left no output or a process died, when a cell
+#         moved nothing, or when any of the 6 cells lacks REPEAT runs of either
+#         binary. bits/CPU-s is reported, not gated.
 #
 # Usage: sudo MQPROXY_BIN_C=build/mqproxy MQPROXY_BIN_RUST=target/release/mqproxy \
 #            bash scripts/ci_benchmarks/ci_bench_gateway.sh
@@ -47,6 +48,9 @@ ORIGIN_CA="${REPO_ROOT}/tests/certs/origin-ca.crt"
 
 DURATION="${DURATION:-10}"
 REPEAT="${REPEAT:-3}"
+case "${REPEAT}" in
+    ''|*[!0-9]*|0) echo "error: REPEAT must be an integer >= 1 (got '${REPEAT}')" >&2; exit 1 ;;
+esac
 GATE=0.95
 DIRECTIONS=(download upload)
 STREAM_COUNTS=(1 4 16)
@@ -100,11 +104,20 @@ ip netns exec "${CB_NS_SERVER}" "${_CB_WORK_DIR}/bench_origin" \
     -cert "${ORIGIN_CERT}" -key "${ORIGIN_KEY}" \
     -port "${ORIGIN_PORT}" -root "${_CB_WORK_DIR}" \
     > "${_CB_WORK_DIR}/origin.log" 2>&1 &
+origin_ready=0
 for _ in $(seq 50); do
-    ip netns exec "${CB_NS_SERVER}" curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CA}" \
-        "https://127.0.0.1:${ORIGIN_PORT}/blob.bin" && break
+    if ip netns exec "${CB_NS_SERVER}" curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CA}" \
+        "https://127.0.0.1:${ORIGIN_PORT}/blob.bin"; then
+        origin_ready=1
+        break
+    fi
     sleep 0.1
 done
+if [ "${origin_ready}" -ne 1 ]; then
+    echo "error: origin not ready" >&2
+    tail -5 "${_CB_WORK_DIR}/origin.log" >&2
+    exit 1
+fi
 
 TARGET_DL="https://127.0.0.1:${ORIGIN_PORT}/blob.bin"
 TARGET_UL="https://127.0.0.1:${ORIGIN_PORT}/sink"
@@ -204,6 +217,11 @@ for impl in c rust; do
                 wait "${pids[@]}"
                 t1=$(date +%s%N)
                 c1=$(cpu_ticks "${_CB_CLIENT_PID}"); s1=$(cpu_ticks "${_CB_SERVER_PID}")
+                # A worker that left no output file counts as a failure.
+                missing=0
+                for w in $(seq 1 "${p}"); do
+                    [ -f "${out}.${w}" ] || missing=$(( missing + 1 ))
+                done
                 cat "${out}".* > "${out}" 2>/dev/null
                 # Count completed 200s; anything else is a failure.
                 read -r nbytes ok errs < <(awk -v d="${dir}" '
@@ -211,6 +229,10 @@ for impl in c rust; do
                     $4 == 0 && $1 == 200 { s += b; n++; next }
                     { e++ }
                     END { printf "%d %d %d\n", s, n, e }' "${out}")
+                if [ "${missing}" -gt 0 ]; then
+                    echo "error: ${run}: ${missing} of ${p} workers left no output" >&2
+                    errs=$(( errs + missing ))
+                fi
                 if ! kill -0 "${_CB_SERVER_PID}" 2>/dev/null || ! kill -0 "${_CB_CLIENT_PID}" 2>/dev/null; then
                     echo "error: ${run}: an mqproxy process died during the run" >&2
                     tail -5 "${_CB_WORK_DIR}/server-${run}.log" "${_CB_WORK_DIR}/client-${run}.log" >&2
@@ -232,7 +254,8 @@ python3 - "${RAW}" "${OUTPUT_FILE}" <<PYEOF
 import json, statistics, sys
 
 raw, out = sys.argv[1], sys.argv[2]
-tck, gate = ${CLK_TCK}, ${GATE}
+tck, gate, repeat = ${CLK_TCK}, ${GATE}, ${REPEAT}
+cells = ["%s_P%s" % (d, p) for d in "${DIRECTIONS[*]}".split() for p in "${STREAM_COUNTS[*]}".split()]
 results = {"c": {}, "rust": {}}
 for line in open(raw):
     impl, d, p, rep, nbytes, ns, cticks, sticks, errs = line.split()
@@ -259,20 +282,23 @@ def ratio(a, b):
 ratios, ok = {}, True
 print("\n%-12s %10s %10s %7s %11s %11s %7s" % (
     "cell", "C Mbps", "Rust Mbps", "ratio", "C bit/cpu", "Rust b/cpu", "ratio"))
-for name in results["c"]:
-    c, r = results["c"][name], results["rust"].get(name, {})
-    tr = ratio(r.get("median_throughput_mbps"), c["median_throughput_mbps"])
-    er = ratio(r.get("median_bits_per_cpu_s"), c["median_bits_per_cpu_s"])
-    failed = sum(x["failed"] for x in c["runs"] + r.get("runs", []))
+for name in cells:
+    c, r = results["c"].get(name, {}), results["rust"].get(name, {})
+    # Every cell needs REPEAT runs of both binaries; a short cell fails.
+    short = [i for i, x in (("C", c), ("Rust", r)) if len(x.get("runs", [])) != repeat]
+    tr = ratio(r.get("median_throughput_mbps"), c.get("median_throughput_mbps"))
+    er = ratio(r.get("median_bits_per_cpu_s"), c.get("median_bits_per_cpu_s"))
+    failed = sum(x["failed"] for x in c.get("runs", []) + r.get("runs", []))
     ratios[name] = {"throughput": tr, "bits_per_cpu_s": er,
-                    "client_bits_per_cpu_s": ratio(r.get("median_client_bits_per_cpu_s"), c["median_client_bits_per_cpu_s"]),
-                    "server_bits_per_cpu_s": ratio(r.get("median_server_bits_per_cpu_s"), c["median_server_bits_per_cpu_s"])}
-    bad = tr is None or tr < gate or failed
+                    "client_bits_per_cpu_s": ratio(r.get("median_client_bits_per_cpu_s"), c.get("median_client_bits_per_cpu_s")),
+                    "server_bits_per_cpu_s": ratio(r.get("median_server_bits_per_cpu_s"), c.get("median_server_bits_per_cpu_s"))}
+    bad = tr is None or tr < gate or failed or short
     ok = ok and not bad
     print("%-12s %10.1f %10.1f %7s %11.3g %11.3g %7s%s" % (
-        name, c["median_throughput_mbps"], r.get("median_throughput_mbps") or 0, tr,
-        c["median_bits_per_cpu_s"] or 0, r.get("median_bits_per_cpu_s") or 0, er,
-        ("  FAIL" + (" (%d failed transfers)" % failed if failed else "")) if bad else ""))
+        name, c.get("median_throughput_mbps") or 0, r.get("median_throughput_mbps") or 0, tr,
+        c.get("median_bits_per_cpu_s") or 0, r.get("median_bits_per_cpu_s") or 0, er,
+        ("  FAIL" + (" (%d failed transfers)" % failed if failed else "")
+         + (" (missing runs: %s)" % "/".join(short) if short else "")) if bad else ""))
 
 output = {
     "test": "gateway",
