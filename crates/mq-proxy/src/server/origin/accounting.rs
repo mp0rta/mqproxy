@@ -48,14 +48,12 @@ impl ConnAccounting {
     }
 
     /// h2 (§7.7): an `Ended`-unreleased record or a `Completed` driver.
-    #[allow(dead_code)] // Task 5.6c: the h2 pool hit
     pub fn draining(&self) -> bool {
         self.ended_unreleased > 0 || self.completed
     }
 
     /// §7.2 step 2: an h2 pool hit needs `!draining` and
     /// `active < current_max_send_streams()`.
-    #[allow(dead_code)] // Task 5.6c: the h2 pool hit
     pub fn h2_hit_allowed(&self, max: usize) -> bool {
         !self.draining() && (self.active as usize) < max
     }

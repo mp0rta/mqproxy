@@ -64,9 +64,10 @@ impl Origin {
     /// released `Ended` records dropped, the rest counted; (b) `draining`
     /// inputs; (c) the h1 removals, by precedence — an `Ended`-unreleased
     /// record → E, an unclean end → C, a `Completed` driver or a closed
-    /// `send` → B — else the h1 idleness transition; (d) a `closing` conn
-    /// whose last `Assigned` record ended is dropped (class B: its deferred
-    /// `tcp_close` now). Then `OriginTimer::Idle` is armed while `pool` or
+    /// `send` → B — else the h1 idleness transition; h2 without a record: a
+    /// `Completed` driver → B, else `idle_since` (`active` is 0); (d) a
+    /// `closing` conn whose last `Assigned` record ended is dropped (class
+    /// B: its deferred `tcp_close` now). Then `OriginTimer::Idle` is armed while `pool` or
     /// `closing` is non-empty, cancelled otherwise.
     pub(super) fn settle(&mut self, cx: &mut Cx<'_>) {
         let now = cx.now();
@@ -103,6 +104,15 @@ impl Origin {
                 } else if c.reqs.is_empty() && c.idle_since.is_none() && ready {
                     // Set once, on the busy → idle transition (a conn left
                     // without a record by a failed build counts too).
+                    c.idle_since = Some(now);
+                }
+            }
+            if c.proto == Some(OriginProto::H2) && !closing && c.reqs.is_empty() {
+                if c.acct.completed {
+                    // Its last record dropped: class B now, not at the sweep.
+                    removal = Some(Removal::B);
+                } else if c.send.is_some() && c.idle_since.is_none() {
+                    // `active` dropped to 0 (cleared on assignment).
                     c.idle_since = Some(now);
                 }
             }

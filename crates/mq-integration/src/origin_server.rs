@@ -39,6 +39,8 @@ pub const ORIGIN_KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/c
 const CHUNK: u64 = 16 * 1024;
 /// The raw peers' read timeout: how often they look at `stop` / `release`.
 const POLL: Duration = Duration::from_millis(10);
+/// How long a finished hyper connection keeps its socket (`run_conn`).
+const LINGER: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub enum Proto {
@@ -437,7 +439,7 @@ async fn run_conn<C: Future>(
     let mut release = sh.release.subscribe();
     loop {
         tokio::select! {
-            _ = conn.as_mut() => return,
+            _ = conn.as_mut() => break,
             _ = ctl.goaway.notified() => shutdown(conn.as_mut()),
             _ = ctl.close.notified() => return,
             _ = release.wait_for(|r| *r), if alert.is_some() => {
@@ -446,6 +448,11 @@ async fn run_conn<C: Future>(
             }
         }
     }
+    // A lingering close: hyper already shut the write side; the socket stays
+    // open a moment so the client's late frames (WINDOW_UPDATE, SETTINGS ACK
+    // after a GOAWAY) do not meet a closed socket, whose RST would discard
+    // the response tail still queued at the client.
+    tokio::time::sleep(LINGER).await;
 }
 
 fn pick(h: &Handler, path: &str) -> Handler {

@@ -27,6 +27,9 @@ pub enum BodySpec {
     Known(u64),
     /// That many bytes, no `content-length`.
     Unknown(u64),
+    /// That many bytes, no `content-length`, and nothing more from H3: no
+    /// fin, so hyper's next poll after them finds the upload `Pending`.
+    Stalled(u64),
 }
 
 /// A request as plain `Send` data; `start` turns it into a `StartReq`.
@@ -61,6 +64,8 @@ struct Upload {
     /// Bytes buffered so far.
     off: u64,
     total: u64,
+    /// `BodySpec::Stalled`: the fin never comes.
+    stalled: bool,
 }
 
 impl Upload {
@@ -71,7 +76,7 @@ impl Upload {
         let end = self.total.min(self.off + room);
         b.data.extend((self.off..end).map(upload_byte));
         self.off = end;
-        b.fin |= end == self.total;
+        b.fin |= end == self.total && !self.stalled;
     }
 }
 
@@ -142,7 +147,7 @@ impl OriginHost {
         let (body, total) = match spec.body {
             BodySpec::None => (BodyKind::None, 0),
             BodySpec::Known(n) => (BodyKind::Known(n), n),
-            BodySpec::Unknown(n) => (BodyKind::Unknown, n),
+            BodySpec::Unknown(n) | BodySpec::Stalled(n) => (BodyKind::Unknown, n),
         };
         let cl = match body {
             BodyKind::Known(n) => Some(n),
@@ -152,6 +157,7 @@ impl OriginHost {
             buf: self.origin.new_upload(cl),
             off: 0,
             total,
+            stalled: matches!(spec.body, BodySpec::Stalled(_)),
         };
         up.fill();
         let req = StartReq {
@@ -397,6 +403,12 @@ mod tests {
                 b.fin && b.data.len() == 5 && b.cl.is_none(),
                 "unknown length"
             );
+            drop(b);
+            let st = host.start(cx, get("http://o.test/", BodySpec::Stalled(5)));
+            host.events.uploads[&st].buf.borrow_mut().data.clear();
+            host.events.want_h3(cx, st);
+            let b = host.events.uploads[&st].buf.borrow();
+            assert!(!b.fin && b.data.is_empty() && b.cl.is_none(), "stalled");
         });
     }
 

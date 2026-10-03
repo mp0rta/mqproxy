@@ -472,8 +472,8 @@ impl Origin {
             body: req.upload,
         };
         if let Some(id) = self.pool_hit(&key, req.ver) {
-            let r = request::build_request(&stored, OriginProto::H1)?;
             let c = self.conns.get_mut(id).expect("pooled conns are live");
+            let r = request::build_request(&stored, c.proto.expect("a hit is negotiated"))?;
             c.exchange(req.h3, r, stored.body.clone(), Some(stored), true, false);
             self.by_h3.insert(req.h3, Where::Conn(id));
             return Ok(());
@@ -493,14 +493,18 @@ impl Origin {
 
     /// §7.2 step 2: a pooled conn under `key` whose protocol the request
     /// accepts, with `send` open — h1: `!busy` and `is_ready()` asked here,
-    /// not taken from the last settling (h2: Task 5.6c).
+    /// not taken from the last settling; h2: `!draining` (as of the last
+    /// settling) and `active < current_max_send_streams()`.
     fn pool_hit(&self, key: &ConnKey, ver: HttpVer) -> Option<OriginConnId> {
         let ids = self.pool.get(key)?;
         ids.iter().copied().find(|&id| {
             let c = self.conns.get(id).expect("pooled conns are live");
             c.proto.is_some_and(|p| key::accepts(ver, p))
-                && match &c.send {
-                    Some(Sender::H1(s)) => !c.busy && !s.is_closed() && s.is_ready(),
+                && match (&c.send, &c.driver) {
+                    (Some(Sender::H1(s)), _) => !c.busy && !s.is_closed() && s.is_ready(),
+                    (Some(Sender::H2(s)), Driver::H2(conn)) => {
+                        !s.is_closed() && c.acct.h2_hit_allowed(conn.current_max_send_streams())
+                    }
                     _ => false,
                 }
         })
@@ -1053,6 +1057,15 @@ impl Origin {
                 .filter(|r| matches!(r, OriginReq::Ended { .. }))
                 .count()
         })
+    }
+
+    /// `draining` as of the last settling (§7.7).
+    pub fn draining(&self, id: OriginConnId) -> bool {
+        self.conns.get(id).is_some_and(|c| c.acct.draining())
+    }
+
+    pub fn idle_since(&self, id: OriginConnId) -> Option<Time> {
+        self.conns.get(id).and_then(|c| c.idle_since)
     }
 
     pub fn conn_of(&self, h3: H3ReqId) -> Option<OriginConnId> {
