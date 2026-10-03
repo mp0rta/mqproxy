@@ -103,13 +103,14 @@ impl Origin {
             match tls.read_tls(&mut rx) {
                 Ok(0) => break,
                 Ok(n) => cx.tcp_consume(tcp, n),
-                // A full deframer buffer during the handshake: no deadline wait.
-                Err(e) if connecting => {
+                // Never "plaintext full" here (`wants_read` requires empty
+                // plaintext): the deframer's sticky "message buffer full",
+                // e.g. an oversized handshake message. Fatal in both phases;
+                // waiting would hang the request.
+                Err(e) => {
                     failed = Some(rustls::Error::General(e.to_string()));
                     break;
                 }
-                // "received plaintext buffer full": backpressure (§7.3).
-                Err(_) => break,
             }
             moved = true;
             if let Err(e) = tls.process_new_packets() {

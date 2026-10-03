@@ -216,6 +216,18 @@ pub struct TlsPeer {
 impl TlsPeer {
     /// `cert`/`key` are PEM paths (`ORIGIN_CRT`, `ORIGIN_KEY`).
     pub fn new(cert: &str, key: &str, alpn: &[&[u8]]) -> TlsPeer {
+        TlsPeer::from_config(TlsPeer::config(cert, key, alpn))
+    }
+
+    /// A peer from a config built by `config` and adjusted by the test.
+    pub fn from_config(c: rustls::ServerConfig) -> TlsPeer {
+        TlsPeer {
+            conn: rustls::ServerConnection::new(Arc::new(c)).unwrap(),
+        }
+    }
+
+    /// The server config `new` uses.
+    pub fn config(cert: &str, key: &str, alpn: &[&[u8]]) -> rustls::ServerConfig {
         install_ring();
         let certs = CertificateDer::pem_file_iter(cert)
             .unwrap()
@@ -227,9 +239,7 @@ impl TlsPeer {
             .with_single_cert(certs, key)
             .unwrap();
         c.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
-        TlsPeer {
-            conn: rustls::ServerConnection::new(Arc::new(c)).unwrap(),
-        }
+        c
     }
 
     /// The test origin with ALPN `http/1.1` only.

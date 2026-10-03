@@ -10,12 +10,13 @@ use mq_proxy::server::origin::{
 };
 use mq_runtime::TcpId;
 use mq_transport_api::H3ReqId;
-use origin_harness::{OH, TlsPeer, cfg, get, tls};
+use origin_harness::{OH, ORIGIN_CRT, ORIGIN_KEY, TlsPeer, cfg, get, tls};
 use std::cell::Cell;
 use std::future::Future;
 use std::io::{self, Read};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -468,4 +469,58 @@ fn pump_timer_is_armed_once() {
         Some(at),
         "re-armed by the timer's pump"
     );
+}
+
+/// A ticketer whose TLS 1.3 tickets are `len` bytes of junk.
+#[derive(Debug)]
+struct HugeTickets(usize);
+impl rustls::server::ProducesTickets for HugeTickets {
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn lifetime(&self) -> u32 {
+        3600
+    }
+    fn encrypt(&self, _: &[u8]) -> Option<Vec<u8>> {
+        Some(vec![7; self.0])
+    }
+    fn decrypt(&self, _: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// A hostile origin: a post-handshake handshake message (a NewSessionTicket
+/// of ~64 KiB) overflows rustls's deframer, whose `read_tls` then fails with
+/// a sticky "message buffer full". That is fatal (class E), never
+/// backpressure: the bytes would sit in `tcp_rx` and the request hang.
+#[test]
+fn deframer_overflow_after_handshake_is_fatal() {
+    let mut oh = oh();
+    let mut c = TlsPeer::config(ORIGIN_CRT, ORIGIN_KEY, &[b"http/1.1"]);
+    c.ticketer = Arc::new(HugeTickets(65_400));
+    c.send_tls13_tickets = 1;
+    let mut peer = TlsPeer::from_config(c);
+    let h3 = oh.start(get("https://localhost/"));
+    let (op, _, _) = oh.dial().unwrap();
+    let tcp = oh.dial_ok(op);
+    peer.pump(&mut oh, tcp); // ClientHello → server flight
+    let conn = oh.with_host(|h, _| h.origin().conn_of(h3)).unwrap();
+    // Client Finished + request → the huge ticket, fed as far as the socket
+    // lives (the bridge aborts it mid-flight).
+    let out = oh.tcp_out_all(tcp);
+    let mut s = &out[..];
+    while !s.is_empty() {
+        peer.conn.read_tls(&mut s).unwrap();
+        peer.conn.process_new_packets().unwrap();
+    }
+    let req = peer_read(&mut peer);
+    assert!(req.starts_with(b"GET / HTTP/1.1\r\n"), "sent");
+    let ticket = sealed(&mut peer, b"");
+    assert!(ticket.len() > 64 * KIB);
+    let fed = oh.tcp_in_some(tcp, &ticket);
+    assert!(oh.with_host(|h, _| h.origin().pipe_dead(conn)), "class E");
+    assert!(oh.aborted(tcp), "tcp_abort at removal");
+    let f = failure(&oh, h3);
+    assert_eq!((f.curl, f.tls), (56, TlsOutcome::ConnectFail), "{f:?}");
+    assert!(fed < ticket.len(), "the socket died mid-flight");
 }
