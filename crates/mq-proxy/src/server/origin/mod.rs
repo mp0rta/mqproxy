@@ -607,15 +607,15 @@ impl Origin {
                 cx.tcp_set_nodelay(tcp);
                 self.connected(cx, tcp, rec, ev)
             }
-            // §6.2 step 9: the socket cap is 502 origin-start-failed.
-            Err(DialError::Limit) => self.fail(cx, rec, start_failed("socket limit"), ev),
             Err(e) => {
-                let curl = match e {
-                    DialError::Dns => 6,
-                    DialError::Timeout => 28,
-                    DialError::Refused | DialError::Other | DialError::Limit => 7,
+                let dial = |curl| connect_failure(https, curl, format!("dial: {e:?}"));
+                let f = match e {
+                    // §6.2 step 9: the socket cap is 502 origin-start-failed.
+                    DialError::Limit => start_failed("socket limit"),
+                    DialError::Dns => dial(6),
+                    DialError::Timeout => dial(28),
+                    DialError::Refused | DialError::Other => dial(7),
                 };
-                let f = connect_failure(https, curl, format!("dial: {e:?}"));
                 self.fail(cx, rec, f, ev);
             }
         }
