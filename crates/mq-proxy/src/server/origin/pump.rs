@@ -444,18 +444,16 @@ impl Origin {
                         #[cfg(feature = "test-support")]
                         self.classes.push(errors::classify(&err));
                         let rx = c.io.rx_since_send();
+                        let bodiless = stored.as_ref().is_some_and(|s| s.body.borrow().bodiless());
+                        let class = errors::classify(&err);
                         let retry = match returned {
-                            // Handed back unsent: the idle conn had died.
-                            Some(req) if !*retried => {
+                            // Handed back unsent: the idle conn had died (h1).
+                            Some(req) if proto == OriginProto::H1 && !*retried => {
                                 Some(ConnectingPayload::Ready(req, upload.clone()))
                             }
-                            // libcurl's other retry: a reused conn closed
-                            // before any response byte, for a bodiless request.
-                            None if *reused
-                                && !*retried
-                                && rx == 0
-                                && errors::classify(&err) == errors::ErrClass::Incomplete
-                                && stored.as_ref().is_some_and(|s| s.body.borrow().bodiless()) =>
+                            None if bodiless_retry(
+                                proto, *reused, *retried, rx, class, bodiless,
+                            ) =>
                             {
                                 stored.take().map(ConnectingPayload::Stored)
                             }
@@ -556,6 +554,24 @@ impl Origin {
         }
         changed
     }
+}
+
+/// §7.7 libcurl's second retry, h1 only (no h2 retry at all): a reused conn
+/// closed before any response byte, for a bodiless request, once.
+fn bodiless_retry(
+    proto: OriginProto,
+    reused: bool,
+    retried: bool,
+    rx_since_send: u64,
+    class: errors::ErrClass,
+    bodiless: bool,
+) -> bool {
+    proto == OriginProto::H1
+        && reused
+        && !retried
+        && rx_since_send == 0
+        && class == errors::ErrClass::Incomplete
+        && bodiless
 }
 
 /// §7.6 for an exchange on a negotiated conn, with hyper's error text.
@@ -702,6 +718,34 @@ mod tests {
             sh.tcp_rx_commit(NOW, tcp, IoResult::Bytes(rx.len()));
         }
         (sh, tcp)
+    }
+
+    /// spec §7.7: the bodiless retry is h1-only — an h2 pool hit is
+    /// `reused` too, and its `rx_since_send` is never reset.
+    #[test]
+    fn bodiless_retry_is_h1_only() {
+        use errors::ErrClass::{Incomplete, Io};
+        let ok = |p| bodiless_retry(p, true, false, 0, Incomplete, true);
+        assert!(ok(OriginProto::H1));
+        assert!(!ok(OriginProto::H2), "no h2 retry");
+        let h1 = OriginProto::H1;
+        assert!(
+            !bodiless_retry(h1, false, false, 0, Incomplete, true),
+            "fresh conn"
+        );
+        assert!(!bodiless_retry(h1, true, true, 0, Incomplete, true), "once");
+        assert!(
+            !bodiless_retry(h1, true, false, 1, Incomplete, true),
+            "a response byte"
+        );
+        assert!(
+            !bodiless_retry(h1, true, false, 0, Io, true),
+            "not IncompleteMessage"
+        );
+        assert!(
+            !bodiless_retry(h1, true, false, 0, Incomplete, false),
+            "a body"
+        );
     }
 
     /// spec §7.3: plain `rx_eof` waits until `tcp_rx` is empty, even when

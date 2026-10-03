@@ -1011,6 +1011,16 @@ pub enum RecordState {
     Assigned,
 }
 
+/// An `Ended` record as `Origin::ended` reports it (test-support).
+#[cfg(feature = "test-support")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EndedRecord {
+    pub since: Time,
+    /// The upload reached its fin.
+    pub fin: bool,
+    pub aborted: bool,
+}
+
 #[cfg(feature = "test-support")]
 impl Origin {
     /// Conns in the pool, every key.
@@ -1064,6 +1074,25 @@ impl Origin {
                 .filter(|r| matches!(r, OriginReq::Ended { .. }))
                 .count()
         })
+    }
+
+    /// The conn's `Ended` records: when they ended and their upload's state.
+    pub fn ended(&self, id: OriginConnId) -> Vec<EndedRecord> {
+        let Some(c) = self.conns.get(id) else {
+            return Vec::new();
+        };
+        let ended = c.reqs.iter().filter_map(|r| match r {
+            OriginReq::Ended { upload, since, .. } => {
+                let u = upload.borrow();
+                Some(EndedRecord {
+                    since: *since,
+                    fin: u.fin,
+                    aborted: u.is_aborted(),
+                })
+            }
+            _ => None,
+        });
+        ended.collect()
     }
 
     /// `draining` as of the last settling (§7.7).

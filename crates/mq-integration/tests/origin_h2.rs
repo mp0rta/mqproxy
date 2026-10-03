@@ -9,7 +9,8 @@ use mq_proxy::server::origin::{
     Accepted, Completion, ErrClass, OriginCfg, OriginConnId, OriginFailure, OriginProto,
     RecordState, RelayHead, SWEEP, TlsOutcome, build_client_config,
 };
-use mq_transport_api::H3ReqId;
+use mq_runtime::driver::Io;
+use mq_transport_api::{H3ReqId, Time};
 use std::time::{Duration, Instant};
 
 const T: Duration = Duration::from_secs(5);
@@ -153,6 +154,27 @@ fn pattern(n: u64) -> Vec<u8> {
 /// (curl, status, origin_tls) of a failure.
 fn row(f: &OriginFailure) -> (u32, u16, TlsOutcome) {
     (f.curl, f.status, f.tls)
+}
+
+/// The conn stays pooled at every observation while the loop clock is
+/// before `since + SWEEP_TEST` (the record has not aged one sweep), then is
+/// retired by a sweep.
+fn retired_once_aged(lp: &mut OriginLoop, since: Time) {
+    let aged = since + SWEEP_TEST;
+    loop {
+        // Read the clock first: every iteration so far ran at or before it.
+        let now = lp.core.io().now();
+        if now >= aged {
+            break;
+        }
+        assert_eq!(
+            lp.host().origin().pool_len(),
+            1,
+            "retired at {now:?} < {aged:?}"
+        );
+        lp.run_until(Duration::from_millis(5), |_| false);
+    }
+    assert!(lp.run_until(T, |h| h.origin().pool_len() == 0), "retired");
 }
 
 /// Nothing of the bridge is left: no conn, no record, no executor task.
@@ -456,14 +478,16 @@ fn stuck_upload_drains_then_retires_at_sweep() {
         let (warm, _) = fetch(&mut lp, get(url(&srv, "/warm")));
         let a = conn(&lp, warm);
         let (h3, o) = fetch(&mut lp, post(url(&srv, "/up"), BodySpec::Known(8 * MIB)));
-        let ended_at = Instant::now();
         assert_eq!(o.head.as_ref().map(|h| h.status), Some(200));
         o.completion();
         if cancel {
             lp.cancel(h3);
         }
         let org = lp.host().origin();
-        assert_eq!(org.ended_records(a), 1, "cancel={cancel}");
+        let [rec] = org.ended(a)[..] else {
+            panic!("{:?} cancel={cancel}", org.ended(a))
+        };
+        assert!(!rec.fin && rec.aborted, "the incomplete upload is aborted");
         assert!(org.draining(a));
         assert_eq!(org.pool_len(), 1);
 
@@ -476,9 +500,7 @@ fn stuck_upload_drains_then_retires_at_sweep() {
         lp.cancel(probe);
         assert_eq!(lp.host().origin().record_state(probe), None);
 
-        assert!(lp.run_until(T, |h| h.origin().pool_len() == 0));
-        let took = ended_at.elapsed();
-        assert!(took >= SWEEP_TEST - Duration::from_millis(50), "{took:?}");
+        retired_once_aged(&mut lp, rec.since);
         assert!(lp.host().origin().pipe_dead(a));
         assert!(lp.run_until(T, all_gone), "cancel={cancel}");
     }
@@ -712,9 +734,15 @@ fn stuck_eos_variant_retires() {
     let (_, o) = fetch(&mut lp, post(url(&srv, "/up"), BodySpec::Known(MIB + 1)));
     o.completion();
     let org = lp.host().origin();
-    assert_eq!(org.ended_records(a), 1);
+    let [rec] = org.ended(a)[..] else {
+        panic!("{:?}", org.ended(a))
+    };
+    assert!(
+        rec.fin && !rec.aborted,
+        "the EOS variant: the whole upload is buffered, nothing aborted"
+    );
     assert!(org.draining(a));
-    assert!(lp.run_until(T, |h| h.origin().pool_len() == 0));
+    retired_once_aged(&mut lp, rec.since);
     assert!(lp.host().origin().pipe_dead(a));
     assert!(lp.run_until(T, all_gone));
 }
