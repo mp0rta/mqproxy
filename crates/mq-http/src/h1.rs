@@ -2,6 +2,9 @@
 
 pub const HEAD_MAX: usize = 16 * 1024;
 pub const MAX_HEADERS: usize = 64;
+/// Longest method (bytes) and longest request-target / canonical target path (C `char[1024]` minus NUL).
+pub const METHOD_MAX: usize = 15;
+pub const PATH_MAX: usize = 1023;
 
 /// One header line; `value` is OWS-trimmed.
 #[derive(Debug, PartialEq, Eq)]
@@ -27,7 +30,7 @@ pub enum Progress<'a> {
     Done { consumed: usize, head: Head<'a> },
 }
 
-fn is_tchar(c: u8) -> bool {
+pub(crate) fn is_tchar(c: u8) -> bool {
     c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
 }
 
@@ -110,14 +113,14 @@ fn parse_complete(head: &[u8]) -> Option<Head<'_>> {
     // METHOD SP TARGET SP HTTP/...
     let m_end = line.iter().position(|&c| c == b' ')?;
     let method = &line[..m_end];
-    if method.is_empty() || method.len() > 15 || !method.iter().all(|&c| is_tchar(c)) {
+    if method.is_empty() || method.len() > METHOD_MAX || !method.iter().all(|&c| is_tchar(c)) {
         return None;
     }
     let rest = &line[m_end + 1..];
     let t_end = rest.iter().position(|&c| c == b' ')?;
     let target = &rest[..t_end];
     // < 1024 bytes, origin-form, no control bytes / DEL (C parity; NUL would truncate).
-    if target.first() != Some(&b'/') || target.len() >= 1024 {
+    if target.first() != Some(&b'/') || target.len() > PATH_MAX {
         return None;
     }
     if target.iter().any(|&c| c < 0x20 || c == 0x7f) {
