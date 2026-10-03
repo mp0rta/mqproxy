@@ -304,6 +304,8 @@ impl Gateway {
             cx.h3_reset(id);
             self.core.finish(cx, id);
         }
+        // Settles the emptied pool: the idle sweep is disarmed.
+        self.pump(cx);
     }
 
     /// false = not the bridge's timer.

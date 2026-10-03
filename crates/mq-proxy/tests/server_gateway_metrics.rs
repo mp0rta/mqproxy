@@ -439,12 +439,22 @@ fn h3closed_cancels_live_origin() {
 
 #[test]
 fn shutdown_aborts_origin_sockets_and_resets() {
-    let mut h = H::with_gateway(cfg());
+    log_capture::install();
+    let mut h = H::with_gateway(mcfg());
+    // In flight on an h1 conn (http), dialling (https), finished (403), in intake.
     let (r1, op1) = admitted(&mut h, &[]);
     let tcp = h.dial_ok(op1);
     h.tcp_out_all(tcp);
-    let (r2, op2) = admitted(&mut h, &[]);
+    let (r2, op2) = admitted(&mut h, &[(":scheme", b"https")]);
+    let r3 = open(&mut h, &[("x-mq-auth", b"Bearer nope")], true);
+    let c = h.h3_conn();
+    let r4 = h.t.new_h3_request(c);
+    h.drive();
     h.reqs();
+    assert!(
+        h.sh.next_timeout().is_some(),
+        "the origin idle sweep is armed"
+    );
     h.sh.on_shutdown_signal(h.now);
     let reqs = h.reqs();
     assert!(
@@ -455,8 +465,21 @@ fn shutdown_aborts_origin_sockets_and_resets() {
         reqs.contains(&IoRequest::CancelDial { op: op2 }),
         "{reqs:?}"
     );
-    for r in [r1, r2] {
+    assert_eq!(h.sh.next_timeout(), None, "no origin timer left");
+    for r in [r1, r2, r3, r4] {
         assert_eq!(h.count(|c| *c == Call::H3Reset(r)), 1);
         assert_eq!(h.count(|c| *c == Call::H3Finish(r)), 0);
     }
+    // Each request still gets exactly one `mq.req` at its `H3Closed`.
+    let l = line(&mut h, r1, stats0());
+    assert_eq!(origin(&l), o("none", "na", "0", "-1"));
+    let l = line(&mut h, r2, stats0());
+    assert_eq!(origin(&l), o("none", "connect_fail", "0", "-1"));
+    let l = line(&mut h, r3, stats0());
+    assert_eq!(field(&l, "status"), "403");
+    let l = line(&mut h, r4, stats0());
+    assert!(
+        l.contains(" method=- status=0 authority=\"-\" path=\"-\" "),
+        "{l}"
+    );
 }
