@@ -80,8 +80,8 @@ pub enum Then {
     /// Reads head `replies + 1` and its declared content-length body, then
     /// closes without replying (`IncompleteMessage`, nothing received).
     CloseAfterNextHead,
-    /// Closes the idle keep-alive conn after the delay.
-    CloseIdle(Duration),
+    /// Closes the idle keep-alive conn once `release()` was called.
+    CloseOnRelease,
     /// The first connection answers `replies` heads, every later one none;
     /// then each behaves as `CloseAfterNextHead`.
     CloseEvery,
@@ -171,6 +171,8 @@ struct Shared {
     sent: Mutex<Vec<(u8, u8)>>,
     /// Connections accepted (the bridge's dials that reached the origin).
     accepted: AtomicU32,
+    /// Raw-mode connections closed.
+    closed: AtomicU32,
     /// `EarlyOkKeepBodyUnread`'s request bodies, by path.
     stash: Mutex<Vec<(String, Incoming)>>,
 }
@@ -202,6 +204,7 @@ impl OriginServer {
             frames: Mutex::default(),
             sent: Mutex::default(),
             accepted: AtomicU32::new(0),
+            closed: AtomicU32::new(0),
             stash: Mutex::default(),
         });
         let sh = shared.clone();
@@ -248,6 +251,11 @@ impl OriginServer {
     /// Connections accepted so far.
     pub fn accepted(&self) -> u32 {
         self.shared.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Raw-mode connections the origin has closed so far.
+    pub fn closed(&self) -> u32 {
+        self.shared.closed.load(Ordering::SeqCst)
     }
 
     /// `RawH2Tls`: the inbound frames so far, as (type, stream id).
@@ -722,6 +730,8 @@ fn raw_conn(tcp: TcpStream, index: u32, proto: &Proto, sh: &Shared) {
         Proto::RawTlsCloseAfterClientHello => close_after_hello(RawConn::new(Box::new(tcp), sh)),
         Proto::H1Plain | Proto::H1Tls | Proto::H2Tls => unreachable!("hyper modes"),
     };
+    // The stream was dropped with the `RawConn` above: the socket is closed.
+    sh.closed.fetch_add(1, Ordering::SeqCst);
 }
 
 trait RawStream: Read + Write {
@@ -861,15 +871,9 @@ fn keep_alive(mut c: RawConn<'_>, replies: u32, then: Then) -> io::Result<()> {
                 c.send(b"HTTP/1.1 200")?;
             }
         }
-        Then::CloseIdle(d) => {
-            // Interruptible, so `stop` never waits for `d`.
-            let end = std::time::Instant::now() + d;
-            while !c.sh.stopped() {
-                let left = end.saturating_duration_since(std::time::Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                thread::sleep(POLL.min(left));
+        Then::CloseOnRelease => {
+            while !c.sh.stopped() && !c.sh.released() {
+                thread::sleep(POLL);
             }
         }
     }

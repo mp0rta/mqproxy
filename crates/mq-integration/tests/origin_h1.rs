@@ -131,6 +131,16 @@ fn fetch(lp: &mut OriginLoop, s: StartSpec) -> (H3ReqId, Outcome) {
     (h3, wait(lp, h3))
 }
 
+/// Iterates until `h3`'s conn would take the next request (§7.2 step 2):
+/// the `End` is reported before hyper's dispatcher is ready again.
+fn wait_reusable(lp: &mut OriginLoop, h3: H3ReqId) {
+    let conn = lp.host().origin().conn_of(h3).expect("h3's conn");
+    assert!(
+        lp.run_until(T, |h| h.origin().reusable(conn)),
+        "the conn became reusable"
+    );
+}
+
 /// Iterates until the loop hands a resolution to the resolver: `cx.dial`
 /// only queues the dial, the next iterations start it.
 fn next_resolve(lp: &mut OriginLoop) -> ResolveRequest {
@@ -199,8 +209,10 @@ fn verify_failure_is_60_verify_fail() {
 
 #[test]
 fn connection_refused_is_7() {
+    // A freed port on 127.0.0.2: the origins of concurrent tests bind
+    // 127.0.0.1 and may take a port freed there (and count this dial).
     let addr = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let l = TcpListener::bind("127.0.0.2:0").unwrap();
         l.local_addr().unwrap()
     }; // closed: nothing listens there now
     let mut lp = plain_loop();
@@ -238,7 +250,8 @@ fn eight_mib_download_and_upload_exercise_pipe_caps() {
     let srv = spawn(Proto::H1Plain, Handler::PerPath(routes));
     let mut lp = plain_loop();
 
-    let (_, o) = fetch(&mut lp, get(url(&srv, "/file")));
+    let (h3, o) = fetch(&mut lp, get(url(&srv, "/file")));
+    wait_reusable(&mut lp, h3);
     assert_eq!(o.completion().delivered, N);
     assert_eq!(o.completion().cl, Some(N));
     assert!(o.body == pattern(N), "the download, in order");
@@ -279,7 +292,8 @@ fn head_204_304_finish() {
         ("GET", "/304", 304),
         ("HEAD", "/file", 200),
     ] {
-        let (_, o) = fetch(&mut lp, spec(method, url(&srv, path), BodySpec::None));
+        let (h3, o) = fetch(&mut lp, spec(method, url(&srv, path), BodySpec::None));
+        wait_reusable(&mut lp, h3);
         assert_eq!(o.head.as_ref().map(|h| h.status), Some(status), "{path}");
         assert_eq!(o.completion().delivered, 0, "{method} {path}");
         assert_eq!(o.frames, 0);
@@ -368,6 +382,11 @@ fn head_257() -> (OriginLoop, OriginServer, Outcome) {
 
 /// hyper's h1 limits (`max_headers(256)`, `max_buf_size(64 KiB)`): 502
 /// `upstream-protocol` through `is_parse_too_large`, not the gateway's cap.
+/// hyper checks `max_buf_size` only after a partial parse and its read buffer
+/// may overshoot it by one read: a 70 KiB head that arrives within one read
+/// is parsed whole, and the gateway's value cap trips instead (the same
+/// 502). Each read takes at most the 64 KiB pipe, so a head ≥ 128 KiB always
+/// passes a partial parse above 64 KiB: that one is hyper's, deterministically.
 #[test]
 fn h1_257_headers_or_70k_head_is_upstream_protocol() {
     let (lp, _srv, o) = head_257();
@@ -378,15 +397,19 @@ fn h1_257_headers_or_70k_head_is_upstream_protocol() {
         [ErrClass::ParseTooLarge]
     );
 
-    let srv = spawn(Proto::H1Plain, Handler::HeaderListBytes(70 * 1024));
-    let mut lp = plain_loop();
-    let (_, o) = fetch(&mut lp, get(url(&srv, "/")));
-    let f = o.failure();
-    assert!(f.upstream_protocol && f.status == 502, "{f:?}");
-    assert_eq!(
-        lp.host().origin().error_classes(),
-        [ErrClass::ParseTooLarge]
-    );
+    for (kib, hypers) in [(70, false), (160, true)] {
+        let srv = spawn(Proto::H1Plain, Handler::HeaderListBytes(kib * 1024));
+        let mut lp = plain_loop();
+        let (_, o) = fetch(&mut lp, get(url(&srv, "/")));
+        let f = o.failure();
+        assert!(f.upstream_protocol && f.status == 502, "{kib} KiB: {f:?}");
+        if hypers {
+            assert_eq!(
+                lp.host().origin().error_classes(),
+                [ErrClass::ParseTooLarge]
+            );
+        }
+    }
 }
 
 #[test]
@@ -442,6 +465,11 @@ fn h1_close_delimited_under_h3_backpressure_delivers_all() {
     );
     let o = Outcome::of(&lp, h3);
     assert!(o.frames > 1, "{} frames", o.frames);
+    assert!(
+        o.frames <= 64,
+        "{} frames: every one met a Partial",
+        o.frames
+    );
     assert_eq!(o.completion().delivered, N);
     assert!(o.body == pattern(N));
     assert!(lp.run_until(T, |h| h.origin().closing_len() == 0));
@@ -470,6 +498,7 @@ fn first_exchange(lp: &mut OriginLoop, srv: &OriginServer, u: &str) -> H3ReqId {
     let done = o.completion();
     assert!(!done.reused);
     assert_eq!(srv.accepted(), 1);
+    wait_reusable(lp, h3);
     h3
 }
 
@@ -522,6 +551,7 @@ fn h1_retry_connect_ms_from_the_retry_instant() {
     let h3 = lp.start(get(u.clone()));
     answer(&mut lp).answer(Ok(vec![srv.addr]));
     assert_eq!(wait(&mut lp, h3).body, b"ok");
+    wait_reusable(&mut lp, h3);
 
     let h3 = lp.start(get(u));
     thread::sleep(GAP); // the origin reads the head and closes meanwhile
@@ -579,11 +609,16 @@ fn h1_retry_exhausted_fails_52() {
 /// reuse (`pool_evicts_after_server_closes`). The request is queued on the
 /// dead conn; hyper hands it back (`Canceled`), and it is retried once.
 fn dead_idle_retry() -> (OriginLoop, OriginServer, Outcome) {
-    let srv = keep_alive(1, Then::CloseIdle(Duration::from_millis(50)));
+    let srv = keep_alive(1, Then::CloseOnRelease);
     let mut lp = plain_loop();
     let u = url(&srv, "/");
-    let first = first_exchange(&mut lp, &srv, &u);
-    thread::sleep(Duration::from_millis(300));
+    let first = first_exchange(&mut lp, &srv, &u); // reusable, origin open
+    srv.release();
+    let end = Instant::now() + T;
+    while srv.closed() == 0 {
+        assert!(Instant::now() < end, "the origin closed the idle conn");
+        thread::sleep(Duration::from_millis(1));
+    }
     let h3 = lp.with_host(|h, cx| h.start_unpumped(cx, get(u)));
     let o = lp.host().origin();
     assert_eq!(o.record_state(h3), Some(RecordState::Assigned));
@@ -597,17 +632,23 @@ fn dead_idle_retry() -> (OriginLoop, OriginServer, Outcome) {
 
 #[test]
 fn h1_dead_idle_conn_retried_once() {
-    let (_lp, srv, o) = dead_idle_retry();
+    let (lp, srv, o) = dead_idle_retry();
     assert_eq!(o.body, b"ok");
     assert!(!o.completion().reused);
     assert_eq!(srv.accepted(), 2);
+    assert_eq!(
+        lp.host().origin().error_classes(),
+        [ErrClass::Canceled],
+        "handed back, not the bodiless Incomplete retry"
+    );
 }
 
 #[test]
 fn h1_reuse_origin_reuse_0_then_1() {
     let srv = spawn(Proto::H1Plain, Handler::FileBytes(10));
     let mut lp = plain_loop();
-    let (_, a) = fetch(&mut lp, get(url(&srv, "/")));
+    let (h3, a) = fetch(&mut lp, get(url(&srv, "/")));
+    wait_reusable(&mut lp, h3);
     let (_, b) = fetch(&mut lp, get(url(&srv, "/")));
     let (a, b) = (a.completion(), b.completion());
     assert!(!a.reused && a.connect_ms >= 0, "{a:?}");
@@ -617,9 +658,10 @@ fn h1_reuse_origin_reuse_0_then_1() {
 
 #[test]
 fn pool_evicts_after_server_closes() {
-    let srv = keep_alive(1, Then::CloseIdle(Duration::ZERO));
+    let srv = keep_alive(1, Then::CloseOnRelease);
     let mut lp = plain_loop();
     first_exchange(&mut lp, &srv, &url(&srv, "/"));
+    srv.release();
     assert!(
         lp.run_until(T, |h| h.origin().pool_len() == 0),
         "the closed conn left the pool"

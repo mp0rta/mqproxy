@@ -499,14 +499,7 @@ impl Origin {
         let ids = self.pool.get(key)?;
         ids.iter().copied().find(|&id| {
             let c = self.conns.get(id).expect("pooled conns are live");
-            c.proto.is_some_and(|p| key::accepts(ver, p))
-                && match (&c.send, &c.driver) {
-                    (Some(Sender::H1(s)), _) => !c.busy && !s.is_closed() && s.is_ready(),
-                    (Some(Sender::H2(s)), Driver::H2(conn)) => {
-                        !s.is_closed() && c.acct.h2_hit_allowed(conn.current_max_send_streams())
-                    }
-                    _ => false,
-                }
+            c.proto.is_some_and(|p| key::accepts(ver, p)) && c.takes_request()
         })
     }
 
@@ -895,6 +888,20 @@ impl Origin {
     }
 }
 
+impl OriginConn {
+    /// §7.2 step 2, the protocol aside: `send` open — h1: `!busy` and
+    /// `is_ready()`; h2: a stream under the peer's limit, not draining.
+    fn takes_request(&self) -> bool {
+        match (&self.send, &self.driver) {
+            (Some(Sender::H1(s)), _) => !self.busy && !s.is_closed() && s.is_ready(),
+            (Some(Sender::H2(s)), Driver::H2(conn)) => {
+                !s.is_closed() && self.acct.h2_hit_allowed(conn.current_max_send_streams())
+            }
+            _ => false,
+        }
+    }
+}
+
 /// The §7.7 removal classes, one socket action each.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Removal {
@@ -1090,6 +1097,12 @@ impl Origin {
     /// Whether hyper called `poll_shutdown` on the conn's pipe.
     pub fn tx_shutdown(&self, id: OriginConnId) -> bool {
         self.conns.get(id).is_some_and(|c| c.io.tx_shutdown())
+    }
+
+    /// Whether the conn is pooled and would take a request now (§7.2 step 2).
+    pub fn reusable(&self, id: OriginConnId) -> bool {
+        self.pool.values().flatten().any(|&x| x == id)
+            && self.conns.get(id).is_some_and(OriginConn::takes_request)
     }
 
     /// `classify` of every hyper error an exchange reported, in order: the
