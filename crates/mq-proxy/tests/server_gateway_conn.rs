@@ -5,7 +5,7 @@ mod server_harness;
 
 use mq_proxy::config::ServerConfig;
 use mq_runtime::testing::log_capture;
-use mq_runtime::{Host, IoRequest, Target};
+use mq_runtime::{Host, IoRequest, IoResult, Target};
 use mq_transport_api::{ConnStats, PathStats, StreamKind};
 use server_harness::*;
 use std::time::Duration;
@@ -124,6 +124,40 @@ fn h3_conn_counts_for_shutdown_exit() {
     );
     h.drive();
     assert_eq!(h.sh.exit_status(), Some(0));
+}
+
+#[test]
+fn raw_and_h3_shutdown_exit_waits_for_h3() {
+    let mut h = H::with_gateway(cfg());
+    let raw = h.conn();
+    let c = h.h3_conn();
+    h.t.hold_conn_closed(true);
+    h.sh.on_shutdown_signal(h.now);
+    h.drive();
+    assert_eq!((h.close_conn_count(raw), h.close_conn_count(c)), (1, 1));
+    h.closed(raw);
+    assert_eq!(h.sh.exit_status(), None, "the H3 conn is still open");
+    h.closed(c);
+    assert_eq!(h.sh.exit_status(), Some(0));
+}
+
+#[test]
+fn raw_connect_tcp_relay_unaffected_by_gateway() {
+    let mut h = H::with_gateway(cfg());
+    let (c, _) = h.authed();
+    let (s, op) = h.request(c, b"early");
+    let tcp = h.dial_ok(op);
+    assert_eq!(h.t.sent_bytes(s), connect_resp(0, 0));
+    assert_eq!(h.tcp_out_all(tcp), b"early", "relaying");
+    h.tcp_in(tcp, b"pong");
+    h.drive();
+    let mut want = connect_resp(0, 0);
+    want.extend_from_slice(b"pong");
+    assert_eq!(h.t.sent_bytes(s), want);
+    h.sh.tcp_rx_commit(h.now, tcp, IoResult::Eof);
+    h.drive();
+    assert_eq!(h.send_fins(s).last(), Some(&true), "origin EOF → FIN");
+    assert!(!h.reset(s));
 }
 
 #[test]

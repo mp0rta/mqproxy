@@ -370,8 +370,10 @@ impl H {
     /// The driver's write: everything queued for `tcp`, committed.
     pub fn tcp_out_all(&mut self, tcp: TcpId) -> Vec<u8> {
         let out = self.sh.tcp_tx_buf(tcp).to_vec();
-        self.sh
-            .tcp_tx_commit(self.now, tcp, IoResult::Bytes(out.len()));
+        if !out.is_empty() {
+            self.sh
+                .tcp_tx_commit(self.now, tcp, IoResult::Bytes(out.len()));
+        }
         out
     }
     /// `n` data streams on `conn` that never send their request, in one drive.
