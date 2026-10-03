@@ -7,13 +7,15 @@ mod intake;
 
 pub use super::origin::{Accepted, BridgeEvents, Completion, OriginFailure, RelayHead};
 use super::origin::{
-    BodyKind, Dirty, Origin, OriginCfg, SLICE, SWEEP, StartReq, UPLOAD_CAP, UploadBuf,
+    BodyKind, Dirty, Origin, OriginCfg, OriginProto, SLICE, SWEEP, StartReq, TlsOutcome,
+    UPLOAD_CAP, UploadBuf,
 };
 use crate::config::GatewayConfig;
 use intake::{Capture, decide};
 use mq_http::headers::{Method, body_check_applies};
+use mq_http::metrics::{PATH_CAP, ReqLine, format_req};
 use mq_runtime::{Cx, DialError, DialOpId, TcpEnd, TcpId, TimerId};
-use mq_transport_api::{ConnId, Event, H3Header, H3ReqId, StreamError};
+use mq_transport_api::{ConnId, Event, H3Header, H3ReqId, H3ReqStats, StreamError};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -46,17 +48,31 @@ enum GwState {
 struct ReqMeta {
     method: Method,
     authority: Vec<u8>,
-    #[allow(dead_code)] // read by `mq.req` (Task 6.4)
     path: Vec<u8>,
-    #[allow(dead_code)] // read by `mq.req` (Task 6.4)
     origin_is_tls: bool,
+}
+
+/// spec §6.6: how the origin transfer ended, committed C-style (`on_done`).
+#[derive(Copy, Clone)]
+struct OriginEnd {
+    tls: TlsOutcome,
+    reuse: bool,
+    connect_ms: i64,
+}
+
+impl OriginEnd {
+    /// A transfer that did not succeed: reuse and connect time are not reported.
+    fn failed(tls: TlsOutcome) -> OriginEnd {
+        OriginEnd {
+            tls,
+            reuse: false,
+            connect_ms: -1,
+        }
+    }
 }
 
 /// spec §6.1: one H3 request, until its `H3Closed`.
 struct GwReq {
-    #[allow(dead_code)] // read by `mq.req` (Task 6.4)
-    conn: ConnId,
-    #[allow(dead_code)] // read by `mq.req` (Task 6.4)
     quic_id: u64,
     authed: bool,
     state: GwState,
@@ -64,6 +80,12 @@ struct GwReq {
     /// `mq.req`'s status: the one `send_error` sent, or the raw origin
     /// status (a `:status` outside 100..=599 is sent as 502, §6.4); 0 = none yet.
     status: u16,
+    /// `None` while the origin is in flight or was never started (§6.6).
+    end: Option<OriginEnd>,
+    /// Known once the head was relayed or the transfer ended after negotiating.
+    proto: Option<OriginProto>,
+    /// The last `content-encoding` value (empty = `none`).
+    content_encoding: Vec<u8>,
 }
 
 /// The gateway's request side: the bridge's `BridgeEvents` sink.
@@ -141,15 +163,17 @@ impl Gateway {
     pub(super) fn on_h3_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
         match ev {
             // spec §6.1; a request already gone (stale) is not entered.
-            Event::H3Request(conn, id) => {
+            Event::H3Request(_, id) => {
                 if let Ok(info) = cx.h3_req_info(id) {
                     let r = GwReq {
-                        conn,
                         quic_id: info.quic_id,
                         authed: false,
                         state: GwState::Intake,
                         meta: None,
                         status: 0,
+                        end: None,
+                        proto: None,
+                        content_encoding: Vec::new(),
                     };
                     self.core.reqs.insert(id, r);
                 }
@@ -170,9 +194,13 @@ impl Gateway {
                     self.origin.resume(id);
                 }
             }
-            // spec §6.6 (`mq.req`: Task 6.4): a live origin request is cancelled.
-            Event::H3Closed(id, _) => {
-                self.core.reqs.remove(&id);
+            // spec §6.6: `mq.req`, then a live origin request is cancelled.
+            Event::H3Closed(id, close) => {
+                if let Some(r) = self.core.reqs.remove(&id)
+                    && self.core.cfg.request_metrics
+                {
+                    log_req(&r, &close.stats);
+                }
                 self.origin.cancel(cx, id);
             }
             _ => {}
@@ -224,7 +252,10 @@ impl Gateway {
                     fin_due: false,
                 }
             }
-            Err(_) => self.core.send_error(cx, id, 502, "origin-start-failed"),
+            Err(_) => {
+                r.end = Some(OriginEnd::failed(TlsOutcome::Na)); // never started
+                self.core.send_error(cx, id, 502, "origin-start-failed");
+            }
         }
     }
 
@@ -259,6 +290,16 @@ impl Gateway {
     pub(super) fn on_tcp_writable(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
         let mine = self.origin.on_tcp_writable(cx, tcp, &mut self.core);
         self.routed(cx, mine);
+    }
+
+    /// spec §6.6: the bridge aborts every origin socket; every request is reset.
+    pub(super) fn on_shutdown(&mut self, cx: &mut Cx<'_>) {
+        self.origin.shutdown(cx);
+        let ids: Vec<H3ReqId> = self.core.reqs.keys().copied().collect();
+        for id in ids {
+            cx.h3_reset(id);
+            self.core.finish(cx, id);
+        }
     }
 
     /// false = not the bridge's timer.
@@ -422,6 +463,47 @@ impl GwCore {
     }
 }
 
+/// spec §6.6/§2.4: the request's `mq.req` line, inputs derived as C's call site.
+fn log_req(r: &GwReq, s: &H3ReqStats) {
+    let m = r.meta.as_ref();
+    let path = m.map_or(&b"-"[..], |m| {
+        let p = m.path.split(|&b| b == b'?').next().unwrap_or_default();
+        &p[..p.len().min(PATH_CAP)]
+    });
+    let in_flight = TlsOutcome::failure(m.is_some_and(|m| m.origin_is_tls));
+    let end = r.end.unwrap_or(OriginEnd::failed(in_flight));
+    let reset = match (s.stream_err, &s.close_msg) {
+        (0, _) => "",
+        (_, Some(msg)) => msg,
+        (_, None) => "stream-err",
+    };
+    let l = ReqLine {
+        sid: r.quic_id,
+        method: m.map_or(b"-", |m| m.method.as_bytes()),
+        status: r.status.into(),
+        authority: m.map_or(b"-", |m| &m.authority),
+        path,
+        req_bytes: s.recv_body,
+        resp_bytes: s.send_body,
+        begin_us: s.begin_us,
+        header_send_us: s.header_send_us,
+        fin_send_us: s.fin_send_us,
+        fin_ack_us: s.fin_ack_us,
+        origin_protocol: r.proto.map_or("none", OriginProto::metric),
+        origin_tls: end.tls.metric(),
+        content_encoding: &r.content_encoding,
+        origin_reuse: end.reuse.into(),
+        origin_connect_ms: end.connect_ms,
+        mp_state: s.mp_state,
+        reset: reset.as_bytes(),
+    };
+    match format_req(&l) {
+        // spec §12: an invalid UTF-8 sequence prints as U+FFFD.
+        Some(line) => log::info!("{}", String::from_utf8_lossy(&line)),
+        None => log::warn!("mq.req line truncated (dropped)"),
+    }
+}
+
 /// spec §6.3: read and discard until `Blocked`, fin or an error — this is
 /// what bounds xquic's eager body queue for a finished request (§3.7).
 fn drain(cx: &mut Cx<'_>, id: H3ReqId) {
@@ -481,6 +563,8 @@ impl BridgeEvents for GwCore {
             return;
         };
         r.status = head.status;
+        r.proto = Some(head.proto);
+        r.content_encoding = head.content_encoding.unwrap_or_default();
         let status = match head.status {
             s @ 100..=599 => s,
             _ => 502,
@@ -538,8 +622,16 @@ impl BridgeEvents for GwCore {
             return;
         };
         if applies && done.cl.is_some_and(|cl| done.delivered < cl) {
+            // spec §6.6: a body-check failure is a transfer error.
+            let https = r.meta.as_ref().is_some_and(|m| m.origin_is_tls);
+            r.end = Some(OriginEnd::failed(TlsOutcome::failure(https)));
             return self.reset(cx, h3);
         }
+        r.end = Some(OriginEnd {
+            tls: done.tls,
+            reuse: done.reused,
+            connect_ms: done.connect_ms,
+        });
         *fin_due = true;
         self.flush(cx, h3);
     }
@@ -556,11 +648,15 @@ impl BridgeEvents for GwCore {
         } else {
             format!("curl:{}", f.curl)
         };
-        if let Some(r) = self.reqs.get(&h3)
-            && let (GwState::Origin { .. }, Some(m)) = (&r.state, &r.meta)
+        if let Some(r) = self.reqs.get_mut(&h3)
+            && let GwState::Origin { .. } = r.state
         {
-            let authority = String::from_utf8_lossy(&m.authority);
-            log::warn!("mq_gw_server: origin {authority} {xmq} ({})", f.cause);
+            r.end = Some(OriginEnd::failed(f.tls));
+            r.proto = r.proto.or(f.proto);
+            if let Some(m) = &r.meta {
+                let authority = String::from_utf8_lossy(&m.authority);
+                log::warn!("mq_gw_server: origin {authority} {xmq} ({})", f.cause);
+            }
         }
         if after_head {
             self.reset(cx, h3);

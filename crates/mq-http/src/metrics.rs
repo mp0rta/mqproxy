@@ -5,7 +5,8 @@ use std::io::Write;
 /// C's `char line[1024]` including the NUL: a line of this length or more is dropped.
 pub const LINE_MAX: usize = 1024;
 const AUTHORITY_CAP: usize = 128;
-const PATH_CAP: usize = 256;
+/// The quoted `path` cap; the server's call site also cuts the path here (spec §6.6).
+pub const PATH_CAP: usize = 256;
 const RESET_CAP: usize = 64;
 const CONTENT_ENCODING_CAP: usize = 23;
 

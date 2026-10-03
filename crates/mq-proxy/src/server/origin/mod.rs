@@ -150,6 +150,27 @@ pub enum TlsOutcome {
     Na,
 }
 
+impl TlsOutcome {
+    /// §7.6: every failure row is `connect_fail` for https, `na` for http.
+    pub fn failure(https: bool) -> TlsOutcome {
+        if https {
+            TlsOutcome::ConnectFail
+        } else {
+            TlsOutcome::Na
+        }
+    }
+
+    /// The `mq.req` `origin_tls` value.
+    pub fn metric(self) -> &'static str {
+        match self {
+            TlsOutcome::Ok => "ok",
+            TlsOutcome::VerifyFail => "verify_fail",
+            TlsOutcome::ConnectFail => "connect_fail",
+            TlsOutcome::Na => "na",
+        }
+    }
+}
+
 /// An origin failure, mapped per §7.6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OriginFailure {

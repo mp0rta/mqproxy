@@ -57,7 +57,7 @@ pub(super) fn map_error(
     OriginFailure {
         curl,
         status: status_from_curl(curl),
-        tls: tls(https),
+        tls: TlsOutcome::failure(https),
         proto: Some(proto),
         upstream_protocol: false,
         start_failed: false,
@@ -79,20 +79,11 @@ fn upstream_protocol(proto: OriginProto, https: bool, cause: &str) -> OriginFail
     OriginFailure {
         curl: 0,
         status: 502,
-        tls: tls(https),
+        tls: TlsOutcome::failure(https),
         proto: Some(proto),
         upstream_protocol: true,
         start_failed: false,
         cause: cause.into(),
-    }
-}
-
-/// §7.6: every failure row is `connect_fail` for https, `na` for http.
-fn tls(https: bool) -> TlsOutcome {
-    if https {
-        TlsOutcome::ConnectFail
-    } else {
-        TlsOutcome::Na
     }
 }
 

@@ -859,6 +859,10 @@ impl App for Server {
     /// connection's UDP sessions and logs its stats line, once.
     fn on_shutdown(&mut self, cx: &mut Cx<'_>) {
         self.shutting_down = true;
+        // SP3 spec §6.6: origin sockets aborted, H3 requests reset.
+        if let Some(g) = self.gw.as_mut() {
+            g.on_shutdown(cx);
+        }
         if self.conns.is_empty() {
             return cx.request_exit(0);
         }
