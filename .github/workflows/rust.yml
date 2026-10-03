@@ -212,6 +212,19 @@ jobs:
           MQPROXY_BIN=$PWD/tests/integration/mqproxy-interop-wrapper.sh \
           MQPROXY_CLIENT_BIN=$PWD/target/release/mqproxy MQPROXY_SERVER_BIN=$PWD/build/mqproxy \
             tests/integration/e2e_multipath.sh
+      # Gateway (spec §10.4): cases 1-13; 14 a-c self-skip against a Rust server.
+      - name: e2e_gateway (Rust both ends)
+        run: MQPROXY_BIN=$PWD/target/release/mqproxy tests/integration/e2e_gateway.sh
+      - name: e2e_gateway interop, C client -> Rust server
+        run: |
+          MQPROXY_BIN=$PWD/tests/integration/mqproxy-interop-wrapper.sh \
+          MQPROXY_CLIENT_BIN=$PWD/build/mqproxy MQPROXY_SERVER_BIN=$PWD/target/release/mqproxy \
+            tests/integration/e2e_gateway.sh
+      - name: e2e_gateway interop, Rust client -> C server
+        run: |
+          MQPROXY_BIN=$PWD/tests/integration/mqproxy-interop-wrapper.sh \
+          MQPROXY_CLIENT_BIN=$PWD/target/release/mqproxy MQPROXY_SERVER_BIN=$PWD/build/mqproxy \
+            tests/integration/e2e_gateway.sh
       - name: Upload e2e logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
