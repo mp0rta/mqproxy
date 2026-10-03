@@ -204,3 +204,19 @@ fn limit_dial_result_origin_start_failed() {
     h.drive();
     assert_eq!(h.t.h3_body_unread(r), 0, "drained after the reply");
 }
+
+#[test]
+fn no_header_section_yet_waits_in_intake() {
+    let mut h = H::with_gateway(cfg());
+    let c = h.h3_conn();
+    let r = h.t.new_h3_request(c);
+    h.event(mq_transport_api::Event::H3Readable(r));
+    assert!(h.log().contains(&Call::H3RecvHeaders(r)), "asked");
+    assert!(h.t.h3_headers_sent(r).is_empty());
+    assert!(!h.log().contains(&Call::H3Reset(r)));
+    // The section arrives later and is admitted.
+    h.t.inject_h3_headers(r, request(OK, &[]), true);
+    h.drive();
+    assert!(h.t.h3_headers_sent(r).is_empty());
+    assert!(h.dial().is_some(), "admitted: the origin is dialled");
+}

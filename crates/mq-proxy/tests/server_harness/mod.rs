@@ -376,6 +376,14 @@ impl H {
         }
         out
     }
+    /// The driver's read returned 0 on the app socket `tcp`.
+    pub fn tcp_eof(&mut self, tcp: TcpId) {
+        self.sh.tcp_rx_commit(self.now, tcp, IoResult::Eof);
+    }
+    /// A socket error on the app socket `tcp`.
+    pub fn tcp_error(&mut self, tcp: TcpId, kind: std::io::ErrorKind) {
+        self.sh.on_tcp_error(self.now, tcp, kind);
+    }
     /// `n` data streams on `conn` that never send their request, in one drive.
     pub fn idle_streams(&mut self, conn: ConnId, n: usize) -> Vec<StreamId> {
         let v = (0..n).map(|_| self.push_data(conn)).collect();
