@@ -269,7 +269,7 @@ impl Server {
     pub fn with_gateway(cfg: ServerConfig, tls: Arc<rustls::ClientConfig>) -> Server {
         let g = cfg.gateway.clone().expect("with_gateway needs cfg.gateway");
         let mut s = Server::new(cfg);
-        s.gw = Some(Gateway::new(g, tls));
+        s.gw = Some(Gateway::new(g, s.token.clone(), tls));
         s
     }
 

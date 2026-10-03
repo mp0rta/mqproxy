@@ -1,7 +1,7 @@
 //! SP3 spec §7.5 / §6.4: the origin's response head, normalised for the
 //! gateway — or the reason it cannot be relayed (502 `upstream-protocol`).
 
-use super::{OriginProto, RelayHead};
+use super::{MAX_FWD, NAME_CAP, OriginProto, RelayHead, VAL_CAP};
 use mq_http::h1;
 use mq_http::headers::is_hop_by_hop;
 
@@ -13,12 +13,6 @@ pub enum HeadError {
     /// More than 64 forwarded headers, a name ≥ 128 or a value ≥ 1024 bytes.
     Overflow,
 }
-
-/// spec §6.4: the gateway's caps on the forwarded set (C `MQ_GWS_MAX_HDRS`
-/// and its arena slots); dropped headers do not count, as in C.
-const MAX_FWD: usize = 64;
-const NAME_CAP: usize = 128;
-const VAL_CAP: usize = 1024;
 
 pub(super) fn normalise(parts: &http::response::Parts) -> Result<RelayHead, HeadError> {
     if parts.status == http::StatusCode::SWITCHING_PROTOCOLS {

@@ -403,6 +403,10 @@ impl ScriptedHandle {
         st.injected.push_back(Event::H3Request(conn, r));
         r
     }
+    /// Injected body bytes of `r` that no `h3_recv_body` has taken yet.
+    pub fn h3_body_unread(&self, r: H3ReqId) -> usize {
+        self.st().h3.get(&r).map_or(0, |q| q.body.len())
+    }
     /// Bytes accepted by each successful `h3_send_body` on `r`, in order.
     pub fn h3_sends(&self, r: H3ReqId) -> Vec<Vec<u8>> {
         self.st()

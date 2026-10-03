@@ -4,7 +4,8 @@ use crate::h1::{METHOD_MAX, PATH_MAX, is_tchar};
 
 /// Longest `X-Mq-Cache` TTL in seconds (1 year).
 pub const CACHE_TTL_MAX: u32 = 31_536_000;
-const AUTHORITY_MAX: usize = 255;
+/// Longest target authority, both intakes (C `char authority[256]`).
+pub const AUTHORITY_MAX: usize = 255;
 
 /// Parsed `X-Mq-Target` (bytes: any non-control, non-DEL, non-space byte round-trips).
 #[derive(Debug, PartialEq, Eq)]
