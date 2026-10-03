@@ -8,12 +8,14 @@ use super::backoff::Backoff;
 use super::paths::Paths;
 use super::{SNI, log_conn_metrics};
 use crate::config::ClientConfig;
-use download::{HeadCollector, body_check_applies, render_head};
+use download::{HeadCollector, Malformed, body_check_applies, is_head, render_head};
 use head::{Head, synth_error};
 use mq_http::h1::{self, HEAD_MAX, Progress};
 use mq_http::headers::{Method, Reject, reject_status, reject_xmq};
 use mq_runtime::{AcceptMeta, Cx, SocketOpId, TCP_BUF, TcpEnd, TcpId, TimerId, UdpSocketId};
-use mq_transport_api::{ConnConfig, ConnId, ConnProto, Event, H3Header, H3ReqId, StreamError};
+use mq_transport_api::{
+    ConnConfig, ConnId, ConnProto, Event, H3Header, H3ReqId, StreamError, Unread,
+};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -45,9 +47,15 @@ enum GwReq {
         upload: Upload,
         download: Download,
     },
-    /// SP3 spec §5.5 finish: the H3 side is done; `pending`, then the chunk
-    /// terminator when `chunked`, then `tcp_close`.
-    Finishing { pending: Vec<u8>, chunked: bool },
+    /// SP3 spec §5.5 finish: the H3 side is done; `pending`, then frames cut
+    /// from the rescued `src` from `off` (§3.7 (2)), then the chunk terminator
+    /// when `chunked`, then `tcp_close`.
+    Finishing {
+        src: Option<Unread>,
+        off: usize,
+        pending: Vec<u8>,
+        chunked: bool,
+    },
 }
 
 /// SP3 spec §5.3: the local request body still to send.
@@ -69,6 +77,30 @@ struct Download {
     /// A single, strictly numeric `content-length`.
     cl: Option<u64>,
     status: u16,
+}
+
+impl Download {
+    /// SP3 spec §5.4: render the collected head and write it (it fits:
+    /// nothing was written before, ≤ 8192 bytes); `Ok(fin)` of the section.
+    fn start(
+        &mut self,
+        cx: &mut Cx<'_>,
+        tcp: TcpId,
+        method: &Method,
+        col: HeadCollector,
+        fin: bool,
+    ) -> Result<bool, Malformed> {
+        let head = col.finish(fin)?;
+        let bytes = render_head(&head, is_head(method))?;
+        self.started = true;
+        self.chunked = !head.has_cl;
+        self.cl = head.cl;
+        self.status = head.status;
+        if cx.tcp_write(tcp, &bytes).is_err() {
+            self.pending = bytes;
+        }
+        Ok(head.fin)
+    }
 }
 
 /// Write `reply` (it always fits: nothing else was written) and close (§5.2, §5.6).
@@ -219,8 +251,11 @@ impl Gateway {
                 }
             }
             Event::MpReady(c) if mine == Some(c) => self.tunnel.paths.on_mp_ready(cx, c),
-            Event::H3Closed(r, _) => {
-                self.by_h3.remove(&r);
+            // Ignored once EOF was read (out of `by_h3`, §5.5).
+            Event::H3Closed(r, close) => {
+                if let Some(tcp) = self.by_h3.remove(&r) {
+                    self.h3_closed(cx, tcp, close.unread);
+                }
             }
             // Only the gateway holds H3 requests on the client (§5.8).
             Event::H3Writable(r) => {
@@ -392,25 +427,10 @@ impl Gateway {
                 Err(StreamError::Blocked) => return,
                 Err(_) => return self.abort(cx, tcp),
             };
-            let is_head = method.as_bytes() == b"HEAD";
-            let Ok((head, bytes)) = col
-                .finish(fin)
-                .and_then(|h| render_head(&h, is_head).map(|b| (h, b)))
-            else {
-                let r = Reject::UpstreamProtocol;
-                reply_close(cx, tcp, &synth_error(reject_status(r), reject_xmq(r)));
-                return self.remove(cx, tcp);
-            };
-            d.started = true;
-            d.chunked = !head.has_cl;
-            d.cl = head.cl;
-            d.status = head.status;
-            // Fits: nothing was written before (≤ 8192 bytes).
-            if cx.tcp_write(tcp, &bytes).is_err() {
-                d.pending = bytes;
-            }
-            if head.fin {
-                return self.download_fin(cx, tcp);
+            match d.start(cx, tcp, method, col, fin) {
+                Ok(true) => return self.finish(cx, tcp, None),
+                Ok(false) => {}
+                Err(Malformed) => return self.synth_reply(cx, tcp, Reject::UpstreamProtocol),
             }
         }
         let mut buf = [0u8; DL_CHUNK];
@@ -434,16 +454,17 @@ impl Gateway {
                 }
             }
             if fin {
-                return self.download_fin(cx, tcp);
+                return self.finish(cx, tcp, None);
             }
         }
     }
 
-    /// SP3 spec §5.4 `fin`: the body check (xquic's fin does not prove frame
-    /// completeness, §3.7), then finish (§5.5) — or abort on a short body.
-    fn download_fin(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+    /// SP3 spec §5.5 `H3Closed` before the pump read EOF (already out of
+    /// `by_h3`): the rescued leftovers (§3.7 (2)) — the header section while
+    /// `!started`, then the body — finish the request; without them, 502
+    /// `upstream-reset` before the head, abort after it.
+    fn h3_closed(&mut self, cx: &mut Cx<'_>, tcp: TcpId, unread: Option<Unread>) {
         let Some(GwReq::Open {
-            h3,
             method,
             download: d,
             ..
@@ -451,22 +472,70 @@ impl Gateway {
         else {
             return;
         };
-        if body_check_applies(method, d.status) && d.cl.is_some_and(|cl| d.delivered < cl) {
+        // Without headers while `!started`, `unread` is treated as absent.
+        let Some(mut u) = unread.filter(|u| d.started || u.headers.is_some()) else {
+            if d.started {
+                return self.abort(cx, tcp);
+            }
+            return self.synth_reply(cx, tcp, Reject::UpstreamReset);
+        };
+        if !d.started {
+            let mut col = HeadCollector::default();
+            for (n, v) in u.headers.take().iter().flatten() {
+                col.push(n, v);
+            }
+            if d.start(cx, tcp, method, col, false).is_err() {
+                return self.synth_reply(cx, tcp, Reject::UpstreamProtocol);
+            }
+        }
+        self.finish(cx, tcp, Some(u));
+    }
+
+    /// SP3 spec §5.5 finish: the §5.4 body check on the delivered plus the
+    /// rescued bytes (xquic's fin does not prove frame completeness, §3.7) —
+    /// a shortfall aborts — then `Finishing`. EOF was read: the H3 side leaves
+    /// `by_h3` (a later `H3Closed` is ignored) and is reset when the upload is
+    /// incomplete (an early response; the truncation is real, §12).
+    fn finish(&mut self, cx: &mut Cx<'_>, tcp: TcpId, src: Option<Unread>) {
+        let Some(GwReq::Open {
+            h3,
+            method,
+            upload,
+            download: d,
+        }) = self.reqs.get_mut(&tcp)
+        else {
+            return;
+        };
+        let rescued = src.as_ref().map_or(0, |u| u.body.len() as u64);
+        if body_check_applies(method, d.status) && d.cl.is_some_and(|cl| d.delivered + rescued < cl)
+        {
             return self.abort(cx, tcp);
         }
-        // EOF read: the H3 side is done (a later `H3Closed` is ignored).
-        self.by_h3.remove(h3);
-        let pending = std::mem::take(&mut d.pending);
-        let chunked = d.chunked;
-        self.reqs.insert(tcp, GwReq::Finishing { pending, chunked });
+        if self.by_h3.remove(h3).is_some() && upload.remaining > 0 {
+            cx.h3_reset(*h3);
+        }
+        let f = GwReq::Finishing {
+            src,
+            off: 0,
+            pending: std::mem::take(&mut d.pending),
+            chunked: d.chunked,
+        };
+        self.reqs.insert(tcp, f);
         self.flush(cx, tcp);
     }
 
-    /// SP3 spec §5.5 `Finishing`: write `pending`, then the chunk terminator,
-    /// then `tcp_close` — each only once the previous was accepted; a
-    /// `SendBufFull` waits for `on_tcp_writable`.
+    /// SP3 spec §5.5 `Finishing`: write `pending`, then `DL_CHUNK` frames cut
+    /// from `src`, then the chunk terminator, then `tcp_close` — each only
+    /// once the previous write was accepted; a `SendBufFull` waits for
+    /// `on_tcp_writable`.
     fn flush(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
-        let Some(GwReq::Finishing { pending, chunked }) = self.reqs.get_mut(&tcp) else {
+        let Some(GwReq::Finishing {
+            src,
+            off,
+            pending,
+            chunked,
+        }) = self.reqs.get_mut(&tcp)
+        else {
             return;
         };
         loop {
@@ -476,22 +545,37 @@ impl Gateway {
                 }
                 pending.clear();
             }
-            if !std::mem::take(chunked) {
+            if let Some(u) = src.as_ref().filter(|u| *off < u.body.len()) {
+                let b = &u.body[*off..u.body.len().min(*off + DL_CHUNK)];
+                *off += b.len();
+                if *chunked {
+                    h1::chunk_frame(pending, b);
+                } else {
+                    pending.extend_from_slice(b);
+                }
+            } else if std::mem::take(chunked) {
+                h1::chunk_end(pending);
+            } else {
                 break;
             }
-            h1::chunk_end(pending);
         }
         self.reqs.remove(&tcp);
         cx.tcp_close(tcp);
     }
 
-    /// Remove the request; `h3_reset` while its H3 side is live (in `by_h3`
-    /// until `H3Closed`, §5.5).
+    /// SP3 spec §5.6: the synthesised error reply, then remove.
+    fn synth_reply(&mut self, cx: &mut Cx<'_>, tcp: TcpId, r: Reject) {
+        reply_close(cx, tcp, &synth_error(reject_status(r), reject_xmq(r)));
+        self.remove(cx, tcp);
+    }
+
+    /// Remove the request: cancel a `Head` timer; `h3_reset` while its H3
+    /// side is live (in `by_h3` until EOF or `H3Closed`, §5.5).
     fn remove(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
-        if let Some(GwReq::Open { h3, .. }) = self.reqs.remove(&tcp)
-            && self.by_h3.remove(&h3).is_some()
-        {
-            cx.h3_reset(h3);
+        match self.reqs.remove(&tcp) {
+            Some(GwReq::Head { timer }) => self.cancel(cx, timer),
+            Some(GwReq::Open { h3, .. }) if self.by_h3.remove(&h3).is_some() => cx.h3_reset(h3),
+            _ => {}
         }
     }
 
@@ -579,14 +663,19 @@ impl Gateway {
         true
     }
 
-    /// SP3 spec §5.9: dump the tunnel's block, close it; `Client` exits once
-    /// both tunnels are gone.
+    /// SP3 spec §5.9: dump the tunnel's block, abort every request (one
+    /// `h3_reset` while live), close the tunnel; `Client` exits once both
+    /// tunnels are gone.
     pub fn on_shutdown(&mut self, cx: &mut Cx<'_>) {
         self.shutting_down = true;
         if let Some(t) = self.tunnel.reconnect.take() {
             self.cancel(cx, t);
         }
         self.dump_metrics(cx);
+        let live: Vec<TcpId> = self.reqs.keys().copied().collect();
+        for tcp in live {
+            self.abort(cx, tcp);
+        }
         if let Some(c) = self.tunnel.conn {
             cx.close_conn(c);
         }

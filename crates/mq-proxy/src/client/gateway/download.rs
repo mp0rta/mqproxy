@@ -132,10 +132,15 @@ pub fn render_head(h: &RespHead, fetch_method_is_head: bool) -> Result<Vec<u8>, 
     Ok(o)
 }
 
+/// The fetch method is `HEAD` (the head render and the body check).
+pub fn is_head(method: &Method) -> bool {
+    method.as_bytes() == b"HEAD"
+}
+
 /// The response may carry a body: the fetch method is not `HEAD` and the
 /// status is not 1xx/204/304 (spec §5.4 body check).
 pub fn body_check_applies(method: &Method, status: u16) -> bool {
-    method.as_bytes() != b"HEAD" && !(100..200).contains(&status) && status != 204 && status != 304
+    !is_head(method) && !(100..200).contains(&status) && status != 204 && status != 304
 }
 
 #[cfg(test)]
@@ -204,6 +209,9 @@ mod tests {
             assert_eq!(collect(&[(":status", s)], false), Err(Malformed), "{s:?}");
         }
         assert_eq!(collect(&[("x", "y")], false), Err(Malformed), "no :status");
+        // C: the last `:status` wins.
+        let two = collect(&[(":status", "200"), (":status", "404")], false);
+        assert_eq!(two.unwrap().status, 404);
     }
 
     #[test]
