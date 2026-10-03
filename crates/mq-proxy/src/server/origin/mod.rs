@@ -3,12 +3,15 @@
 //! tokio task or channel on the data path.
 
 mod body;
+mod errors;
 mod events;
 mod exec;
 #[cfg(feature = "test-support")]
 pub mod host;
 mod key;
 mod pipe;
+mod request;
+mod response;
 pub mod tls;
 
 pub use body::{UploadBody, UploadBuf};
