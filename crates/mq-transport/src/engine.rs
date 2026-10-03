@@ -1,6 +1,6 @@
 //! Engine creation, connection settings, logs and qlog (spec §4.9).
 
-use crate::ffi::{app_proto_callbacks, guard, transport_callbacks};
+use crate::ffi::{app_proto_callbacks, guard, h3_callbacks, transport_callbacks};
 use crate::{Error, Inner, Transport, clock};
 use core::ffi::{c_char, c_void};
 use core::ptr;
@@ -63,6 +63,23 @@ fn server_settings(cfg: &TransportConfig) -> xqc_conn_settings_t {
     conn_settings(cfg, None)
 }
 
+/// xquic's default engine config with the fields this tree pins. The log level stays WARN:
+/// `xqc_h3_request_close` reads a destroyed request in a DEBUG log (spec §3.1).
+fn engine_config(ty: xqc_engine_type_t) -> Option<xqc_config_t> {
+    // SAFETY: a plain C struct; xquic fills it.
+    let mut config: xqc_config_t = unsafe { core::mem::zeroed() };
+    // SAFETY: `config` outlives the call.
+    if unsafe { xqc_engine_get_default_config(&mut config, ty) } < 0 {
+        return None;
+    }
+    config.cfg_log_level = XQC_LOG_WARN;
+    // As mq_transport_new: event qlog at EXTRA importance (also xquic's defaults, pinned so a
+    // fork default change cannot silently drop events).
+    config.cfg_log_event = 1;
+    config.cfg_qlog_importance = EVENT_IMPORTANCE_EXTRA;
+    Some(config)
+}
+
 fn cstring(what: &str, s: impl Into<Vec<u8>>) -> Result<CString, Error> {
     CString::new(s).map_err(|_| Error::Config(format!("{what} contains a NUL byte")))
 }
@@ -98,6 +115,7 @@ impl Transport {
         let settings = server.then(|| server_settings(&t.inner.cfg));
         let alpn_ptr = t.inner.alpn.as_ptr();
         let alpn_len = t.inner.alpn.as_bytes().len();
+        let h3_on = t.inner.cfg.h3;
         let inner: *mut Inner = &mut *t.inner;
 
         let engine = clock::enter(inner, Time(0), || {
@@ -105,15 +123,9 @@ impl Transport {
             // strings, the callback tables and the ALPN registration (xqc_engine.c). Engine user
             // data is SlotId::NONE (= null, spec §4.8): callbacks find Inner via clock::current().
             unsafe {
-                let mut config: xqc_config_t = core::mem::zeroed();
-                if xqc_engine_get_default_config(&mut config, ty) < 0 {
+                let Some(config) = engine_config(ty) else {
                     return ptr::null_mut();
-                }
-                // As mq_transport_new: event qlog at EXTRA importance (also xquic's defaults,
-                // pinned so a fork default change cannot silently drop events).
-                config.cfg_log_event = 1;
-                config.cfg_qlog_importance = EVENT_IMPORTANCE_EXTRA;
-
+                };
                 let mut ssl: xqc_engine_ssl_config_t = core::mem::zeroed();
                 ssl.ciphers = XQC_TLS_CIPHERS.as_ptr() as *mut c_char;
                 ssl.groups = XQC_TLS_GROUPS.as_ptr() as *mut c_char;
@@ -142,6 +154,12 @@ impl Transport {
                 if xqc_engine_register_alpn(engine, alpn_ptr, alpn_len, &mut ap, ptr::null_mut())
                     != 0
                 {
+                    xqc_engine_destroy(engine);
+                    return ptr::null_mut();
+                }
+                // spec §3.2: registers `h3` and `h3-29`; cleans up after itself on failure.
+                let mut h3 = h3_callbacks();
+                if h3_on && xqc_h3_ctx_init(engine, &mut h3) != 0 {
                     xqc_engine_destroy(engine);
                     return ptr::null_mut();
                 }
@@ -181,8 +199,15 @@ impl Transport {
             return;
         }
         let inner: *mut Inner = &mut *self.inner;
+        let h3 = self.inner.cfg.h3;
         // SAFETY: `engine` is live (non-null) and destroyed exactly once: it is nulled below.
-        clock::enter(inner, now, || unsafe { xqc_engine_destroy(engine) });
+        // spec §3.2: the H3 ctx is freed through the live engine, so it goes first.
+        clock::enter(inner, now, || unsafe {
+            if h3 {
+                xqc_h3_ctx_destroy(engine);
+            }
+            xqc_engine_destroy(engine)
+        });
         self.inner.engine = ptr::null_mut();
     }
 }
@@ -351,6 +376,17 @@ mod tests {
         assert!(d.datagram_acked_notify.is_none());
         assert!(d.datagram_lost_notify.is_none());
         assert!(d.datagram_mss_updated_notify.is_none());
+    }
+
+    /// spec §3.1: `xqc_h3_request_close` reads freed memory in a DEBUG log; never raise it.
+    #[test]
+    fn engine_config_pins_log_level_warn() {
+        for ty in [XQC_ENGINE_CLIENT, XQC_ENGINE_SERVER] {
+            let c = engine_config(ty).expect("default config");
+            assert_eq!(c.cfg_log_level, XQC_LOG_WARN);
+            assert_eq!(c.cfg_log_event, 1);
+            assert_eq!(c.cfg_qlog_importance, EVENT_IMPORTANCE_EXTRA);
+        }
     }
 
     #[test]

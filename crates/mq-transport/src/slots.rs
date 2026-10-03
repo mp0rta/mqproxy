@@ -2,8 +2,8 @@
 //! `(index, generation)`; a stale id never resolves to a reused slot.
 
 use mq_transport_api::ringbuf::RingBuf;
-use mq_transport_api::{SlotId, StreamKind, Time};
-use xquic_sys::{xqc_cid_t, xqc_connection_t, xqc_stream_t};
+use mq_transport_api::{ConnProto, SlotId, StreamKind, Time};
+use xquic_sys::{xqc_cid_t, xqc_connection_t, xqc_h3_conn_t, xqc_stream_t};
 
 pub(crate) struct Slots<T> {
     entries: Vec<Entry<T>>,
@@ -83,6 +83,10 @@ pub(crate) struct ConnSlot {
     pub cid: xqc_cid_t,
     pub counted: bool,
     pub server: bool,
+    /// Set by the create notification (spec §3.2).
+    pub proto: ConnProto,
+    /// Bound in the H3 create notification; null for raw connections (spec §3.2).
+    pub h3c: *mut xqc_h3_conn_t,
     /// Counted in `n_provisional` while true; cleared only by a successful ALPN admission (spec §4.7).
     pub provisional: bool,
     /// Scheduling input for `next_timeout()`; cleared when the deadline closes the connection.
@@ -107,6 +111,8 @@ impl ConnSlot {
             cid,
             counted: false,
             server,
+            proto: ConnProto::Raw,
+            h3c: core::ptr::null_mut(),
             provisional: false,
             provisional_deadline: None,
             streams: 0,
