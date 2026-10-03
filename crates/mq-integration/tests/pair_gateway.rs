@@ -218,7 +218,7 @@ fn h3_client(server: SocketAddr, s: H3Script) -> DriverThread<H3Handle> {
 
 fn stop(d: DriverThread<H3Handle>) {
     d.shutdown.trigger();
-    d.join();
+    assert_eq!(d.join(), 0);
 }
 
 /// A request to `authority` + `path`; `extra` follows the pseudo-headers.
@@ -424,7 +424,7 @@ fn fetch_download_8mib_cl() {
         "body differs ({} bytes)",
         r.body.len()
     );
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §5.3, §6.3, §10.3: an 8 MiB `PUT` upload, streamed back by an h1 echo origin.
@@ -439,7 +439,7 @@ fn fetch_upload_8mib_put() {
     assert_eq!(r.status, 200);
     assert_eq!(r.header("content-length"), Some("8388608"));
     assert!(r.body == body, "echo differs ({} bytes)", r.body.len());
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §5.4, §5.5, §10.3: `content-length: 100` over a complete 50-byte DATA frame + FIN
@@ -451,7 +451,7 @@ fn fetch_short_cl_response_aborts_client() {
     let r = fetch_when_up(p.fetch_addr(), &auth("http://x/short", "any"));
     assert!(is_reset(&r), "{r:?}");
     assert!(h.lock().requests >= 1);
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §3.7 (3), §5.4, Review Focus 5: the response's DATA frame is cut by FIN inside its
@@ -466,7 +466,7 @@ fn fetch_response_cut_inside_frame_aborts() {
     assert!(is_reset(&r), "{:?}", r.as_ref().map(|b| b.len()));
     let accepted = h.lock().accepted.expect("the peer sent the cut frame");
     assert!(0 < accepted && accepted < CUT_BODY, "accepted {accepted}");
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §5.4, §6.4, §10.3: a HEAD response and a 304, each carrying `content-length`,
@@ -498,7 +498,7 @@ fn head_and_304_with_cl_finish_cleanly() {
     );
     assert_eq!((r.status, r.header("content-length")), (304, Some("100")));
     assert!(r.body.is_empty());
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §7.4, §10.3: `/a/../b` reaches the origin as `/b` (the query untouched).
@@ -511,7 +511,7 @@ fn dot_segments_normalised_at_origin() {
     assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
     let head = o.one().head;
     assert!(head.starts_with("get /b?q=/../x http/1.1\r\n"), "{head}");
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §7.4, §10.3: an empty forwarded `x-test:` is not sent, and an empty `accept:`
@@ -528,7 +528,7 @@ fn empty_header_not_sent_empty_accept_suppresses_default() {
     assert!(head.contains("\r\nx-kept: yes\r\n"), "{head}");
     assert!(!head.contains("x-test"), "{head}");
     assert!(!head.contains("\r\naccept:"), "{head}");
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §7.2, §7.7, §10.3 (e2e case 13): an h1-forced request reuses the idle h1 conn a
@@ -554,12 +554,14 @@ fn h1_forced_reuses_idle_default_conn() {
     let r = parse(&r.expect("h1-forced request"));
     assert_eq!((r.status, r.body.len()), (200, 2));
     assert_eq!(o.accepted(), 1);
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §6.4, §10.3: an h2 origin declares `content-length: 100`, sends 50 bytes and then
-/// RST_STREAM(NO_ERROR): the server's body check resets the H3 response and the Rust
-/// client's local reply is an abort.
+/// RST_STREAM(NO_ERROR): the server's body check resets the H3 response (pinned by its
+/// `mq.req`). The Rust client's local reply is an abort, or 502 `upstream-reset` when its
+/// xquic processes HEADERS and RESET_STREAM in one pass (the reset discards the unread
+/// head; `ClTooShort` leaves only 10 ms between them, too little on a slow CI).
 #[test]
 fn h2_cl_100_then_rst_resets_h3_end_to_end() {
     let h = Handler::ClTooShort { cl: 100, send: 50 };
@@ -568,15 +570,16 @@ fn h2_cl_100_then_rst_resets_h3_end_to_end() {
     wait_up(&p);
     let url = format!("https://127.0.0.1:{}/h2-short", o.addr.port());
     let r = fetch(&p, &url, &[], b"");
+    let upstream_reset = b"HTTP/1.1 502 \r\nX-Mq-Error: upstream-reset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     assert!(
-        is_reset(&r),
+        is_reset(&r) || matches!(&r, Ok(b) if b == upstream_reset),
         "{:?}",
         r.as_ref().map(|b| String::from_utf8_lossy(b).into_owned())
     );
     // The reset is the server's (its check), not only the client's own body check.
     let line = wait_log(&["mq.req", "path=\"/h2-short\""]);
     assert!(line.contains("reset=\"local reset\""), "{line}");
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §5.2, §6.2, §10.3: CONNECT is refused by the fetch listener (400 `bad-method`) and
@@ -611,7 +614,7 @@ fn connect_rejected_both_intakes() {
         assert_eq!(h3_header(&r, "x-mq-error").as_deref(), Some("bad-request"));
     }
     stop(c);
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 // ---- direct H3 against the gateway server ----
@@ -634,7 +637,7 @@ fn drain_after_403_counts_whole_body() {
     }
     wait_log(&["mq.req", "status=403", &format!("req_bytes={body_len} ")]);
     stop(c);
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §6.2 step 8, §10.3: `content-length: 10` with FIN on HEADERS reaches the origin
@@ -663,7 +666,7 @@ fn direct_h3_cl_with_fin_on_headers_is_bodiless() {
         .find_map(|l| l.strip_prefix("content-length:"));
     assert!(cl.is_none_or(|v| v.trim() == "0"), "{}", seen.head);
     stop(c);
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// spec §7.4, §10.3: a GET with an unknown-length DATA body reaches an h1 origin chunked and
@@ -695,7 +698,7 @@ fn direct_h3_get_with_body_is_chunked_on_h1() {
     );
     assert_eq!(dechunk(&seen.body).as_deref(), Some(&b"hello body"[..]));
     stop(c);
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
 
 /// A direct-H3 upload the server must reset (§6.3): the client sees the reset, the server
@@ -714,12 +717,13 @@ fn upload_reset(path: &str, cl: &str, body: Vec<u8>, truncate: bool) -> H3Handle
         assert_ne!(r.closed[0].0.stats.stream_err, 0, "{r:?}");
         assert!(!r.fin, "{r:?}");
     }
-    wait_log(&["mq.req", &format!("path=\"{path}\"")]);
+    let line = wait_log(&["mq.req", &format!("path=\"{path}\"")]);
+    assert!(line.contains("reset=\"local reset\""), "{line}");
     let seen = o.settled();
     assert!(seen.iter().all(|s| !s.complete), "{seen:?}");
     let h = c.handle.clone();
     stop(c);
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
     h
 }
 
@@ -792,5 +796,5 @@ fn nul_in_auth_path_class_direct_h3() {
         stop(c);
     }
     wait_log(&["x-mq-class='nul?class-marker'"]);
-    p.join_both();
+    assert_eq!(p.join_both(), (0, 0));
 }
