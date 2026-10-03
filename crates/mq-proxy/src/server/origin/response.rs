@@ -20,7 +20,6 @@ const MAX_FWD: usize = 64;
 const NAME_CAP: usize = 128;
 const VAL_CAP: usize = 1024;
 
-#[allow(dead_code)] // Task 5.4
 pub(super) fn normalise(parts: &http::response::Parts) -> Result<RelayHead, HeadError> {
     if parts.status == http::StatusCode::SWITCHING_PROTOCOLS {
         return Err(HeadError::Upgrade101);

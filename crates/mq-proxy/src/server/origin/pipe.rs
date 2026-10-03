@@ -69,12 +69,26 @@ impl PipeHandle {
         n
     }
 
+    /// Free room in `rx`.
+    pub fn rx_room(&self) -> usize {
+        PIPE_CAP - self.0.borrow().rx.len()
+    }
+
     /// The origin's plaintext stream ended (published once nothing is left
-    /// below the pipe, §7.3).
-    pub fn set_eof(&self) {
+    /// below the pipe, §7.3). Returns whether this call published it.
+    pub fn set_eof(&self) -> bool {
         let mut st = self.0.borrow_mut();
+        if st.rx_eof {
+            return false;
+        }
         st.rx_eof = true;
         st.wake_reader();
+        true
+    }
+
+    /// hyper's `poll_shutdown` was seen (recorded and ignored, §7.3 step 1).
+    pub fn tx_shutdown(&self) -> bool {
+        self.0.borrow().tx_shutdown
     }
 
     /// Offers the first `max` bytes hyper wrote to `sink`, which returns how

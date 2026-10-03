@@ -9,7 +9,6 @@ use http::Request;
 /// `content-length` for a known length, `transfer-encoding: chunked` for an
 /// unknown length on h1 only. A residual build error is
 /// 502 `origin-start-failed` (§7.4): intake already validated every part.
-#[allow(dead_code)] // Task 5.4
 pub(super) fn build_request(
     req: &StoredRequest,
     proto: OriginProto,

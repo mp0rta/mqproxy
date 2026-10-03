@@ -156,6 +156,24 @@ impl OH {
         self.drive();
     }
 
+    /// The driver's read under backpressure: as much of `bytes` as the
+    /// receive buffer takes; returns that count.
+    pub fn tcp_in_some(&mut self, tcp: TcpId, bytes: &[u8]) -> usize {
+        let mut fed = 0;
+        loop {
+            let buf = self.sh.tcp_rx_buf(tcp);
+            let n = buf.len().min(bytes.len() - fed);
+            if n == 0 {
+                break;
+            }
+            buf[..n].copy_from_slice(&bytes[fed..fed + n]);
+            self.sh.tcp_rx_commit(self.now, tcp, IoResult::Bytes(n));
+            fed += n;
+        }
+        self.drive();
+        fed
+    }
+
     /// The driver's write: everything queued toward the socket, committed.
     pub fn tcp_out_all(&mut self, tcp: TcpId) -> Vec<u8> {
         let out = self.sh.tcp_tx_buf(tcp).to_vec();

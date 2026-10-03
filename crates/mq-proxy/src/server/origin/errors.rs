@@ -20,7 +20,6 @@ pub enum ErrClass {
 }
 
 /// `is_parse_too_large` before `is_parse`: it is a sub-kind of it.
-#[allow(dead_code)] // Task 5.4
 pub(super) fn classify(e: &hyper::Error) -> ErrClass {
     if e.is_incomplete_message() {
         ErrClass::Incomplete
@@ -41,7 +40,6 @@ pub(super) fn classify(e: &hyper::Error) -> ErrClass {
 /// class is the same reset marker (`curl:56`): the gateway resets the H3
 /// request on `after_head` and only logs the code. `rx_since_send` is h1-only.
 /// `cause` names the class; the bridge may replace it with the error text.
-#[allow(dead_code)] // Task 5.4
 pub(super) fn map_error(
     c: ErrClass,
     after_head: bool,
@@ -69,7 +67,6 @@ pub(super) fn map_error(
 
 /// A head the gateway cannot relay (§7.5): 502 `upstream-protocol` after
 /// negotiating, delivered as `on_failure(.., after_head: false)`.
-#[allow(dead_code)] // Task 5.4
 pub(super) fn head_error(e: HeadError, proto: OriginProto, https: bool) -> OriginFailure {
     let cause = match e {
         HeadError::Upgrade101 => "101 response",

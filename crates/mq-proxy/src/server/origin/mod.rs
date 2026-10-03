@@ -22,6 +22,7 @@ use pipe::{HyperIo, PipeHandle};
 pub use tls::{TlsSetupError, build_client_config, install_ring, native_roots};
 
 use http::{Request, Response};
+use http_body::Body;
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use mq_http::headers::{HttpVer, Method, status_from_curl};
@@ -32,6 +33,7 @@ use std::collections::HashMap;
 #[cfg(feature = "test-support")]
 use std::collections::HashSet;
 use std::future::Future;
+use std::io::{self, Read, Write};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -334,6 +336,13 @@ enum OriginReq {
         head_seen: bool,
         reused: bool,
         retried: bool,
+        /// A `Partial` frame waits on the H3 side: no further body frame is
+        /// polled until `Origin::resume` (§7.5).
+        held: bool,
+        /// Body bytes handed to `on_body_frame`.
+        delivered: u64,
+        /// The head's single numeric `content-length`.
+        cl: Option<u64>,
     },
     /// Waits for `released`.
     Ended {
@@ -460,19 +469,67 @@ impl Origin {
         Ok(())
     }
 
-    /// spec §7.3; this task drives the `Tls` and `Handshaking` drivers
-    /// (Task 5.4 adds the rest of the pump).
+    /// spec §7.3: steps 1–3 repeated while the `Dirty` flag was set or any
+    /// buffer changed, at most `PUMP_CAP` rounds (then a zero-delay
+    /// `OriginTimer::Pump` re-enters); step 5 settles after every call.
     pub fn pump(&mut self, cx: &mut Cx<'_>, ev: &mut dyn BridgeEvents) {
         let waker = Waker::from(self.dirty.clone());
         let mut tcx = Context::from_waker(&waker);
-        for id in self.conns.ids() {
-            self.pump_tls(cx, id, ev);
-            self.poll_handshake(cx, id, &mut tcx, ev);
+        let mut rounds = 0;
+        loop {
+            self.dirty.take();
+            let mut changed = false;
+            for id in self.conns.ids() {
+                changed |= self.tcp_to_pipe(cx, id, ev);
+            }
+            // Step 2 in the §7.3 order: handshakes and public `Connection`s,
+            // then the executor tasks, then the exchanges.
+            for id in self.conns.ids() {
+                changed |= self.poll_driver(cx, id, &mut tcx, ev);
+            }
+            changed |= self.exec.poll_all(&mut tcx);
+            for id in self.conns.ids() {
+                changed |= self.poll_exchanges(cx, id, &mut tcx, ev);
+            }
+            for id in self.conns.ids() {
+                changed |= self.pipe_to_tcp(cx, id);
+            }
+            changed |= self.refill(cx, ev);
+            if !(changed | self.dirty.take()) {
+                break;
+            }
+            rounds += 1;
+            if rounds == PUMP_CAP {
+                // The shard's runnable check cannot see `Dirty` (§7.3 step 4).
+                if !self.timers.values().any(|t| *t == OriginTimer::Pump) {
+                    let t = cx.set_timer(Duration::ZERO);
+                    self.timers.insert(t, OriginTimer::Pump);
+                }
+                break;
+            }
         }
+        self.settle(cx);
     }
 
-    /// The gateway drained a `Partial` frame: polling the body resumes (Task 5.5).
-    pub fn resume(&mut self, _h3: H3ReqId) {}
+    /// §7.7 settling point (Task 5.5a).
+    fn settle(&mut self, _cx: &mut Cx<'_>) {}
+
+    /// The gateway drained a `Partial` frame: the next pump polls the body again.
+    pub fn resume(&mut self, h3: H3ReqId) {
+        let Some(&Where::Conn(id)) = self.by_h3.get(&h3) else {
+            return;
+        };
+        let Some(c) = self.conns.get_mut(id) else {
+            return;
+        };
+        for rec in &mut c.reqs {
+            if let OriginReq::Assigned { h3: x, held, .. } = rec
+                && *x == h3
+            {
+                *held = false;
+            }
+        }
+    }
 
     /// `H3Closed` (§7.7 cancel). While `Connecting` the record is dropped: a
     /// pending dial is cancelled, a handshaking conn is removed as class D.
@@ -517,18 +574,7 @@ impl Origin {
         match r {
             Ok(tcp) => self.connected(cx, tcp, rec, ev),
             // §6.2 step 9: the socket cap is 502 origin-start-failed.
-            Err(DialError::Limit) => {
-                let f = OriginFailure {
-                    curl: 0,
-                    status: 502,
-                    tls: TlsOutcome::Na,
-                    proto: None,
-                    upstream_protocol: false,
-                    start_failed: true,
-                    cause: "socket limit".into(),
-                };
-                self.fail(cx, rec, f, ev);
-            }
+            Err(DialError::Limit) => self.fail(cx, rec, start_failed("socket limit"), ev),
             Err(e) => {
                 let curl = match e {
                     DialError::Dns => 6,
@@ -552,19 +598,21 @@ impl Origin {
         self.by_tcp.contains_key(&tcp)
     }
 
-    /// Returns whether `tcp` was the bridge's (Task 5.4).
+    /// Returns whether `tcp` was the bridge's; the pump flushes what waits.
     pub fn on_tcp_writable(
         &mut self,
         _cx: &mut Cx<'_>,
-        _tcp: TcpId,
+        tcp: TcpId,
         _ev: &mut dyn BridgeEvents,
     ) -> bool {
-        false
+        self.by_tcp.contains_key(&tcp)
     }
 
     /// Returns whether `tcp` was the bridge's. `ReadEof` is published by the
-    /// pump once the buffered bytes were processed; a socket error during the
-    /// TLS handshake is `curl:35` at once (§7.3). After it: Task 5.4.
+    /// pump once the buffered bytes were processed. A socket error while the
+    /// requester is still `Connecting` is `curl:35` at once (§7.3; `curl:56`
+    /// in the transient hyper handshake); after it, class E without
+    /// `tcp_abort` — the shard already closed the socket.
     pub fn on_tcp_end(
         &mut self,
         cx: &mut Cx<'_>,
@@ -578,11 +626,16 @@ impl Origin {
         let c = self.conns.get_mut(id).expect("by_tcp names a live conn");
         match end {
             TcpEnd::ReadEof => c.tcp_eof = true,
-            TcpEnd::Error(k) if matches!(c.driver, Driver::Tls(_)) => {
-                let cause = format!("socket error during the TLS handshake: {k:?}");
-                self.fail_conn(cx, id, 35, cause, ev);
+            TcpEnd::Error(k) if c.pending.is_some() => {
+                let curl = if matches!(c.driver, Driver::Tls(_)) {
+                    35
+                } else {
+                    56
+                };
+                let cause = format!("socket error during the handshake: {k:?}");
+                self.fail_conn(cx, id, curl, cause, ev);
             }
-            TcpEnd::Error(_) => {}
+            TcpEnd::Error(_) => self.remove(cx, id, Removal::E { abort: false }),
         }
         true
     }
@@ -678,49 +731,130 @@ impl Origin {
         }
     }
 
-    /// The TLS handshake through the socket (§7.3 steps 1 and 3 while the
-    /// driver is `Tls`): `read_tls` only with bytes and `wants_read`,
-    /// `write_tls` on `wants_write`, then the hyper handshake.
-    fn pump_tls(&mut self, cx: &mut Cx<'_>, id: OriginConnId, ev: &mut dyn BridgeEvents) {
+    /// §7.3 step 1, TCP → pipe. TLS: `reader()` first, `read_tls` only with
+    /// bytes and `wants_read` (a zero-byte read would mark EOF inside
+    /// rustls); a TLS error ends the handshake (`curl:35`/`60`, E′) or, after
+    /// it, the conn (class E). `rx_eof` is published only once `tcp_rx` and
+    /// rustls are empty. Returns whether bytes moved.
+    fn tcp_to_pipe(
+        &mut self,
+        cx: &mut Cx<'_>,
+        id: OriginConnId,
+        ev: &mut dyn BridgeEvents,
+    ) -> bool {
+        if self.closing.contains(&id) {
+            return false; // its socket is gone (class E)
+        }
         let Some(c) = self.conns.get_mut(id) else {
-            return;
-        };
-        let (Driver::Tls(_), Some(tls)) = (&c.driver, c.tls.as_mut()) else {
-            return;
+            return false;
         };
         let tcp = c.tcp;
+        let Some(tls) = c.tls.as_mut() else {
+            let n = c.io.push_rx(cx.tcp_rx(tcp));
+            if n > 0 {
+                cx.tcp_consume(tcp, n);
+            }
+            let eof = c.tcp_eof && cx.tcp_rx(tcp).is_empty() && c.io.set_eof();
+            return n > 0 || eof;
+        };
+        let connecting = matches!(c.driver, Driver::Tls(_));
+        let mut moved = drain_plaintext(tls, &c.io);
         let mut failed = None;
-        // A zero-byte `read_tls` would mark EOF inside rustls.
-        while tls.is_handshaking() && tls.wants_read() && !cx.tcp_rx(tcp).is_empty() {
+        while tls.wants_read() && !cx.tcp_rx(tcp).is_empty() {
             let mut rx = cx.tcp_rx(tcp);
-            let Ok(n @ 1..) = tls.read_tls(&mut rx) else {
-                break;
-            };
-            cx.tcp_consume(tcp, n);
+            match tls.read_tls(&mut rx) {
+                Ok(0) => break,
+                Ok(n) => cx.tcp_consume(tcp, n),
+                // A full deframer buffer during the handshake: no deadline wait.
+                Err(e) if connecting => {
+                    failed = Some(rustls::Error::General(e.to_string()));
+                    break;
+                }
+                // "received plaintext buffer full": backpressure (§7.3).
+                Err(_) => break,
+            }
+            moved = true;
             if let Err(e) = tls.process_new_packets() {
                 failed = Some(e);
                 break;
             }
+            moved |= drain_plaintext(tls, &c.io);
         }
         if let Some(e) = failed {
-            let curl = match e {
-                rustls::Error::InvalidCertificate(_) => 60,
-                _ => 35,
-            };
-            return self.fail_conn(cx, id, curl, e.to_string(), ev);
+            if connecting {
+                let curl = match e {
+                    rustls::Error::InvalidCertificate(_) => 60,
+                    _ => 35,
+                };
+                self.fail_conn(cx, id, curl, e.to_string(), ev);
+            } else {
+                // Fatal and sticky in rustls: the socket is useless (§7.3).
+                self.remove(cx, id, Removal::E { abort: true });
+            }
+            return true;
         }
-        while tls.wants_write() && tls.write_tls(&mut c.out).is_ok() {}
-        flush_out(cx, tcp, &mut c.out);
-        if !tls.is_handshaking() {
+        let eof = c.tcp_eof && cx.tcp_rx(tcp).is_empty();
+        if connecting && !tls.is_handshaking() {
             let proto = match tls.alpn_protocol() {
                 Some(b"h2") => OriginProto::H2,
                 _ => OriginProto::H1,
             };
             self.begin_hyper(cx, id, proto);
-        } else if c.tcp_eof && cx.tcp_rx(tcp).is_empty() {
+            moved = true;
+        } else if connecting && eof {
             let cause = "EOF during the TLS handshake".to_string();
             self.fail_conn(cx, id, 35, cause, ev);
+            return true;
         }
+        if eof {
+            let c = self.conns.get_mut(id).expect("live conn");
+            let tls = c.tls.as_mut().expect("TLS conn");
+            // `Err` while rustls's plaintext is full: retried on a later pump.
+            let _ = tls.read_tls(&mut &[][..]);
+            moved |= drain_plaintext(tls, &c.io);
+        }
+        moved
+    }
+
+    /// §7.3 step 3, pipe → TCP, in slices of ≤ `SLICE`. TLS: `write_tls`
+    /// whenever `wants_write`, plaintext fed while `out` < 64 KiB. Returns
+    /// whether bytes moved.
+    fn pipe_to_tcp(&mut self, cx: &mut Cx<'_>, id: OriginConnId) -> bool {
+        if self.closing.contains(&id) {
+            return false;
+        }
+        let Some(OriginConn {
+            tcp, tls, io, out, ..
+        }) = self.conns.get_mut(id)
+        else {
+            return false;
+        };
+        let tcp = *tcp;
+        let Some(tls) = tls else {
+            let mut moved = false;
+            while io.with_tx(SLICE, |s| match cx.tcp_write(tcp, s) {
+                Ok(()) => s.len(),
+                Err(_) => 0,
+            }) > 0
+            {
+                moved = true;
+            }
+            return moved;
+        };
+        let before = out.len();
+        let mut fed = false;
+        loop {
+            while tls.wants_write() && tls.write_tls(out).is_ok() {}
+            if out.len() >= PIPE_CAP
+                || io.with_tx(SLICE, |s| tls.writer().write(s).unwrap_or(0)) == 0
+            {
+                break;
+            }
+            fed = true;
+        }
+        let staged = out.len();
+        flush_out(cx, tcp, out);
+        fed || staged != before || out.len() != staged
     }
 
     /// `Tls` → `Handshaking`: `connect_ms` is taken now and hyper gets its
@@ -754,38 +888,59 @@ impl Origin {
         });
     }
 
-    /// Polls a `Handshaking` future: done → `H1`/`H2` + `send`, and the
-    /// requester is `Assigned` (the request is sent by Task 5.4); `Err` →
-    /// `curl:56`, class E′.
-    fn poll_handshake(
+    /// §7.3 step 2 for one conn's driver: a `Handshaking` future (done →
+    /// `H1`/`H2` + `send`, the requester assigned and its request sent;
+    /// `Err` → `curl:56`, class E′), then the public `Connection` unless held
+    /// (5.1b `hold_public_poll`); its completion → `Completed`, `send`
+    /// dropped (§7.7). Returns whether the driver changed.
+    fn poll_driver(
         &mut self,
         cx: &mut Cx<'_>,
         id: OriginConnId,
         tcx: &mut Context<'_>,
         ev: &mut dyn BridgeEvents,
-    ) {
+    ) -> bool {
         let Some(c) = self.conns.get_mut(id) else {
-            return;
+            return false;
         };
-        let Driver::Handshaking(fut) = &mut c.driver else {
-            return;
-        };
-        match fut.as_mut().poll(tcx) {
-            Poll::Pending => {}
-            Poll::Ready(Err(e)) => self.fail_conn(cx, id, 56, e.to_string(), ev),
-            Poll::Ready(Ok(hs)) => {
-                (c.driver, c.send) = match hs {
-                    Handshaked::H1(s, conn) => (Driver::H1(conn), Some(Sender::H1(s))),
-                    Handshaked::H2(s, conn) => (Driver::H2(conn), Some(Sender::H2(s))),
-                };
-                self.assign(cx, id);
+        let mut changed = false;
+        if let Driver::Handshaking(fut) = &mut c.driver {
+            match fut.as_mut().poll(tcx) {
+                Poll::Pending => return false,
+                Poll::Ready(Err(e)) => {
+                    self.fail_conn(cx, id, 56, e.to_string(), ev);
+                    return true;
+                }
+                Poll::Ready(Ok(hs)) => {
+                    (c.driver, c.send) = match hs {
+                        Handshaked::H1(s, conn) => (Driver::H1(conn), Some(Sender::H1(s))),
+                        Handshaked::H2(s, conn) => (Driver::H2(conn), Some(Sender::H2(s))),
+                    };
+                    self.assign(cx, id, ev);
+                    changed = true;
+                }
             }
         }
+        let c = self.conns.get_mut(id).expect("live conn");
+        if c.hold_public {
+            return changed;
+        }
+        let done = match &mut c.driver {
+            Driver::H1(conn) => conn.as_mut().poll(tcx).is_ready(),
+            Driver::H2(conn) => conn.as_mut().poll(tcx).is_ready(),
+            _ => false,
+        };
+        if done {
+            c.driver = Driver::Completed;
+            c.send = None;
+        }
+        changed || done
     }
 
-    /// §7.7: the conn's `pending` requester → `Assigned`; `Tm::OriginConnect`
+    /// §7.7: the conn's `pending` requester → `Assigned` and its request is
+    /// sent (§7.4: built now, in the conn's URI form); `Tm::OriginConnect`
     /// is cancelled.
-    fn assign(&mut self, cx: &mut Cx<'_>, id: OriginConnId) {
+    fn assign(&mut self, cx: &mut Cx<'_>, id: OriginConnId, ev: &mut dyn BridgeEvents) {
         let c = self.conns.get_mut(id).expect("live conn");
         let Some(OriginReq::Connecting {
             h3,
@@ -804,21 +959,178 @@ impl Origin {
         let ConnectingPayload::Stored(stored) = payload else {
             unreachable!("Ready is the h1 retry's payload (Task 5.5b)");
         };
-        match c.proto {
-            Some(OriginProto::H2) => c.active += 1,
-            _ => c.busy = true,
+        let proto = c.proto.expect("negotiated");
+        let Ok(req) = request::build_request(&stored, proto) else {
+            self.by_h3.remove(&h3);
+            ev.on_failure(cx, h3, start_failed("request build"), false);
+            return;
+        };
+        let send = c.send.as_mut().expect("H1/H2 driver");
+        let fut = send_request(send, req, false);
+        match proto {
+            OriginProto::H2 => c.active += 1,
+            OriginProto::H1 => {
+                c.busy = true;
+                c.io.reset_rx_since_send();
+            }
         }
         c.idle_since = None;
         c.reqs.push(OriginReq::Assigned {
             h3,
-            fut: None,
+            fut: Some(fut),
             body: None,
             upload: stored.body.clone(),
             stored: Some(stored),
             head_seen: false,
             reused: false,
             retried,
+            held: false,
+            delivered: 0,
+            cl: None,
         });
+    }
+
+    /// §7.3 step 2 for one conn's exchanges (§7.5): the response future →
+    /// `on_response` (or `head_error` / the §7.6 mapping → `on_failure`),
+    /// then body frames one at a time until `Pending`, a `Partial` answer
+    /// (`held`), the end or an error. An exchange that ended becomes `Ended`.
+    fn poll_exchanges(
+        &mut self,
+        cx: &mut Cx<'_>,
+        id: OriginConnId,
+        tcx: &mut Context<'_>,
+        ev: &mut dyn BridgeEvents,
+    ) -> bool {
+        let Some(c) = self.conns.get_mut(id) else {
+            return false;
+        };
+        let (Some(proto), https) = (c.proto, c.key.0 == Scheme::Https) else {
+            return false;
+        };
+        let mut changed = false;
+        for rec in &mut c.reqs {
+            let OriginReq::Assigned {
+                h3,
+                fut,
+                body,
+                upload,
+                head_seen,
+                reused,
+                held,
+                delivered,
+                cl,
+                ..
+            } = rec
+            else {
+                continue;
+            };
+            let h3 = *h3;
+            let mut ended = false;
+            if let Some(f) = fut
+                && let Poll::Ready(r) = f.as_mut().poll(tcx)
+            {
+                *fut = None;
+                changed = true;
+                match r {
+                    Ok(resp) => {
+                        let (parts, incoming) = resp.into_parts();
+                        match response::normalise(&parts) {
+                            Ok(head) => {
+                                (*head_seen, *cl, *body) = (true, head.cl, Some(incoming));
+                                ev.on_response(cx, h3, head);
+                            }
+                            Err(e) => {
+                                drop(incoming);
+                                let f = errors::head_error(e, proto, https);
+                                ev.on_failure(cx, h3, f, false);
+                                ended = true;
+                            }
+                        }
+                    }
+                    // A hand-back (`returned`) is the h1 retry's (Task 5.5b).
+                    Err(SendFailure { err, returned }) => {
+                        drop(returned);
+                        let rx = c.io.rx_since_send();
+                        let f = failure(&err, false, proto, rx, https);
+                        ev.on_failure(cx, h3, f, false);
+                        ended = true;
+                    }
+                }
+            }
+            while !*held && let Some(b) = body {
+                match Pin::new(b).poll_frame(tcx) {
+                    Poll::Pending => break,
+                    Poll::Ready(Some(Ok(frame))) => {
+                        changed = true;
+                        // Trailers are dropped (§7.5).
+                        let Ok(data) = frame.into_data() else {
+                            continue;
+                        };
+                        if data.is_empty() {
+                            continue;
+                        }
+                        *delivered += data.len() as u64;
+                        *held = matches!(ev.on_body_frame(cx, h3, &data), Accepted::Partial(_));
+                    }
+                    Poll::Ready(None) => {
+                        *body = None;
+                        let tls = if https {
+                            TlsOutcome::Ok
+                        } else {
+                            TlsOutcome::Na
+                        };
+                        let done = Completion {
+                            reused: *reused,
+                            connect_ms: c.connect_ms,
+                            tls,
+                            delivered: *delivered,
+                            cl: *cl,
+                        };
+                        ev.on_body_end(cx, h3, done);
+                        ended = true;
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        *body = None;
+                        let rx = c.io.rx_since_send();
+                        ev.on_failure(cx, h3, failure(&e, true, proto, rx, https), true);
+                        ended = true;
+                    }
+                }
+            }
+            if ended {
+                // §7.7: settling (Task 5.5a) drops it once `released`.
+                let upload = upload.clone();
+                *rec = OriginReq::Ended {
+                    upload,
+                    since: cx.now(),
+                };
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// §7.4: the uploads hyper found empty before their fin are refilled by
+    /// the gateway (`want_h3`); a refill that added nothing changes nothing.
+    fn refill(&mut self, cx: &mut Cx<'_>, ev: &mut dyn BridgeEvents) -> bool {
+        let mut wanted = Vec::new();
+        for id in self.conns.ids() {
+            for rec in &self.conns.get(id).expect("live conn").reqs {
+                if let OriginReq::Assigned { h3, upload, .. } = rec
+                    && std::mem::take(&mut upload.borrow_mut().want_h3)
+                {
+                    wanted.push((*h3, upload.clone()));
+                }
+            }
+        }
+        let mut changed = false;
+        for (h3, upload) in wanted {
+            let state = |u: &UploadBuf| (u.data.len(), u.fin, u.is_aborted());
+            let before = state(&upload.borrow());
+            ev.want_h3(cx, h3);
+            changed |= state(&upload.borrow()) != before;
+        }
+        changed
     }
 
     /// A `Connecting` record leaves the bridge: its deadline timer and
@@ -870,21 +1182,34 @@ impl Origin {
 
     /// §7.7 "every removal": the pipe is marked dead before the conn leaves
     /// the table, `by_tcp` and `pool` forget it, then the class's socket
-    /// action. (Tasks 5.4/5.5a add the other classes and `closing`.)
+    /// action. A class-E conn with an `Assigned` record waits in `closing`,
+    /// where hyper reports each exchange from the dead pipe. (Task 5.5a adds
+    /// the other classes.)
     fn remove(&mut self, cx: &mut Cx<'_>, id: OriginConnId, class: Removal) {
         self.mark_pipe_dead(id);
-        let Some(c) = self.conns.remove(id) else {
+        let Some(c) = self.conns.get(id) else {
             return;
         };
-        self.by_tcp.remove(&c.tcp);
-        if let Some(v) = self.pool.get_mut(&c.key) {
+        let (tcp, key) = (c.tcp, c.key.clone());
+        let keep = matches!(class, Removal::E { .. })
+            && c.reqs
+                .iter()
+                .any(|r| matches!(r, OriginReq::Assigned { .. }));
+        self.by_tcp.remove(&tcp);
+        if let Some(v) = self.pool.get_mut(&key) {
             v.retain(|&x| x != id);
             if v.is_empty() {
-                self.pool.remove(&c.key);
+                self.pool.remove(&key);
             }
         }
         match class {
-            Removal::D | Removal::EPrime => cx.tcp_abort(c.tcp),
+            Removal::D | Removal::EPrime | Removal::E { abort: true } => cx.tcp_abort(tcp),
+            Removal::E { abort: false } => {}
+        }
+        if keep {
+            self.closing.push(id);
+        } else {
+            self.conns.remove(id);
         }
     }
 }
@@ -896,6 +1221,9 @@ enum Removal {
     D,
     /// A `Connecting` failure that already owns a socket.
     EPrime,
+    /// The socket is useless: `on_tcp_end(Error)` (`abort: false`, the
+    /// shard already closed it) or a fatal TLS error after the handshake.
+    E { abort: bool },
 }
 
 impl OriginReq {
@@ -927,6 +1255,86 @@ fn connect_failure(https: bool, curl: u32, cause: String) -> OriginFailure {
         upstream_protocol: false,
         start_failed: false,
         cause,
+    }
+}
+
+/// §6.2 step 9: 502 `origin-start-failed`, not a §7.6 error.
+fn start_failed(cause: &str) -> OriginFailure {
+    OriginFailure {
+        curl: 0,
+        status: 502,
+        tls: TlsOutcome::Na,
+        proto: None,
+        upstream_protocol: false,
+        start_failed: true,
+        cause: cause.into(),
+    }
+}
+
+/// §7.6 for an exchange on a negotiated conn, with hyper's error text.
+fn failure(
+    e: &hyper::Error,
+    after_head: bool,
+    proto: OriginProto,
+    rx_since_send: u64,
+    https: bool,
+) -> OriginFailure {
+    let c = errors::classify(e);
+    OriginFailure {
+        cause: e.to_string(),
+        ..errors::map_error(c, after_head, proto, rx_since_send, https)
+    }
+}
+
+/// §7.4/§7.7: `try_send_request` on a reused h1 conn (hyper may hand the
+/// request back), `send_request` otherwise; the future is boxed as §7.1.
+fn send_request(send: &mut Sender, req: Request<UploadBody>, reused: bool) -> ResponseFut {
+    let plain = |err| SendFailure {
+        err,
+        returned: None,
+    };
+    match send {
+        Sender::H1(s) if reused => {
+            let f = s.try_send_request(req);
+            Box::pin(async move {
+                f.await.map_err(|mut e| SendFailure {
+                    returned: e.take_message(),
+                    err: e.into_error(),
+                })
+            })
+        }
+        Sender::H1(s) => {
+            let f = s.send_request(req);
+            Box::pin(async move { f.await.map_err(plain) })
+        }
+        Sender::H2(s) => {
+            let f = s.send_request(req);
+            Box::pin(async move { f.await.map_err(plain) })
+        }
+    }
+}
+
+/// §7.3 step 1: rustls's plaintext → `rx` while the pipe has room; a
+/// `close_notify` (`Ok(0)`) or a close_notify-less EOF (`UnexpectedEof`,
+/// after the buffered plaintext) publishes `rx_eof`. Returns whether
+/// anything moved.
+fn drain_plaintext(tls: &mut rustls::ClientConnection, io: &PipeHandle) -> bool {
+    let mut buf = [0u8; SLICE];
+    let mut moved = false;
+    loop {
+        let room = io.rx_room().min(SLICE);
+        if room == 0 {
+            return moved;
+        }
+        match tls.reader().read(&mut buf[..room]) {
+            Ok(0) => return io.set_eof() || moved,
+            Ok(n) => {
+                io.push_rx(&buf[..n]);
+                moved = true;
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return io.set_eof() || moved,
+            Err(_) => return moved, // WouldBlock: nothing buffered
+        }
     }
 }
 
@@ -1023,6 +1431,11 @@ impl Origin {
         if let Some(c) = self.conns.get_mut(id) {
             c.hold_public = on;
         }
+    }
+
+    /// Whether hyper called `poll_shutdown` on the conn's pipe.
+    pub fn tx_shutdown(&self, id: OriginConnId) -> bool {
+        self.conns.get(id).is_some_and(|c| c.io.tx_shutdown())
     }
 
     /// Pushes `fut` onto the bridge's executor.
@@ -1212,6 +1625,61 @@ mod tests {
         fn want_h3(&mut self, _: &mut Cx<'_>, _: H3ReqId) {
             unreachable!()
         }
+    }
+
+    /// Records failures only.
+    #[derive(Default)]
+    struct Failures(Vec<(H3ReqId, OriginFailure)>);
+    impl BridgeEvents for Failures {
+        fn on_response(&mut self, _: &mut Cx<'_>, _: H3ReqId, _: RelayHead) {
+            unreachable!()
+        }
+        fn on_body_frame(&mut self, _: &mut Cx<'_>, _: H3ReqId, _: &[u8]) -> Accepted {
+            unreachable!()
+        }
+        fn on_body_end(&mut self, _: &mut Cx<'_>, _: H3ReqId, _: Completion) {
+            unreachable!()
+        }
+        fn on_failure(&mut self, _: &mut Cx<'_>, h3: H3ReqId, f: OriginFailure, _: bool) {
+            self.0.push((h3, f));
+        }
+        fn want_h3(&mut self, _: &mut Cx<'_>, _: H3ReqId) {
+            unreachable!()
+        }
+    }
+
+    /// 5.2 gap: an `Err` from the hyper handshake future is `curl:56`, class
+    /// E′. The producer: h2's handshake writes the client preface, which a
+    /// dead pipe refuses (no peer can make the h1 handshake fail).
+    #[test]
+    fn hyper_handshake_err_is_56() {
+        let (t, _) = ScriptedTransport::new();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
+        let mut sh = Shard::new(t, RecordingApp::new().0, addr, 7);
+        let mut origin = test_origin();
+        let mut ev = Failures::default();
+        let req = start_req(&origin, "o.test");
+        let h3 = req.h3;
+        sh.with_app(Time::from_micros(1), |_, cx| {
+            origin.start(cx, req).unwrap();
+            let rec = origin.dials.drain().next().unwrap().1;
+            let id = origin.conns.insert(|id| OriginConn {
+                pending: Some(rec),
+                ..bare_conn(id)
+            });
+            origin.by_h3.insert(h3, Where::Conn(id));
+            origin.conns.get(id).unwrap().io.mark_dead();
+            origin.begin_hyper(cx, id, OriginProto::H2);
+            origin.pump(cx, &mut ev);
+            assert!(origin.conns.get(id).is_none(), "class E′: removed");
+        });
+        let [(x, f)] = &ev.0[..] else {
+            panic!("{:?}", ev.0)
+        };
+        assert_eq!(*x, h3);
+        // `bare_conn` is keyed http://: `na`.
+        assert_eq!((f.curl, f.status, f.tls), (56, 502, TlsOutcome::Na));
+        assert!(origin.by_h3.is_empty(), "the record is dropped");
     }
 
     #[test]
