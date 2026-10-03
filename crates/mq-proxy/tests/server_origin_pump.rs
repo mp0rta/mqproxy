@@ -423,11 +423,12 @@ fn tx_shutdown_recorded_and_ignored() {
     let mut oh = oh();
     let (h3, tcp, conn) = plain(&mut oh, get("http://o.test/"));
     oh.tcp_out_all(tcp);
+    // The held frame keeps the completed conn (in `closing`, §7.7 B) alive.
+    oh.with_host(|h, _| h.push_accept(Accepted::Partial(0)));
     oh.tcp_in(
         tcp,
         b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok",
     );
-    assert_eq!(end_of(&oh.events(), h3).expect("body end").delivered, 2);
     assert!(
         oh.with_host(|h, _| h.origin().tx_shutdown(conn)),
         "recorded"
@@ -436,6 +437,9 @@ fn tx_shutdown_recorded_and_ignored() {
         !oh.closed(tcp),
         "ignored: no half-close, no close by the pump"
     );
+    oh.with_host(|h, cx| h.resume(cx, h3));
+    assert_eq!(end_of(&oh.events(), h3).expect("body end").delivered, 2);
+    assert!(oh.closed(tcp), "then the record's end closes it (class B)");
 }
 
 /// The connect timer is cancelled at assignment, not merely ignored when it

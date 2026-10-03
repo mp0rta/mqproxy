@@ -67,6 +67,12 @@ impl UploadBuf {
         self.live_bodies == 0
     }
 
+    /// The request has no body: `fin`, nothing buffered, nothing ever
+    /// yielded (§7.7: only such a request is retried from `stored`).
+    pub(super) fn bodiless(&self) -> bool {
+        self.fin && self.data.is_empty() && self.yielded == 0
+    }
+
     fn is_end_stream(&self) -> bool {
         self.fin && self.data.is_empty() && !self.aborted
     }

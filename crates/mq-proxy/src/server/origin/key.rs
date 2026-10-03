@@ -45,6 +45,14 @@ pub(super) fn host_key(h: &Host) -> String {
     }
 }
 
+/// The dial host of a `ConnKey` host (the inverse of `host_key`: a domain
+/// never parses as an IP, `parse_host` made it `Host::Ip`).
+pub(super) fn host_of(key_host: &str) -> Host {
+    key_host
+        .parse::<IpAddr>()
+        .map_or_else(|_| Host::Domain(key_host.to_owned()), Host::Ip)
+}
+
 /// §7.2 step 4, from the `ConnKey` host: an IP literal → `IpAddress`, else
 /// `DnsName`; `None` = invalid (`curl:6`).
 pub(super) fn server_name(host: &str) -> Option<ServerName<'static>> {
@@ -66,7 +74,6 @@ pub(super) fn alpn_for(scheme: Scheme, ver: HttpVer) -> &'static [&'static [u8]]
 }
 
 /// Whether a conn that negotiated `proto` may carry a request of `ver`.
-#[allow(dead_code)] // the pool hit, Task 5.5b
 pub(super) fn accepts(ver: HttpVer, proto: OriginProto) -> bool {
     ver != HttpVer::H1 || proto == OriginProto::H1
 }
@@ -75,6 +82,14 @@ pub(super) fn accepts(ver: HttpVer, proto: OriginProto) -> bool {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn host_of_inverts_host_key() {
+        for a in ["o.test", "127.0.0.1", "[::1]:8443"] {
+            let (h, _) = split_authority(Scheme::Https, a.as_bytes()).unwrap();
+            assert_eq!(host_of(&host_key(&h)), h, "{a}");
+        }
+    }
 
     #[test]
     fn split_authority_cases() {

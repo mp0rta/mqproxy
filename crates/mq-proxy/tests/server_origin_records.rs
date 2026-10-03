@@ -1,6 +1,7 @@
 //! spec §7.7: request records, the settling point, the removal classes A, D,
 //! E and E′, `closing`, `by_h3` upkeep, the idle sweep and shutdown, driven
-//! through `OriginHost` with plain HTTP/1.1 bytes (B and C: Task 5.5b).
+//! through `OriginHost` with plain HTTP/1.1 bytes (B and C:
+//! `server_origin_pool_h1.rs`).
 
 mod origin_harness;
 
@@ -142,8 +143,8 @@ fn cancel_while_assigned_moves_to_ended() {
     assert_eq!(record_state(&mut oh, h3), None);
     oh.with_host(|h, cx| h.pump(cx));
     assert_eq!(ended_records(&mut oh, conn), 0, "dropped once released");
-    oh.tcp_in(tcp, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
     assert!(oh.events().is_empty(), "{:?}", oh.events());
+    assert!(closed_gracefully(&mut oh, tcp), "class C (5.5b)");
 
     // After the head, with the upload still incomplete.
     let mut oh = self::oh();
@@ -163,8 +164,13 @@ fn cancel_while_assigned_moves_to_ended() {
     // body (§7.7); the abort itself is pinned in-module
     // (`end_aborts_only_an_incomplete_upload`).
     assert_eq!(ended_records(&mut oh, conn), 0, "released → dropped");
-    oh.tcp_in(tcp, b"defghij");
     assert_eq!(oh.events().len(), seen, "nothing after the cancel");
+    assert!(
+        pipe_dead(&mut oh, conn) && !oh.aborted(tcp),
+        "class C (5.5b)"
+    );
+    oh.tcp_out_all(tcp); // a graceful close follows the queued upload bytes
+    assert!(closed_gracefully(&mut oh, tcp));
 }
 
 #[test]

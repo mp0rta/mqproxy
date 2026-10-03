@@ -62,8 +62,10 @@ impl Origin {
 
     /// §7.7 settling point, for every conn in `pool` and `closing`: (a)
     /// released `Ended` records dropped, the rest counted; (b) `draining`
-    /// inputs; (c) the h1 idleness transition; (d) a `closing` conn whose
-    /// last `Assigned` record ended is dropped (class B: its deferred
+    /// inputs; (c) the h1 removals, by precedence — an `Ended`-unreleased
+    /// record → E, an unclean end → C, a `Completed` driver or a closed
+    /// `send` → B — else the h1 idleness transition; (d) a `closing` conn
+    /// whose last `Assigned` record ended is dropped (class B: its deferred
     /// `tcp_close` now). Then `OriginTimer::Idle` is armed while `pool` or
     /// `closing` is non-empty, cancelled otherwise.
     pub(super) fn settle(&mut self, cx: &mut Cx<'_>) {
@@ -73,22 +75,34 @@ impl Origin {
             let c = self.conns.get_mut(id).expect("live conn");
             c.acct.ended_unreleased = 0;
             let acct = &mut c.acct;
+            let mut unclean = false;
             c.reqs.retain(|r| match r {
-                OriginReq::Ended { upload, .. } => {
+                OriginReq::Ended { upload, clean, .. } => {
                     let released = upload.borrow().released();
                     acct.record_dropped(released);
+                    unclean |= !clean;
                     !released
                 }
                 _ => true,
             });
             c.acct.completed = matches!(c.driver, Driver::Completed);
             let assigned = c.reqs.iter().any(|r| r.assigned_h3().is_some());
+            let mut removal = None;
             if c.proto == Some(OriginProto::H1) && !closing {
-                // `idle_since` is set once, on the busy → idle transition (a
-                // conn left without a record by a failed build counts too).
                 c.busy = assigned;
-                let ready = matches!(&c.send, Some(Sender::H1(s)) if s.is_ready());
-                if c.reqs.is_empty() && c.idle_since.is_none() && ready {
+                let (ready, closed) = match &c.send {
+                    Some(Sender::H1(s)) => (s.is_ready(), s.is_closed()),
+                    _ => (false, false),
+                };
+                if c.acct.ended_unreleased > 0 {
+                    removal = Some(Removal::E { abort: true });
+                } else if unclean {
+                    removal = Some(Removal::C);
+                } else if c.acct.completed || closed {
+                    removal = Some(Removal::B);
+                } else if c.reqs.is_empty() && c.idle_since.is_none() && ready {
+                    // Set once, on the busy → idle transition (a conn left
+                    // without a record by a failed build counts too).
                     c.idle_since = Some(now);
                 }
             }
@@ -98,6 +112,9 @@ impl Origin {
                 }
                 self.closing.retain(|&x| x != id);
                 self.conns.remove(id);
+            }
+            if let Some(class) = removal {
+                self.remove(cx, id, class);
             }
         }
         let want = !self.pool.is_empty() || !self.closing.is_empty();
@@ -337,42 +354,27 @@ impl Origin {
             cx.cancel_timer(t);
             self.timers.remove(&t);
         }
-        let ConnectingPayload::Stored(stored) = payload else {
-            unreachable!("Ready is the h1 retry's payload (Task 5.5b)");
+        let (req, upload, stored) = match payload {
+            ConnectingPayload::Stored(stored) => {
+                let proto = c.proto.expect("negotiated");
+                let Ok(req) = request::build_request(&stored, proto) else {
+                    self.by_h3.remove(&h3);
+                    ev.on_failure(cx, h3, start_failed("request build"), false);
+                    return;
+                };
+                (req, stored.body.clone(), Some(stored))
+            }
+            // The h1 retry: re-sent as is (§7.4).
+            ConnectingPayload::Ready(req, upload) => (req, upload, None),
         };
-        let proto = c.proto.expect("negotiated");
-        let Ok(req) = request::build_request(&stored, proto) else {
-            self.by_h3.remove(&h3);
-            ev.on_failure(cx, h3, start_failed("request build"), false);
-            return;
-        };
-        let send = c.send.as_mut().expect("H1/H2 driver");
-        let fut = send_request(send, req, false);
-        c.acct.assign();
-        if proto == OriginProto::H1 {
-            c.busy = true;
-            c.io.reset_rx_since_send();
-        }
-        c.idle_since = None;
-        c.reqs.push(OriginReq::Assigned {
-            h3,
-            fut: Some(fut),
-            body: None,
-            upload: stored.body.clone(),
-            stored: Some(stored),
-            head_seen: false,
-            reused: false,
-            retried,
-            held: false,
-            delivered: 0,
-            cl: None,
-        });
+        c.exchange(h3, req, upload, stored, false, retried);
     }
 
     /// §7.3 step 2 for one conn's exchanges (§7.5): the response future →
-    /// `on_response` (or `head_error` / the §7.6 mapping → `on_failure`),
-    /// then body frames one at a time until `Pending`, a `Partial` answer
-    /// (`held`), the end or an error. An exchange that ended becomes `Ended`.
+    /// `on_response` (or `head_error` / the §7.6 mapping → `on_failure`, or
+    /// the §7.7 h1 retry), then body frames one at a time until `Pending`, a
+    /// `Partial` answer (`held`), the end or an error. An exchange that ended
+    /// becomes `Ended`; a retried one leaves the conn for a fresh dial.
     fn poll_exchanges(
         &mut self,
         cx: &mut Cx<'_>,
@@ -387,23 +389,26 @@ impl Origin {
             return false;
         };
         let mut changed = false;
+        let mut retries = Vec::new();
         for rec in &mut c.reqs {
             let OriginReq::Assigned {
                 h3,
                 fut,
                 body,
+                upload,
+                stored,
                 head_seen,
                 reused,
+                retried,
                 held,
                 delivered,
                 cl,
-                ..
             } = rec
             else {
                 continue;
             };
             let h3 = *h3;
-            let mut ended = false;
+            let (mut ended, mut clean) = (false, false);
             if let Some(f) = fut
                 && let Poll::Ready(r) = f.as_mut().poll(tcx)
             {
@@ -425,10 +430,29 @@ impl Origin {
                             }
                         }
                     }
-                    // A hand-back (`returned`) is the h1 retry's (Task 5.5b).
                     Err(SendFailure { err, returned }) => {
-                        drop(returned);
                         let rx = c.io.rx_since_send();
+                        let retry = match returned {
+                            // Handed back unsent: the idle conn had died.
+                            Some(req) if !*retried => {
+                                Some(ConnectingPayload::Ready(req, upload.clone()))
+                            }
+                            // libcurl's other retry: a reused conn closed
+                            // before any response byte, for a bodiless request.
+                            None if *reused
+                                && !*retried
+                                && rx == 0
+                                && errors::classify(&err) == errors::ErrClass::Incomplete
+                                && stored.as_ref().is_some_and(|s| s.body.borrow().bodiless()) =>
+                            {
+                                stored.take().map(ConnectingPayload::Stored)
+                            }
+                            _ => None,
+                        };
+                        if let Some(p) = retry {
+                            retries.push((h3, p));
+                            continue;
+                        }
                         let f = failure(&err, false, proto, rx, https);
                         ev.on_failure(cx, h3, f, false);
                         ended = true;
@@ -459,13 +483,14 @@ impl Origin {
                         };
                         let done = Completion {
                             reused: *reused,
-                            connect_ms: c.connect_ms,
+                            // §7.2 step 2: 0 for a pool hit.
+                            connect_ms: if *reused { 0 } else { c.connect_ms },
                             tls,
                             delivered: *delivered,
                             cl: *cl,
                         };
                         ev.on_body_end(cx, h3, done);
-                        ended = true;
+                        (ended, clean) = (true, true);
                     }
                     Poll::Ready(Some(Err(e))) => {
                         *body = None;
@@ -476,11 +501,23 @@ impl Origin {
                 }
             }
             if ended {
-                rec.end(cx.now()); // dropped at a settling once `released`
+                rec.end(cx.now(), clean); // dropped at a settling once `released`
                 changed = true;
             }
         }
-        changed
+        if retries.is_empty() {
+            return changed;
+        }
+        let gone = |x: H3ReqId| retries.iter().any(|(h, _)| *h == x);
+        c.reqs.retain(|r| !r.assigned_h3().is_some_and(gone));
+        for _ in &retries {
+            c.acct.record_dropped(true);
+        }
+        let key = c.key.clone();
+        for (h3, p) in retries {
+            self.retry(cx, h3, key.clone(), p);
+        }
+        true
     }
 
     /// §7.4: the uploads hyper found empty before their fin are refilled by
@@ -519,6 +556,43 @@ fn failure(
     OriginFailure {
         cause: e.to_string(),
         ..errors::map_error(c, after_head, proto, rx_since_send, https)
+    }
+}
+
+impl OriginConn {
+    /// §7.7: the request goes out as an `Assigned` record (`active += 1`,
+    /// h1 `busy`, `idle_since` cleared); `reused` sends it with
+    /// `try_send_request`, which may hand it back.
+    pub(super) fn exchange(
+        &mut self,
+        h3: H3ReqId,
+        req: Request<UploadBody>,
+        upload: Rc<RefCell<UploadBuf>>,
+        stored: Option<StoredRequest>,
+        reused: bool,
+        retried: bool,
+    ) {
+        let send = self.send.as_mut().expect("H1/H2 driver");
+        let fut = send_request(send, req, reused);
+        self.acct.assign();
+        if self.proto == Some(OriginProto::H1) {
+            self.busy = true;
+            self.io.reset_rx_since_send();
+        }
+        self.idle_since = None;
+        self.reqs.push(OriginReq::Assigned {
+            h3,
+            fut: Some(fut),
+            body: None,
+            upload,
+            stored,
+            head_seen: false,
+            reused,
+            retried,
+            held: false,
+            delivered: 0,
+            cl: None,
+        });
     }
 }
 

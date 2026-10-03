@@ -307,8 +307,9 @@ struct StoredRequest {
 #[allow(dead_code)] // Tasks 5.2–5.6c
 enum ConnectingPayload {
     Stored(StoredRequest),
-    /// Handed back by `try_send_request` (h1 retry), re-sent as is.
-    Ready(Request<UploadBody>),
+    /// Handed back by `try_send_request` (h1 retry), re-sent as is, with
+    /// its upload for the new `Assigned` record.
+    Ready(Request<UploadBody>, Rc<RefCell<UploadBuf>>),
 }
 
 /// The bridge's record of a request's origin side (§7.1, §7.7). Owned by the
@@ -349,6 +350,9 @@ enum OriginReq {
     Ended {
         upload: Rc<RefCell<UploadBuf>>,
         since: Time,
+        /// The exchange reached its body end with the upload complete; an
+        /// h1 conn is closed as class C otherwise (§7.7).
+        clean: bool,
     },
 }
 
@@ -443,17 +447,15 @@ impl Origin {
         Rc::new(RefCell::new(UploadBuf::new(cl, self.dirty.clone())))
     }
 
-    /// spec §7.2 steps 1 and 3 (the pool hit of step 2 is Task 5.5b). The
-    /// authority passes the bridge's split and `http::uri::Authority`, which
-    /// also rejects `"<>\^`, backtick, `{|}` and non-ASCII (§7.4, §12).
+    /// spec §7.2 steps 1–3. The authority passes the bridge's split and
+    /// `http::uri::Authority`, which also rejects `"<>\^`, backtick, `{|}`
+    /// and non-ASCII (§7.4, §12).
     pub fn start(&mut self, cx: &mut Cx<'_>, req: StartReq) -> Result<(), StartErr> {
         let (host, port) = key::split_authority(req.scheme, &req.authority)
             .map_err(|()| StartErr::BadAuthority)?;
         http::uri::Authority::try_from(req.authority.as_slice())
             .map_err(|_| StartErr::BadAuthority)?;
         let key = (req.scheme, key::host_key(&host), port);
-        let op = cx.dial(Target { host, port }, self.cfg.connect_timeout);
-        self.by_h3.insert(req.h3, Where::Dial(op));
         let stored = StoredRequest {
             method: req.method,
             scheme: req.scheme,
@@ -462,6 +464,13 @@ impl Origin {
             headers: req.headers,
             body: req.upload,
         };
+        if let Some(id) = self.pool_hit(&key, req.ver) {
+            let r = request::build_request(&stored, OriginProto::H1)?;
+            let c = self.conns.get_mut(id).expect("pooled conns are live");
+            c.exchange(req.h3, r, stored.body.clone(), Some(stored), true, false);
+            self.by_h3.insert(req.h3, Where::Conn(id));
+            return Ok(());
+        }
         let rec = OriginReq::Connecting {
             h3: req.h3,
             key,
@@ -471,8 +480,50 @@ impl Origin {
             payload: ConnectingPayload::Stored(stored),
             retried: false,
         };
-        self.dials.insert(op, rec);
+        self.dial(cx, Target { host, port }, rec);
         Ok(())
+    }
+
+    /// §7.2 step 2: a pooled conn under `key` whose protocol the request
+    /// accepts, with `send` open — h1: `!busy` and `is_ready()` asked here,
+    /// not taken from the last settling (h2: Task 5.6c).
+    fn pool_hit(&self, key: &ConnKey, ver: HttpVer) -> Option<OriginConnId> {
+        let ids = self.pool.get(key)?;
+        ids.iter().copied().find(|&id| {
+            let c = self.conns.get(id).expect("pooled conns are live");
+            c.proto.is_some_and(|p| key::accepts(ver, p))
+                && match &c.send {
+                    Some(Sender::H1(s)) => !c.busy && !s.is_closed() && s.is_ready(),
+                    _ => false,
+                }
+        })
+    }
+
+    /// §7.2 step 3: `rec` (`Connecting`) waits in `dials` for the result.
+    fn dial(&mut self, cx: &mut Cx<'_>, target: Target, rec: OriginReq) {
+        let h3 = rec.connecting_h3().expect("a Connecting record");
+        let op = cx.dial(target, self.cfg.connect_timeout);
+        self.by_h3.insert(h3, Where::Dial(op));
+        self.dials.insert(op, rec);
+    }
+
+    /// §7.7 h1 retry: the record left its conn (`Assigned` → `Connecting`)
+    /// and dials a fresh h1-only conn, its deadline from now; never again.
+    fn retry(&mut self, cx: &mut Cx<'_>, h3: H3ReqId, key: ConnKey, payload: ConnectingPayload) {
+        let target = Target {
+            host: key::host_of(&key.1),
+            port: key.2,
+        };
+        let rec = OriginReq::Connecting {
+            h3,
+            key,
+            ver: HttpVer::H1,
+            started_at: cx.now(),
+            timer: None,
+            payload,
+            retried: true,
+        };
+        self.dial(cx, target, rec);
     }
 
     /// `H3Closed` (§7.7 cancel): the `by_h3` entry goes. While `Connecting`
@@ -497,7 +548,7 @@ impl Origin {
                     self.drop_connecting(cx, rec);
                     self.remove(cx, id, Removal::D);
                 } else if let Some(rec) = c.reqs.iter_mut().find(|r| r.assigned_h3() == Some(h3)) {
-                    rec.end(cx.now());
+                    rec.end(cx.now(), false);
                 }
             }
             None => {}
@@ -840,10 +891,8 @@ enum Removal {
     A,
     /// `Completed` with no record left; h1 close after its last `Incoming`
     /// ended: `tcp_close`, deferred while an `Assigned` record remains.
-    #[allow(dead_code)] // Task 5.5b: the h1 B decision
     B,
     /// An h1 conn not to be pooled: `tcp_close`.
-    #[allow(dead_code)] // Task 5.5b: the h1 C decision
     C,
     /// The `pending` requester was cancelled during `Tls`/`Handshaking`.
     D,
@@ -856,17 +905,26 @@ enum Removal {
 
 impl OriginReq {
     /// §7.7: `Assigned` → `Ended` at any end of the exchange, with the
-    /// upload aborted when it is not complete (§6.3: `!fin`). The response
+    /// upload aborted when it is not complete (§6.3: `!fin`); `clean` = a
+    /// body end, kept only while the upload is not aborted. The response
     /// future and `Incoming` are dropped here, with no `UploadBuf` borrow held.
-    fn end(&mut self, now: Time) {
+    fn end(&mut self, now: Time, clean: bool) {
         let OriginReq::Assigned { upload, .. } = self else {
             return;
         };
         let upload = upload.clone();
-        if !upload.borrow().fin {
-            upload.borrow_mut().abort();
-        }
-        *self = OriginReq::Ended { upload, since: now };
+        let whole = {
+            let mut u = upload.borrow_mut();
+            if !u.fin {
+                u.abort();
+            }
+            !u.is_aborted()
+        };
+        *self = OriginReq::Ended {
+            upload,
+            since: now,
+            clean: clean && whole,
+        };
     }
 
     fn assigned_h3(&self) -> Option<H3ReqId> {
@@ -1280,6 +1338,47 @@ mod tests {
         );
     }
 
+    /// spec §7.2 step 2: a `!busy` h1 conn is a hit only while
+    /// `send.is_ready()`, asked in the lookup itself. The producer: a
+    /// handshaken conn whose `Connection` was never polled (hyper's
+    /// dispatcher has not asked for a request yet) — no exchange through
+    /// the pump can leave an idle conn in that state.
+    #[test]
+    fn h1_is_ready_rechecked_in_pool_lookup() {
+        let (t, _) = ScriptedTransport::new();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
+        let mut sh = Shard::new(t, RecordingApp::new().0, addr, 7);
+        let mut origin = test_origin();
+        let req = |origin: &Origin, n| StartReq {
+            h3: h3(n),
+            scheme: Scheme::Http,
+            ..start_req(origin, "o.test")
+        };
+        sh.with_app(Time::from_micros(1), |_, cx| {
+            let id = origin.conns.insert(bare_conn);
+            let key = origin.conns.get(id).unwrap().key.clone();
+            origin.pool.entry(key).or_default().push(id);
+            origin.hold_public_poll(id, true);
+            origin.begin_hyper(cx, id, OriginProto::H1);
+            origin.pump(cx, &mut NoEvents);
+            let c = origin.conns.get(id).unwrap();
+            assert!(matches!(&c.send, Some(Sender::H1(s)) if !s.is_ready()));
+            assert!(!c.busy);
+            origin.start(cx, req(&origin, 1)).unwrap();
+            assert!(
+                matches!(origin.by_h3[&h3(1)], Where::Dial(_)),
+                "not ready: a dial"
+            );
+            origin.hold_public_poll(id, false);
+            origin.pump(cx, &mut NoEvents);
+            origin.start(cx, req(&origin, 2)).unwrap();
+            assert!(
+                matches!(origin.by_h3[&h3(2)], Where::Conn(x) if x == id),
+                "ready: a hit"
+            );
+        });
+    }
+
     fn assigned(h3: H3ReqId, upload: &Rc<RefCell<UploadBuf>>) -> OriginReq {
         OriginReq::Assigned {
             h3,
@@ -1309,9 +1408,13 @@ mod tests {
         whole.borrow_mut().fin = true;
         for (up, abort) in [(&whole, false), (&cut, true)] {
             let mut rec = assigned(h3(0), up);
-            rec.end(Time(5));
+            rec.end(Time(5), true);
             assert_eq!(rec.ended_since(), Some(Time(5)));
             assert_eq!(up.borrow().is_aborted(), abort);
+            assert!(
+                matches!(rec, OriginReq::Ended { clean, .. } if clean == !abort),
+                "a cut upload is never a clean end"
+            );
         }
     }
 
@@ -1345,7 +1448,7 @@ mod tests {
         };
         sh.with_app(Time(7), |_, cx| {
             for rec in &mut origin.conns.get_mut(id).unwrap().reqs {
-                rec.end(cx.now());
+                rec.end(cx.now(), true);
             }
             assert_eq!(ended(&origin), 2, "Ended between the end and the settling");
             origin.settle(cx);
