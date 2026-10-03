@@ -6,6 +6,9 @@
 //
 // Build:  go build -o bench_origin bench_origin_server.go
 // Usage:  ./bench_origin -cert C -key K -port P -root DIR
+//
+// PUT/POST /sink reads and discards the request body and replies 200 "len=<n>"
+// (the upload sink of ci_bench_gateway.sh); every other request is a file GET.
 
 package main
 
@@ -13,6 +16,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -38,6 +42,18 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/sink", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut && r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		n, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		fmt.Fprintf(w, "len=%d", n)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		name := filepath.Base(r.URL.Path)
 		if name == "." || name == "/" || name == ".." {

@@ -236,7 +236,8 @@ jobs:
   perf-rust:
     # The Rust binary in the perf job, under perf.yml's rules (privileged
     # container, never on PRs). Push to main: ci_bench_tcp_proxy.sh, informational.
-    # Weekly schedule / manual: unshaped + idle for both binaries (spec §9.2).
+    # Weekly schedule / manual: unshaped + idle for both binaries (spec §9.2) and
+    # the gateway Rust-vs-C benchmark (SP3 spec §10.6).
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -291,6 +292,12 @@ jobs:
             MQPROXY_BIN=$PWD/${b#*:} BENCH_LABEL=${b%%:*} bash scripts/ci_benchmarks/ci_bench_unshaped.sh
             MQPROXY_BIN=$PWD/${b#*:} BENCH_LABEL=${b%%:*} bash scripts/ci_benchmarks/ci_bench_idle.sh
           done
+      # Gateway Rust vs C (SP3 spec §10.6): fails when a throughput ratio < 0.95.
+      - name: Gateway benchmark, Rust vs C
+        if: github.event_name != 'push'
+        run: |
+          MQPROXY_BIN_C=$PWD/build/mqproxy MQPROXY_BIN_RUST=$PWD/target/release/mqproxy \
+            bash scripts/ci_benchmarks/ci_bench_gateway.sh
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
