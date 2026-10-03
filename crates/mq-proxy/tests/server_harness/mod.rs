@@ -7,7 +7,7 @@ use mq_proxy::server::Server;
 use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
 use mq_runtime::{DialError, DialOpId, IoRequest, Shard, SocketOpId, Target, TcpId, UdpSocketId};
 use mq_transport_api::{
-    CloseReason, ConnId, ErrType, Event, StreamId, StreamInfo, StreamKind, Time,
+    CloseReason, ConnId, ConnProto, ErrType, Event, StreamId, StreamInfo, StreamKind, Time,
 };
 use mq_wire::frames::{AddrType, AuthReq, ConnectTcpResp, UdpSessionOpen, UdpSessionResp};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -193,7 +193,7 @@ impl H {
     /// `NewConn`.
     pub fn conn(&mut self) -> ConnId {
         let c = self.t.new_conn_id();
-        self.event(Event::NewConn(c));
+        self.event(Event::NewConn(c, ConnProto::Raw));
         c
     }
 

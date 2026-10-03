@@ -3,8 +3,8 @@
 use crate::ids::{DialOpId, SocketOpId, TcpId, TimerId, UdpSocketId};
 use crate::shard::{Rng, ShardState};
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Error, Event, PathError, PathId,
-    StreamError, StreamId, StreamInfo, Time, TransportOps,
+    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Error, Event, H3Header, H3ReqId,
+    H3ReqInfo, PathError, PathId, StreamError, StreamId, StreamInfo, Time, TransportOps,
 };
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -272,6 +272,66 @@ impl<'a> Cx<'a> {
     /// spec §3.1: `buf.len() >= 65535`; `None` = ring empty / stale.
     pub fn datagram_recv(&mut self, conn: ConnId, buf: &mut [u8]) -> Option<usize> {
         self.tm().datagram_recv(conn, buf)
+    }
+
+    // --- H3 requests (spec §3.1) ---
+
+    /// spec §3.1: client only.
+    pub fn open_h3_request(&mut self, conn: ConnId) -> Result<H3ReqId, Error> {
+        let now = self.now;
+        self.tm().open_h3_request(now, conn)
+    }
+    /// spec §3.1: all-or-error.
+    pub fn h3_send_headers(
+        &mut self,
+        r: H3ReqId,
+        hs: &[H3Header<'_>],
+        fin: bool,
+    ) -> Result<(), StreamError> {
+        let now = self.now;
+        self.tm().h3_send_headers(now, r, hs, fin)
+    }
+    /// spec §3.1: the `stream_send` contract.
+    pub fn h3_send_body(
+        &mut self,
+        r: H3ReqId,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<usize, StreamError> {
+        let now = self.now;
+        self.tm().h3_send_body(now, r, data, fin)
+    }
+    /// spec §3.1: a bare FIN.
+    pub fn h3_finish(&mut self, r: H3ReqId) -> Result<(), StreamError> {
+        let now = self.now;
+        self.tm().h3_finish(now, r)
+    }
+    /// spec §3.1: `Ok(fin)`.
+    pub fn h3_recv_headers(
+        &mut self,
+        r: H3ReqId,
+        each: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<bool, StreamError> {
+        let now = self.now;
+        self.tm().h3_recv_headers(now, r, each)
+    }
+    /// spec §3.1: `(bytes, fin)`.
+    pub fn h3_recv_body(
+        &mut self,
+        r: H3ReqId,
+        buf: &mut [u8],
+    ) -> Result<(usize, bool), StreamError> {
+        let now = self.now;
+        self.tm().h3_recv_body(now, r, buf)
+    }
+    /// spec §3.1: a no-op on a stale id.
+    pub fn h3_reset(&mut self, r: H3ReqId) {
+        let now = self.now;
+        self.tm().h3_reset(now, r)
+    }
+    /// spec §3.1.
+    pub fn h3_req_info(&self, r: H3ReqId) -> Result<H3ReqInfo, Error> {
+        self.t.h3_req_info(r)
     }
 
     // --- Paths (spec §5.4) ---

@@ -10,11 +10,15 @@ pub mod ringbuf;
 mod time;
 
 pub use config::{
-    CongestionControl, ConnConfig, ConnStats, PathStats, Role, Scheduler, TransportConfig,
+    CongestionControl, ConnConfig, ConnProto, ConnStats, PathStats, Role, Scheduler,
+    TransportConfig,
 };
 pub use error::{ConnectError, DatagramError, Error, PathError, StreamError};
-pub use event::{CloseReason, ErrType, Event, StreamInfo, StreamKind, Transmit};
-pub use ids::{ConnId, PathId, SlotId, StreamId, TxKey};
+pub use event::{
+    CloseReason, ErrType, Event, H3Close, H3Header, H3ReqInfo, H3ReqStats, StreamInfo, StreamKind,
+    Transmit, Unread,
+};
+pub use ids::{ConnId, H3ReqId, PathId, SlotId, StreamId, TxKey};
 pub use ops::TransportOps;
 pub use time::Time;
 

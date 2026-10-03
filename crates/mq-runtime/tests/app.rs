@@ -5,8 +5,9 @@ use mq_runtime::{
     StreamPreread, Target, TcpEnd, TcpId, TimerId, UdpSocketId,
 };
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Error, Event, PathError, PathId,
-    SlotId, StreamError, StreamId, StreamInfo, Time, Transmit, TransportOps, TxKey,
+    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Error, Event, H3Header, H3ReqId,
+    H3ReqInfo, PathError, PathId, SlotId, StreamError, StreamId, StreamInfo, Time, Transmit,
+    TransportOps, TxKey,
 };
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -73,6 +74,50 @@ impl TransportOps for Null {
     }
     fn datagram_recv(&mut self, _: ConnId, _: &mut [u8]) -> Option<usize> {
         None
+    }
+    fn open_h3_request(&mut self, _: Time, _: ConnId) -> Result<H3ReqId, Error> {
+        Err(Error::Role)
+    }
+    fn h3_send_headers(
+        &mut self,
+        _: Time,
+        _: H3ReqId,
+        _: &[H3Header<'_>],
+        _: bool,
+    ) -> Result<(), StreamError> {
+        Err(StreamError::Stale)
+    }
+    fn h3_send_body(
+        &mut self,
+        _: Time,
+        _: H3ReqId,
+        _: &[u8],
+        _: bool,
+    ) -> Result<usize, StreamError> {
+        Err(StreamError::Stale)
+    }
+    fn h3_finish(&mut self, _: Time, _: H3ReqId) -> Result<(), StreamError> {
+        Err(StreamError::Stale)
+    }
+    fn h3_recv_headers(
+        &mut self,
+        _: Time,
+        _: H3ReqId,
+        _: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<bool, StreamError> {
+        Err(StreamError::Stale)
+    }
+    fn h3_recv_body(
+        &mut self,
+        _: Time,
+        _: H3ReqId,
+        _: &mut [u8],
+    ) -> Result<(usize, bool), StreamError> {
+        Err(StreamError::Stale)
+    }
+    fn h3_reset(&mut self, _: Time, _: H3ReqId) {}
+    fn h3_req_info(&self, _: H3ReqId) -> Result<H3ReqInfo, Error> {
+        Err(Error::Stale)
     }
 }
 

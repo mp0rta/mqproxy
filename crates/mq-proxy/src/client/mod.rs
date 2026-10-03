@@ -28,7 +28,7 @@ use mq_runtime::{
     AcceptMeta, App, Cx, DialError, DialOpId, Host, ListenerTag, SocketOpId, StreamPreread, Target,
     TcpEnd, TcpId, TimerId, UdpSocketId,
 };
-use mq_transport_api::{ConnConfig, ConnId, Event, StreamId};
+use mq_transport_api::{ConnConfig, ConnId, ConnProto, Event, StreamId};
 use mq_wire::frames::{
     AddrType, AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp, DecodeError, FEAT_UDP_RELAY,
     MAX_FRAME, STREAM_TYPE_CONNECT_TCP, TcpErr,
@@ -245,6 +245,7 @@ impl Client {
             peer: self.cfg.server,
             sni: SNI,
             idle_timeout: self.cfg.keepalive_idle,
+            proto: ConnProto::Raw,
         };
         match cx.connect(&cfg) {
             Ok(id) => {

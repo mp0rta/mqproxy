@@ -59,7 +59,7 @@ fn second_client_refused_until_first_is_gone() {
     let sev = w.server.drain_events();
     assert_eq!(
         sev.iter()
-            .filter(|e| matches!(e, Event::NewConn(_)))
+            .filter(|e| matches!(e, Event::NewConn(..)))
             .count(),
         1
     );
@@ -73,7 +73,7 @@ fn second_client_refused_until_first_is_gone() {
         !w.server
             .drain_events()
             .iter()
-            .any(|e| matches!(e, Event::NewConn(_)))
+            .any(|e| matches!(e, Event::NewConn(..)))
     );
     assert_eq!(w.count(), (1, 0));
 
@@ -100,7 +100,7 @@ fn second_client_refused_until_first_is_gone() {
         w.server
             .drain_events()
             .iter()
-            .any(|e| matches!(e, Event::NewConn(_)))
+            .any(|e| matches!(e, Event::NewConn(..)))
     );
     assert_eq!(w.count(), (1, 0));
 }

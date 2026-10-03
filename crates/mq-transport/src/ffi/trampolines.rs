@@ -13,7 +13,8 @@ use crate::{Inner, clock, datagram, stream};
 use core::ffi::{c_int, c_uchar, c_void};
 use libc::{sockaddr, socklen_t};
 use mq_transport_api::{
-    CloseReason, ConnId, ErrType, Event, PathId, SlotId, StreamId, StreamInfo, StreamKind, Time,
+    CloseReason, ConnId, ConnProto, ErrType, Event, PathId, SlotId, StreamId, StreamInfo,
+    StreamKind, Time,
 };
 use std::time::Duration;
 use xquic_sys::*;
@@ -132,7 +133,7 @@ pub(crate) fn on_conn_create(
         slot.provisional = false;
         slot.provisional_deadline = None;
         slot.counted = true;
-        events.push(Event::NewConn(conn_id(s)));
+        events.push(Event::NewConn(conn_id(s), ConnProto::Raw)); // H3: Task 2.3
     } else {
         slot.xqc = conn;
         if let Some(cid) = cid {
@@ -572,6 +573,7 @@ mod tests {
                 scheduler: Scheduler::MinRtt,
                 cc: CongestionControl::Bbr,
                 realtime_offset_us: 0,
+                h3: false,
             },
             CString::new("mqproxy-tcp/1").unwrap(),
         )
@@ -661,7 +663,10 @@ mod tests {
             std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns)).collect();
         assert_eq!(
             evs,
-            vec![Event::NewConn(conn_id(a)), Event::ConnClosed(conn_id(a), r)]
+            vec![
+                Event::NewConn(conn_id(a), ConnProto::Raw),
+                Event::ConnClosed(conn_id(a), r)
+            ]
         );
     }
 

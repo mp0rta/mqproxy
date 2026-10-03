@@ -81,6 +81,7 @@ fn transport(role: Role) -> Transport {
         scheduler: Scheduler::MinRtt,
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
+        h3: false,
     })
     .expect("transport")
 }

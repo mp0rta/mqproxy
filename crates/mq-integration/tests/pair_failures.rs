@@ -6,7 +6,7 @@ use mq_integration::shard_pair::*;
 use mq_proxy::client::Client;
 use mq_proxy::server::Server;
 use mq_runtime::testing::Op;
-use mq_transport_api::{ConnId, Event};
+use mq_transport_api::{ConnId, ConnProto, Event};
 use std::io::ErrorKind;
 use std::time::Duration;
 
@@ -54,7 +54,7 @@ fn pair_server_auth_timeout_slot_released_once() {
     let c = p.server_conns()[0];
     let accepted = p.with_server(move |n| {
         (n.tap().events.iter())
-            .find(|(_, e)| *e == Event::NewConn(c))
+            .find(|(_, e)| *e == Event::NewConn(c, ConnProto::Raw))
             .map(|(t, _)| *t)
             .expect("NewConn")
     });

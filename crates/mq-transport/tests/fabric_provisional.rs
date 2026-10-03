@@ -153,7 +153,7 @@ fn incomplete_client_hello_flood() {
         server
             .drain_events()
             .iter()
-            .any(|e| matches!(e, Event::NewConn(_)))
+            .any(|e| matches!(e, Event::NewConn(..)))
     );
     assert_eq!(
         server.call(now, |t, _| (t.conn_count(), t.n_provisional())),

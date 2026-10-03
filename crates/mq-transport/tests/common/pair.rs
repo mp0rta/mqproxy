@@ -3,8 +3,8 @@
 
 use super::lockstep::{Datagram, Peer, cfg, server_role};
 use mq_transport_api::{
-    ConnConfig, ConnId, Event, PathError, PathId, Role, StreamError, StreamId, StreamInfo, Time,
-    TransportConfig, TransportOps,
+    ConnConfig, ConnId, ConnProto, Event, PathError, PathId, Role, StreamError, StreamId,
+    StreamInfo, Time, TransportConfig, TransportOps,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -28,6 +28,7 @@ pub fn conn_cfg(idle: Option<Duration>) -> ConnConfig {
         peer: srv_addr(),
         sni: "mqproxy",
         idle_timeout: idle,
+        proto: ConnProto::Raw,
     }
 }
 
@@ -39,6 +40,8 @@ pub struct Opts {
     pub idle: Option<Duration>,
     /// Client qlog directory, enabled before `connect`.
     pub qlog: Option<PathBuf>,
+    /// Client connection protocol.
+    pub proto: ConnProto,
 }
 
 impl Default for Opts {
@@ -49,6 +52,7 @@ impl Default for Opts {
             paths: 1,
             idle: None,
             qlog: None,
+            proto: ConnProto::Raw,
         }
     }
 }
@@ -83,7 +87,8 @@ impl Pair {
                 .call(T0, move |t, _| t.enable_qlog(&dir))
                 .expect("enable_qlog");
         }
-        let cc = conn_cfg(o.idle);
+        let mut cc = conn_cfg(o.idle);
+        cc.proto = o.proto;
         let conn = client
             .call(T0, move |t, now| t.connect(now, &cc))
             .expect("connect");
@@ -104,7 +109,7 @@ impl Pair {
             .sev
             .iter()
             .find_map(|e| match e {
-                Event::NewConn(c) => Some(*c),
+                Event::NewConn(c, _) => Some(*c),
                 _ => None,
             })
             .expect("server NewConn");

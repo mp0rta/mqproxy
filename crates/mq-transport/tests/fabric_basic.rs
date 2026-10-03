@@ -3,7 +3,7 @@ mod common;
 
 use common::lockstep::{Peer, cfg, exchange, server_role};
 use mq_transport_api::{
-    ConnConfig, ConnId, Event, Role, StreamError, StreamKind, Time, TransportOps,
+    ConnConfig, ConnId, ConnProto, Event, Role, StreamError, StreamKind, Time, TransportOps,
 };
 use std::net::SocketAddr;
 
@@ -20,6 +20,7 @@ fn connected() -> (Peer, Peer, ConnId, ConnId) {
         peer: srv_addr,
         sni: "mqproxy",
         idle_timeout: None,
+        proto: ConnProto::Raw,
     };
     let conn = client
         .call(T0, move |t, now| t.connect(now, &cc))
@@ -31,7 +32,7 @@ fn connected() -> (Peer, Peer, ConnId, ConnId) {
     let new_conn = srv_ev
         .iter()
         .find_map(|e| match e {
-            Event::NewConn(c) => Some(*c),
+            Event::NewConn(c, _) => Some(*c),
             _ => None,
         })
         .expect("server NewConn");

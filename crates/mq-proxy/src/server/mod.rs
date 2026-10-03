@@ -664,7 +664,7 @@ impl App for Server {
 
     fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
         match ev {
-            Event::NewConn(c) => self.on_new_conn(cx, c),
+            Event::NewConn(c, _) => self.on_new_conn(cx, c),
             Event::ConnClosed(c, _) => self.on_conn_closed(cx, c),
             Event::NewStream(c, s, info) => self.on_new_stream(cx, c, s, info),
             Event::StreamReadable(s) if self.data.contains_key(&s) => self.data_readable(cx, s),
@@ -684,6 +684,11 @@ impl App for Server {
             // Client-only events.
             Event::ConnEstablished(_) | Event::MpReady(_) => {}
             Event::DatagramReadable(c) => self.udp_inbound(cx, c),
+            // H3 requests are handled from Task 6.x on (spec §6).
+            Event::H3Request(..)
+            | Event::H3Readable(_)
+            | Event::H3Writable(_)
+            | Event::H3Closed(..) => {}
         }
     }
 

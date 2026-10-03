@@ -79,6 +79,7 @@ fn transport(r: &Resolved, role: Role, max_conns: u32, err: String) -> Result<Tr
         scheduler: r.scheduler,
         cc: r.cc,
         realtime_offset_us: realtime_offset_us(),
+        h3: false,
     })
     .map_err(|e| format!("{err} ({e:?})"))?;
     if let Some(dir) = &r.qlog {

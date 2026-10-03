@@ -228,7 +228,7 @@ impl H {
         self.count(|x| *x == Call::CloseConn(c))
     }
     pub fn connects(&self) -> usize {
-        self.count(|x| *x == Call::Connect)
+        self.count(|x| matches!(x, Call::Connect(_)))
     }
     pub fn opens(&self) -> usize {
         self.count(|x| matches!(x, Call::OpenStream(_)))

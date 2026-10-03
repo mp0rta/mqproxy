@@ -14,6 +14,7 @@ fn cfg(role: Role) -> TransportConfig {
         scheduler: Scheduler::MinRtt,
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
+        h3: false,
     }
 }
 

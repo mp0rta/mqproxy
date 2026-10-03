@@ -16,6 +16,8 @@ pub struct TransportConfig {
     pub cc: CongestionControl,
     /// Wall clock minus monotonic, fixed at creation (spec §4.3).
     pub realtime_offset_us: i64,
+    /// Register the H3 context (spec §3.1).
+    pub h3: bool,
 }
 
 /// Client or server; the server needs a cert and key (spec §4.2).
@@ -49,6 +51,14 @@ pub struct ConnConfig {
     pub sni: &'static str,
     /// `--keepalive-idle`; `None` disables keepalive.
     pub idle_timeout: Option<Duration>,
+    pub proto: ConnProto,
+}
+
+/// What a connection carries (spec §3.1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ConnProto {
+    Raw,
+    H3,
 }
 
 /// Snapshot for the `mq.conn` line (spec §6.5); `paths.len()` is `paths=`.
