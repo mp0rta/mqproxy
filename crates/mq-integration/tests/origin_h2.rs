@@ -6,7 +6,7 @@ use mq_integration::origin_loop::OriginLoop;
 use mq_integration::origin_server::{Handler, ORIGIN_CA, OriginServer, OriginServerMode, Proto};
 use mq_proxy::server::origin::host::{BodySpec, BridgeEv, StartSpec, upload_byte};
 use mq_proxy::server::origin::{OriginCfg, OriginProto, SWEEP, build_client_config};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const T: Duration = Duration::from_secs(5);
 
@@ -71,18 +71,22 @@ fn h2_tls_alpn_echo() {
 
 /// `RawH2Tls`: the head arrives without END_STREAM; `release()` sends
 /// SETTINGS(MAX_CONCURRENT_STREAMS = 1), GOAWAY(1) and DATA(END_STREAM) for
-/// stream 1, so the response ends cleanly; the inbound frames are recorded.
+/// stream 1, so the response ends cleanly; the client ACKs both SETTINGS.
 #[test]
 fn raw_h2_frame_order() {
-    const SETTINGS: u8 = 4;
+    const DATA: u8 = 0;
     const HEADERS: u8 = 1;
+    const SETTINGS: u8 = 4;
+    const GOAWAY: u8 = 7;
+    const ACK: u8 = 0x1;
+    const END_STREAM: u8 = 0x1;
+    const END_HEADERS: u8 = 0x4;
+    let settings_in =
+        |srv: &OriginServer| srv.frames().iter().filter(|f| **f == (SETTINGS, 0)).count();
     let srv = OriginServer::spawn(OriginServerMode::new(Proto::RawH2Tls, Handler::Echo));
     let mut lp = origin_loop();
-    let h3 = lp.start(spec(
-        "GET",
-        format!("https://{}/", srv.addr),
-        BodySpec::None,
-    ));
+    let url = format!("https://{}/", srv.addr);
+    let h3 = lp.start(spec("GET", url, BodySpec::None));
     let head = |evs: &[BridgeEv]| evs.iter().any(|e| matches!(e, BridgeEv::Response(..)));
     assert!(
         lp.run_until(T, |h| head(h.events())),
@@ -93,7 +97,7 @@ fn raw_h2_frame_order() {
     assert_eq!(
         before.first(),
         Some(&(SETTINGS, 0)),
-        "the client's SETTINGS first"
+        "the client's SETTINGS"
     );
     assert!(before.contains(&(HEADERS, 1)), "{before:?}");
     srv.release();
@@ -106,8 +110,23 @@ fn raw_h2_frame_order() {
         Some(BridgeEv::End(id, done)) => assert_eq!((*id, done.delivered), (h3, 0)),
         e => panic!("{e:?}"),
     }
-    // The client ACKed the released SETTINGS after its HEADERS.
-    let after = srv.frames();
-    let hdr = after.iter().position(|f| *f == (HEADERS, 1)).unwrap();
-    assert!(after[hdr..].contains(&(SETTINGS, 0)), "{after:?}");
+    assert_eq!(
+        srv.sent(),
+        [
+            (SETTINGS, 0),
+            (SETTINGS, ACK),
+            (HEADERS, END_HEADERS),
+            (SETTINGS, 0),
+            (GOAWAY, 0),
+            (DATA, END_STREAM),
+        ]
+    );
+    // Inbound SETTINGS frames: the client's own, its ACK of the server's
+    // first SETTINGS and its ACK of the released one. Keep the loop running
+    // (in short slices) so the last ACK is written.
+    let end = Instant::now() + T;
+    while settings_in(&srv) < 3 && Instant::now() < end {
+        lp.run_until(Duration::from_millis(20), |_| false);
+    }
+    assert_eq!(settings_in(&srv), 3, "{:?}", srv.frames());
 }

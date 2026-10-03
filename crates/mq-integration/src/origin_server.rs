@@ -1,8 +1,8 @@
 //! `OriginServer`: a real origin for the bridge tests (spec §10.3). The hyper
 //! modes run a hyper 1.10 **server** on a tokio current_thread runtime on a
 //! std thread (TLS through tokio-rustls); the raw modes are canned-bytes peers
-//! on a std thread (TLS through a synchronous `rustls::ServerConnection`) for
-//! what a hyper server cannot produce. Body byte `i` is `upload_byte(i)`.
+//! on std threads, one per connection (TLS through a synchronous
+//! `rustls::ServerConnection`), for what a hyper server cannot produce. Body byte `i` is `upload_byte(i)`.
 
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
@@ -165,6 +165,8 @@ struct Shared {
     stop: watch::Sender<bool>,
     release: watch::Sender<bool>,
     frames: Mutex<Vec<(u8, u32)>>,
+    /// `RawH2Tls`: outbound frames as (type, flags).
+    sent: Mutex<Vec<(u8, u8)>>,
     /// Connections accepted (the bridge's dials that reached the origin).
     accepted: AtomicU32,
     /// `EarlyOkKeepBodyUnread`'s request bodies, by path.
@@ -196,13 +198,14 @@ impl OriginServer {
             stop: watch::Sender::new(false),
             release: watch::Sender::new(false),
             frames: Mutex::default(),
+            sent: Mutex::default(),
             accepted: AtomicU32::new(0),
             stash: Mutex::default(),
         });
         let sh = shared.clone();
         let thread = thread::spawn(move || match mode.proto {
             Proto::H1Plain | Proto::H1Tls | Proto::H2Tls => serve(l, mode, sh),
-            _ => raw(l, mode, &sh),
+            _ => raw(l, mode, sh),
         });
         OriginServer {
             addr,
@@ -248,6 +251,11 @@ impl OriginServer {
     /// `RawH2Tls`: the inbound frames so far, as (type, stream id).
     pub fn frames(&self) -> Vec<(u8, u32)> {
         self.shared.frames.lock().unwrap().clone()
+    }
+
+    /// `RawH2Tls`: the frames written so far, as (type, flags).
+    pub fn sent(&self) -> Vec<(u8, u8)> {
+        self.shared.sent.lock().unwrap().clone()
     }
 }
 
@@ -657,44 +665,56 @@ impl Body for OBody {
     }
 }
 
-// ---- raw modes (std thread, one connection at a time) ----
+// ---- raw modes (std threads, one per connection) ----
 
-fn raw(l: TcpListener, mode: OriginServerMode, sh: &Shared) {
-    let mut accepted = 0u32;
+/// Accepts until `stop`; each connection is served on its own thread, or
+/// inline (one at a time) under `single_conn`.
+fn raw(l: TcpListener, mode: OriginServerMode, sh: Arc<Shared>) {
+    let mut conns = Vec::new();
     while !sh.stopped() {
         let Ok((tcp, _)) = l.accept() else {
             thread::sleep(Duration::from_millis(2));
             continue;
         };
-        sh.accepted.fetch_add(1, Ordering::SeqCst);
+        let index = sh.accepted.fetch_add(1, Ordering::SeqCst);
         if tcp.set_nonblocking(false).is_err() || tcp.set_read_timeout(Some(POLL)).is_err() {
             continue;
         }
-        // A peer that goes away mid-exchange is not a harness failure.
-        let _ = match &mode.proto {
-            Proto::RawH1 { tls, reply } => {
-                let s: Box<dyn RawStream> = if *tls {
-                    Box::new(tls_stream(tcp, b"http/1.1"))
-                } else {
-                    Box::new(tcp)
-                };
-                raw_h1(RawConn::new(s, sh), reply)
-            }
-            Proto::RawH1KeepAlive { replies, then } => {
-                let replies = match then {
-                    Then::CloseEvery if accepted > 0 => 0,
-                    _ => *replies,
-                };
-                keep_alive(RawConn::new(Box::new(tcp), sh), replies, *then)
-            }
-            Proto::RawH2Tls => raw_h2(RawConn::new(Box::new(tls_stream(tcp, b"h2")), sh)),
-            Proto::RawTlsCloseAfterClientHello => {
-                close_after_hello(RawConn::new(Box::new(tcp), sh))
-            }
-            Proto::H1Plain | Proto::H1Tls | Proto::H2Tls => unreachable!("hyper modes"),
-        };
-        accepted += 1;
+        if mode.single_conn {
+            raw_conn(tcp, index, &mode.proto, &sh);
+        } else {
+            let (proto, sh) = (mode.proto.clone(), sh.clone());
+            conns.push(thread::spawn(move || raw_conn(tcp, index, &proto, &sh)));
+        }
     }
+    for t in conns {
+        let _ = t.join();
+    }
+}
+
+/// Serves connection number `index` (0-based, in accept order).
+fn raw_conn(tcp: TcpStream, index: u32, proto: &Proto, sh: &Shared) {
+    // A peer that goes away mid-exchange is not a harness failure.
+    let _ = match proto {
+        Proto::RawH1 { tls, reply } => {
+            let s: Box<dyn RawStream> = if *tls {
+                Box::new(tls_stream(tcp, b"http/1.1"))
+            } else {
+                Box::new(tcp)
+            };
+            raw_h1(RawConn::new(s, sh), reply)
+        }
+        Proto::RawH1KeepAlive { replies, then } => {
+            let replies = match then {
+                Then::CloseEvery if index > 0 => 0,
+                _ => *replies,
+            };
+            keep_alive(RawConn::new(Box::new(tcp), sh), replies, *then)
+        }
+        Proto::RawH2Tls => raw_h2(RawConn::new(Box::new(tls_stream(tcp, b"h2")), sh)),
+        Proto::RawTlsCloseAfterClientHello => close_after_hello(RawConn::new(Box::new(tcp), sh)),
+        Proto::H1Plain | Proto::H1Tls | Proto::H2Tls => unreachable!("hyper modes"),
+    };
 }
 
 trait RawStream: Read + Write {
@@ -793,6 +813,12 @@ impl<'a> RawConn<'a> {
         self.s.write_all(b)?;
         self.s.flush()
     }
+
+    /// One h2 frame, recorded in `sent`.
+    fn send_frame(&mut self, ty: u8, flags: u8, sid: u32, payload: &[u8]) -> io::Result<()> {
+        self.sh.sent.lock().unwrap().push((ty, flags));
+        self.send(&frame(ty, flags, sid, payload))
+    }
 }
 
 fn content_length(head: &[u8]) -> usize {
@@ -828,7 +854,17 @@ fn keep_alive(mut c: RawConn<'_>, replies: u32, then: Then) -> io::Result<()> {
                 c.send(b"HTTP/1.1 200")?;
             }
         }
-        Then::CloseIdle(d) => thread::sleep(d),
+        Then::CloseIdle(d) => {
+            // Interruptible, so `stop` never waits for `d`.
+            let end = std::time::Instant::now() + d;
+            while !c.sh.stopped() {
+                let left = end.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                thread::sleep(POLL.min(left));
+            }
+        }
     }
     Ok(()) // the drop closes
 }
@@ -870,7 +906,7 @@ fn raw_h2(mut c: RawConn<'_>) -> io::Result<()> {
         }
     }
     c.buf.drain(..PREFACE);
-    c.send(&frame(SETTINGS, 0, 0, &[]))?;
+    c.send_frame(SETTINGS, 0, 0, &[])?;
     let (mut answered, mut released) = (false, false);
     loop {
         while c.buf.len() >= 9 {
@@ -883,21 +919,20 @@ fn raw_h2(mut c: RawConn<'_>) -> io::Result<()> {
             let sid = u32::from_be_bytes([f[5], f[6], f[7], f[8]]) & 0x7fff_ffff;
             c.sh.frames.lock().unwrap().push((ty, sid));
             match ty {
-                SETTINGS if flags & ACK == 0 => c.send(&frame(SETTINGS, ACK, 0, &[]))?,
-                PING if flags & ACK == 0 => c.send(&frame(PING, ACK, 0, &f[9..]))?,
+                SETTINGS if flags & ACK == 0 => c.send_frame(SETTINGS, ACK, 0, &[])?,
+                PING if flags & ACK == 0 => c.send_frame(PING, ACK, 0, &f[9..])?,
                 HEADERS if !answered => {
                     answered = true;
-                    c.send(&frame(HEADERS, END_HEADERS, sid, &[0x88]))?;
+                    c.send_frame(HEADERS, END_HEADERS, sid, &[0x88])?;
                 }
                 _ => {}
             }
         }
         if answered && !released && c.sh.released() {
             released = true;
-            let mut out = frame(SETTINGS, 0, 0, &[0, 3, 0, 0, 0, 1]);
-            out.extend(frame(GOAWAY, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]));
-            out.extend(frame(DATA, END_STREAM, 1, &[]));
-            c.send(&out)?;
+            c.send_frame(SETTINGS, 0, 0, &[0, 3, 0, 0, 0, 1])?;
+            c.send_frame(GOAWAY, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0])?;
+            c.send_frame(DATA, END_STREAM, 1, &[])?;
         }
         if c.poll_fill()? == Some(false) || c.sh.stopped() {
             return Ok(());
