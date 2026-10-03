@@ -12,9 +12,7 @@ use mq_runtime::TcpId;
 use mq_transport_api::H3ReqId;
 use origin_harness::{OH, ORIGIN_CRT, ORIGIN_KEY, TlsPeer, cfg, get, tls};
 use std::cell::Cell;
-use std::future::Future;
 use std::io::{self, Read};
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -444,31 +442,37 @@ fn connect_timer_gone_from_shard_at_assignment() {
     assert_eq!(oh.sh.next_timeout(), None);
 }
 
-/// A dirty-forever task never starves the shard: each pump stops at the cap.
+/// A dirty-forever task never starves the shard: each pump stops at the cap
+/// and one `OriginTimer::Pump` is pending, however many pumps capped. Each
+/// timer that fires runs one capped pump (`PUMP_CAP` polls), so the poll
+/// count after one `drive` tells how many were armed.
 #[test]
 fn pump_timer_is_armed_once() {
-    struct Spin;
-    impl Future for Spin {
-        type Output = ();
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
+    let polls = Rc::new(Cell::new(0));
+    let p = polls.clone();
+    let spin = std::future::poll_fn(move |cx: &mut Context<'_>| {
+        p.set(p.get() + 1);
+        cx.waker().wake_by_ref();
+        Poll::<()>::Pending
+    });
     let mut oh = oh();
     oh.with_host(|h, cx| {
-        h.origin_mut().spawn_test_task(Box::pin(Spin));
+        h.origin_mut().spawn_test_task(Box::pin(spin));
         h.pump(cx);
         h.pump(cx);
     });
+    assert_eq!(polls.get(), 2 * PUMP_CAP);
     let at = oh.now;
     assert_eq!(oh.sh.next_timeout(), Some(at));
     oh.drive();
+    assert_eq!(polls.get(), 3 * PUMP_CAP, "one timer fired, not two");
     assert_eq!(
         oh.sh.next_timeout(),
         Some(at),
         "re-armed by the timer's pump"
     );
+    oh.drive();
+    assert_eq!(polls.get(), 4 * PUMP_CAP, "still one");
 }
 
 /// A ticketer whose TLS 1.3 tickets are `len` bytes of junk.
