@@ -92,8 +92,13 @@ impl<T: TransportOps, A: App> Shard<T, A> {
             Some(TcpEntry::App(e)) => match r {
                 IoResult::Bytes(n) => {
                     e.tx.drain(..n.min(e.tx.len()));
-                    if e.closing && e.tx.is_empty() {
-                        self.st.close_now(tcp, false);
+                    if e.tx.is_empty() {
+                        if e.closing {
+                            self.st.close_now(tcp, false);
+                        } else if std::mem::take(&mut e.want_writable) {
+                            // spec §4: once, after the buffer fully drained.
+                            self.call_app(now, |a, cx| a.on_tcp_writable(cx, tcp));
+                        }
                     }
                 }
                 IoResult::WouldBlock => {}

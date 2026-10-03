@@ -159,6 +159,9 @@ pub trait App {
     fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId);
     /// spec §5.4: read EOF or error on an app-owned socket.
     fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd);
+    /// spec §4: once after a `tcp_write` failed with `SendBufFull`, when the
+    /// send buffer has fully drained. Never for a relay or a closed socket.
+    fn on_tcp_writable(&mut self, _cx: &mut Cx<'_>, _tcp: TcpId) {}
     /// spec §5.4: a dial completed (never delivered once cancelled).
     fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>);
     /// SP2 spec §4.2: a resolve-only request completed (never delivered once

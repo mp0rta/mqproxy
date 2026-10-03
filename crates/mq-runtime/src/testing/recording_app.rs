@@ -20,6 +20,7 @@ pub enum Recorded {
     },
     TcpData(TcpId),
     TcpEnd(TcpId, TcpEnd),
+    TcpWritable(TcpId),
     DialResult(DialOpId, Result<TcpId, DialError>),
     ResolveResult(DialOpId, Result<SocketAddr, DialError>),
     UdpSocket(SocketOpId, Result<(UdpSocketId, SocketAddr), io::ErrorKind>),
@@ -108,6 +109,9 @@ impl App for RecordingApp {
     }
     fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
         self.rec(cx, Recorded::TcpEnd(tcp, end))
+    }
+    fn on_tcp_writable(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        self.rec(cx, Recorded::TcpWritable(tcp))
     }
     fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>) {
         self.rec(cx, Recorded::DialResult(op, r))

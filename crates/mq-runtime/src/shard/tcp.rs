@@ -28,6 +28,9 @@ pub(crate) struct AppTcp {
     pub(crate) read_eof: bool,
     /// `tcp_close` seen; closes once `tx` drains. The app has let go.
     pub(crate) closing: bool,
+    /// spec §4: a `tcp_write` hit `SendBufFull`; `on_tcp_writable` is owed
+    /// when `tx` next drains empty.
+    pub(crate) want_writable: bool,
 }
 
 impl AppTcp {
@@ -40,6 +43,7 @@ impl AppTcp {
             read: true,
             read_eof: false,
             closing: false,
+            want_writable: false,
         }
     }
 
@@ -112,6 +116,8 @@ impl ShardState {
     pub(crate) fn tcp_write(&mut self, tcp: TcpId, bytes: &[u8]) -> Result<(), SendBufFull> {
         let e = self.app_tcp(tcp).ok_or(SendBufFull)?;
         if e.tx.len() + bytes.len() > TCP_BUF {
+            // An empty `tx` has nothing to drain, so waiting cannot help.
+            e.want_writable |= !e.tx.is_empty();
             return Err(SendBufFull);
         }
         e.tx.extend_from_slice(bytes);
