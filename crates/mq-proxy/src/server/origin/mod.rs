@@ -57,12 +57,10 @@ pub const SWEEP: Duration = Duration::from_secs(10);
 pub const PUMP_CAP: usize = 16;
 /// spec §7.3/§7.4: one `tcp_write` slice, one upload frame.
 pub const SLICE: usize = 16 * 1024;
-/// spec §6.2/§6.4: the gateway's caps on a forwarded header set, both
-/// directions (C `MQ_GWS_MAX_HDRS` and its arena slots): more than 64, a
-/// name ≥ 128 or a value ≥ 1024 bytes; dropped headers do not count, as in C.
+/// spec §6.2/§6.4: the gateway's cap on a forwarded header set, both
+/// directions (C `MQ_GWS_MAX_HDRS`): more than 64 (names/values are capped by
+/// `mq_http::headers::{NAME_CAP, VAL_CAP}`); dropped headers do not count, as in C.
 pub(crate) const MAX_FWD: usize = 64;
-pub(crate) const NAME_CAP: usize = 128;
-pub(crate) const VAL_CAP: usize = 1024;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Scheme {

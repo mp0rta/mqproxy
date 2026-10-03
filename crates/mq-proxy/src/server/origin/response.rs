@@ -1,9 +1,10 @@
 //! SP3 spec §7.5 / §6.4: the origin's response head, normalised for the
 //! gateway — or the reason it cannot be relayed (502 `upstream-protocol`).
 
-use super::{MAX_FWD, NAME_CAP, OriginProto, RelayHead, VAL_CAP};
+use super::{MAX_FWD, OriginProto, RelayHead};
 use mq_http::h1;
 use mq_http::headers::is_hop_by_hop;
+use mq_http::headers::{NAME_CAP, VAL_CAP};
 
 /// Why a response head cannot be relayed (§7.5, §6.4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

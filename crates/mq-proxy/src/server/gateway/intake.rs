@@ -5,11 +5,11 @@
 //! is just a control byte (§12.41).
 
 use super::ReqMeta;
-use crate::server::origin::{BodyKind, MAX_FWD, NAME_CAP, Scheme, VAL_CAP};
+use crate::server::origin::{BodyKind, MAX_FWD, Scheme};
 use mq_http::h1::{PATH_MAX, parse_content_length};
 use mq_http::headers::{
-    AUTHORITY_MAX, HttpVer, Method, name_ok, parse_http_ver, parse_method, strip_server,
-    uri_field_ok, value_ok,
+    AUTHORITY_MAX, HttpVer, Method, NAME_CAP, VAL_CAP, name_ok, parse_http_ver, parse_method,
+    strip_server, uri_field_ok, value_ok,
 };
 use subtle::ConstantTimeEq;
 

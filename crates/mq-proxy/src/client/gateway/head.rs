@@ -3,14 +3,10 @@
 
 use mq_http::h1;
 use mq_http::headers::{
-    HttpVer, Method, Reject, Target, forward_cookie_requested, has_dup_xmq, parse_cache_ttl,
-    parse_http_ver, parse_method, parse_target, strip_client,
+    HttpVer, Method, NAME_CAP, Reject, Target, VAL_CAP, forward_cookie_requested, has_dup_xmq,
+    parse_cache_ttl, parse_http_ver, parse_method, parse_target, strip_client,
 };
 
-/// C `MQ_GW_HDR_NAME_CAP` / `MQ_GW_HDR_VAL_CAP`: a forwarded name ≥ 128 or
-/// value ≥ 1024 bytes is `header-too-long` (spec §5.2 step 8).
-const NAME_CAP: usize = 128;
-const VAL_CAP: usize = 1024;
 /// C `MQ_GW_MAX_SEND_HDRS` (spec §5.2: at most 64 + 8 headers).
 const MAX_FWD: usize = h1::MAX_HEADERS + 8;
 

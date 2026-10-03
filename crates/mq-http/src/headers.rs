@@ -6,6 +6,11 @@ use crate::h1::{METHOD_MAX, PATH_MAX, is_tchar};
 pub const CACHE_TTL_MAX: u32 = 31_536_000;
 /// Longest target authority, both intakes (C `char authority[256]`).
 pub const AUTHORITY_MAX: usize = 255;
+/// Forwarded header caps, both gateway ends (C `MQ_GW_HDR_NAME_CAP` /
+/// `MQ_GW_HDR_VAL_CAP` / `MQ_GWS_*` arena slots): a name ≥ 128 or a value
+/// ≥ 1024 bytes is too long.
+pub const NAME_CAP: usize = 128;
+pub const VAL_CAP: usize = 1024;
 
 /// Parsed `X-Mq-Target` (bytes: any non-control, non-DEL, non-space byte round-trips).
 #[derive(Debug, PartialEq, Eq)]
