@@ -31,6 +31,7 @@ pub enum Op {
     CancelConnect(DialOpId),
     OpenUdp(IpAddr),
     ShutdownWrite(TcpSock),
+    SetNodelay(TcpSock),
     CloseTcp(TcpSock, bool),
     CloseUdp(UdpSock),
     SocketError(TcpSock),
@@ -447,6 +448,11 @@ impl Io for FakeIo {
 
     fn shutdown_write(&mut self, s: TcpSock) -> io::Result<()> {
         self.ops.push(Op::ShutdownWrite(s));
+        Ok(())
+    }
+
+    fn set_nodelay(&mut self, s: TcpSock) -> io::Result<()> {
+        self.ops.push(Op::SetNodelay(s));
         Ok(())
     }
 

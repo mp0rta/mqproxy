@@ -339,6 +339,23 @@ fn tcp_abort_closes_now() {
 }
 
 #[test]
+fn tcp_set_nodelay_requested_for_app_socket_only() {
+    let mut h = setup();
+    let tcp = h.accept();
+    h.sh.with_app(T0, |_, cx| cx.tcp_set_nodelay(tcp));
+    assert_eq!(h.reqs(), [IoRequest::TcpSetNodelay { tcp }]);
+    h.sh.with_app(T0, |_, cx| {
+        cx.tcp_abort(tcp);
+        cx.tcp_set_nodelay(tcp);
+    });
+    assert_eq!(
+        h.reqs(),
+        [IoRequest::TcpClose { tcp, abort: true }],
+        "a stale id is ignored"
+    );
+}
+
+#[test]
 fn read_eof_only_from_zero_read() {
     let mut h = setup();
     let tcp = h.accept();

@@ -105,6 +105,10 @@ pub enum IoRequest {
     TcpShutdownWrite {
         tcp: TcpId,
     },
+    /// `TCP_NODELAY` on the socket (SP3: the origin bridge, libcurl parity).
+    TcpSetNodelay {
+        tcp: TcpId,
+    },
     /// `abort`: `SO_LINGER` 0 then close, so the peer sees `ECONNRESET`.
     TcpClose {
         tcp: TcpId,
@@ -420,6 +424,10 @@ impl<'a> Cx<'a> {
     /// spec §5.4: resets the connection now.
     pub fn tcp_abort(&mut self, tcp: TcpId) {
         self.st.tcp_abort(tcp)
+    }
+    /// Disables Nagle (`TCP_NODELAY`) on an app-owned socket; a stale id is ignored.
+    pub fn tcp_set_nodelay(&mut self, tcp: TcpId) {
+        self.st.tcp_set_nodelay(tcp)
     }
 
     // --- Relay (spec §5.4, §5.6) ---

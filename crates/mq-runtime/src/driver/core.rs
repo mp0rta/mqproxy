@@ -600,6 +600,13 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
                     }
                 }
             }
+            IoRequest::TcpSetNodelay { tcp } => {
+                if let Some(&s) = self.tcp.get(&tcp) {
+                    if let Err(e) = self.io.set_nodelay(s) {
+                        log::debug!("setsockopt(TCP_NODELAY): {e}");
+                    }
+                }
+            }
             IoRequest::TcpClose { tcp, abort } => {
                 if let Some(s) = self.tcp.remove(&tcp) {
                     self.unregister(s.0);

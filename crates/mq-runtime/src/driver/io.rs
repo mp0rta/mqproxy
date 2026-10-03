@@ -97,6 +97,7 @@ pub trait Io {
     fn cancel_connect(&mut self, op: DialOpId);
     fn open_udp(&mut self, local_ip: IpAddr) -> io::Result<(UdpSock, SocketAddr)>;
     fn shutdown_write(&mut self, s: TcpSock) -> io::Result<()>;
+    fn set_nodelay(&mut self, s: TcpSock) -> io::Result<()>;
     /// abort: mq_linux::set_linger_zero then close → the peer sees ECONNRESET.
     fn close_tcp(&mut self, s: TcpSock, abort: bool);
     fn close_udp(&mut self, s: UdpSock);

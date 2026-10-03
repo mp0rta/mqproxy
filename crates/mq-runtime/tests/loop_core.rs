@@ -570,6 +570,23 @@ fn late_connect_for_cancelled_op_closed() {
 }
 
 #[test]
+fn tcp_set_nodelay_reaches_the_socket() {
+    let mut h = setup();
+    let op = h.dial(ip([10, 0, 0, 1], 80), SEC);
+    h.it();
+    let s = h.io().connect_ok(op);
+    h.it();
+    let tcp = match h.dial_results()[..] {
+        [(o, Ok(t))] if o == op => t,
+        ref r => panic!("{r:?}"),
+    };
+    h.ops();
+    h.act(|cx| cx.tcp_set_nodelay(tcp));
+    h.it();
+    assert!(h.ops().contains(&Op::SetNodelay(s)));
+}
+
+#[test]
 fn dial_deadline_beats_same_iteration_success() {
     let mut h = setup();
     h.io().set_auto_advance(false);

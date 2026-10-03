@@ -134,6 +134,11 @@ impl ShardState {
             e.rx_limit = n.min(TCP_BUF);
         }
     }
+    pub(crate) fn tcp_set_nodelay(&mut self, tcp: TcpId) {
+        if self.app_tcp(tcp).is_some() {
+            self.push_request(IoRequest::TcpSetNodelay { tcp });
+        }
+    }
     /// Graceful: closes now if nothing is queued, else once `tx` drains.
     pub(crate) fn tcp_close(&mut self, tcp: TcpId) {
         if let Some(e) = self.app_tcp(tcp) {
