@@ -2,6 +2,7 @@
 //! polled from the shard with the `Dirty` waker and `ShardExec` (§7.1); no
 //! tokio task or channel on the data path.
 
+mod accounting;
 mod body;
 mod errors;
 mod events;
@@ -15,6 +16,7 @@ mod request;
 mod response;
 pub mod tls;
 
+use accounting::{ConnAccounting, SweepClass};
 pub use body::{UploadBody, UploadBuf};
 pub use events::{Accepted, BridgeEvents};
 pub use exec::Dirty;
@@ -368,12 +370,13 @@ struct OriginConn {
     /// TLS ciphertext staging (§7.3).
     out: Vec<u8>,
     tcp_eof: bool,
-    /// h1.
+    /// h1: the conn has an `Assigned` record.
     busy: bool,
-    /// h2 only: `Assigned` + `Ended`-unreleased records.
-    active: u32,
-    /// h2 (§7.7).
-    draining: bool,
+    /// `active`, `draining` (h2) and retirement (§7.7).
+    acct: ConnAccounting,
+    /// In `closing` as class B: its `tcp_close` waits for the last
+    /// `Assigned` record to end (§7.7).
+    close_due: bool,
     idle_since: Option<Time>,
     connect_ms: i64,
     /// Step 1 last stopped with the pipe full: rustls may hold decrypted
@@ -472,11 +475,13 @@ impl Origin {
         Ok(())
     }
 
-    /// `H3Closed` (§7.7 cancel). While `Connecting` the record is dropped: a
-    /// pending dial is cancelled, a handshaking conn is removed as class D.
-    /// (`Assigned`: Task 5.5a.)
+    /// `H3Closed` (§7.7 cancel): the `by_h3` entry goes. While `Connecting`
+    /// the record is dropped: a pending dial is cancelled, a handshaking conn
+    /// is removed as class D. `Assigned` → `Ended` (the response future and
+    /// `Incoming` dropped). A lookup that lands on an `Ended` record, or on a
+    /// conn already gone, is a no-op.
     pub fn cancel(&mut self, cx: &mut Cx<'_>, h3: H3ReqId) {
-        match self.by_h3.get(&h3).copied() {
+        match self.by_h3.remove(&h3) {
             Some(Where::Dial(op)) => {
                 if let Some(rec) = self.dials.remove(&op) {
                     self.drop_connecting(cx, rec);
@@ -491,14 +496,29 @@ impl Origin {
                     let rec = c.pending.take().expect("checked");
                     self.drop_connecting(cx, rec);
                     self.remove(cx, id, Removal::D);
+                } else if let Some(rec) = c.reqs.iter_mut().find(|r| r.assigned_h3() == Some(h3)) {
+                    rec.end(cx.now());
                 }
             }
             None => {}
         }
     }
 
-    /// §7.7 shutdown (Task 5.6c).
-    pub fn shutdown(&mut self, _cx: &mut Cx<'_>) {}
+    /// §7.7 shutdown: class E for every conn, dials cancelled, the executor
+    /// list dropped. No event: the gateway resets every request (§6.6).
+    pub fn shutdown(&mut self, cx: &mut Cx<'_>) {
+        for (op, rec) in std::mem::take(&mut self.dials) {
+            self.drop_connecting(cx, rec);
+            cx.cancel_dial(op);
+        }
+        for id in self.conns.ids() {
+            if let Some(rec) = self.conns.get_mut(id).and_then(|c| c.pending.take()) {
+                self.drop_connecting(cx, rec);
+            }
+            self.remove(cx, id, Removal::E { abort: true });
+        }
+        self.exec.clear();
+    }
 
     /// Returns whether `op` was the bridge's (§7.2 steps 4–5).
     pub fn on_dial_result(
@@ -587,6 +607,10 @@ impl Origin {
         let Some(t) = self.timers.remove(&id) else {
             return false;
         };
+        if t == OriginTimer::Idle {
+            self.idle_timer = None;
+            self.sweep(cx);
+        }
         if let OriginTimer::Connect(h3) = t
             && let Some(&Where::Conn(conn)) = self.by_h3.get(&h3)
             && let Some(c) = self.conns.get_mut(conn)
@@ -657,8 +681,8 @@ impl Origin {
             out: Vec::new(),
             tcp_eof: false,
             busy: false,
-            active: 0,
-            draining: false,
+            acct: ConnAccounting::default(),
+            close_due: false,
             idle_since: None,
             connect_ms: 0,
             hold_public: false,
@@ -752,20 +776,26 @@ impl Origin {
     }
 
     /// §7.7 "every removal": the pipe is marked dead before the conn leaves
-    /// the table, `by_tcp` and `pool` forget it, then the class's socket
-    /// action. A class-E conn with an `Assigned` record waits in `closing`,
-    /// where hyper reports each exchange from the dead pipe. (Task 5.5a adds
-    /// the other classes.)
+    /// the table, `by_tcp` and `pool` forget it, then the class's one socket
+    /// action. A class-B/E conn with an `Assigned` record waits in `closing`
+    /// (hyper reports each exchange; B's `tcp_close` is deferred to the
+    /// settling where the last one ended); any other conn is dropped with
+    /// its records. Idempotent for a conn already in `closing` (shutdown).
     fn remove(&mut self, cx: &mut Cx<'_>, id: OriginConnId, class: Removal) {
         self.mark_pipe_dead(id);
-        let Some(c) = self.conns.get(id) else {
+        let Some(c) = self.conns.get_mut(id) else {
             return;
         };
         let (tcp, key) = (c.tcp, c.key.clone());
-        let keep = matches!(class, Removal::E { .. })
-            && c.reqs
-                .iter()
-                .any(|r| matches!(r, OriginReq::Assigned { .. }));
+        let keep = matches!(class, Removal::B | Removal::E { .. })
+            && c.reqs.iter().any(|r| r.assigned_h3().is_some());
+        c.close_due = keep && class == Removal::B;
+        match class {
+            Removal::A | Removal::C => cx.tcp_close(tcp),
+            Removal::B if !keep => cx.tcp_close(tcp),
+            Removal::D | Removal::EPrime | Removal::E { abort: true } => cx.tcp_abort(tcp),
+            Removal::B | Removal::E { abort: false } => {}
+        }
         self.by_tcp.remove(&tcp);
         if let Some(v) = self.pool.get_mut(&key) {
             v.retain(|&x| x != id);
@@ -773,21 +803,45 @@ impl Origin {
                 self.pool.remove(&key);
             }
         }
-        match class {
-            Removal::D | Removal::EPrime | Removal::E { abort: true } => cx.tcp_abort(tcp),
-            Removal::E { abort: false } => {}
-        }
+        self.closing.retain(|&x| x != id);
         if keep {
             self.closing.push(id);
         } else {
             self.conns.remove(id);
         }
     }
+
+    /// §7.7 idle sweep (`OriginTimer::Idle`): per pooled conn, expiry
+    /// (class A) or h2 retirement (class E).
+    fn sweep(&mut self, cx: &mut Cx<'_>) {
+        let now = cx.now();
+        let ids: Vec<_> = self.pool.values().flatten().copied().collect();
+        for id in ids {
+            let c = self.conns.get(id).expect("pooled conns are live");
+            let newest_ended = c.reqs.iter().filter_map(OriginReq::ended_since).max();
+            let class =
+                accounting::sweep_class(&c.acct, c.idle_since, newest_ended, now, self.cfg.sweep);
+            match class {
+                SweepClass::A => self.remove(cx, id, Removal::A),
+                SweepClass::E => self.remove(cx, id, Removal::E { abort: true }),
+                SweepClass::Keep => {}
+            }
+        }
+    }
 }
 
-/// The §7.7 removal classes this task produces.
+/// The §7.7 removal classes, one socket action each.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Removal {
+    /// Idle expiry: `tcp_close`.
+    A,
+    /// `Completed` with no record left; h1 close after its last `Incoming`
+    /// ended: `tcp_close`, deferred while an `Assigned` record remains.
+    #[allow(dead_code)] // Task 5.5b: the h1 B decision
+    B,
+    /// An h1 conn not to be pooled: `tcp_close`.
+    #[allow(dead_code)] // Task 5.5b: the h1 C decision
+    C,
     /// The `pending` requester was cancelled during `Tls`/`Handshaking`.
     D,
     /// A `Connecting` failure that already owns a socket.
@@ -798,6 +852,34 @@ enum Removal {
 }
 
 impl OriginReq {
+    /// §7.7: `Assigned` → `Ended` at any end of the exchange, with the
+    /// upload aborted when it is not complete (§6.3: `!fin`). The response
+    /// future and `Incoming` are dropped here, with no `UploadBuf` borrow held.
+    fn end(&mut self, now: Time) {
+        let OriginReq::Assigned { upload, .. } = self else {
+            return;
+        };
+        let upload = upload.clone();
+        if !upload.borrow().fin {
+            upload.borrow_mut().abort();
+        }
+        *self = OriginReq::Ended { upload, since: now };
+    }
+
+    fn assigned_h3(&self) -> Option<H3ReqId> {
+        match self {
+            OriginReq::Assigned { h3, .. } => Some(*h3),
+            _ => None,
+        }
+    }
+
+    fn ended_since(&self) -> Option<Time> {
+        match self {
+            OriginReq::Ended { since, .. } => Some(*since),
+            _ => None,
+        }
+    }
+
     fn connecting_h3(&self) -> Option<H3ReqId> {
         match self {
             OriginReq::Connecting { h3, .. } => Some(*h3),
@@ -1006,8 +1088,8 @@ mod tests {
             out: Vec::new(),
             tcp_eof: false,
             busy: false,
-            active: 0,
-            draining: false,
+            acct: ConnAccounting::default(),
+            close_due: false,
             idle_since: None,
             connect_ms: 0,
             hold_public: false,
@@ -1193,5 +1275,84 @@ mod tests {
             dirty.take(),
             "the buffer's abort marks the bridge's own Dirty"
         );
+    }
+
+    fn assigned(h3: H3ReqId, upload: &Rc<RefCell<UploadBuf>>) -> OriginReq {
+        OriginReq::Assigned {
+            h3,
+            fut: None,
+            body: None,
+            upload: upload.clone(),
+            stored: None,
+            head_seen: false,
+            reused: false,
+            retried: false,
+            held: false,
+            delivered: 0,
+            cl: None,
+        }
+    }
+
+    fn h3(n: u32) -> H3ReqId {
+        H3ReqId::from_slot(mq_transport_api::SlotId::new(n, 1)).unwrap()
+    }
+
+    /// spec §6.3/§7.7: the `Assigned` → `Ended` rule aborts the upload only
+    /// when it has not reached its fin.
+    #[test]
+    fn end_aborts_only_an_incomplete_upload() {
+        let origin = test_origin();
+        let (whole, cut) = (origin.new_upload(None), origin.new_upload(None));
+        whole.borrow_mut().fin = true;
+        for (up, abort) in [(&whole, false), (&cut, true)] {
+            let mut rec = assigned(h3(0), up);
+            rec.end(Time(5));
+            assert_eq!(rec.ended_since(), Some(Time(5)));
+            assert_eq!(up.borrow().is_aborted(), abort);
+        }
+    }
+
+    /// spec §7.7: an exchange's end leaves an `Ended` record that only the
+    /// settling drops, once `released`; an unreleased one stays and counts.
+    #[test]
+    fn ended_record_exists_between_body_end_and_settle() {
+        let (t, _) = ScriptedTransport::new();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
+        let mut sh = Shard::new(t, RecordingApp::new().0, addr, 7);
+        let mut origin = test_origin();
+        let (done, stuck) = (origin.new_upload(None), origin.new_upload(None));
+        done.borrow_mut().fin = true;
+        let hyper_owned = UploadBody::new(&stuck);
+        let id = origin.conns.insert(|id| OriginConn {
+            reqs: vec![assigned(h3(0), &done), assigned(h3(1), &stuck)],
+            acct: ConnAccounting {
+                active: 2,
+                ..ConnAccounting::default()
+            },
+            ..bare_conn(id)
+        });
+        let ended = |o: &Origin| {
+            o.conns
+                .get(id)
+                .unwrap()
+                .reqs
+                .iter()
+                .filter_map(OriginReq::ended_since)
+                .count()
+        };
+        sh.with_app(Time(7), |_, cx| {
+            for rec in &mut origin.conns.get_mut(id).unwrap().reqs {
+                rec.end(cx.now());
+            }
+            assert_eq!(ended(&origin), 2, "Ended between the end and the settling");
+            origin.settle(cx);
+            assert_eq!(ended(&origin), 1, "the released one is dropped");
+            let acct = origin.conns.get(id).unwrap().acct;
+            assert_eq!((acct.active, acct.ended_unreleased), (1, 1));
+            drop(hyper_owned);
+            origin.settle(cx);
+            assert_eq!(ended(&origin), 0);
+            assert_eq!(origin.conns.get(id).unwrap().acct.active, 0);
+        });
     }
 }

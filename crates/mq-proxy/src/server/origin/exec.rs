@@ -93,6 +93,12 @@ impl ShardExec {
         self.tasks.len() + self.spawned.borrow().len()
     }
 
+    /// Drops every task (§7.7 shutdown).
+    pub fn clear(&mut self) {
+        self.tasks.clear();
+        self.spawned.borrow_mut().clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

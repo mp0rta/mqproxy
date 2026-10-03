@@ -60,8 +60,61 @@ impl Origin {
         })
     }
 
-    /// §7.7 settling point (Task 5.5a).
-    fn settle(&mut self, _cx: &mut Cx<'_>) {}
+    /// §7.7 settling point, for every conn in `pool` and `closing`: (a)
+    /// released `Ended` records dropped, the rest counted; (b) `draining`
+    /// inputs; (c) the h1 idleness transition; (d) a `closing` conn whose
+    /// last `Assigned` record ended is dropped (class B: its deferred
+    /// `tcp_close` now). Then `OriginTimer::Idle` is armed while `pool` or
+    /// `closing` is non-empty, cancelled otherwise.
+    pub(super) fn settle(&mut self, cx: &mut Cx<'_>) {
+        let now = cx.now();
+        for id in self.conns.ids() {
+            let closing = self.closing.contains(&id);
+            let c = self.conns.get_mut(id).expect("live conn");
+            c.acct.ended_unreleased = 0;
+            let acct = &mut c.acct;
+            c.reqs.retain(|r| match r {
+                OriginReq::Ended { upload, .. } => {
+                    let released = upload.borrow().released();
+                    acct.record_dropped(released);
+                    !released
+                }
+                _ => true,
+            });
+            c.acct.completed = matches!(c.driver, Driver::Completed);
+            let assigned = c.reqs.iter().any(|r| r.assigned_h3().is_some());
+            if c.proto == Some(OriginProto::H1) && !closing {
+                // `idle_since` is set once, on the busy → idle transition (a
+                // conn left without a record by a failed build counts too).
+                c.busy = assigned;
+                let ready = matches!(&c.send, Some(Sender::H1(s)) if s.is_ready());
+                if c.reqs.is_empty() && c.idle_since.is_none() && ready {
+                    c.idle_since = Some(now);
+                }
+            }
+            if closing && !assigned {
+                if c.close_due {
+                    cx.tcp_close(c.tcp);
+                }
+                self.closing.retain(|&x| x != id);
+                self.conns.remove(id);
+            }
+        }
+        let want = !self.pool.is_empty() || !self.closing.is_empty();
+        match (want, self.idle_timer) {
+            (true, None) => {
+                let t = cx.set_timer(self.cfg.sweep);
+                self.timers.insert(t, OriginTimer::Idle);
+                self.idle_timer = Some(t);
+            }
+            (false, Some(t)) => {
+                cx.cancel_timer(t);
+                self.timers.remove(&t);
+                self.idle_timer = None;
+            }
+            _ => {}
+        }
+    }
 
     /// The gateway drained a `Partial` frame: the next pump polls the body again.
     pub fn resume(&mut self, h3: H3ReqId) {
@@ -295,12 +348,10 @@ impl Origin {
         };
         let send = c.send.as_mut().expect("H1/H2 driver");
         let fut = send_request(send, req, false);
-        match proto {
-            OriginProto::H2 => c.active += 1,
-            OriginProto::H1 => {
-                c.busy = true;
-                c.io.reset_rx_since_send();
-            }
+        c.acct.assign();
+        if proto == OriginProto::H1 {
+            c.busy = true;
+            c.io.reset_rx_since_send();
         }
         c.idle_since = None;
         c.reqs.push(OriginReq::Assigned {
@@ -341,7 +392,6 @@ impl Origin {
                 h3,
                 fut,
                 body,
-                upload,
                 head_seen,
                 reused,
                 held,
@@ -426,12 +476,7 @@ impl Origin {
                 }
             }
             if ended {
-                // §7.7: settling (Task 5.5a) drops it once `released`.
-                let upload = upload.clone();
-                *rec = OriginReq::Ended {
-                    upload,
-                    since: cx.now(),
-                };
+                rec.end(cx.now()); // dropped at a settling once `released`
                 changed = true;
             }
         }

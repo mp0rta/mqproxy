@@ -439,13 +439,14 @@ fn tx_shutdown_recorded_and_ignored() {
 }
 
 /// The connect timer is cancelled at assignment, not merely ignored when it
-/// fires (5.2 review gap): the shard holds no timer for it any more.
+/// fires (5.2 review gap): the shard holds no timer for it any more — the
+/// only one left is the idle sweep of the pooled conn (§7.7).
 #[test]
 fn connect_timer_gone_from_shard_at_assignment() {
     let mut oh = oh();
     let (_, tcp, _, _) = tls_h1(&mut oh, get("https://localhost/"));
     assert!(!oh.closed(tcp));
-    assert_eq!(oh.sh.next_timeout(), None);
+    assert_eq!(oh.sh.next_timeout(), Some(oh.now + cfg().sweep));
 }
 
 /// A dirty-forever task never starves the shard: each pump stops at the cap
