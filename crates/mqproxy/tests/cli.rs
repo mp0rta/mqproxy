@@ -269,17 +269,25 @@ fn no_gateway_disables_h3_and_warns_masquerade_and_metrics() {
     assert_eq!(server(&r).config.gateway, None);
     assert!(!cli::wants_h3(&r));
     assert!(r.startup_lines.is_empty(), "{:?}", r.startup_lines);
+    // C's order: request-metrics, cache, masquerade.
     let r = parse(
         SERVER,
-        &["--no-gateway", "--masquerade", "--request-metrics"],
+        &[
+            "--masquerade",
+            "--cache-max-bytes",
+            "1",
+            "--no-gateway",
+            "--request-metrics",
+        ],
     )
     .unwrap();
     assert_eq!(server(&r).config.gateway, None);
     assert_eq!(
         r.warnings,
         vec![
-            "--masquerade has no effect with --no-gateway (masquerade is gateway-only); ignoring",
             "--request-metrics has no effect with --no-gateway (request metrics are gateway-only); ignoring",
+            "--cache-max-bytes ([Gateway] CacheMaxBytes) is ignored: the origin response cache was removed",
+            "--masquerade has no effect with --no-gateway (masquerade is gateway-only); ignoring",
         ]
     );
 }
@@ -316,6 +324,20 @@ fn client_gateway_counts_as_ingress() {
         assert!(
             client(&cli::parse(&argv).unwrap()).config.has_tcp_ingress,
             "{extra:?}"
+        );
+    }
+    // C's validation order: server, socks5, http-connect, gateway, tproxy.
+    for (extra, first) in [
+        (&["--server", "x", "--socks5", "y"][..], "--server"),
+        (&["--socks5", "x", "--gateway", "y"], "--socks5"),
+        (&["--http-connect", "x", "--gateway", "y"], "--http-connect"),
+        (&["--gateway", "x", "--tproxy", "y"], "--gateway"),
+    ] {
+        let e = exit(parse(CLIENT, extra));
+        assert!(
+            e.message.contains(&format!("invalid {first} address")),
+            "{extra:?}: {}",
+            e.message
         );
     }
     let e = exit(parse(CLIENT, &["--gateway", "127.0.0.1"]));
@@ -772,6 +794,12 @@ fn help_lists_every_longopt() {
                 "{sub} --help lacks {flag}:\n{text}"
             );
         }
+        // C's wording now that the gateway conn exists.
+        let metrics = match sub {
+            "server" => "Logs the most-recently-accepted TCP and gateway conn",
+            _ => "Logs the proxy conn (and the gateway conn with --gateway)",
+        };
+        assert!(text.contains(metrics), "{sub}: {text}");
         let entry = |flag: &str| {
             let start = text
                 .find(&format!("  {flag} "))

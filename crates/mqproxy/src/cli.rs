@@ -142,7 +142,7 @@ struct ServerArgs {
     /// Multipath scheduler: minrtt (default) | backup | wlb.
     #[arg(long, value_name = "s", allow_hyphen_values = true)]
     scheduler: Option<String>,
-    /// Periodically log per-path stats (mq.conn/mq.path) every <sec>s (must be > 0; omit to disable). Logs the most-recently-accepted TCP conn.
+    /// Periodically log per-path stats (mq.conn/mq.path) every <sec>s (must be > 0; omit to disable). Logs the most-recently-accepted TCP and gateway conn.
     #[arg(long, value_name = "sec", allow_hyphen_values = true, value_parser = clap::value_parser!(u64).range(1..))]
     metrics_interval: Option<u64>,
     /// Emit one mq.req logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of --metrics-interval.
@@ -215,7 +215,7 @@ struct ClientArgs {
     /// Maximum reconnect back-off in seconds (default: 30; must be > 0).
     #[arg(long, value_name = "sec", allow_hyphen_values = true, value_parser = clap::value_parser!(u64).range(1..))]
     reconnect_max_backoff: Option<u64>,
-    /// Periodically log per-path stats (mq.conn/mq.path) every <sec>s (must be > 0; omit to disable). Logs the proxy conn.
+    /// Periodically log per-path stats (mq.conn/mq.path) every <sec>s (must be > 0; omit to disable). Logs the proxy conn (and the gateway conn with --gateway).
     #[arg(long, value_name = "sec", allow_hyphen_values = true, value_parser = clap::value_parser!(u64).range(1..))]
     metrics_interval: Option<u64>,
     /// Load settings from an INI file (CLI flags override file values).
@@ -309,28 +309,16 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
         request_metrics,
         ..GatewayConfig::default()
     });
-    if gateway.is_none() {
-        // C text: warned, ignored.
-        if masquerade {
-            warnings.push(
-                "--masquerade has no effect with --no-gateway (masquerade is gateway-only); ignoring"
-                    .into(),
-            );
-        }
-        if request_metrics {
-            warnings.push(
-                "--request-metrics has no effect with --no-gateway (request metrics are \
-                 gateway-only); ignoring"
-                    .into(),
-            );
-        }
+    // C's order: request-metrics, cache, masquerade; the gateway-only two are
+    // warned and ignored with the gateway off (C text).
+    let off = gateway.is_none();
+    if off && request_metrics {
+        warnings.push(
+            "--request-metrics has no effect with --no-gateway (request metrics are \
+             gateway-only); ignoring"
+                .into(),
+        );
     }
-    let startup_lines = match gateway {
-        Some(_) => vec![format!(
-            "mq_origin: hyper {HYPER_VERSION} + rustls (HTTP3=no)"
-        )],
-        None => Vec::new(),
-    };
     // Warning, ignored: the feature was removed.
     if a.cache_max_bytes.or(f.cache_max_bytes).is_some() {
         warnings.push(
@@ -338,6 +326,18 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
                 .into(),
         );
     }
+    if off && masquerade {
+        warnings.push(
+            "--masquerade has no effect with --no-gateway (masquerade is gateway-only); ignoring"
+                .into(),
+        );
+    }
+    let startup_lines = match gateway {
+        Some(_) => vec![format!(
+            "mq_origin: hyper {HYPER_VERSION} + rustls (HTTP3=no)"
+        )],
+        None => Vec::new(),
+    };
     let cc = cc(a.cc.or(f.cc).as_deref())?;
     let scheduler = scheduler(a.scheduler.or(f.scheduler).as_deref())?;
     let listen = a.listen.or(f.listen).ok_or("missing required --listen")?;
@@ -430,10 +430,16 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
             ka
         ));
     }
+    // C's validation order: server, socks5, http-connect, gateway, tproxy.
+    let server = ip_port("--server", &server)?;
+    let socks5 = opt("--socks5", socks5)?;
+    let http_connect = opt("--http-connect", http_connect)?;
+    let gateway = opt("--gateway", gateway)?;
+    let tproxy = opt("--tproxy", tproxy)?;
     Ok(Resolved {
         mode: Mode::Client(Client {
             config: ClientConfig {
-                server: ip_port("--server", &server)?,
+                server,
                 paths,
                 scheduler,
                 keepalive_idle,
@@ -450,13 +456,13 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
                         .unwrap_or(30),
                 ),
                 metrics_interval: metrics_interval(a.metrics_interval, f.metrics_interval),
-                gateway: opt("--gateway", gateway)?,
+                gateway,
                 has_tcp_ingress,
                 ..ClientConfig::default()
             },
-            socks5: opt("--socks5", socks5)?,
-            http_connect: opt("--http-connect", http_connect)?,
-            tproxy: opt("--tproxy", tproxy)?,
+            socks5,
+            http_connect,
+            tproxy,
             tproxy_mode,
             // C defaults: fwmark 1, table 100, dport 443, uid = geteuid().
             tproxy_fwmark: a.tproxy_fwmark.or(f.tproxy_fwmark).unwrap_or(1),

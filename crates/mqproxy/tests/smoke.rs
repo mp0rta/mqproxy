@@ -98,8 +98,41 @@ fn origin_ca_unreadable_exits_1_with_message() {
         own(&p.lines),
         vec![
             "[ERROR] failed to create HTTP gateway server \
+             (origin_ca=/nonexistent/origin-ca.pem, connect_timeout=10s) \
              (cannot read origin CA /nonexistent/origin-ca.pem)"
         ]
+    );
+}
+
+/// C order: the tproxy listener is bound before the fetch listener.
+#[test]
+fn client_binds_tproxy_before_fetch_listener() {
+    let (tp, gw) = (
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+    );
+    let (tp, gw) = (
+        tp.local_addr().unwrap().to_string(),
+        gw.local_addr().unwrap().to_string(),
+    );
+    let server = format!("127.0.0.1:{}", free_udp());
+    let mut p = Proc::spawn(&[
+        "client",
+        "--server",
+        &server,
+        "--token",
+        "t",
+        "--gateway",
+        &gw,
+        "--tproxy",
+        &tp,
+    ]);
+    assert_eq!(p.wait_exit(), 1, "{:#?}", p.lines);
+    let err = own(&p.lines);
+    assert_eq!(err.len(), 1, "{err:#?}");
+    assert!(
+        err[0].starts_with(&format!("[ERROR] failed to bind tproxy listener on {tp} (")),
+        "{err:#?}"
     );
 }
 

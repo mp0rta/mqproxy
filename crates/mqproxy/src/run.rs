@@ -160,8 +160,14 @@ fn run_server(r: &Resolved, s: &ServerArgs) -> Result<i32, String> {
     // spec §7.8: the origin TLS config; no usable roots is a startup error.
     let app = match &s.config.gateway {
         Some(g) => {
-            let tls = build_client_config(g.origin_ca.as_deref(), &native_roots)
-                .map_err(|e| format!("failed to create HTTP gateway server ({e})"))?;
+            let tls = build_client_config(g.origin_ca.as_deref(), &native_roots).map_err(|e| {
+                // C's line, plus the cause (as the transport's).
+                let ca = g.origin_ca.as_deref().map_or("(system)".into(), |p| p.display().to_string());
+                format!(
+                    "failed to create HTTP gateway server (origin_ca={ca}, connect_timeout={}s) ({e})",
+                    g.origin_connect_timeout.as_secs()
+                )
+            })?;
             Server::with_gateway(s.config.clone(), tls)
         }
         None => Server::new(s.config.clone()),
@@ -215,7 +221,6 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
         opts: Rc::default(),
         uninstall: setup_redirect::uninstall,
     };
-    // C's order: socks5, http-connect, gateway, then tproxy.
     let plain = [
         (c.socks5, client::SOCKS5, "SOCKS5", "socks5"),
         (
@@ -224,7 +229,6 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
             "HTTP CONNECT",
             "http-connect",
         ),
-        (c.config.gateway, client::FETCH, "gateway fetch", "gateway"),
     ];
     for (addr, tag, what, key) in plain {
         let Some(addr) = addr else { continue };
@@ -234,6 +238,9 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
         d.attach_listener(l, shard.add_listener(tag));
         ingress += &format!(" {key}={addr}");
     }
+    // C binds tproxy (and installs its rules) before the fetch listener, but
+    // logs the ingress list as socks5, http-connect, gateway, tproxy.
+    let mut tproxy = String::new();
     if let Some(addr) = c.tproxy {
         let l = d
             .listen(addr, c.tproxy_mode)
@@ -245,7 +252,7 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
         } else {
             "redirect"
         };
-        ingress += &format!(" tproxy={}:{port}({mode})", addr.ip());
+        tproxy = format!(" tproxy={}:{port}({mode})", addr.ip());
         if c.setup_redirect {
             let o = setup_redirect::Opts {
                 mode: c.tproxy_mode,
@@ -264,6 +271,14 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
             d.on_shutdown(move || Rules::remove(&hook, f));
         }
     }
+    if let Some(addr) = c.config.gateway {
+        let l = d
+            .listen(addr, ListenKind::Plain)
+            .map_err(|e| format!("failed to bind gateway fetch listener on {addr} ({e})"))?;
+        d.attach_listener(l, shard.add_listener(client::FETCH));
+        ingress += &format!(" gateway={addr}");
+    }
+    ingress += &tproxy;
     ready(
         r,
         format!(
