@@ -305,6 +305,58 @@ pub(crate) fn on_h3_request_close(
     inner.events.push(Event::H3Closed(req_id(s), close));
 }
 
+/// spec §3.3 close row: a client request whose fin the app has not consumed is drained before
+/// the release; `Some(read_flags)` then.
+fn rescue_flags(inner: &Inner, s: SlotId) -> Option<u8> {
+    if inner.cfg.role != Role::Client {
+        return None;
+    }
+    inner
+        .h3reqs
+        .get(s)
+        .filter(|r| !r.fin_consumed)
+        .map(|r| r.read_flags)
+}
+
+/// spec §3.7: drains the pending header section (when `header`) and the whole body; `Some` only
+/// when the drain ends with xquic's fin — a partial body is never rescued.
+///
+/// # Safety
+/// `h3r` is the request inside its close notification (intact until it returns).
+unsafe fn drain_unread(h3r: *mut xqc_h3_request_t, header: bool) -> Option<Unread> {
+    let headers = if header {
+        let mut fin = 0u8; // xquic logs it before writing it
+        // SAFETY: guaranteed by the caller.
+        let hs = unsafe { xqc_h3_request_recv_headers(h3r, &mut fin) };
+        if hs.is_null() {
+            return None;
+        }
+        let mut v = Vec::new();
+        // SAFETY: the section just returned, unchanged for this call.
+        unsafe { crate::h3::for_each_header(hs, &mut |n, x| v.push((n.to_vec(), x.to_vec()))) };
+        Some(v)
+    } else {
+        None
+    };
+    const CHUNK: usize = 64 * 1024;
+    let mut body = Vec::new();
+    loop {
+        let len = body.len();
+        body.resize(len + CHUNK, 0);
+        let mut fin = 0u8;
+        // SAFETY: guaranteed by the caller; `CHUNK` writable bytes at `len`.
+        let n =
+            unsafe { xqc_h3_request_recv_body(h3r, body.as_mut_ptr().add(len), CHUNK, &mut fin) };
+        if n < 0 {
+            return None; // EAGAIN: no fin behind the buffered body
+        }
+        body.truncate(len + n as usize);
+        if fin != 0 {
+            return Some(Unread { headers, body });
+        }
+    }
+}
+
 /// spec §3.1: the fields C's call site reads; `close_msg` copied up to 64 bytes.
 ///
 /// # Safety
@@ -666,7 +718,10 @@ pub(super) unsafe extern "C" fn h3_request_close_notify(
     // SAFETY: the request is intact for the duration of its close notification (spec §3.7);
     // xquic's close messages are static strings.
     let stats = unsafe { h3_stats(&xqc_h3_request_get_stats(h3r)) };
-    with_inner((), |i| on_h3_request_close(i, s, stats, None));
+    let unread = with_inner(None, |i| rescue_flags(i, s))
+        // SAFETY: as above; the drain calls getters that fire no notification.
+        .and_then(|flags| unsafe { drain_unread(h3r, flags & READ_HEADER != 0) });
+    with_inner((), |i| on_h3_request_close(i, s, stats, unread));
     0
 }
 

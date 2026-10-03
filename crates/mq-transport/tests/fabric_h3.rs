@@ -484,3 +484,147 @@ fn h3_empty_fin_is_zero_true() {
     assert_eq!(readables(&p.cev[before..], cr), 1, "{:?}", p.cev);
     assert_eq!(recv_body(&p.client, p.now, cr), Ok((Vec::new(), true)));
 }
+
+// ── H3Closed stats and the client-side unread rescue (spec §3.3 close row, §3.5, §3.7) ──
+
+/// The server's response `RESP` + `body` (+ fin), the client reading nothing.
+fn respond(p: &mut Pair, body: &'static [u8], fin: bool) -> (H3ReqId, H3ReqId) {
+    let cr = open_req(p);
+    send_headers(&p.client, p.now, cr, REQ, true).unwrap();
+    p.tick(Duration::ZERO);
+    let sr = server_req(p);
+    recv_headers(&p.server, p.now, sr).unwrap();
+    send_headers(&p.server, p.now, sr, RESP, body.is_empty() && fin).unwrap();
+    if !body.is_empty() {
+        assert_eq!(send_body(&p.server, p.now, sr, body, fin), Ok(body.len()));
+    }
+    p.tick(Duration::ZERO);
+    (cr, sr)
+}
+
+/// Follows timeouts until `side`'s events hold `r`'s `H3Closed`.
+fn wait_one(p: &mut Pair, client: bool, r: H3ReqId) -> H3Close {
+    for _ in 0..2000 {
+        if let Some(c) = h3_closed(if client { &p.cev } else { &p.sev }, r) {
+            return c;
+        }
+        if !p.follow_timeout() {
+            p.tick(10 * MS);
+        }
+    }
+    panic!("H3Closed never arrived: {:?} / {:?}", p.cev, p.sev);
+}
+
+#[test]
+fn h3_closed_carries_stats_before_drain() {
+    const BODY: &[u8] = &[7u8; 100];
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let (cr, sr) = respond(&mut p, BODY, true);
+    let (c, _) = wait_closed(&mut p, cr, sr); // past the 3 × PTO close timer
+    assert_eq!(c.stats.recv_body, 0, "stats read before the drain: {c:?}");
+    assert_eq!(c.stats.stream_err, 0);
+    let u = c.unread.expect("a complete unread response is rescued");
+    assert_eq!(u.body, BODY);
+    let hs: Vec<_> = u
+        .headers
+        .expect("never read")
+        .into_iter()
+        .map(|(n, v)| (String::from_utf8(n).unwrap(), String::from_utf8(v).unwrap()))
+        .collect();
+    assert_eq!(hs, owned(RESP));
+}
+
+#[test]
+fn h3_unread_none_on_reset() {
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let (cr, sr) = respond(&mut p, b"partial", false);
+    p.server.call(p.now, move |t, now| t.h3_reset(now, sr));
+    let c = wait_one(&mut p, true, cr);
+    assert_eq!(c.unread, None, "{c:?}");
+    assert_ne!(c.stats.stream_err, 0, "{c:?}");
+}
+
+#[test]
+fn h3_unread_none_on_conn_close_code_0() {
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let (cr, _) = respond(&mut p, b"partial", false);
+    let sc = p.srv_conn;
+    p.server.call(p.now, move |t, now| t.close_conn(now, sc));
+    let c = wait_one(&mut p, true, cr);
+    assert_eq!(c.unread, None, "{c:?}");
+}
+
+#[test]
+fn h3_unread_headers_when_never_read() {
+    // (a) A header-only response (fin on HEADERS) the client never read.
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let (cr, _) = respond(&mut p, b"", true);
+    let u = wait_one(&mut p, true, cr).unread.expect("rescued");
+    assert_eq!(u.headers.map(|h| h.len()), Some(RESP.len()));
+    assert!(u.body.is_empty());
+
+    // (b) Headers read, body not: only the body is rescued.
+    p.sev.clear();
+    let (cr, _) = respond(&mut p, b"tail", true);
+    assert_eq!(recv_headers(&p.client, p.now, cr), Ok((owned(RESP), false)));
+    let u = wait_one(&mut p, true, cr).unread.expect("rescued");
+    assert_eq!(u.headers, None);
+    assert_eq!(u.body, b"tail");
+}
+
+#[test]
+fn h3_server_never_rescues() {
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let cr = open_req(&p);
+    send_headers(&p.client, p.now, cr, REQ, false).unwrap();
+    assert_eq!(send_body(&p.client, p.now, cr, b"unread", true), Ok(6));
+    p.tick(Duration::ZERO);
+    let sr = server_req(&p);
+    // The server answers without reading anything of the request.
+    send_headers(&p.server, p.now, sr, RESP, true).unwrap();
+    p.tick(Duration::ZERO);
+    let (_, s) = wait_closed(&mut p, cr, sr);
+    assert_eq!(s.unread, None, "{s:?}");
+    assert_eq!(s.stats.stream_err, 0, "{s:?}");
+}
+
+#[test]
+fn h3_idle_timeout_mid_response_aborts() {
+    let idle = Duration::from_secs(30);
+    let mut p = Pair::with(Opts {
+        idle: Some(idle),
+        ..h3_opts(ConnProto::H3)
+    });
+    let (cr, _) = respond(&mut p, b"partial", false);
+    p.lose = true; // the server goes silent mid-response
+    let start = p.now;
+    let c = wait_one(&mut p, true, cr);
+    assert!(p.client_closed().is_some(), "closed by the idle timeout");
+    assert!(p.now - start <= 2 * idle, "after {:?}", p.now - start);
+    assert_eq!(c.unread, None, "{c:?}");
+}
+
+#[test]
+fn h3_drop_transport_with_live_requests_is_clean() {
+    // (a) A local close with a request holding unread data: its `H3Closed` precedes
+    // `ConnClosed` and rescues nothing (no fin).
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let (cr, _) = respond(&mut p, b"partial", false);
+    let c = p.conn;
+    p.client.call(p.now, move |t, now| t.close_conn(now, c));
+    assert!(p.pump_until(10 * MS, 1000, |p| p.client_closed().is_some()));
+    let at = |e: &dyn Fn(&Event) -> bool| p.cev.iter().position(e);
+    let closed = at(&|e| matches!(e, Event::H3Closed(r, _) if *r == cr)).expect("H3Closed");
+    let conn = at(&|e| matches!(e, Event::ConnClosed(x, _) if *x == c)).expect("ConnClosed");
+    assert!(closed < conn, "{:?}", p.cev);
+    assert_eq!(h3_closed(&p.cev, cr).unwrap().unread, None);
+
+    // (b) Both transports dropped with open requests on both sides (one holding unread body):
+    // the close notifications fire inside the engine teardown, without a panic.
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    respond(&mut p, b"partial", false);
+    let cr = open_req(&p);
+    send_headers(&p.client, p.now, cr, REQ, false).unwrap();
+    p.tick(Duration::ZERO);
+    drop(p);
+}

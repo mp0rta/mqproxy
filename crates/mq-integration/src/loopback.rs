@@ -73,7 +73,9 @@ impl<S: Send + 'static, C: Send + 'static> LoopbackPair<S, C> {
 /// (`client.listen_addrs[0]`) and an HTTP CONNECT (`[1]`) listener.
 pub type LoopbackProxy = LoopbackPair<(), ()>;
 
-fn transport(role: Role) -> Transport {
+/// A real transport as the proxy runs it (test cert, ALPN "mqproxy-tcp/1", BBR/MinRtt); `h3`
+/// registers the H3 ctx.
+pub fn transport(role: Role, h3: bool) -> Transport {
     Transport::new(TransportConfig {
         role,
         alpn: "mqproxy-tcp/1",
@@ -81,12 +83,13 @@ fn transport(role: Role) -> Transport {
         scheduler: Scheduler::MinRtt,
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
-        h3: false,
+        h3,
     })
     .expect("transport")
 }
 
-fn cert(name: &str) -> PathBuf {
+/// `tests/certs/<name>`.
+pub fn cert(name: &str) -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/certs")).join(name)
 }
 
@@ -111,15 +114,18 @@ impl LoopbackProxy {
                 (ListenKind::Plain, HTTP_CONNECT),
             ],
             move |local| {
-                let t = transport(Role::Server {
-                    cert: cert("test.crt"),
-                    key: cert("test.key"),
-                });
+                let t = transport(
+                    Role::Server {
+                        cert: cert("test.crt"),
+                        key: cert("test.key"),
+                    },
+                    false,
+                );
                 (Shard::new(t, Server::new(server), local, 1), ())
             },
             move |local, server_udp| {
                 client.server = server_udp;
-                let t = transport(Role::Client);
+                let t = transport(Role::Client, false);
                 (Shard::new(t, Client::new(client), local, 2), ())
             },
         )

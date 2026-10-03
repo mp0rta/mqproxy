@@ -251,6 +251,7 @@ version = "0.0.4"
 name = "mq-integration"
 version = "0.0.4"
 dependencies = [
+ "log",
  "mq-integration",
  "mq-linux",
  "mq-proxy",
