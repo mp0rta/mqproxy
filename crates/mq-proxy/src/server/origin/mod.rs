@@ -7,19 +7,22 @@ mod events;
 mod exec;
 #[cfg(feature = "test-support")]
 pub mod host;
+mod key;
 mod pipe;
+pub mod tls;
 
 pub use body::{UploadBody, UploadBuf};
 pub use events::{Accepted, BridgeEvents};
 pub use exec::Dirty;
 use exec::ShardExec;
 use pipe::{HyperIo, PipeHandle};
+pub use tls::{TlsSetupError, build_client_config, install_ring, native_roots};
 
 use http::{Request, Response};
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
-use mq_http::headers::{HttpVer, Method};
-use mq_runtime::{Cx, DialError, DialOpId, TcpEnd, TcpId, TimerId};
+use mq_http::headers::{HttpVer, Method, status_from_curl};
+use mq_runtime::{Cx, DialError, DialOpId, Target, TcpEnd, TcpId, TimerId};
 use mq_transport_api::{H3ReqId, Time};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -29,6 +32,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 /// spec §8: the pinned hyper line (`hyper = "~1.10"`), for the startup log.
@@ -211,6 +215,16 @@ impl<T> Conns<T> {
             _ => None,
         }
     }
+
+    /// The live ids, a snapshot (the pump may remove conns while iterating).
+    fn ids(&self) -> Vec<OriginConnId> {
+        let live = self.0.iter().enumerate().filter(|(_, (_, c))| c.is_some());
+        live.map(|(i, (g, _))| OriginConnId {
+            index: i as u32,
+            generation: *g,
+        })
+        .collect()
+    }
 }
 
 impl<T> Default for Conns<T> {
@@ -246,7 +260,9 @@ enum Handshaked {
 
 #[allow(dead_code)] // Tasks 5.2–5.6c
 enum Driver {
-    Tls,
+    /// The TLS handshake runs through the socket; hyper's end of the pipe
+    /// waits here for the hyper handshake (§7.2 step 4).
+    Tls(HyperIo),
     Handshaking(Pin<Box<dyn Future<Output = hyper::Result<Handshaked>>>>),
     H1(Pin<Box<H1Conn>>),
     H2(Pin<Box<H2Conn>>),
@@ -297,6 +313,8 @@ enum OriginReq {
     Connecting {
         h3: H3ReqId,
         key: ConnKey,
+        /// Gives the ALPN list of the dial (§7.2 step 1).
+        ver: HttpVer,
         started_at: Time,
         /// `OriginTimer::Connect`, armed at the dial result.
         timer: Option<TimerId>,
@@ -394,7 +412,6 @@ impl Origin {
     }
 
     /// spec §7.7 "every removal": the conn's reads and writes fail from now on.
-    #[allow(dead_code)] // Tasks 5.4/5.5a
     fn mark_pipe_dead(&mut self, id: OriginConnId) {
         if let Some(c) = self.conns.get(id) {
             c.io.mark_dead();
@@ -408,42 +425,128 @@ impl Origin {
         Rc::new(RefCell::new(UploadBuf::new(cl, self.dirty.clone())))
     }
 
-    /// spec §7.2 (Task 5.2).
-    pub fn start(&mut self, _cx: &mut Cx<'_>, _req: StartReq) -> Result<(), StartErr> {
+    /// spec §7.2 steps 1 and 3 (the pool hit of step 2 is Task 5.5b). The
+    /// authority passes the bridge's split and `http::uri::Authority`, which
+    /// also rejects `"<>\^`, backtick, `{|}` and non-ASCII (§7.4, §12).
+    pub fn start(&mut self, cx: &mut Cx<'_>, req: StartReq) -> Result<(), StartErr> {
+        let (host, port) = key::split_authority(req.scheme, &req.authority)
+            .map_err(|()| StartErr::BadAuthority)?;
+        http::uri::Authority::try_from(req.authority.as_slice())
+            .map_err(|_| StartErr::BadAuthority)?;
+        let key = (req.scheme, key::host_key(&host), port);
+        let op = cx.dial(Target { host, port }, self.cfg.connect_timeout);
+        self.by_h3.insert(req.h3, Where::Dial(op));
+        let stored = StoredRequest {
+            method: req.method,
+            scheme: req.scheme,
+            authority: req.authority,
+            path: req.path,
+            headers: req.headers,
+            body: req.upload,
+        };
+        let rec = OriginReq::Connecting {
+            h3: req.h3,
+            key,
+            ver: req.ver,
+            started_at: cx.now(),
+            timer: None,
+            payload: ConnectingPayload::Stored(stored),
+            retried: false,
+        };
+        self.dials.insert(op, rec);
         Ok(())
     }
 
-    /// spec §7.3 (Tasks 5.2/5.4).
-    pub fn pump(&mut self, _cx: &mut Cx<'_>, _ev: &mut dyn BridgeEvents) {}
+    /// spec §7.3; this task drives the `Tls` and `Handshaking` drivers
+    /// (Task 5.4 adds the rest of the pump).
+    pub fn pump(&mut self, cx: &mut Cx<'_>, ev: &mut dyn BridgeEvents) {
+        let waker = Waker::from(self.dirty.clone());
+        let mut tcx = Context::from_waker(&waker);
+        for id in self.conns.ids() {
+            self.pump_tls(cx, id, ev);
+            self.poll_handshake(cx, id, &mut tcx, ev);
+        }
+    }
 
     /// The gateway drained a `Partial` frame: polling the body resumes (Task 5.5).
     pub fn resume(&mut self, _h3: H3ReqId) {}
 
-    /// `H3Closed` (§7.7 cancel; Task 5.5).
-    pub fn cancel(&mut self, _cx: &mut Cx<'_>, _h3: H3ReqId) {}
+    /// `H3Closed` (§7.7 cancel). While `Connecting` the record is dropped: a
+    /// pending dial is cancelled, a handshaking conn is removed as class D.
+    /// (`Assigned`: Task 5.5a.)
+    pub fn cancel(&mut self, cx: &mut Cx<'_>, h3: H3ReqId) {
+        match self.by_h3.get(&h3).copied() {
+            Some(Where::Dial(op)) => {
+                if let Some(rec) = self.dials.remove(&op) {
+                    self.drop_connecting(cx, rec);
+                    cx.cancel_dial(op);
+                }
+            }
+            Some(Where::Conn(id)) => {
+                let Some(c) = self.conns.get_mut(id) else {
+                    return;
+                };
+                if c.pending.as_ref().and_then(OriginReq::connecting_h3) == Some(h3) {
+                    let rec = c.pending.take().expect("checked");
+                    self.drop_connecting(cx, rec);
+                    self.remove(cx, id, Removal::D);
+                }
+            }
+            None => {}
+        }
+    }
 
     /// §7.7 shutdown (Task 5.6c).
     pub fn shutdown(&mut self, _cx: &mut Cx<'_>) {}
 
-    /// Returns whether `op` was the bridge's (Task 5.2).
+    /// Returns whether `op` was the bridge's (§7.2 steps 4–5).
     pub fn on_dial_result(
         &mut self,
-        _cx: &mut Cx<'_>,
-        _op: DialOpId,
-        _r: Result<TcpId, DialError>,
-        _ev: &mut dyn BridgeEvents,
+        cx: &mut Cx<'_>,
+        op: DialOpId,
+        r: Result<TcpId, DialError>,
+        ev: &mut dyn BridgeEvents,
     ) -> bool {
-        false
+        let Some(rec) = self.dials.remove(&op) else {
+            return false;
+        };
+        let https = rec.https();
+        match r {
+            Ok(tcp) => self.connected(cx, tcp, rec, ev),
+            // §6.2 step 9: the socket cap is 502 origin-start-failed.
+            Err(DialError::Limit) => {
+                let f = OriginFailure {
+                    curl: 0,
+                    status: 502,
+                    tls: TlsOutcome::Na,
+                    proto: None,
+                    upstream_protocol: false,
+                    start_failed: true,
+                    cause: "socket limit".into(),
+                };
+                self.fail(cx, rec, f, ev);
+            }
+            Err(e) => {
+                let curl = match e {
+                    DialError::Dns => 6,
+                    DialError::Timeout => 28,
+                    DialError::Refused | DialError::Other | DialError::Limit => 7,
+                };
+                let f = connect_failure(https, curl, format!("dial: {e:?}"));
+                self.fail(cx, rec, f, ev);
+            }
+        }
+        true
     }
 
-    /// Returns whether `tcp` was the bridge's (Task 5.2).
+    /// Returns whether `tcp` was the bridge's; the pump moves the bytes.
     pub fn on_tcp_data(
         &mut self,
         _cx: &mut Cx<'_>,
-        _tcp: TcpId,
+        tcp: TcpId,
         _ev: &mut dyn BridgeEvents,
     ) -> bool {
-        false
+        self.by_tcp.contains_key(&tcp)
     }
 
     /// Returns whether `tcp` was the bridge's (Task 5.4).
@@ -456,21 +559,385 @@ impl Origin {
         false
     }
 
-    /// Returns whether `tcp` was the bridge's (Task 5.2).
+    /// Returns whether `tcp` was the bridge's. `ReadEof` is published by the
+    /// pump once the buffered bytes were processed; a socket error during the
+    /// TLS handshake is `curl:35` at once (§7.3). After it: Task 5.4.
     pub fn on_tcp_end(
         &mut self,
-        _cx: &mut Cx<'_>,
-        _tcp: TcpId,
-        _end: TcpEnd,
-        _ev: &mut dyn BridgeEvents,
+        cx: &mut Cx<'_>,
+        tcp: TcpId,
+        end: TcpEnd,
+        ev: &mut dyn BridgeEvents,
     ) -> bool {
-        false
+        let Some(&id) = self.by_tcp.get(&tcp) else {
+            return false;
+        };
+        let c = self.conns.get_mut(id).expect("by_tcp names a live conn");
+        match end {
+            TcpEnd::ReadEof => c.tcp_eof = true,
+            TcpEnd::Error(k) if matches!(c.driver, Driver::Tls(_)) => {
+                let cause = format!("socket error during the TLS handshake: {k:?}");
+                self.fail_conn(cx, id, 35, cause, ev);
+            }
+            TcpEnd::Error(_) => {}
+        }
+        true
     }
 
-    /// false = not the bridge's timer (Tasks 5.2/5.4/5.6c).
-    pub fn on_timer(&mut self, _cx: &mut Cx<'_>, _id: TimerId, _ev: &mut dyn BridgeEvents) -> bool {
-        false
+    /// false = not the bridge's timer. `Connect` fires `curl:28` for a
+    /// requester still `Connecting` on its conn (§7.2 step 4).
+    pub fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId, ev: &mut dyn BridgeEvents) -> bool {
+        let Some(t) = self.timers.remove(&id) else {
+            return false;
+        };
+        if let OriginTimer::Connect(h3) = t
+            && let Some(&Where::Conn(conn)) = self.by_h3.get(&h3)
+            && let Some(c) = self.conns.get_mut(conn)
+            && let Some(OriginReq::Connecting { timer, .. }) = &mut c.pending
+            && *timer == Some(id)
+        {
+            *timer = None;
+            self.fail_conn(cx, conn, 28, "connect deadline".into(), ev);
+        }
+        true
     }
+
+    /// §7.2 step 4: the record moves to the new conn's `pending`; the
+    /// deadline timer covers the TLS and hyper handshakes.
+    fn connected(
+        &mut self,
+        cx: &mut Cx<'_>,
+        tcp: TcpId,
+        mut rec: OriginReq,
+        ev: &mut dyn BridgeEvents,
+    ) {
+        let OriginReq::Connecting {
+            h3,
+            key,
+            ver,
+            started_at,
+            timer,
+            ..
+        } = &mut rec
+        else {
+            unreachable!("dials hold Connecting records");
+        };
+        let (h3, key, started_at) = (*h3, key.clone(), *started_at);
+        let tls = if key.0 == Scheme::Https {
+            let Some(name) = key::server_name(&key.1) else {
+                cx.tcp_abort(tcp); // class E′, before the conn exists
+                let f = connect_failure(true, 6, format!("invalid server name {}", key.1));
+                return self.fail(cx, rec, f, ev);
+            };
+            let alpn = key::alpn_for(key.0, *ver).iter().map(|a| a.to_vec());
+            match rustls::ClientConnection::new_with_alpn(self.tls.clone(), name, alpn.collect()) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    cx.tcp_abort(tcp);
+                    return self.fail(cx, rec, connect_failure(true, 35, e.to_string()), ev);
+                }
+            }
+        } else {
+            None
+        };
+        cx.tcp_set_rx_limit(tcp, PIPE_CAP);
+        let t = cx.set_timer((started_at + self.cfg.connect_timeout) - cx.now());
+        self.timers.insert(t, OriginTimer::Connect(h3));
+        *timer = Some(t);
+        let plain = tls.is_none();
+        let (hyper_io, io) = pipe::pipe();
+        let id = self.conns.insert(|id| OriginConn {
+            id,
+            key: key.clone(),
+            tcp,
+            tls,
+            io,
+            proto: None,
+            driver: Driver::Tls(hyper_io),
+            send: None,
+            pending: Some(rec),
+            reqs: Vec::new(),
+            out: Vec::new(),
+            tcp_eof: false,
+            busy: false,
+            active: 0,
+            draining: false,
+            idle_since: None,
+            connect_ms: 0,
+            hold_public: false,
+        });
+        self.pool.entry(key).or_default().push(id);
+        self.by_tcp.insert(tcp, id);
+        self.by_h3.insert(h3, Where::Conn(id));
+        if plain {
+            // C used CONNECT_TIME_T: the TCP dial's duration.
+            self.begin_hyper(cx, id, OriginProto::H1);
+        }
+    }
+
+    /// The TLS handshake through the socket (§7.3 steps 1 and 3 while the
+    /// driver is `Tls`): `read_tls` only with bytes and `wants_read`,
+    /// `write_tls` on `wants_write`, then the hyper handshake.
+    fn pump_tls(&mut self, cx: &mut Cx<'_>, id: OriginConnId, ev: &mut dyn BridgeEvents) {
+        let Some(c) = self.conns.get_mut(id) else {
+            return;
+        };
+        let (Driver::Tls(_), Some(tls)) = (&c.driver, c.tls.as_mut()) else {
+            return;
+        };
+        let tcp = c.tcp;
+        let mut failed = None;
+        // A zero-byte `read_tls` would mark EOF inside rustls.
+        while tls.is_handshaking() && tls.wants_read() && !cx.tcp_rx(tcp).is_empty() {
+            let mut rx = cx.tcp_rx(tcp);
+            let Ok(n @ 1..) = tls.read_tls(&mut rx) else {
+                break;
+            };
+            cx.tcp_consume(tcp, n);
+            if let Err(e) = tls.process_new_packets() {
+                failed = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = failed {
+            let curl = match e {
+                rustls::Error::InvalidCertificate(_) => 60,
+                _ => 35,
+            };
+            return self.fail_conn(cx, id, curl, e.to_string(), ev);
+        }
+        while tls.wants_write() && tls.write_tls(&mut c.out).is_ok() {}
+        flush_out(cx, tcp, &mut c.out);
+        if !tls.is_handshaking() {
+            let proto = match tls.alpn_protocol() {
+                Some(b"h2") => OriginProto::H2,
+                _ => OriginProto::H1,
+            };
+            self.begin_hyper(cx, id, proto);
+        } else if c.tcp_eof && cx.tcp_rx(tcp).is_empty() {
+            let cause = "EOF during the TLS handshake".to_string();
+            self.fail_conn(cx, id, 35, cause, ev);
+        }
+    }
+
+    /// `Tls` → `Handshaking`: `connect_ms` is taken now and hyper gets its
+    /// end of the pipe, with the §7.2 builder settings.
+    fn begin_hyper(&mut self, cx: &mut Cx<'_>, id: OriginConnId, proto: OriginProto) {
+        let exec = self.exec.clone();
+        let c = self.conns.get_mut(id).expect("live conn");
+        let Driver::Tls(io) = std::mem::replace(&mut c.driver, Driver::Completed) else {
+            unreachable!("begin_hyper runs once, from Tls");
+        };
+        if let Some(OriginReq::Connecting { started_at, .. }) = &c.pending {
+            c.connect_ms = (cx.now() - *started_at).as_millis() as i64;
+        }
+        c.proto = Some(proto);
+        c.driver = Driver::Handshaking(match proto {
+            OriginProto::H1 => Box::pin(async move {
+                let (send, conn) = http1::Builder::new()
+                    .max_buf_size(64 * 1024)
+                    .max_headers(256)
+                    .handshake(io)
+                    .await?;
+                Ok(Handshaked::H1(send, Box::pin(conn)))
+            }),
+            OriginProto::H2 => Box::pin(async move {
+                let (send, conn) = http2::Builder::new(exec)
+                    .max_header_list_size(128 * 1024)
+                    .handshake(io)
+                    .await?;
+                Ok(Handshaked::H2(send, Box::pin(conn)))
+            }),
+        });
+    }
+
+    /// Polls a `Handshaking` future: done → `H1`/`H2` + `send`, and the
+    /// requester is `Assigned` (the request is sent by Task 5.4); `Err` →
+    /// `curl:56`, class E′.
+    fn poll_handshake(
+        &mut self,
+        cx: &mut Cx<'_>,
+        id: OriginConnId,
+        tcx: &mut Context<'_>,
+        ev: &mut dyn BridgeEvents,
+    ) {
+        let Some(c) = self.conns.get_mut(id) else {
+            return;
+        };
+        let Driver::Handshaking(fut) = &mut c.driver else {
+            return;
+        };
+        match fut.as_mut().poll(tcx) {
+            Poll::Pending => {}
+            Poll::Ready(Err(e)) => self.fail_conn(cx, id, 56, e.to_string(), ev),
+            Poll::Ready(Ok(hs)) => {
+                (c.driver, c.send) = match hs {
+                    Handshaked::H1(s, conn) => (Driver::H1(conn), Some(Sender::H1(s))),
+                    Handshaked::H2(s, conn) => (Driver::H2(conn), Some(Sender::H2(s))),
+                };
+                self.assign(cx, id);
+            }
+        }
+    }
+
+    /// §7.7: the conn's `pending` requester → `Assigned`; `Tm::OriginConnect`
+    /// is cancelled.
+    fn assign(&mut self, cx: &mut Cx<'_>, id: OriginConnId) {
+        let c = self.conns.get_mut(id).expect("live conn");
+        let Some(OriginReq::Connecting {
+            h3,
+            timer,
+            payload,
+            retried,
+            ..
+        }) = c.pending.take()
+        else {
+            return;
+        };
+        if let Some(t) = timer {
+            cx.cancel_timer(t);
+            self.timers.remove(&t);
+        }
+        let ConnectingPayload::Stored(stored) = payload else {
+            unreachable!("Ready is the h1 retry's payload (Task 5.5b)");
+        };
+        match c.proto {
+            Some(OriginProto::H2) => c.active += 1,
+            _ => c.busy = true,
+        }
+        c.idle_since = None;
+        c.reqs.push(OriginReq::Assigned {
+            h3,
+            fut: None,
+            body: None,
+            upload: stored.body.clone(),
+            stored: Some(stored),
+            head_seen: false,
+            reused: false,
+            retried,
+        });
+    }
+
+    /// A `Connecting` record leaves the bridge: its deadline timer and
+    /// `by_h3` entry go with it.
+    fn drop_connecting(&mut self, cx: &mut Cx<'_>, rec: OriginReq) -> Option<H3ReqId> {
+        let OriginReq::Connecting { h3, timer, .. } = rec else {
+            return None;
+        };
+        if let Some(t) = timer {
+            cx.cancel_timer(t);
+            self.timers.remove(&t);
+        }
+        self.by_h3.remove(&h3);
+        Some(h3)
+    }
+
+    /// A `Connecting` failure (§7.7): the record is dropped with `f`.
+    fn fail(
+        &mut self,
+        cx: &mut Cx<'_>,
+        rec: OriginReq,
+        f: OriginFailure,
+        ev: &mut dyn BridgeEvents,
+    ) {
+        if let Some(h3) = self.drop_connecting(cx, rec) {
+            ev.on_failure(cx, h3, f, false);
+        }
+    }
+
+    /// A `Connecting` failure on a conn: class E′, then the requester fails.
+    fn fail_conn(
+        &mut self,
+        cx: &mut Cx<'_>,
+        id: OriginConnId,
+        curl: u32,
+        cause: String,
+        ev: &mut dyn BridgeEvents,
+    ) {
+        let Some(c) = self.conns.get_mut(id) else {
+            return;
+        };
+        let https = c.key.0 == Scheme::Https;
+        let rec = c.pending.take();
+        self.remove(cx, id, Removal::EPrime);
+        if let Some(rec) = rec {
+            self.fail(cx, rec, connect_failure(https, curl, cause), ev);
+        }
+    }
+
+    /// §7.7 "every removal": the pipe is marked dead before the conn leaves
+    /// the table, `by_tcp` and `pool` forget it, then the class's socket
+    /// action. (Tasks 5.4/5.5a add the other classes and `closing`.)
+    fn remove(&mut self, cx: &mut Cx<'_>, id: OriginConnId, class: Removal) {
+        self.mark_pipe_dead(id);
+        let Some(c) = self.conns.remove(id) else {
+            return;
+        };
+        self.by_tcp.remove(&c.tcp);
+        if let Some(v) = self.pool.get_mut(&c.key) {
+            v.retain(|&x| x != id);
+            if v.is_empty() {
+                self.pool.remove(&c.key);
+            }
+        }
+        match class {
+            Removal::D | Removal::EPrime => cx.tcp_abort(c.tcp),
+        }
+    }
+}
+
+/// The §7.7 removal classes this task produces.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Removal {
+    /// The `pending` requester was cancelled during `Tls`/`Handshaking`.
+    D,
+    /// A `Connecting` failure that already owns a socket.
+    EPrime,
+}
+
+impl OriginReq {
+    fn connecting_h3(&self) -> Option<H3ReqId> {
+        match self {
+            OriginReq::Connecting { h3, .. } => Some(*h3),
+            _ => None,
+        }
+    }
+
+    fn https(&self) -> bool {
+        matches!(self, OriginReq::Connecting { key, .. } if key.0 == Scheme::Https)
+    }
+}
+
+/// §7.6: a connect-phase failure; `origin_tls` = `verify_fail` for `curl:60`,
+/// `connect_fail` for https, `na` for http.
+fn connect_failure(https: bool, curl: u32, cause: String) -> OriginFailure {
+    let tls = match (curl, https) {
+        (60, _) => TlsOutcome::VerifyFail,
+        (_, true) => TlsOutcome::ConnectFail,
+        (_, false) => TlsOutcome::Na,
+    };
+    OriginFailure {
+        curl,
+        status: status_from_curl(curl),
+        tls,
+        proto: None,
+        upstream_protocol: false,
+        start_failed: false,
+        cause,
+    }
+}
+
+/// §7.3 step 3: `tcp_write` is all-or-nothing, so `out` goes in slices of
+/// ≤ `SLICE` until one does not fit; the rest waits for `on_tcp_writable`.
+fn flush_out(cx: &mut Cx<'_>, tcp: TcpId, out: &mut Vec<u8>) {
+    let mut sent = 0;
+    for chunk in out.chunks(SLICE) {
+        if cx.tcp_write(tcp, chunk).is_err() {
+            break;
+        }
+        sent += chunk.len();
+    }
+    out.drain(..sent);
 }
 
 /// A live record's state (test-support; an `Ended` record has no `h3`).
@@ -565,7 +1032,7 @@ impl Origin {
 mod tests {
     use super::*;
     use mq_runtime::testing::{RecordingApp, ScriptedTransport};
-    use mq_runtime::{Host, Shard, Target};
+    use mq_runtime::{Host, Shard};
     use std::net::{Ipv4Addr, SocketAddr};
 
     #[test]
@@ -617,14 +1084,15 @@ mod tests {
     }
 
     fn bare_conn(id: OriginConnId) -> OriginConn {
+        let (hyper_io, io) = pipe::pipe();
         OriginConn {
             id,
             key: (Scheme::Http, "o.test".into(), 80),
             tcp: some_tcp(),
             tls: None,
-            io: pipe::pipe().1,
+            io,
             proto: None,
-            driver: Driver::Tls,
+            driver: Driver::Tls(hyper_io),
             send: None,
             pending: None,
             reqs: Vec::new(),
@@ -653,6 +1121,94 @@ mod tests {
             !origin.pipe_dead(reused),
             "a reused slot is a different conn"
         );
+    }
+
+    fn start_req(origin: &Origin, authority: &str) -> StartReq {
+        StartReq {
+            h3: H3ReqId::from_slot(mq_transport_api::SlotId::new(0, 1)).unwrap(),
+            scheme: Scheme::Https,
+            authority: authority.as_bytes().to_vec(),
+            path: b"/".to_vec(),
+            method: mq_http::headers::parse_method(b"GET").unwrap(),
+            headers: Vec::new(),
+            ver: HttpVer::Default,
+            body: BodyKind::None,
+            upload: origin.new_upload(None),
+        }
+    }
+
+    #[test]
+    fn start_rejects_authority_http_refuses() {
+        let (t, _) = ScriptedTransport::new();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
+        let mut sh = Shard::new(t, RecordingApp::new().0, addr, 7);
+        let mut origin = test_origin();
+        sh.with_app(Time::from_micros(1), |_, cx| {
+            for a in ["a{b", "é.test"] {
+                assert!(
+                    mq_http::headers::uri_field_ok(a.as_bytes()),
+                    "{a}: the intake lets it through"
+                );
+                let req = start_req(&origin, a);
+                assert_eq!(origin.start(cx, req), Err(StartErr::BadAuthority), "{a}");
+            }
+            let req = start_req(&origin, "u@h");
+            assert_eq!(
+                origin.start(cx, req),
+                Err(StartErr::BadAuthority),
+                "userinfo"
+            );
+            let req = start_req(&origin, "o.test");
+            assert_eq!(origin.start(cx, req), Ok(()));
+        });
+        let dials = std::iter::from_fn(|| sh.poll_io_request())
+            .filter(|r| matches!(r, mq_runtime::IoRequest::Dial { .. }))
+            .count();
+        assert_eq!(dials, 1, "only the good authority dials");
+    }
+
+    /// 5.1b gap: callbacks for ids the bridge does not own are declined.
+    #[test]
+    fn foreign_ids_are_declined() {
+        let (t, _) = ScriptedTransport::new();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
+        let mut sh = Shard::new(t, RecordingApp::new().0, addr, 7);
+        let mut origin = test_origin();
+        let tcp = some_tcp();
+        let mut ev = NoEvents;
+        sh.with_app(Time::from_micros(1), |_, cx| {
+            let timer = cx.set_timer(Duration::from_secs(1));
+            let target = Target {
+                host: mq_runtime::Host::Ip(addr.ip()),
+                port: 80,
+            };
+            let op = cx.dial(target, Duration::from_secs(1));
+            assert!(!origin.on_dial_result(cx, op, Ok(tcp), &mut ev));
+            assert!(!origin.on_tcp_data(cx, tcp, &mut ev));
+            assert!(!origin.on_tcp_writable(cx, tcp, &mut ev));
+            assert!(!origin.on_tcp_end(cx, tcp, TcpEnd::ReadEof, &mut ev));
+            assert!(!origin.on_timer(cx, timer, &mut ev));
+        });
+    }
+
+    /// A sink no test here expects to be called.
+    struct NoEvents;
+    impl BridgeEvents for NoEvents {
+        fn on_response(&mut self, _: &mut Cx<'_>, _: H3ReqId, _: RelayHead) {
+            unreachable!()
+        }
+        fn on_body_frame(&mut self, _: &mut Cx<'_>, _: H3ReqId, _: &[u8]) -> Accepted {
+            unreachable!()
+        }
+        fn on_body_end(&mut self, _: &mut Cx<'_>, _: H3ReqId, _: Completion) {
+            unreachable!()
+        }
+        fn on_failure(&mut self, _: &mut Cx<'_>, _: H3ReqId, _: OriginFailure, _: bool) {
+            unreachable!()
+        }
+        fn want_h3(&mut self, _: &mut Cx<'_>, _: H3ReqId) {
+            unreachable!()
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod request;
 mod socks5;
 mod transparent;
 
+pub(crate) use http_connect::parse_host;
 pub use http_connect::{HttpConnectParser, http_error_reply, http_success_reply};
 pub use request::{INGRESS_CAP, Progress};
 pub use socks5::{
