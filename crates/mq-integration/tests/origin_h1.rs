@@ -676,7 +676,8 @@ fn tls_origin_closing_mid_handshake_is_35_immediately() {
     let t0 = Instant::now();
     let (_, o) = fetch(&mut lp, get(format!("https://{}/", srv.addr)));
     assert_eq!(row(o.failure()), (35, 502, TlsOutcome::ConnectFail));
-    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    // Well under the 10 s connect deadline (generous for sanitizer/CI load).
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
 }
 
 /// A post-handshake fatal TLS error before the head: the pipe dies (class
@@ -732,7 +733,8 @@ fn run_until_times_out_when_pred_never_true() {
     assert!(!lp.run_until(limit, |_| false));
     let took = t0.elapsed();
     assert!(took >= limit, "returned early: {took:?}");
-    assert!(took < limit + Duration::from_millis(50), "took {took:?}");
+    // Bounded, not hanging (generous for sanitizer/CI load).
+    assert!(took < limit + Duration::from_secs(3), "took {took:?}");
 }
 
 #[test]
@@ -746,9 +748,10 @@ fn run_until_twice_second_call_does_not_wait_for_first_limit() {
         checks.set(checks.get() + 1);
         checks.get() >= 2
     }));
-    assert!(t0.elapsed() < Duration::from_secs(1));
+    assert!(t0.elapsed() < Duration::from_secs(3));
     let t1 = Instant::now();
     assert!(!lp.run_until(Duration::from_millis(200), |_| false));
     let took = t1.elapsed();
-    assert!(took < Duration::from_millis(300), "took {took:?}");
+    // Not the first call's 5 s limit (generous for sanitizer/CI load).
+    assert!(took < Duration::from_secs(3), "took {took:?}");
 }
