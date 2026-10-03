@@ -25,10 +25,13 @@ pub(super) struct Paths {
     cands: Vec<(IpAddr, Cand)>,
     /// spec §6.2: under the `backup` scheduler paths are added as standby.
     standby: bool,
+    /// The log prefix: `mq_client` (raw tunnel) or `mq_gw_client` (gateway
+    /// tunnel), as C's two owners log (SP3 spec §5.7).
+    log: &'static str,
 }
 
 impl Paths {
-    pub(super) fn new(cfg: &ClientConfig) -> Paths {
+    pub(super) fn new(cfg: &ClientConfig, log: &'static str) -> Paths {
         Paths {
             cands: cfg
                 .paths
@@ -38,6 +41,7 @@ impl Paths {
                 .map(|ip| (*ip, Cand::NotStarted))
                 .collect(),
             standby: cfg.scheduler == Scheduler::Backup,
+            log,
         }
     }
 
@@ -69,7 +73,7 @@ impl Paths {
             }
             return;
         };
-        let ip = self.cands[i].0;
+        let (ip, log) = (self.cands[i].0, self.log);
         match (r, conn) {
             (Ok((sock, _)), Some(conn)) => self.add(cx, conn, i, sock),
             (Ok((sock, _)), None) => {
@@ -77,7 +81,7 @@ impl Paths {
                 self.cands[i].1 = Cand::NotStarted;
             }
             (Err(k), _) => {
-                log::warn!("mq_client: cannot open a UDP socket on {ip} for an extra path: {k}");
+                log::warn!("{log}: cannot open a UDP socket on {ip} for an extra path: {k}");
                 self.cands[i].1 = Cand::Failed;
             }
         }
@@ -89,16 +93,16 @@ impl Paths {
     }
 
     fn add(&mut self, cx: &mut Cx<'_>, conn: ConnId, i: usize, sock: UdpSocketId) {
-        let ip = self.cands[i].0;
+        let (ip, log) = (self.cands[i].0, self.log);
         self.cands[i].1 = match cx.add_path(conn, sock, self.standby) {
             Ok(p) => {
-                log::info!("mq_client: extra path up: bind {ip} -> path_id {}", p.0);
+                log::info!("{log}: extra path up: bind {ip} -> path_id {}", p.0);
                 Cand::Active
             }
             // xquic raises MpReady again when an id is available.
             Err(PathError::NoPathId) => Cand::SocketReady(sock),
             Err(e) => {
-                log::warn!("mq_client: failed to add extra path bind {ip} ({e})");
+                log::warn!("{log}: failed to add extra path bind {ip} ({e})");
                 cx.close_udp_socket(sock);
                 Cand::Failed
             }

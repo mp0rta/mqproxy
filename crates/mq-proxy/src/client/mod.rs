@@ -202,7 +202,7 @@ impl Client {
             reconnect: None,
             ingress: HashMap::new(),
             opens: HashMap::new(),
-            paths: Paths::new(&cfg),
+            paths: Paths::new(&cfg, "mq_client"),
             timers: HashMap::new(),
             udp: UdpAvail::Unknown,
             assocs: HashMap::new(),

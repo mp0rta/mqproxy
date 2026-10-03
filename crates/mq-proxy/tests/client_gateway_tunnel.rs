@@ -247,9 +247,9 @@ fn gateway_only_shutdown_exits_at_gateway_close() {
     assert_eq!(h.sh.exit_status(), Some(0));
 }
 
-#[test]
-fn mp_ready_and_udp_socket_route_to_gateway_paths() {
-    let a: IpAddr = "10.0.0.2".parse().unwrap();
+/// A client with one extra path whose gateway tunnel is established and got
+/// `MpReady`; returns the harness and the socket open it issued.
+fn gw_with_extra_path(a: IpAddr) -> (H, SocketOpId) {
     let mut h = H::new(ClientConfig {
         paths: vec!["10.0.0.1".parse().unwrap(), a],
         ..gw_cfg()
@@ -267,8 +267,26 @@ fn mp_ready_and_udp_socket_route_to_gateway_paths() {
         })
         .collect();
     assert_eq!(ops.iter().map(|o| o.1).collect::<Vec<_>>(), [a]);
-    h.sh.on_udp_socket(h.now, ops[0].0, Ok(SocketAddr::new(a, 40000)))
+    (h, ops[0].0)
+}
+
+#[test]
+fn mp_ready_and_udp_socket_route_to_gateway_paths() {
+    log_capture::install();
+    let a: IpAddr = "10.0.0.2".parse().unwrap();
+    let (mut h, op) = gw_with_extra_path(a);
+    let gw = h.gw_conn.unwrap();
+    log_capture::take();
+    h.sh.on_udp_socket(h.now, op, Ok(SocketAddr::new(a, 40000)))
         .unwrap();
+    // C `mq_gw_client.c`: the gateway tunnel's own prefix.
+    let lines = log_capture::take();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("INFO mq_gw_client: extra path up: bind 10.0.0.2 -> path_id ")),
+        "{lines:?}"
+    );
     assert!(h.log().contains(&Call::AddPath {
         conn: gw,
         standby: false
@@ -278,6 +296,26 @@ fn mp_ready_and_udp_socket_route_to_gateway_paths() {
             .iter()
             .any(|r| matches!(r, IoRequest::CloseUdpSocket { .. })),
         "the gateway kept the socket"
+    );
+}
+
+#[test]
+fn late_path_socket_after_shutdown_is_closed() {
+    let a: IpAddr = "10.0.0.2".parse().unwrap();
+    let (mut h, op) = gw_with_extra_path(a);
+    h.t.hold_conn_closed(true);
+    h.sh.on_shutdown_signal(h.now);
+    h.reqs();
+    h.sh.on_udp_socket(h.now, op, Ok(SocketAddr::new(a, 40000)))
+        .unwrap();
+    assert!(
+        !h.log().iter().any(|c| matches!(c, Call::AddPath { .. })),
+        "no add_path on the closing tunnel"
+    );
+    assert!(
+        h.reqs()
+            .iter()
+            .any(|r| matches!(r, IoRequest::CloseUdpSocket { .. }))
     );
 }
 

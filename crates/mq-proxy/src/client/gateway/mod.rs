@@ -60,7 +60,7 @@ impl Gateway {
                 conn: None,
                 up: false,
                 backoff: Backoff::new(cfg.reconnect_max_backoff),
-                paths: Paths::new(cfg),
+                paths: Paths::new(cfg, "mq_gw_client"),
                 reconnect: None,
             },
             reqs: HashMap::new(),
@@ -78,11 +78,16 @@ impl Gateway {
 
     /// SP3 spec §5.7: the one tunnel connection, when established (the seam for
     /// a future route/policy/pool, §1.2).
+    #[cfg_attr(
+        not(feature = "test-support"),
+        expect(dead_code, reason = "the head path (Task 4.2) calls it")
+    )]
     fn pick_conn(&self) -> Option<ConnId> {
         self.tunnel.conn.filter(|_| self.tunnel.up)
     }
 
     /// Test support: `pick_conn()`.
+    #[cfg(feature = "test-support")]
     pub fn tunnel_conn(&self) -> Option<ConnId> {
         self.pick_conn()
     }
@@ -209,7 +214,9 @@ impl Gateway {
         if !self.tunnel.paths.owns(op) {
             return false;
         }
-        self.tunnel.paths.on_udp_socket(cx, self.tunnel.conn, op, r);
+        // Not on a conn being closed at shutdown (as the raw tunnel's `closing`).
+        let conn = self.tunnel.conn.filter(|_| !self.shutting_down);
+        self.tunnel.paths.on_udp_socket(cx, conn, op, r);
         true
     }
 
