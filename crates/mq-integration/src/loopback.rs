@@ -4,15 +4,16 @@
 //! the local application and the origin with plain `std::net` sockets.
 
 use crate::driver_harness::DriverThread;
-use mq_proxy::client::{Client, HTTP_CONNECT, SOCKS5};
-use mq_proxy::config::{ClientConfig, ServerConfig};
+use mq_proxy::client::{Client, FETCH, HTTP_CONNECT, SOCKS5};
+use mq_proxy::config::{ClientConfig, GatewayConfig, ServerConfig};
 use mq_proxy::server::Server;
+use mq_proxy::server::origin::build_client_config;
 use mq_runtime::driver::{DriverConfig, StdResolver};
 use mq_runtime::{App, ListenKind, ListenerTag, Shard};
 use mq_transport::Transport;
 use mq_transport_api::{CongestionControl, Role, Scheduler, TransportConfig, TransportOps};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Both sides, already running. `S`/`C` are what the factories handed back.
@@ -137,5 +138,64 @@ impl LoopbackProxy {
 
     pub fn http_addr(&self) -> SocketAddr {
         self.client.listen_addrs[1]
+    }
+
+    /// The gateway pair (spec §5, §6): the fetch client against `Server::with_gateway`, H3
+    /// on both transports. The FETCH listener is the client's only listener (no TCP ingress,
+    /// so no raw tunnel); `origin_ca` is the bridge's only trust root. A `None` gateway in
+    /// either config is filled with a placeholder / `GatewayConfig::default()`.
+    pub fn spawn_gateway(
+        client: ClientConfig,
+        mut server: ServerConfig,
+        origin_ca: &Path,
+    ) -> LoopbackProxy {
+        server.gateway.get_or_insert_with(GatewayConfig::default);
+        let tls = build_client_config(Some(origin_ca), &Vec::new).expect("origin CA");
+        // `Server` holds `Rc`s: it is built on its driver thread.
+        Self::gateway_pair(client, move || Server::with_gateway(server, tls))
+    }
+
+    /// The fetch client of `spawn_gateway` against an arbitrary H3 server `App` (a
+    /// malformed peer).
+    pub fn spawn_gateway_against<A: App + Send + 'static>(
+        client: ClientConfig,
+        server_app: A,
+    ) -> LoopbackProxy {
+        Self::gateway_pair(client, move || server_app)
+    }
+
+    fn gateway_pair<A: App + 'static>(
+        mut client: ClientConfig,
+        server_app: impl FnOnce() -> A + Send + 'static,
+    ) -> LoopbackProxy {
+        // The bound address is what `fetch_addr` reports; `Client::new` only needs `Some`.
+        client
+            .gateway
+            .get_or_insert(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+        client.has_tcp_ingress = false;
+        let lo = Ipv4Addr::LOCALHOST.into();
+        LoopbackPair::spawn(
+            (lo, lo),
+            vec![(ListenKind::Plain, FETCH)],
+            move |local| {
+                let t = transport(
+                    Role::Server {
+                        cert: cert("test.crt"),
+                        key: cert("test.key"),
+                    },
+                    true,
+                );
+                (Shard::new(t, server_app(), local, 1), ())
+            },
+            move |local, server_udp| {
+                client.server = server_udp;
+                let t = transport(Role::Client, true);
+                (Shard::new(t, Client::new(client), local, 2), ())
+            },
+        )
+    }
+
+    pub fn fetch_addr(&self) -> SocketAddr {
+        self.client.listen_addrs[0]
     }
 }

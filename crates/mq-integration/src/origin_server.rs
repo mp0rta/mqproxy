@@ -364,6 +364,10 @@ fn serve(l: TcpListener, mode: OriginServerMode, sh: Arc<Shared>) {
                 r = l.accept() => match r {
                     Ok((tcp, _)) => {
                         sh.accepted.fetch_add(1, Ordering::SeqCst);
+                        // Nagle would hold a small write behind the bridge's delayed ACK
+                        // (40 ms), past `ClTooShort`'s 10 ms gate: the head would then
+                        // reach the bridge in one segment with the reset.
+                        let _ = tcp.set_nodelay(true);
                         tcp
                     }
                     Err(_) => continue,
