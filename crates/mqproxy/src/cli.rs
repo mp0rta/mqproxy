@@ -4,7 +4,8 @@
 use crate::config::{self, FileConfig};
 use clap::error::ErrorKind;
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
-use mq_proxy::config::{ClientConfig, ServerConfig};
+use mq_proxy::config::{ClientConfig, GatewayConfig, ServerConfig};
+use mq_proxy::server::origin::HYPER_VERSION;
 use mq_proxy::udp::DEFAULT_IDLE;
 use mq_runtime::ListenKind;
 use mq_transport_api::{CongestionControl, Scheduler};
@@ -36,7 +37,7 @@ pub struct Resolved {
     pub scheduler: Scheduler,
     /// To log as warnings at startup.
     pub warnings: Vec<String>,
-    /// To log as info at startup (the server's "gateway off" line).
+    /// To log as info at startup (the server's `mq_origin:` line).
     pub startup_lines: Vec<String>,
 }
 
@@ -120,10 +121,10 @@ struct ServerArgs {
     /// TLS private key (PEM) (required).
     #[arg(long, value_name = "path", allow_hyphen_values = true)]
     key: Option<String>,
-    /// (not available in this build) CA bundle (PEM) used to verify origin TLS for the HTTP gateway. Defaults to the system trust store.
+    /// CA bundle (PEM) used to verify origin TLS for the HTTP gateway. Defaults to the system trust store.
     #[arg(long, value_name = "pem", allow_hyphen_values = true)]
     origin_ca: Option<String>,
-    /// (accepted, no effect: the gateway is off in this build) Disable the HTTP gateway origin bridge (enabled by default; the server still serves the TCP-proxy core).
+    /// Disable the HTTP gateway origin bridge (enabled by default; the server still serves the TCP-proxy core).
     #[arg(long)]
     no_gateway: bool,
     /// Idle timeout for UDP relay sessions in seconds (default: 60; must be > 0).
@@ -144,10 +145,10 @@ struct ServerArgs {
     /// Periodically log per-path stats (mq.conn/mq.path) every <sec>s (must be > 0; omit to disable). Logs the most-recently-accepted TCP conn.
     #[arg(long, value_name = "sec", allow_hyphen_values = true, value_parser = clap::value_parser!(u64).range(1..))]
     metrics_interval: Option<u64>,
-    /// (not available in this build) Emit one mq.req logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of --metrics-interval.
+    /// Emit one mq.req logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of --metrics-interval.
     #[arg(long)]
     request_metrics: bool,
-    /// (not available in this build) Answer unauthenticated requests with a bare 404 (hides mqproxy from probes; gateway only).
+    /// Answer unauthenticated requests with a bare 404 (hides mqproxy from probes; gateway only).
     #[arg(long)]
     masquerade: bool,
     /// (ignored with a warning: the response cache was removed) In-memory origin response cache bounded to N bytes (0 = off = default).
@@ -166,7 +167,7 @@ struct ServerArgs {
     infer_long_args = true,
     disable_help_flag = true,
     args_override_self = true,
-    after_help = "At least one ingress is required: --socks5, --http-connect, or --tproxy."
+    after_help = "At least one ingress is required: --socks5, --http-connect, --gateway, or --tproxy."
 )]
 struct ClientArgs {
     /// Show this help and exit.
@@ -184,7 +185,7 @@ struct ClientArgs {
     /// Local TCP address for the HTTP CONNECT ingress.
     #[arg(long, value_name = "ip:port", allow_hyphen_values = true)]
     http_connect: Option<String>,
-    /// (not available in this build) Local TCP address for the HTTP gateway fetch ingress (POST /_mqproxy/fetch over its own H3 tunnel; independent of the SOCKS5/CONNECT core).
+    /// Local TCP address for the HTTP gateway fetch ingress (POST /_mqproxy/fetch over its own H3 tunnel; independent of the SOCKS5/CONNECT core).
     #[arg(long, value_name = "ip:port", allow_hyphen_values = true)]
     gateway: Option<String>,
     /// Local IP to bind a path to (repeatable, at most 8). The first is the primary bind; each extra becomes a second/third MPQUIC path once the connection is multipath-ready.
@@ -298,19 +299,38 @@ fn unavailable(flag: &str) -> String {
 
 // spec §6.4: each value below is `CLI.or(file)`, then the C default.
 fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
-    // spec §6.4 table: startup error, exit 2 (an INI bool only when true).
-    if a.origin_ca.is_some() || f.origin_ca.is_some() {
-        return Err(unavailable("--origin-ca ([Gateway] OriginCA)"));
-    }
-    if a.masquerade || f.masquerade {
-        return Err(unavailable("--masquerade ([Gateway] Masquerade)"));
-    }
-    if a.request_metrics || f.request_metrics {
-        return Err(unavailable("--request-metrics ([Metrics] PerRequest)"));
-    }
-    // Accepted, no effect: --no-gateway.
-    let _ = a.no_gateway;
     let mut warnings = f.warnings;
+    // spec §8: default on; `--no-gateway` only ever turns the file's value off.
+    let masquerade = a.masquerade || f.masquerade;
+    let request_metrics = a.request_metrics || f.request_metrics;
+    let gateway = (!a.no_gateway && f.gateway_enabled.unwrap_or(true)).then(|| GatewayConfig {
+        origin_ca: a.origin_ca.or(f.origin_ca).map(PathBuf::from),
+        masquerade,
+        request_metrics,
+        ..GatewayConfig::default()
+    });
+    if gateway.is_none() {
+        // C text: warned, ignored.
+        if masquerade {
+            warnings.push(
+                "--masquerade has no effect with --no-gateway (masquerade is gateway-only); ignoring"
+                    .into(),
+            );
+        }
+        if request_metrics {
+            warnings.push(
+                "--request-metrics has no effect with --no-gateway (request metrics are \
+                 gateway-only); ignoring"
+                    .into(),
+            );
+        }
+    }
+    let startup_lines = match gateway {
+        Some(_) => vec![format!(
+            "mq_origin: hyper {HYPER_VERSION} + rustls (HTTP3=no)"
+        )],
+        None => Vec::new(),
+    };
     // Warning, ignored: the feature was removed.
     if a.cache_max_bytes.or(f.cache_max_bytes).is_some() {
         warnings.push(
@@ -340,6 +360,7 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
                     .udp_idle_timeout
                     .or(f.udp_idle_timeout)
                     .map_or(DEFAULT_IDLE, Duration::from_secs),
+                gateway,
                 ..ServerConfig::default()
             },
             listen,
@@ -352,16 +373,12 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
         cc,
         scheduler,
         warnings,
-        // spec §8: C has the gateway default-on; this build has none.
-        startup_lines: vec!["HTTP gateway is not available in this build".into()],
+        startup_lines,
     })
 }
 
 fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
-    // spec §6.4 table: startup error, exit 2 (an INI bool only when true).
-    if a.gateway.is_some() || f.gateway.is_some() {
-        return Err(unavailable("--gateway ([Ingress] Gateway)"));
-    }
+    // spec §8: startup error, exit 2 (the INI bool only when true) until SP4.
     if a.mitm || f.mitm {
         return Err(unavailable("--mitm ([Mitm] Enabled)"));
     }
@@ -379,10 +396,11 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
     let socks5 = a.socks5.or(f.socks5);
     let http_connect = a.http_connect.or(f.http_connect);
     let tproxy = a.tproxy.or(f.tproxy);
-    if socks5.is_none() && http_connect.is_none() && tproxy.is_none() {
+    let gateway = a.gateway.or(f.gateway);
+    let has_tcp_ingress = socks5.is_some() || http_connect.is_some() || tproxy.is_some();
+    if !has_tcp_ingress && gateway.is_none() {
         return Err(
-            "at least one ingress is required (--socks5, --http-connect, --tproxy, \
-             or --gateway; --gateway is not available in this build)"
+            "at least one ingress is required (--socks5, --http-connect, --gateway, or --tproxy)"
                 .into(),
         );
     }
@@ -432,6 +450,8 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
                         .unwrap_or(30),
                 ),
                 metrics_interval: metrics_interval(a.metrics_interval, f.metrics_interval),
+                gateway: opt("--gateway", gateway)?,
+                has_tcp_ingress,
                 ..ClientConfig::default()
             },
             socks5: opt("--socks5", socks5)?,
@@ -494,4 +514,23 @@ pub fn ip_port(flag: &str, s: &str) -> Result<SocketAddr, String> {
             Some(SocketAddr::new(ip.parse().ok()?, port))
         })
         .ok_or_else(|| format!("invalid {flag} address: {s}"))
+}
+
+/// spec §8: the transport's H3 layer — the server's gateway, or the client's
+/// fetch ingress (its tunnel conn is an `xqc_h3_connect`).
+pub fn wants_h3(r: &Resolved) -> bool {
+    match &r.mode {
+        Mode::Server(s) => s.config.gateway.is_some(),
+        Mode::Client(c) => c.config.gateway.is_some(),
+    }
+}
+
+/// spec §8: `MQ_GW_ORIGIN_CONNECT_TIMEOUT_S` (test-only, as C): an integer in
+/// [1, 600], else 10 s (not clamped). `main` reads the variable.
+pub fn origin_connect_timeout(env: Option<&str>) -> Duration {
+    let s = env
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| (1..=600).contains(s))
+        .unwrap_or(10);
+    Duration::from_secs(s)
 }
