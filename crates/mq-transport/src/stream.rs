@@ -9,7 +9,7 @@ use mq_transport_api::{
 };
 use xquic_sys::*;
 
-fn stream_err(r: isize) -> StreamError {
+pub(crate) fn stream_err(r: isize) -> StreamError {
     match u32::try_from(-r).unwrap_or(0) {
         XQC_EAGAIN => StreamError::Blocked,
         XQC_ESTREAM_RESET | XQC_ESTREAM_ST => StreamError::Reset,
@@ -47,15 +47,7 @@ fn open_with(
     create: impl FnOnce(*mut xqc_engine_t, &xqc_cid_t, *mut core::ffi::c_void) -> *mut xqc_stream_t,
 ) -> Result<StreamId, Error> {
     t.inner.last_now = now;
-    if matches!(t.inner.cfg.role, Role::Server { .. }) {
-        return Err(Error::Role); // xqc_stream_create always makes a client-initiated id
-    }
-    let conn = t.inner.conns.get_mut(c.slot()).ok_or(Error::Stale)?;
-    if conn.streams >= STREAM_CEILING {
-        return Err(Error::Ceiling);
-    }
-    conn.streams += 1;
-    let cid = conn.cid;
+    let cid = reserve_local(&mut t.inner, c, false)?;
     let s = t.inner.streams.insert(StreamSlot::new(
         c.slot(),
         ptr::null_mut(),
@@ -85,6 +77,26 @@ fn open_with(
         // Released by a close notification inside the call (spec §4.8).
         (_, None) => Err(Error::Other),
     }
+}
+
+/// A client's local stream (`h3 = false`) or H3 request (`h3 = true`) on `c`: role, protocol,
+/// then the per-connection ceiling both share (spec §4.2, §3.3). Counts it; the caller undoes
+/// the count if xquic then fails to create it.
+pub(crate) fn reserve_local(inner: &mut Inner, c: ConnId, h3: bool) -> Result<xqc_cid_t, Error> {
+    if matches!(inner.cfg.role, Role::Server { .. }) {
+        return Err(Error::Role); // xquic creates only client-initiated ids
+    }
+    let conn = inner.conns.get_mut(c.slot()).ok_or(Error::Stale)?;
+    // A raw stream on an H3 conn (or a request on a raw one) would reach the other protocol's
+    // callbacks with our slot id as their user data.
+    if conn.h3c.is_null() == h3 {
+        return Err(Error::Other);
+    }
+    if conn.streams >= STREAM_CEILING {
+        return Err(Error::Ceiling);
+    }
+    conn.streams += 1;
+    Ok(conn.cid)
 }
 
 /// The stream's xquic pointer and its connection's slot.

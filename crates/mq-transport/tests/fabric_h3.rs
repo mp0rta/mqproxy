@@ -1,11 +1,14 @@
-//! spec §3.2, §3.3 (conn rows): H3 connections share the raw connections' slot table,
-//! admission, provisional expiry and close reporting.
+//! spec §3.2, §3.3: H3 connections share the raw connections' slot table, admission,
+//! provisional expiry and close reporting; H3 requests (spec §3.1, §3.4).
 mod common;
 
 use common::initial::{client_hello_fragment, initial};
 use common::lockstep::{Peer, cfg, exchange_many, server_role};
-use common::pair::{MS, Opts, Pair, T0, cli_addr, conn_cfg, srv_addr};
-use mq_transport_api::{ConnId, ConnProto, Event, Role, Time, TransportConfig, TransportOps};
+use common::pair::{MS, Opts, Pair, T0, cli_addr, conn_cfg, srv_addr, stream_count};
+use mq_transport_api::{
+    ConnId, ConnProto, Event, H3Close, H3Header, H3ReqId, Role, StreamError, Time, TransportConfig,
+    TransportOps,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -157,4 +160,327 @@ fn h3_conn_close_reported() {
         p.client_closed().is_some() && p.server_closed().is_some()
     }));
     assert_eq!(p.server.call(p.now, |t, _| t.conn_count()), 0);
+}
+
+// ── requests (spec §3.1 contracts, §3.3 request rows, §3.4) ─────────────
+
+const REQ: &[(&str, &str)] = &[
+    (":method", "POST"),
+    (":scheme", "https"),
+    (":authority", "x"),
+    (":path", "/"),
+];
+const RESP: &[(&str, &str)] = &[(":status", "200")];
+
+fn owned(hs: &[(&str, &str)]) -> Vec<(String, String)> {
+    hs.iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect()
+}
+
+fn open_req(p: &Pair) -> H3ReqId {
+    let c = p.conn;
+    p.client
+        .call(p.now, move |t, now| t.open_h3_request(now, c))
+        .expect("open_h3_request")
+}
+
+fn send_headers(
+    peer: &Peer,
+    now: Time,
+    r: H3ReqId,
+    hs: &'static [(&'static str, &'static str)],
+    fin: bool,
+) -> Result<(), StreamError> {
+    peer.call(now, move |t, now| {
+        let v: Vec<H3Header<'_>> = hs
+            .iter()
+            .map(|(n, v)| H3Header {
+                name: n.as_bytes(),
+                value: v.as_bytes(),
+            })
+            .collect();
+        t.h3_send_headers(now, r, &v, fin)
+    })
+}
+
+fn send_body(
+    peer: &Peer,
+    now: Time,
+    r: H3ReqId,
+    data: &'static [u8],
+    fin: bool,
+) -> Result<usize, StreamError> {
+    peer.call(now, move |t, now| t.h3_send_body(now, r, data, fin))
+}
+
+/// One `h3_recv_headers` call.
+fn recv_headers(
+    peer: &Peer,
+    now: Time,
+    r: H3ReqId,
+) -> Result<(Vec<(String, String)>, bool), StreamError> {
+    peer.call(now, move |t, now| {
+        let mut out = Vec::new();
+        let mut each = |n: &[u8], v: &[u8]| {
+            out.push((
+                String::from_utf8_lossy(n).into_owned(),
+                String::from_utf8_lossy(v).into_owned(),
+            ))
+        };
+        t.h3_recv_headers(now, r, &mut each).map(|fin| (out, fin))
+    })
+}
+
+/// One `h3_recv_body` call into a 64 KiB buffer.
+fn recv_body(peer: &Peer, now: Time, r: H3ReqId) -> Result<(Vec<u8>, bool), StreamError> {
+    peer.call(now, move |t, now| {
+        let mut buf = vec![0u8; 64 * 1024];
+        t.h3_recv_body(now, r, &mut buf)
+            .map(|(n, fin)| (buf[..n].to_vec(), fin))
+    })
+}
+
+fn h3_requests(ev: &[Event]) -> Vec<(ConnId, H3ReqId)> {
+    ev.iter()
+        .filter_map(|e| match e {
+            Event::H3Request(c, r) => Some((*c, *r)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn h3_closed(ev: &[Event], r: H3ReqId) -> Option<H3Close> {
+    ev.iter().find_map(|e| match e {
+        Event::H3Closed(x, c) if *x == r => Some((**c).clone()),
+        _ => None,
+    })
+}
+
+fn readables(ev: &[Event], r: H3ReqId) -> usize {
+    ev.iter().filter(|e| **e == Event::H3Readable(r)).count()
+}
+
+/// The server's one request.
+fn server_req(p: &Pair) -> H3ReqId {
+    match h3_requests(&p.sev)[..] {
+        [(c, r)] => {
+            assert_eq!(c, p.srv_conn);
+            r
+        }
+        ref other => panic!("expected one H3Request, got {other:?}"),
+    }
+}
+
+/// Follows timeouts until both requests reported `H3Closed`.
+fn wait_closed(p: &mut Pair, cr: H3ReqId, sr: H3ReqId) -> (H3Close, H3Close) {
+    for _ in 0..500 {
+        if let (Some(c), Some(s)) = (h3_closed(&p.cev, cr), h3_closed(&p.sev, sr)) {
+            return (c, s);
+        }
+        if !p.follow_timeout() {
+            p.tick(10 * MS);
+        }
+    }
+    panic!("H3Closed never arrived: {:?} / {:?}", p.cev, p.sev);
+}
+
+/// POST "hello" → 200 "hello", every byte read on both sides (`h3_request_echo`).
+// Body writes defer their flush to the next drive (`defer_send_flush`, SP2 spec §3.3), so the
+// tests move packets with `tick(ZERO)` (drive both, then exchange), as the runtime drives.
+fn echo(p: &mut Pair) -> (H3ReqId, H3ReqId) {
+    let cr = open_req(p);
+    send_headers(&p.client, p.now, cr, REQ, false).unwrap();
+    assert_eq!(send_body(&p.client, p.now, cr, b"hello", true), Ok(5));
+    p.tick(Duration::ZERO);
+    let sr = server_req(p);
+    assert!(p.sev.contains(&Event::H3Readable(sr)), "{:?}", p.sev);
+    assert_eq!(recv_headers(&p.server, p.now, sr), Ok((owned(REQ), false)));
+    assert_eq!(
+        recv_body(&p.server, p.now, sr),
+        Ok((b"hello".to_vec(), true))
+    );
+    send_headers(&p.server, p.now, sr, RESP, false).unwrap();
+    assert_eq!(send_body(&p.server, p.now, sr, b"hello", true), Ok(5));
+    p.tick(Duration::ZERO);
+    assert!(p.cev.contains(&Event::H3Readable(cr)), "{:?}", p.cev);
+    assert_eq!(recv_headers(&p.client, p.now, cr), Ok((owned(RESP), false)));
+    assert_eq!(
+        recv_body(&p.client, p.now, cr),
+        Ok((b"hello".to_vec(), true))
+    );
+    (cr, sr)
+}
+
+#[test]
+fn h3_request_echo() {
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let (cr, sr) = echo(&mut p);
+    let info = p.client.call(p.now, move |t, _| t.h3_req_info(cr)).unwrap();
+    assert_eq!(info.conn, p.conn);
+    let sinfo = p.server.call(p.now, move |t, _| t.h3_req_info(sr)).unwrap();
+    assert_eq!((sinfo.conn, sinfo.quic_id), (p.srv_conn, info.quic_id));
+    let (c, s) = wait_closed(&mut p, cr, sr);
+    for x in [&c, &s] {
+        assert_eq!(x.stats.stream_err, 0, "{x:?}");
+        assert_eq!((x.stats.send_body, x.stats.recv_body), (5, 5), "{x:?}");
+        assert_eq!(x.unread, None);
+    }
+    assert_eq!(stream_count(&p.client, p.conn), 0);
+    assert_eq!(stream_count(&p.server, p.srv_conn), 0);
+}
+
+#[test]
+fn h3_stats_monotone() {
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let cr = open_req(&p);
+    p.tick(MS);
+    send_headers(&p.client, p.now, cr, REQ, false).unwrap();
+    p.tick(MS);
+    assert_eq!(send_body(&p.client, p.now, cr, b"x", true), Ok(1));
+    p.tick(Duration::ZERO);
+    let sr = server_req(&p);
+    recv_headers(&p.server, p.now, sr).unwrap();
+    recv_body(&p.server, p.now, sr).unwrap();
+    send_headers(&p.server, p.now, sr, RESP, true).unwrap();
+    p.tick(Duration::ZERO);
+    recv_headers(&p.client, p.now, cr).unwrap();
+    let (c, _) = wait_closed(&mut p, cr, sr);
+    let s = &c.stats;
+    assert!(s.begin_us > 0, "{s:?}");
+    assert!(s.begin_us < s.header_send_us, "{s:?}");
+    assert!(s.header_send_us < s.fin_send_us, "{s:?}");
+    assert!(s.fin_send_us <= s.fin_ack_us, "{s:?}");
+}
+
+#[test]
+fn h3_server_reset_reaches_client() {
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let cr = open_req(&p);
+    send_headers(&p.client, p.now, cr, REQ, false).unwrap();
+    p.tick(Duration::ZERO);
+    let sr = server_req(&p);
+    p.server.call(p.now, move |t, now| t.h3_reset(now, sr));
+    let (c, s) = wait_closed(&mut p, cr, sr);
+    assert_ne!(c.stats.stream_err, 0, "{c:?}");
+    assert_eq!(c.stats.close_msg.as_deref(), Some("remote reset"));
+    assert_eq!(c.unread, None);
+    assert_eq!(s.stats.close_msg.as_deref(), Some("local reset"));
+    assert_eq!(stream_count(&p.client, p.conn), 0);
+    assert_eq!(stream_count(&p.server, p.srv_conn), 0);
+}
+
+#[test]
+fn h3_readable_coalesces() {
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let cr = open_req(&p);
+    send_headers(&p.client, p.now, cr, REQ, false).unwrap();
+    p.tick(Duration::ZERO);
+    let sr = server_req(&p);
+    recv_headers(&p.server, p.now, sr).unwrap();
+    // Two body injections reach the server before anyone polls it.
+    for chunk in [&b"a"[..], &b"b"[..]] {
+        assert_eq!(send_body(&p.client, p.now, cr, chunk, false), Ok(1));
+        p.client.drive(p.now);
+        let out = p.client.pump_out(p.now);
+        assert!(!out.is_empty());
+        for d in out {
+            p.server.deliver(p.now, d.to, d.from, d.data);
+        }
+        p.server.drive(p.now);
+    }
+    let ev = p.server.drain_events();
+    assert_eq!(readables(&ev, sr), 1, "{ev:?}");
+    assert_eq!(recv_body(&p.server, p.now, sr), Ok((b"ab".to_vec(), false)));
+    assert_eq!(recv_body(&p.server, p.now, sr), Err(StreamError::Blocked));
+}
+
+#[test]
+fn h3_trailer_drained_inside_transport() {
+    // (a) The trailer arrives before the app read the header section: drained right after it.
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let cr = open_req(&p);
+    send_headers(&p.client, p.now, cr, REQ, true).unwrap();
+    p.tick(Duration::ZERO);
+    let sr = server_req(&p);
+    send_headers(&p.server, p.now, sr, RESP, false).unwrap();
+    assert_eq!(send_body(&p.server, p.now, sr, b"body", false), Ok(4));
+    send_headers(&p.server, p.now, sr, &[("x-trailer", "v")], true).unwrap();
+    p.tick(Duration::ZERO);
+    assert_eq!(recv_headers(&p.client, p.now, cr), Ok((owned(RESP), false)));
+    assert_eq!(
+        recv_headers(&p.client, p.now, cr),
+        Err(StreamError::Blocked)
+    );
+    assert_eq!(
+        recv_body(&p.client, p.now, cr),
+        Ok((b"body".to_vec(), true))
+    );
+
+    // (b) The trailer arrives after the header section was read: drained in the notification.
+    let cr = open_req(&p);
+    send_headers(&p.client, p.now, cr, REQ, true).unwrap();
+    p.sev.clear();
+    p.tick(Duration::ZERO);
+    let sr = server_req(&p);
+    send_headers(&p.server, p.now, sr, RESP, false).unwrap();
+    p.tick(Duration::ZERO);
+    assert_eq!(recv_headers(&p.client, p.now, cr), Ok((owned(RESP), false)));
+    assert_eq!(send_body(&p.server, p.now, sr, b"body", false), Ok(4));
+    send_headers(&p.server, p.now, sr, &[("x-trailer", "v")], true).unwrap();
+    p.tick(Duration::ZERO);
+    assert_eq!(
+        recv_headers(&p.client, p.now, cr),
+        Err(StreamError::Blocked)
+    );
+    assert_eq!(
+        recv_body(&p.client, p.now, cr),
+        Ok((b"body".to_vec(), true))
+    );
+}
+
+#[test]
+fn h3_ops_stale_after_close() {
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let (cr, sr) = echo(&mut p);
+    wait_closed(&mut p, cr, sr);
+    for (peer, r) in [(&p.client, cr), (&p.server, sr)] {
+        let now = p.now;
+        assert_eq!(
+            send_headers(peer, now, r, RESP, false),
+            Err(StreamError::Stale)
+        );
+        assert_eq!(send_body(peer, now, r, b"x", true), Err(StreamError::Stale));
+        assert_eq!(
+            peer.call(now, move |t, now| t.h3_finish(now, r)),
+            Err(StreamError::Stale)
+        );
+        assert_eq!(recv_headers(peer, now, r), Err(StreamError::Stale));
+        assert_eq!(recv_body(peer, now, r), Err(StreamError::Stale));
+        assert_eq!(
+            peer.call(now, move |t, _| t.h3_req_info(r)),
+            Err(mq_transport_api::Error::Stale)
+        );
+        peer.call(now, move |t, now| t.h3_reset(now, r)); // a no-op
+    }
+}
+
+#[test]
+fn h3_empty_fin_is_zero_true() {
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let cr = open_req(&p);
+    send_headers(&p.client, p.now, cr, REQ, true).unwrap();
+    p.tick(Duration::ZERO);
+    let sr = server_req(&p);
+    send_headers(&p.server, p.now, sr, RESP, false).unwrap();
+    p.tick(Duration::ZERO);
+    assert_eq!(recv_headers(&p.client, p.now, cr), Ok((owned(RESP), false)));
+    let before = p.cev.len();
+    assert_eq!(
+        p.server.call(p.now, move |t, now| t.h3_finish(now, sr)),
+        Ok(())
+    );
+    p.tick(Duration::ZERO);
+    assert_eq!(readables(&p.cev[before..], cr), 1, "{:?}", p.cev);
+    assert_eq!(recv_body(&p.client, p.now, cr), Ok((Vec::new(), true)));
 }

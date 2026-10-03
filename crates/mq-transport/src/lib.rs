@@ -12,6 +12,7 @@ mod datagram;
 mod engine;
 mod events;
 mod ffi;
+mod h3;
 mod slots;
 mod stream;
 mod txq;
@@ -21,7 +22,7 @@ use mq_transport_api::{
     H3ReqInfo, PathError, PathId, StreamError, StreamId, StreamInfo, Time, Transmit,
     TransportConfig, TransportOps, TxKey,
 };
-use slots::{ConnSlot, Slots, StreamSlot};
+use slots::{ConnSlot, H3ReqSlot, Slots, StreamSlot};
 use std::ffi::CString;
 use std::fs::File;
 use std::net::SocketAddr;
@@ -41,6 +42,7 @@ pub(crate) struct Inner {
     n_provisional: u32,
     conns: Slots<ConnSlot>,
     streams: Slots<StreamSlot>,
+    h3reqs: Slots<H3ReqSlot>,
     txq: txq::TxQueues,
     events: events::Events,
     /// Recorded by `set_event_timer` (spec §4.3).
@@ -61,6 +63,7 @@ impl Inner {
             n_provisional: 0,
             conns: Default::default(),
             streams: Default::default(),
+            h3reqs: Default::default(),
             txq: Default::default(),
             events: Default::default(),
             deadline: None,
@@ -135,10 +138,11 @@ impl TransportOps for Transport {
             events,
             streams,
             conns,
+            h3reqs,
             ..
         } = &mut *self.inner;
         loop {
-            let e = events.pop(streams, conns)?;
+            let e = events.pop(streams, conns, h3reqs)?;
             let live = match &e {
                 Event::ConnEstablished(c)
                 | Event::NewConn(c, _)
@@ -147,12 +151,10 @@ impl TransportOps for Transport {
                 Event::NewStream(_, s, _) | Event::StreamReadable(s) | Event::StreamWritable(s) => {
                     streams.is_live(s.slot())
                 }
-                Event::ConnClosed(..) | Event::StreamClosed(_) => true,
-                // Tasks 2.2-2.3 queue these and add the liveness check
-                Event::H3Request(..)
-                | Event::H3Readable(_)
-                | Event::H3Writable(_)
-                | Event::H3Closed(..) => true,
+                Event::H3Request(_, r) | Event::H3Readable(r) | Event::H3Writable(r) => {
+                    h3reqs.is_live(r.slot())
+                }
+                Event::ConnClosed(..) | Event::StreamClosed(_) | Event::H3Closed(..) => true,
             };
             if live {
                 return Some(e);
@@ -223,61 +225,62 @@ impl TransportOps for Transport {
         datagram::ring_pop(self.inner.conns.get_mut(c.slot())?, buf)
     }
 
-    // H3 stubs; Tasks 2.2-2.3 fill them (spec §3.1).
     fn open_h3_request(
         &mut self,
-        _now: Time,
-        _conn: ConnId,
+        now: Time,
+        c: ConnId,
     ) -> Result<H3ReqId, mq_transport_api::Error> {
-        Err(mq_transport_api::Error::Role)
+        h3::open_h3_request(self, now, c)
     }
 
     fn h3_send_headers(
         &mut self,
-        _now: Time,
-        _r: H3ReqId,
-        _hs: &[H3Header<'_>],
-        _fin: bool,
+        now: Time,
+        r: H3ReqId,
+        hs: &[H3Header<'_>],
+        fin: bool,
     ) -> Result<(), StreamError> {
-        Err(StreamError::Stale)
+        h3::h3_send_headers(self, now, r, hs, fin)
     }
 
     fn h3_send_body(
         &mut self,
-        _now: Time,
-        _r: H3ReqId,
-        _data: &[u8],
-        _fin: bool,
+        now: Time,
+        r: H3ReqId,
+        data: &[u8],
+        fin: bool,
     ) -> Result<usize, StreamError> {
-        Err(StreamError::Stale)
+        h3::h3_send_body(self, now, r, data, fin)
     }
 
-    fn h3_finish(&mut self, _now: Time, _r: H3ReqId) -> Result<(), StreamError> {
-        Err(StreamError::Stale)
+    fn h3_finish(&mut self, now: Time, r: H3ReqId) -> Result<(), StreamError> {
+        h3::h3_finish(self, now, r)
     }
 
     fn h3_recv_headers(
         &mut self,
-        _now: Time,
-        _r: H3ReqId,
-        _each: &mut dyn FnMut(&[u8], &[u8]),
+        now: Time,
+        r: H3ReqId,
+        each: &mut dyn FnMut(&[u8], &[u8]),
     ) -> Result<bool, StreamError> {
-        Err(StreamError::Stale)
+        h3::h3_recv_headers(self, now, r, each)
     }
 
     fn h3_recv_body(
         &mut self,
-        _now: Time,
-        _r: H3ReqId,
-        _buf: &mut [u8],
+        now: Time,
+        r: H3ReqId,
+        buf: &mut [u8],
     ) -> Result<(usize, bool), StreamError> {
-        Err(StreamError::Stale)
+        h3::h3_recv_body(self, now, r, buf)
     }
 
-    fn h3_reset(&mut self, _now: Time, _r: H3ReqId) {}
+    fn h3_reset(&mut self, now: Time, r: H3ReqId) {
+        h3::h3_reset(self, now, r)
+    }
 
-    fn h3_req_info(&self, _r: H3ReqId) -> Result<H3ReqInfo, mq_transport_api::Error> {
-        Err(mq_transport_api::Error::Stale)
+    fn h3_req_info(&self, r: H3ReqId) -> Result<H3ReqInfo, mq_transport_api::Error> {
+        h3::h3_req_info(self, r)
     }
 }
 
