@@ -211,6 +211,11 @@ impl OriginHost {
         &mut self.origin
     }
 
+    /// The upload bytes handed to `h3`'s `UploadBuf` so far.
+    pub fn upload_buffered(&self, h3: H3ReqId) -> u64 {
+        self.events.uploads.get(&h3).map_or(0, |u| u.off)
+    }
+
     pub fn events(&self) -> &[BridgeEv] {
         &self.events.log
     }

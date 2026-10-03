@@ -7,7 +7,7 @@ use mq_integration::origin_server::{Handler, ORIGIN_CA, OriginServer, OriginServ
 use mq_proxy::server::origin::host::{BodySpec, BridgeEv, OriginHost, StartSpec, upload_byte};
 use mq_proxy::server::origin::{
     Accepted, Completion, ErrClass, OriginCfg, OriginConnId, OriginFailure, OriginProto,
-    RecordState, RelayHead, SWEEP, TlsOutcome, build_client_config,
+    RecordState, RelayHead, SWEEP, TlsOutcome, UPLOAD_CAP, build_client_config,
 };
 use mq_runtime::driver::Io;
 use mq_transport_api::{H3ReqId, Time};
@@ -467,43 +467,74 @@ fn h2_idle_since_on_active_zero() {
 /// zero capacity with the `UploadBody` held: a stuck `Ended` record. The
 /// conn drains and is retired (class E) at the sweep once the record aged
 /// one interval. A bodiless warm-up exchange first, so the server's SETTINGS
-/// (1 MiB windows) are processed before the upload starts. With the client's
-/// cancel: the head carries END_STREAM, so the record already `Ended` and
-/// the `H3Closed` lookup is a no-op (§7.1).
+/// (1 MiB windows) are processed before the upload starts.
 #[test]
 fn stuck_upload_drains_then_retires_at_sweep() {
-    for cancel in [false, true] {
-        let srv = h2(Handler::EarlyOkKeepBodyUnread);
-        let mut lp = loop_with_sweep(SWEEP_TEST);
-        let (warm, _) = fetch(&mut lp, get(url(&srv, "/warm")));
-        let a = conn(&lp, warm);
-        let (h3, o) = fetch(&mut lp, post(url(&srv, "/up"), BodySpec::Known(8 * MIB)));
-        assert_eq!(o.head.as_ref().map(|h| h.status), Some(200));
-        o.completion();
-        if cancel {
-            lp.cancel(h3);
-        }
-        let org = lp.host().origin();
-        let [rec] = org.ended(a)[..] else {
-            panic!("{:?} cancel={cancel}", org.ended(a))
-        };
-        assert!(!rec.fin && rec.aborted, "the incomplete upload is aborted");
-        assert!(org.draining(a));
-        assert_eq!(org.pool_len(), 1);
+    let srv = h2(Handler::EarlyOkKeepBodyUnread);
+    let mut lp = loop_with_sweep(SWEEP_TEST);
+    let (warm, _) = fetch(&mut lp, get(url(&srv, "/warm")));
+    let a = conn(&lp, warm);
+    let (_, o) = fetch(&mut lp, post(url(&srv, "/up"), BodySpec::Known(8 * MIB)));
+    assert_eq!(o.head.as_ref().map(|h| h.status), Some(200));
+    o.completion();
+    drains_then_retires(&mut lp, &srv, a);
+}
 
-        // No new assignment: the probe dials; its dial is cancelled.
-        let probe = lp.start(get(url(&srv, "/warm")));
-        assert_eq!(
-            lp.host().origin().record_state(probe),
-            Some(RecordState::Connecting)
-        );
-        lp.cancel(probe);
-        assert_eq!(lp.host().origin().record_state(probe), None);
+/// The cancel variant: the head comes without END_STREAM, the response body
+/// is gated and the upload unread. Once hyper took the whole 1 MiB window the
+/// pipe waits for capacity and never polls the body again; the client's
+/// cancel then ends the `Assigned` record with the abort, unreleased — the
+/// conn drains and is retired at the sweep as above.
+#[test]
+fn stuck_upload_cancelled_after_head_drains_then_retires_at_sweep() {
+    let srv = h2(Handler::PerPath(vec![
+        ("/warm", Handler::FileBytes(10)),
+        ("/up", Handler::GatedKeepBodyUnread(1000)),
+    ]));
+    let mut lp = loop_with_sweep(SWEEP_TEST);
+    let (warm, _) = fetch(&mut lp, get(url(&srv, "/warm")));
+    let a = conn(&lp, warm);
+    let h3 = lp.start(post(url(&srv, "/up"), BodySpec::Known(8 * MIB)));
+    wait_head(&mut lp, h3);
+    // `UploadBuf` is topped up to `UPLOAD_CAP` on every refill: past this
+    // mark hyper has taken at least the 1 MiB window.
+    let window_taken = MIB + UPLOAD_CAP as u64;
+    assert!(
+        lp.run_until(T, |h| h.upload_buffered(h3) >= window_taken),
+        "{}",
+        lp.host().upload_buffered(h3)
+    );
+    assert_eq!(
+        lp.host().origin().record_state(h3),
+        Some(RecordState::Assigned)
+    );
+    lp.cancel(h3);
+    drains_then_retires(&mut lp, &srv, a);
+}
 
-        retired_once_aged(&mut lp, rec.since);
-        assert!(lp.host().origin().pipe_dead(a));
-        assert!(lp.run_until(T, all_gone), "cancel={cancel}");
-    }
+/// The common tail: one aborted `Ended` record left unreleased, the conn
+/// draining (a probe dials rather than joining it), retired once aged.
+fn drains_then_retires(lp: &mut OriginLoop, srv: &OriginServer, a: OriginConnId) {
+    let org = lp.host().origin();
+    let [rec] = org.ended(a)[..] else {
+        panic!("{:?}", org.ended(a))
+    };
+    assert!(!rec.fin && rec.aborted, "the incomplete upload is aborted");
+    assert!(org.draining(a));
+    assert_eq!(org.pool_len(), 1);
+
+    // No new assignment: the probe dials; its dial is cancelled.
+    let probe = lp.start(get(url(srv, "/warm")));
+    assert_eq!(
+        lp.host().origin().record_state(probe),
+        Some(RecordState::Connecting)
+    );
+    lp.cancel(probe);
+    assert_eq!(lp.host().origin().record_state(probe), None);
+
+    retired_once_aged(lp, rec.since);
+    assert!(lp.host().origin().pipe_dead(a));
+    assert!(lp.run_until(T, all_gone));
 }
 
 #[test]

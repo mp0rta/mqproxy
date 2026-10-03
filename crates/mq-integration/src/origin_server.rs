@@ -98,6 +98,9 @@ pub enum Handler {
     FileBytes(u64),
     /// `FileBytes`, the head at once, the body only after `release()`.
     FileBytesGated(u64),
+    /// `FileBytesGated` (the head without END_STREAM), the request body kept
+    /// unread as `EarlyOkKeepBodyUnread` does.
+    GatedKeepBodyUnread(u64),
     /// By exact path; `404` for anything else.
     PerPath(Vec<(&'static str, Handler)>),
     /// `200`, `len` bytes without a content-length, then a trailers frame
@@ -173,7 +176,7 @@ struct Shared {
     accepted: AtomicU32,
     /// Raw-mode connections closed.
     closed: AtomicU32,
-    /// `EarlyOkKeepBodyUnread`'s request bodies, by path.
+    /// `EarlyOkKeepBodyUnread` / `GatedKeepBodyUnread` request bodies, by path.
     stash: Mutex<Vec<(String, Incoming)>>,
 }
 
@@ -488,7 +491,11 @@ async fn respond(
     let body = match handler {
         Handler::Echo => OBody::Echo(req.into_body()),
         Handler::FileBytes(n) => OBody::Gen(Gen::new(n, Some(n))),
-        Handler::FileBytesGated(n) => {
+        Handler::FileBytesGated(n) | Handler::GatedKeepBodyUnread(n) => {
+            if matches!(handler, Handler::GatedKeepBodyUnread(_)) {
+                let path = req.uri().path().to_owned();
+                sh.stash.lock().unwrap().push((path, req.into_body()));
+            }
             let mut rx = sh.release.subscribe();
             let mut g = Gen::new(n, Some(n));
             g.gate = Some(Box::pin(async move {
