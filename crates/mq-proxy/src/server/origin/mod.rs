@@ -376,6 +376,10 @@ struct OriginConn {
     draining: bool,
     idle_since: Option<Time>,
     connect_ms: i64,
+    /// Step 1 last stopped with the pipe full: rustls may hold decrypted
+    /// plaintext (`wants_read` is then false) or `tcp_rx` bytes, which move
+    /// once hyper frees room (§7.3 step 4 liveness).
+    rx_blocked: bool,
     /// Test gate (5.1b `hold_public_poll`): pump step 2 skips the public
     /// `Connection` future but still polls the executor tasks.
     hold_public: bool,
@@ -658,6 +662,7 @@ impl Origin {
             idle_since: None,
             connect_ms: 0,
             hold_public: false,
+            rx_blocked: false,
         });
         self.pool.entry(key).or_default().push(id);
         self.by_tcp.insert(tcp, id);
@@ -1006,6 +1011,7 @@ mod tests {
             idle_since: None,
             connect_ms: 0,
             hold_public: false,
+            rx_blocked: false,
         }
     }
 

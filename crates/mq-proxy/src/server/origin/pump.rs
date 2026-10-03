@@ -33,7 +33,7 @@ impl Origin {
                 changed |= self.pipe_to_tcp(cx, id);
             }
             changed |= self.refill(cx, ev);
-            changed |= self.rx_movable(cx);
+            changed |= self.rx_movable();
             if !(changed | self.dirty.take()) {
                 break;
             }
@@ -50,16 +50,13 @@ impl Origin {
         self.settle(cx);
     }
 
-    /// Liveness: step 1 could still move bytes — a live socket's `tcp_rx`
-    /// holds some, the pipe has room, and (TLS) rustls wants to read; one
-    /// more round then runs.
-    fn rx_movable(&self, cx: &Cx<'_>) -> bool {
+    /// Liveness: step 1 stopped for lack of pipe room and hyper has freed
+    /// some since; one more round then runs. Spin-safe: the flag is set again
+    /// only by a step 1 that fills the pipe.
+    fn rx_movable(&self) -> bool {
         self.conns.ids().into_iter().any(|id| {
             let c = self.conns.get(id).expect("live conn");
-            !self.closing.contains(&id)
-                && !cx.tcp_rx(c.tcp).is_empty()
-                && c.io.rx_room() > 0
-                && c.tls.as_ref().is_none_or(|t| t.wants_read())
+            !self.closing.contains(&id) && c.rx_blocked && c.io.rx_room() > 0
         })
     }
 
@@ -94,6 +91,15 @@ impl Origin {
         id: OriginConnId,
         ev: &mut dyn BridgeEvents,
     ) -> bool {
+        let moved = self.move_in(cx, id, ev);
+        if let Some(c) = self.conns.get_mut(id) {
+            c.rx_blocked = c.io.rx_room() == 0;
+        }
+        moved
+    }
+
+    /// `tcp_to_pipe` without the `rx_blocked` upkeep.
+    fn move_in(&mut self, cx: &mut Cx<'_>, id: OriginConnId, ev: &mut dyn BridgeEvents) -> bool {
         if self.closing.contains(&id) {
             return false; // its socket is gone (class E)
         }
@@ -542,15 +548,13 @@ mod tests {
     use super::*;
     use mq_runtime::testing::{RecordingApp, ScriptedTransport};
     use mq_runtime::{Host, IoResult, Shard};
+    use std::io::Write;
     use std::net::{Ipv4Addr, SocketAddr};
 
-    /// spec §7.3: plain `rx_eof` waits until `tcp_rx` is empty, even when
-    /// the pipe is full and nothing moves (an end-to-end test cannot see an
-    /// early EOF: each round refills the pipe before hyper reads again).
     const NOW: Time = Time(1);
 
-    /// A shard with one live app socket whose `tcp_rx` holds `abc`.
-    fn socket_with_rx() -> (Shard<ScriptedTransport, RecordingApp>, TcpId) {
+    /// A shard with one live app socket whose `tcp_rx` holds `rx`.
+    fn socket_with_rx(rx: &[u8]) -> (Shard<ScriptedTransport, RecordingApp>, TcpId) {
         let (t, _) = ScriptedTransport::new();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
         let mut sh = Shard::new(t, RecordingApp::new().0, addr, 7);
@@ -560,14 +564,19 @@ mod tests {
         };
         let op = sh.with_app(NOW, |_, cx| cx.dial(target, Duration::from_secs(1)));
         let tcp = sh.on_dial_result(NOW, op, Ok(addr)).expect("a live dial");
-        sh.tcp_rx_buf(tcp)[..3].copy_from_slice(b"abc");
-        sh.tcp_rx_commit(NOW, tcp, IoResult::Bytes(3));
+        if !rx.is_empty() {
+            sh.tcp_rx_buf(tcp)[..rx.len()].copy_from_slice(rx);
+            sh.tcp_rx_commit(NOW, tcp, IoResult::Bytes(rx.len()));
+        }
         (sh, tcp)
     }
 
+    /// spec §7.3: plain `rx_eof` waits until `tcp_rx` is empty, even when
+    /// the pipe is full and nothing moves (an end-to-end test cannot see an
+    /// early EOF: each round refills the pipe before hyper reads again).
     #[test]
     fn plain_eof_waits_for_tcp_rx() {
-        let (mut sh, tcp) = socket_with_rx();
+        let (mut sh, tcp) = socket_with_rx(b"abc");
         let now = NOW;
         let mut origin = test_origin();
         sh.with_app(now, |_, cx| {
@@ -589,34 +598,101 @@ mod tests {
         });
     }
 
-    /// Belt and braces: bytes step 1 could still move keep the pump going.
+    /// Moves every pending TLS record from `a` to `b`.
+    fn xfer(a: &mut rustls::Connection, b: &mut rustls::Connection) {
+        let mut buf = Vec::new();
+        while a.wants_write() {
+            a.write_tls(&mut buf).unwrap();
+        }
+        let mut s = &buf[..];
+        while !s.is_empty() {
+            b.read_tls(&mut s).unwrap();
+            b.process_new_packets().unwrap();
+        }
+    }
+
+    /// A client past its handshake holding `n` bytes of decrypted plaintext
+    /// it has not handed out (so `wants_read()` is false).
+    fn client_with_plaintext(n: usize) -> rustls::ClientConnection {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/certs/");
+        let ca = std::path::PathBuf::from(format!("{certs}origin-ca.crt"));
+        let ccfg = build_client_config(Some(&ca), &Vec::new).unwrap();
+        let chain = CertificateDer::pem_file_iter(format!("{certs}origin.crt"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_file(format!("{certs}origin.key")).unwrap();
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut c = rustls::Connection::from(rustls::ClientConnection::new(ccfg, name).unwrap());
+        let mut s =
+            rustls::Connection::from(rustls::ServerConnection::new(Arc::new(scfg)).unwrap());
+        while c.is_handshaking() || s.is_handshaking() {
+            xfer(&mut c, &mut s);
+            xfer(&mut s, &mut c);
+        }
+        s.writer().write_all(&vec![9; n]).unwrap();
+        xfer(&mut s, &mut c);
+        let rustls::Connection::Client(c) = c else {
+            unreachable!()
+        };
+        assert!(!c.wants_read(), "plaintext pending");
+        c
+    }
+
+    /// §7.3 step 4 liveness: a step 1 that stopped for lack of pipe room
+    /// makes the next round run once hyper freed room — whether the rest
+    /// waits in `tcp_rx` (plain) or as decrypted plaintext inside rustls
+    /// (`wants_read()` false). Spin-safe: no flag without a full pipe.
     #[test]
-    fn rx_movable_needs_bytes_room_and_tls_interest() {
-        let (mut sh, tcp) = socket_with_rx();
+    fn rx_movable_after_step1_stopped_for_room() {
+        let (mut sh, tcp) = socket_with_rx(b"abc");
         let mut origin = test_origin();
+        let free_room = |o: &mut Origin, id| o.conns.get_mut(id).unwrap().io = pipe::pipe().1;
         sh.with_app(NOW, |_, cx| {
+            // Plain: the rest waits in `tcp_rx`.
             let id = origin.conns.insert(|id| OriginConn {
                 tcp,
+                driver: Driver::Completed,
                 ..bare_conn(id)
             });
-            assert!(origin.rx_movable(cx), "plain: bytes and room");
-            let c = origin.conns.get(id).unwrap();
-            c.io.push_rx(&[0; PIPE_CAP]);
-            assert!(!origin.rx_movable(cx), "the pipe is full");
-            let (_, io) = pipe::pipe();
-            let c = origin.conns.get_mut(id).unwrap();
-            c.io = io;
-            let name = rustls::pki_types::ServerName::try_from("o.test").unwrap();
-            let tls = rustls::ClientConnection::new(origin.tls.clone(), name).unwrap();
-            assert!(
-                !tls.wants_read(),
-                "a fresh client has its ClientHello to send"
-            );
-            origin.conns.get_mut(id).unwrap().tls = Some(tls);
-            assert!(!origin.rx_movable(cx), "rustls does not want to read");
+            origin.conns.get(id).unwrap().io.push_rx(&[0; PIPE_CAP]);
+            origin.tcp_to_pipe(cx, id, &mut NoEvents);
+            assert!(!origin.rx_movable(), "blocked, the pipe still full");
+            free_room(&mut origin, id);
+            assert!(origin.rx_movable(), "plain: room freed");
+            assert!(origin.tcp_to_pipe(cx, id, &mut NoEvents));
+            assert!(cx.tcp_rx(tcp).is_empty());
+            assert!(!origin.rx_movable(), "step 1 did not hit the room limit");
             origin.closing.push(id);
-            origin.conns.get_mut(id).unwrap().tls = None;
-            assert!(!origin.rx_movable(cx), "a closing conn has no socket");
+            origin.conns.get_mut(id).unwrap().rx_blocked = true;
+            assert!(!origin.rx_movable(), "a closing conn has no socket");
+        });
+        let (mut sh, tcp) = socket_with_rx(b"");
+        let mut origin = test_origin();
+        sh.with_app(NOW, |_, cx| {
+            // TLS: 10 KiB decrypted, 4 KiB of pipe room.
+            let id = origin.conns.insert(|id| OriginConn {
+                tcp,
+                tls: Some(client_with_plaintext(10 * 1024)),
+                driver: Driver::Completed,
+                ..bare_conn(id)
+            });
+            let c = origin.conns.get(id).unwrap();
+            c.io.push_rx(&[0; PIPE_CAP - 4096]);
+            assert!(origin.tcp_to_pipe(cx, id, &mut NoEvents), "4 KiB moved");
+            assert!(!origin.rx_movable(), "blocked, the pipe still full");
+            free_room(&mut origin, id);
+            assert!(cx.tcp_rx(tcp).is_empty());
+            assert!(origin.rx_movable(), "TLS: residual plaintext, room freed");
+            assert!(origin.tcp_to_pipe(cx, id, &mut NoEvents), "the 6 KiB rest");
+            assert_eq!(origin.conns.get(id).unwrap().io.rx_room(), PIPE_CAP - 6144);
+            assert!(!origin.rx_movable(), "drained: no spin");
         });
     }
 }
