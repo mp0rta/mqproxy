@@ -63,6 +63,7 @@ impl<F: Future<Output = ()> + 'static> hyper::rt::Executor<F> for ShardExec {
     }
 }
 
+#[allow(dead_code)] // Tasks 5.2–5.6c
 impl ShardExec {
     /// Polls every task once, including those spawned during this call, and
     /// drops the finished ones. Returns whether anything changed (a task was

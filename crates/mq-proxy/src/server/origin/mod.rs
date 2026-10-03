@@ -9,8 +9,9 @@ mod pipe;
 
 pub use body::{UploadBody, UploadBuf};
 pub use events::{Accepted, BridgeEvents};
-pub use exec::{Dirty, ShardExec};
-pub use pipe::{HyperIo, PipeHandle, pipe};
+pub use exec::Dirty;
+use exec::ShardExec;
+use pipe::{HyperIo, PipeHandle};
 
 use http::{Request, Response};
 use hyper::body::Incoming;

@@ -112,6 +112,8 @@ impl Body for UploadBody {
         let n = b.data.len().min(SLICE);
         let chunk: Bytes = b.data.drain(..n).collect();
         b.yielded += n as u64;
+        // The gateway never buffers more than a known CL (§6.3 aborts first).
+        debug_assert!(b.cl.is_none_or(|cl| b.yielded <= cl));
         Poll::Ready(Some(Ok(Frame::data(chunk))))
     }
 

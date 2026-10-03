@@ -50,11 +50,13 @@ pub struct HyperIo(Rc<RefCell<PipeState>>);
 pub struct PipeHandle(Rc<RefCell<PipeState>>);
 
 /// A fresh pipe: hyper's end and the pump's.
+#[allow(dead_code)] // Tasks 5.2–5.6c
 pub fn pipe() -> (HyperIo, PipeHandle) {
     let st = Rc::new(RefCell::new(PipeState::default()));
     (HyperIo(st.clone()), PipeHandle(st))
 }
 
+#[allow(dead_code)] // Tasks 5.2–5.6c
 impl PipeHandle {
     /// Appends origin bytes up to `PIPE_CAP`; returns how many were taken.
     pub fn push_rx(&self, bytes: &[u8]) -> usize {
@@ -75,17 +77,22 @@ impl PipeHandle {
         st.wake_reader();
     }
 
-    /// Removes and returns up to `max` bytes hyper wrote.
-    pub fn take_tx(&self, max: usize) -> Vec<u8> {
+    /// Offers the first `max` bytes hyper wrote to `sink`, which returns how
+    /// many it accepted; exactly that many leave `tx`, the rest stay in order
+    /// (spec §7.3 step 3: plain `tcp_write` is all-or-nothing, rustls's
+    /// `writer().write` may take fewer). Returns the accepted count.
+    pub fn with_tx(&self, max: usize, sink: impl FnOnce(&[u8]) -> usize) -> usize {
         let mut st = self.0.borrow_mut();
-        let n = max.min(st.tx.len());
-        let out: Vec<u8> = st.tx.drain(..n).collect();
+        let len = max.min(st.tx.len());
+        let n = sink(&st.tx[..len]);
+        assert!(n <= len, "sink accepted more than offered");
+        st.tx.drain(..n);
         if n > 0 {
             if let Some(w) = st.tx_waker.take() {
                 w.wake();
             }
         }
-        out
+        n
     }
 
     /// spec §7.7 "every removal": reads and writes fail from now on.
@@ -232,11 +239,11 @@ mod tests {
         let big = vec![7u8; PIPE_CAP + 100];
         assert!(matches!(write(&mut io, &mut cx, &big), Poll::Ready(Ok(n)) if n == PIPE_CAP));
         assert!(write(&mut io, &mut cx, b"x").is_pending(), "full → Pending");
-        assert_eq!(h.take_tx(16 * 1024).len(), 16 * 1024);
-        assert!(woke(&f), "take_tx wakes the parked writer");
+        assert_eq!(h.with_tx(16 * 1024, |s| s.len()), 16 * 1024);
+        assert!(woke(&f), "consuming wakes the parked writer");
         assert!(matches!(write(&mut io, &mut cx, &big), Poll::Ready(Ok(n)) if n == 16 * 1024));
-        assert_eq!(h.take_tx(usize::MAX).len(), PIPE_CAP);
-        assert!(h.take_tx(usize::MAX).is_empty());
+        assert_eq!(h.with_tx(usize::MAX, |s| s.len()), PIPE_CAP);
+        assert_eq!(h.with_tx(usize::MAX, |s| s.len()), 0);
         assert!(Pin::new(&mut io).poll_flush(&mut cx).is_ready());
         assert!(Pin::new(&mut io).poll_shutdown(&mut cx).is_ready());
     }
@@ -285,6 +292,83 @@ mod tests {
             h.push_rx(&vec![0; PIPE_CAP + 1]),
             PIPE_CAP,
             "rx bounded by PIPE_CAP"
+        );
+    }
+
+    #[test]
+    fn pipe_tx_partial_consume_keeps_rest_in_order() {
+        let (mut io, h) = pipe();
+        let (f, w) = flag();
+        let mut cx = Context::from_waker(&w);
+        assert!(write(&mut io, &mut cx, b"0123456789").is_ready());
+        // an all-or-nothing sink that refuses the slice leaves tx untouched
+        assert_eq!(
+            h.with_tx(4, |s| {
+                assert_eq!(s, b"0123");
+                0
+            }),
+            0
+        );
+        assert!(!woke(&f));
+        // a sink that takes fewer than offered drops exactly that count
+        assert_eq!(
+            h.with_tx(6, |s| {
+                assert_eq!(s, b"012345");
+                2
+            }),
+            2
+        );
+        assert_eq!(
+            h.with_tx(usize::MAX, |s| {
+                assert_eq!(s, b"23456789", "the rest stays in order");
+                s.len()
+            }),
+            8
+        );
+    }
+
+    #[test]
+    fn pipe_read_across_vecdeque_wrap() {
+        let (mut io, h) = pipe();
+        let mut cx = Context::from_waker(Waker::noop());
+        let a: Vec<u8> = (0..200u8).collect();
+        // fill to the cap, read all but 10: the live bytes sit at the ring's end
+        assert_eq!(h.push_rx(&[9; PIPE_CAP]), PIPE_CAP);
+        assert_eq!(h.0.borrow().rx.capacity(), PIPE_CAP);
+        let n = PIPE_CAP - 10;
+        assert_eq!(read(&mut io, &mut cx, n).unwrap().unwrap().len(), n);
+        assert_eq!(h.push_rx(&a[..150]), 150);
+        assert!(
+            !h.0.borrow().rx.as_slices().1.is_empty(),
+            "the ring wrapped"
+        );
+        let mut want = vec![9; 10];
+        want.extend(&a[..30]);
+        assert_eq!(
+            read(&mut io, &mut cx, 40).unwrap().unwrap(),
+            want,
+            "one read across the wrap"
+        );
+        assert_eq!(h.push_rx(&a[150..]), 50);
+        assert_eq!(read(&mut io, &mut cx, 1000).unwrap().unwrap(), &a[30..]);
+    }
+
+    #[test]
+    fn pipe_eof_after_buffered_bytes() {
+        let (mut io, h) = pipe();
+        let mut cx = Context::from_waker(Waker::noop());
+        h.push_rx(b"tail");
+        h.set_eof();
+        assert_eq!(
+            read(&mut io, &mut cx, 2).unwrap().unwrap(),
+            b"ta",
+            "bytes before eof"
+        );
+        assert_eq!(read(&mut io, &mut cx, 16).unwrap().unwrap(), b"il");
+        assert_eq!(
+            read(&mut io, &mut cx, 16).unwrap().unwrap(),
+            b"",
+            "then the 0-byte read"
         );
     }
 }
