@@ -252,8 +252,12 @@ impl Gateway {
                     fin_due: false,
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 r.end = Some(OriginEnd::failed(TlsOutcome::Na)); // never started
+                if let Some(m) = &r.meta {
+                    let authority = String::from_utf8_lossy(&m.authority);
+                    log::warn!("mq_gw_server: origin {authority} origin-start-failed ({e:?})");
+                }
                 self.core.send_error(cx, id, 502, "origin-start-failed");
             }
         }

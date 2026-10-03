@@ -4,7 +4,7 @@ mod server_harness;
 
 use mq_proxy::config::{GatewayConfig, ServerConfig};
 use mq_runtime::DialError;
-use mq_runtime::testing::Call;
+use mq_runtime::testing::{Call, log_capture};
 use mq_transport_api::{H3ReqId, StreamError};
 use server_harness::*;
 
@@ -172,6 +172,26 @@ fn origin_start_failed_502() {
         assert_eq!(h.t.h3_headers_sent(r), reply, "{a}");
     }
     assert_eq!(h.dial(), None, "nothing dialled");
+}
+
+#[test]
+fn sync_origin_start_failed_warns() {
+    log_capture::install();
+    let mut h = H::with_gateway(cfg());
+    log_capture::take();
+    let r = open(&mut h, request(OK, &[(":authority", "user@o.test")]), true);
+    assert_eq!(
+        h.t.h3_headers_sent(r),
+        error_reply("502", "origin-start-failed")
+    );
+    let warns: Vec<_> = log_capture::take()
+        .into_iter()
+        .filter(|l| l.starts_with("WARN"))
+        .collect();
+    assert_eq!(
+        warns,
+        ["WARN mq_gw_server: origin user@o.test origin-start-failed (BadAuthority)"]
+    );
 }
 
 #[test]
