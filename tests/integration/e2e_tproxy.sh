@@ -7,7 +7,7 @@
 #   mqproxy QUIC tunnel works end-to-end, byte-exactly, with clean teardown.
 #
 #   The key falsifiability axis is OPACITY: curl is asked to verify the origin's
-#   TLS certificate against the origin CA directly (--cacert origin.crt).  If
+#   TLS certificate against the origin CA directly (--cacert origin-ca.crt).  If
 #   mqproxy were intercepting/MITM-ing the TLS session it would need to present its
 #   OWN cert (test.crt, not trusted by the origin CA), and curl would REJECT it
 #   with a certificate-verification error.  A clean TLS handshake that verifies
@@ -28,7 +28,7 @@
 #     This means: connections from root are SKIPPED by the nft rule, so mqproxy
 #     itself and the origin server (both root) can talk to each other directly.
 #   - Test TLS check via curl running as nobody (uid 65534, typically):
-#       sudo -u nobody curl https://127.0.0.1:${ORIGIN_PORT}/ --cacert origin.crt
+#       sudo -u nobody curl https://127.0.0.1:${ORIGIN_PORT}/ --cacert origin-ca.crt
 #     nobody's outbound TCP to 127.0.0.1:${ORIGIN_PORT} is caught by the nft
 #     REDIRECT rule, diverted to the tproxy listener port, tunneled over QUIC to
 #     the server, and the server relays it to 127.0.0.1:${ORIGIN_PORT} where the
@@ -53,6 +53,7 @@
 #        MQPROXY_KEY=/path/to/tests/certs/test.key \
 #        MQPROXY_ORIGIN_CERT=/path/to/tests/certs/origin.crt \
 #        MQPROXY_ORIGIN_KEY=/path/to/tests/certs/origin.key \
+#        MQPROXY_ORIGIN_CA=/path/to/tests/certs/origin-ca.crt \
 #        bash tests/integration/e2e_tproxy.sh
 #
 #   Or via ctest (registered with SKIP_RETURN_CODE 77):
@@ -61,8 +62,9 @@
 # ENV (passed by CMake; overridable):
 #   MQPROXY_BIN              the `mqproxy` binary.
 #   MQPROXY_CERT/KEY         tunnel TLS cert/key (CN=mqproxy-test).
-#   MQPROXY_ORIGIN_CERT/KEY  origin TLS cert/key (SAN=IP:127.0.0.1) — curl
-#                            verifies against MQPROXY_ORIGIN_CERT.
+#   MQPROXY_ORIGIN_CERT/KEY  origin TLS leaf cert/key (SAN=IP:127.0.0.1), served
+#                            by the python origin.
+#   MQPROXY_ORIGIN_CA        CA that signed the leaf — curl verifies against it.
 #
 set -u
 
@@ -76,6 +78,7 @@ MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 ORIGIN_CERT="${MQPROXY_ORIGIN_CERT:-${REPO_ROOT}/tests/certs/origin.crt}"
 ORIGIN_KEY="${MQPROXY_ORIGIN_KEY:-${REPO_ROOT}/tests/certs/origin.key}"
+ORIGIN_CA="${MQPROXY_ORIGIN_CA:-${REPO_ROOT}/tests/certs/origin-ca.crt}"
 
 TOKEN="tproxy-e2e-token"
 SERVER_IP="127.0.0.1"
@@ -136,9 +139,9 @@ if ! python3 -c 'import ssl, http.server' 2>/dev/null; then
     note "SKIP: python3 lacks ssl/http.server — cannot stand up the TLS origin."
     exit "${SKIP}"
 fi
-for f in "${ORIGIN_CERT}" "${ORIGIN_KEY}" "${MQPROXY_CERT}" "${MQPROXY_KEY}"; do
+for f in "${ORIGIN_CERT}" "${ORIGIN_KEY}" "${ORIGIN_CA}" "${MQPROXY_CERT}" "${MQPROXY_KEY}"; do
     if [ ! -f "${f}" ]; then
-        note "ERROR: cert/key missing: ${f} (CMake generates it; set MQPROXY_ORIGIN_CERT/KEY)."
+        note "ERROR: cert/key missing: ${f} (CMake generates it; set MQPROXY_ORIGIN_CERT/KEY/CA)."
         exit 1
     fi
 done
@@ -189,7 +192,7 @@ chmod 755 "${WORK}"
 # WORK is under /tmp (world-traversable) and chmod 755, so a 0644 copy here is
 # reachable by nobody. The root-run origin readiness poll keeps the repo path.
 CACERT_PUB="${WORK}/origin_ca.crt"
-cp "${ORIGIN_CERT}" "${CACERT_PUB}" && chmod 644 "${CACERT_PUB}" || {
+cp "${ORIGIN_CA}" "${CACERT_PUB}" && chmod 644 "${CACERT_PUB}" || {
     note "ERROR: could not stage origin CA into WORK for the unprivileged curl."
     exit 1
 }
@@ -294,7 +297,7 @@ start_origin() {
             sed 's/^/  origin| /' "${WORK}/origin.log" >&2 2>/dev/null
             return 1
         fi
-        if curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CERT}" \
+        if curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CA}" \
             "https://127.0.0.1:${ORIGIN_PORT}/" 2>/dev/null; then
             return 0
         fi
@@ -417,9 +420,9 @@ sleep 1
 # diverts nobody's connection to the tproxy listener, which tunnels it over
 # QUIC to the server, which relays it to 127.0.0.1:${ORIGIN_PORT} (the actual origin).
 #
-# --cacert uses the ORIGIN cert (not the mqproxy tunnel cert).  If the relay
+# --cacert uses the ORIGIN CA (not the mqproxy tunnel cert).  If the relay
 # were a TLS MITM (Slice 1 must NOT be), the server-side cert would be
-# test.crt (not trusted by origin.crt) → curl would exit with CURLE_SSL_PEER_CERTIFICATE.
+# test.crt (not trusted by origin-ca.crt) → curl would exit with CURLE_SSL_PEER_CERTIFICATE.
 # A clean 200 + body match proves opaque relay.
 #
 # IMPORTANT: --cacert points at ${CACERT_PUB} (a copy staged in WORK under /tmp),

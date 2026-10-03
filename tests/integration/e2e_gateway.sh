@@ -38,9 +38,11 @@
 # ENV (passed by CMake; overridable):
 #   MQPROXY_BIN              the `mqproxy` binary.
 #   MQPROXY_CERT/KEY         tunnel TLS cert/key (CN=mqproxy-test).
-#   MQPROXY_ORIGIN_CERT/KEY  origin TLS cert/key (SAN=IP:127.0.0.1) — the server
-#                            verifies the origin against MQPROXY_ORIGIN_CERT
-#                            (passed as --origin-ca; we NEVER disable verify).
+#   MQPROXY_ORIGIN_CERT/KEY  origin TLS leaf cert/key (CA:FALSE, SAN=IP:127.0.0.1,
+#                            DNS:localhost), served by the python origin.
+#   MQPROXY_ORIGIN_CA        the CA that signed the leaf — the server verifies the
+#                            origin against it (passed as --origin-ca; we NEVER
+#                            disable verify).
 #
 set -u
 
@@ -54,6 +56,7 @@ MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 ORIGIN_CERT="${MQPROXY_ORIGIN_CERT:-${REPO_ROOT}/tests/certs/origin.crt}"
 ORIGIN_KEY="${MQPROXY_ORIGIN_KEY:-${REPO_ROOT}/tests/certs/origin.key}"
+ORIGIN_CA="${MQPROXY_ORIGIN_CA:-${REPO_ROOT}/tests/certs/origin-ca.crt}"
 
 TOKEN="gw-e2e-token"
 SERVER_IP="127.0.0.1"
@@ -73,9 +76,9 @@ if ! python3 -c 'import ssl, http.server' 2>/dev/null; then
     note "python3 lacks ssl/http.server — cannot stand up the TLS origin. SKIPPING."
     exit "${SKIP}"
 fi
-for f in "${ORIGIN_CERT}" "${ORIGIN_KEY}"; do
+for f in "${ORIGIN_CERT}" "${ORIGIN_KEY}" "${ORIGIN_CA}"; do
     if [ ! -f "${f}" ]; then
-        note "origin cert/key missing: ${f} (CMake generates it; set MQPROXY_ORIGIN_CERT/KEY)."
+        note "origin cert/key missing: ${f} (CMake generates it; set MQPROXY_ORIGIN_CERT/KEY/CA)."
         exit 1
     fi
 done
@@ -287,7 +290,7 @@ start_origin() {
             sed 's/^/  origin| /' "${WORK}/origin.log" >&2 2>/dev/null
             return 1
         fi
-        if curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CERT}" \
+        if curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CA}" \
             "https://127.0.0.1:${ORIGIN_PORT}/big.bin" --range 0-0 2>/dev/null; then
             return 0
         fi
@@ -303,7 +306,7 @@ start_server() {
         --listen "${SERVER_IP}:${QUIC_PORT}" \
         --token "${TOKEN}" \
         --cert "${MQPROXY_CERT}" --key "${MQPROXY_KEY}" \
-        --origin-ca "${ORIGIN_CERT}" \
+        --origin-ca "${ORIGIN_CA}" \
         --request-metrics \
         --cache-max-bytes 67108864 \
         >"${WORK}/server.log" 2>&1 &
