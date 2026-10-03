@@ -26,6 +26,16 @@ proptest = "1"
 static_assertions = "1"
 cmake = "0.1"
 cc = "1"
+# SP3 spec §8: the origin bridge (hyper polled from the shard; h2 locked to 0.4.19 in Cargo.lock, spec §13).
+# h2 0.4.19, not the spec's 0.4.14: RUSTSEC-2026-0258.
+hyper = { version = "~1.10", default-features = false, features = ["client", "http1", "http2", "server"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+rustls-native-certs = "0.8"
 
 [profile.release]
 debug = 1

@@ -15,6 +15,7 @@
 //! Each held stream (control included) takes one of the connection's 4096
 //! budget entries until it is released; relaying streams take none.
 
+pub mod origin;
 mod udp_session;
 
 use crate::app_stream::{self, CHUNK, Recv};

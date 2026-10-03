@@ -12,6 +12,14 @@ mq-transport-api = { path = "../mq-transport-api" }
 mq-wire = { path = "../mq-wire" }
 log = { workspace = true }
 subtle = { workspace = true }
+hyper = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls-native-certs = { workspace = true }
 
 [dev-dependencies]
 mq-runtime = { path = "../mq-runtime", features = ["test-support"] }
