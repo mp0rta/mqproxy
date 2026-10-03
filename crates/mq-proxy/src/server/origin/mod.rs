@@ -207,9 +207,8 @@ pub struct OriginConnId {
 /// revalidates a stale id.
 struct Conns<T>(Vec<(u32, Option<T>)>);
 
-#[allow(dead_code)] // Tasks 5.2–5.6c
 impl<T> Conns<T> {
-    fn insert(&mut self, make: impl FnOnce(OriginConnId) -> T) -> OriginConnId {
+    fn insert(&mut self, v: T) -> OriginConnId {
         // ponytail: linear free-slot scan; a free list if conns ever number in the thousands.
         let index = match self.0.iter().position(|(_, c)| c.is_none()) {
             Some(i) => i,
@@ -224,7 +223,7 @@ impl<T> Conns<T> {
             index: index as u32,
             generation: slot.0,
         };
-        slot.1 = Some(make(id));
+        slot.1 = Some(v);
         id
     }
 
@@ -274,7 +273,6 @@ type Pool = HashMap<ConnKey, Vec<OriginConnId>>;
 // The §7.1 state below is filled by Tasks 5.2–5.6c.
 
 /// Where a request's record lives (§7.1 lookups).
-#[allow(dead_code)] // Tasks 5.2–5.6c
 #[derive(Copy, Clone, Debug)]
 enum Where {
     Dial(DialOpId),
@@ -285,13 +283,11 @@ type H1Conn = http1::Connection<HyperIo, UploadBody>;
 type H2Conn = http2::Connection<HyperIo, UploadBody, ShardExec>;
 
 /// The hyper handshake's result, either protocol.
-#[allow(dead_code)] // Tasks 5.2–5.6c
 enum Handshaked {
     H1(http1::SendRequest<UploadBody>, Pin<Box<H1Conn>>),
     H2(http2::SendRequest<UploadBody>, Pin<Box<H2Conn>>),
 }
 
-#[allow(dead_code)] // Tasks 5.2–5.6c
 enum Driver {
     /// The TLS handshake runs through the socket; hyper's end of the pipe
     /// waits here for the hyper handshake (§7.2 step 4).
@@ -303,7 +299,6 @@ enum Driver {
     Completed,
 }
 
-#[allow(dead_code)] // Tasks 5.2–5.6c
 enum Sender {
     H1(http1::SendRequest<UploadBody>),
     H2(http2::SendRequest<UploadBody>),
@@ -312,7 +307,6 @@ enum Sender {
 /// hyper's `TrySendError` has `pub(crate)` fields and no constructor: the
 /// bridge maps it through `take_message()` + `into_error()`, and
 /// `send_request`'s `hyper::Error` with `returned: None` (§7.1).
-#[allow(dead_code)] // Tasks 5.2–5.6c
 struct SendFailure {
     err: hyper::Error,
     returned: Option<Request<UploadBody>>,
@@ -320,7 +314,6 @@ struct SendFailure {
 
 type ResponseFut = Pin<Box<dyn Future<Output = Result<Response<Incoming>, SendFailure>>>>;
 
-#[allow(dead_code)] // Tasks 5.2–5.6c
 struct StoredRequest {
     method: Method,
     scheme: Scheme,
@@ -331,7 +324,6 @@ struct StoredRequest {
     body: Rc<RefCell<UploadBuf>>,
 }
 
-#[allow(dead_code)] // Tasks 5.2–5.6c
 enum ConnectingPayload {
     Stored(StoredRequest),
     /// Handed back by `try_send_request` (h1 retry), re-sent as is, with
@@ -342,7 +334,6 @@ enum ConnectingPayload {
 /// The bridge's record of a request's origin side (§7.1, §7.7). Owned by the
 /// bridge — never by the gateway's `GwReq`: it outlives the `GwReq` removed
 /// at `H3Closed` until hyper lets go of the body.
-#[allow(dead_code)] // Tasks 5.2–5.6c
 enum OriginReq {
     Connecting {
         h3: H3ReqId,
@@ -383,9 +374,7 @@ enum OriginReq {
     },
 }
 
-#[allow(dead_code)] // Tasks 5.2–5.6c
 struct OriginConn {
-    id: OriginConnId,
     key: ConnKey,
     tcp: TcpId,
     tls: Option<rustls::ClientConnection>,
@@ -419,7 +408,6 @@ struct OriginConn {
     hold_public: bool,
 }
 
-#[allow(dead_code)] // Tasks 5.2–5.6c
 pub struct Origin {
     cfg: OriginCfg,
     tls: Arc<rustls::ClientConfig>,
@@ -752,8 +740,7 @@ impl Origin {
         *timer = Some(t);
         let plain = tls.is_none();
         let (hyper_io, io) = pipe::pipe();
-        let id = self.conns.insert(|id| OriginConn {
-            id,
+        let id = self.conns.insert(OriginConn {
             key: key.clone(),
             tcp,
             tls,
@@ -1186,18 +1173,13 @@ mod tests {
     #[test]
     fn conn_table_generational_ids_go_stale() {
         let mut t = Conns::<&str>::default();
-        let a = t.insert(|_| "a");
-        let b = t.insert(|_| "b");
+        let a = t.insert("a");
+        let b = t.insert("b");
         assert_ne!(a, b);
         assert_eq!(t.remove(a), Some("a"));
         assert_eq!(t.get_mut(a), None, "removed id is stale");
         assert_eq!(t.remove(a), None);
-        let mut seen = None;
-        let c = t.insert(|id| {
-            seen = Some(id);
-            "c"
-        });
-        assert_eq!(seen, Some(c), "the value is built with its own id");
+        let c = t.insert("c");
         assert_eq!(c.index, a.index, "the free slot is reused");
         assert_ne!(c, a, "under a new generation");
         assert_eq!(t.get_mut(a), None, "the stale id does not revalidate");
@@ -1231,10 +1213,9 @@ mod tests {
         sh.on_dial_result(now, op, Ok(addr)).expect("a live dial")
     }
 
-    pub(super) fn bare_conn(id: OriginConnId) -> OriginConn {
+    pub(super) fn bare_conn() -> OriginConn {
         let (hyper_io, io) = pipe::pipe();
         OriginConn {
-            id,
             key: (Scheme::Http, "o.test".into(), 80),
             tcp: some_tcp(),
             tls: None,
@@ -1259,13 +1240,13 @@ mod tests {
     #[test]
     fn pipe_dead_survives_conn_removal() {
         let mut origin = test_origin();
-        let id = origin.conns.insert(bare_conn);
+        let id = origin.conns.insert(bare_conn());
         assert!(!origin.pipe_dead(id), "never marked");
         origin.mark_pipe_dead(id);
         assert!(origin.pipe_dead(id));
         origin.conns.remove(id);
         assert!(origin.pipe_dead(id), "still answerable after removal");
-        let reused = origin.conns.insert(bare_conn);
+        let reused = origin.conns.insert(bare_conn());
         assert!(
             !origin.pipe_dead(reused),
             "a reused slot is a different conn"
@@ -1396,9 +1377,9 @@ mod tests {
         sh.with_app(Time::from_micros(1), |_, cx| {
             origin.start(cx, req).unwrap();
             let rec = origin.dials.drain().next().unwrap().1;
-            let id = origin.conns.insert(|id| OriginConn {
+            let id = origin.conns.insert(OriginConn {
                 pending: Some(rec),
-                ..bare_conn(id)
+                ..bare_conn()
             });
             origin.by_h3.insert(h3, Where::Conn(id));
             origin.conns.get(id).unwrap().io.mark_dead();
@@ -1453,7 +1434,7 @@ mod tests {
             ..start_req(origin, "o.test")
         };
         sh.with_app(Time::from_micros(1), |_, cx| {
-            let id = origin.conns.insert(bare_conn);
+            let id = origin.conns.insert(bare_conn());
             let key = origin.conns.get(id).unwrap().key.clone();
             origin.pool.entry(key).or_default().push(id);
             origin.hold_public_poll(id, true);
@@ -1527,13 +1508,13 @@ mod tests {
         let (done, stuck) = (origin.new_upload(None), origin.new_upload(None));
         done.borrow_mut().fin = true;
         let hyper_owned = UploadBody::new(&stuck);
-        let id = origin.conns.insert(|id| OriginConn {
+        let id = origin.conns.insert(OriginConn {
             reqs: vec![assigned(h3(0), &done), assigned(h3(1), &stuck)],
             acct: ConnAccounting {
                 active: 2,
                 ..ConnAccounting::default()
             },
-            ..bare_conn(id)
+            ..bare_conn()
         });
         let ended = |o: &Origin| {
             o.conns

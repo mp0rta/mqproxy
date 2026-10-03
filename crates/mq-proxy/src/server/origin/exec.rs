@@ -63,7 +63,6 @@ impl<F: Future<Output = ()> + 'static> hyper::rt::Executor<F> for ShardExec {
     }
 }
 
-#[allow(dead_code)] // Tasks 5.2–5.6c
 impl ShardExec {
     /// Polls every task once, including those spawned during this call, and
     /// drops the finished ones. Returns whether anything changed (a task was
@@ -89,6 +88,7 @@ impl ShardExec {
     }
 
     /// Tasks spawned and not yet finished (test-support accessor, Task 5.1b).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn len(&self) -> usize {
         self.tasks.len() + self.spawned.borrow().len()
     }
@@ -101,6 +101,7 @@ impl ShardExec {
         drop(s);
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

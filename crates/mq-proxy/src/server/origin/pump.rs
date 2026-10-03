@@ -757,10 +757,10 @@ mod tests {
         let now = NOW;
         let mut origin = test_origin();
         sh.with_app(now, |_, cx| {
-            let id = origin.conns.insert(|id| OriginConn {
+            let id = origin.conns.insert(OriginConn {
                 tcp,
                 tcp_eof: true,
-                ..bare_conn(id)
+                ..bare_conn()
             });
             let c = origin.conns.get(id).unwrap();
             assert_eq!(c.io.push_rx(&[0; PIPE_CAP]), PIPE_CAP, "pipe full");
@@ -833,10 +833,10 @@ mod tests {
         let free_room = |o: &mut Origin, id| o.conns.get_mut(id).unwrap().io = pipe::pipe().1;
         sh.with_app(NOW, |_, cx| {
             // Plain: the rest waits in `tcp_rx`.
-            let id = origin.conns.insert(|id| OriginConn {
+            let id = origin.conns.insert(OriginConn {
                 tcp,
                 driver: Driver::Completed,
-                ..bare_conn(id)
+                ..bare_conn()
             });
             origin.conns.get(id).unwrap().io.push_rx(&[0; PIPE_CAP]);
             origin.tcp_to_pipe(cx, id, &mut NoEvents);
@@ -854,11 +854,11 @@ mod tests {
         let mut origin = test_origin();
         sh.with_app(NOW, |_, cx| {
             // TLS: 10 KiB decrypted, 4 KiB of pipe room.
-            let id = origin.conns.insert(|id| OriginConn {
+            let id = origin.conns.insert(OriginConn {
                 tcp,
                 tls: Some(client_with_plaintext(10 * 1024)),
                 driver: Driver::Completed,
-                ..bare_conn(id)
+                ..bare_conn()
             });
             let c = origin.conns.get(id).unwrap();
             c.io.push_rx(&[0; PIPE_CAP - 4096]);

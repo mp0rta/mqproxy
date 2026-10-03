@@ -50,13 +50,11 @@ pub struct HyperIo(Rc<RefCell<PipeState>>);
 pub struct PipeHandle(Rc<RefCell<PipeState>>);
 
 /// A fresh pipe: hyper's end and the pump's.
-#[allow(dead_code)] // Tasks 5.2–5.6c
 pub fn pipe() -> (HyperIo, PipeHandle) {
     let st = Rc::new(RefCell::new(PipeState::default()));
     (HyperIo(st.clone()), PipeHandle(st))
 }
 
-#[allow(dead_code)] // Tasks 5.2–5.6c
 impl PipeHandle {
     /// Appends origin bytes up to `PIPE_CAP`; returns how many were taken.
     pub fn push_rx(&self, bytes: &[u8]) -> usize {
@@ -87,6 +85,7 @@ impl PipeHandle {
     }
 
     /// hyper's `poll_shutdown` was seen (recorded and ignored, §7.3 step 1).
+    #[cfg(feature = "test-support")]
     pub fn tx_shutdown(&self) -> bool {
         self.0.borrow().tx_shutdown
     }
