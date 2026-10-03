@@ -648,6 +648,12 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
     pub fn next_wait(&self) -> Wait {
         self.next_wait
     }
+    /// Test plumbing: the next iteration does not sleep on a wait computed
+    /// before a harness changed the shard between iterations (`with_app`).
+    #[cfg(feature = "test-support")]
+    pub fn reset_wait(&mut self) {
+        self.next_wait = Wait::Yield;
+    }
     pub fn latch(&self, k: SockKey) -> Option<Latch> {
         self.latches.get(&k).copied()
     }
