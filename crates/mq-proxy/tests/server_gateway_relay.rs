@@ -514,6 +514,17 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+/// libcurl parity: Nagle on the origin socket held the second write of a
+/// request behind the origin's delayed ACK (~40 ms per 20 KB upload).
+#[test]
+fn origin_dial_sets_nodelay() {
+    let mut h = H::with_gateway(cfg());
+    let (_r, op) = admitted(&mut h, &[], true);
+    h.reqs();
+    let tcp = h.dial_ok(op);
+    assert!(h.reqs().contains(&IoRequest::TcpSetNodelay { tcp }));
+}
+
 #[test]
 fn composed_h1_roundtrip() {
     let mut h = H::with_gateway(cfg());

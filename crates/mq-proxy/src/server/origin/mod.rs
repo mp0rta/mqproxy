@@ -615,7 +615,12 @@ impl Origin {
         };
         let https = rec.https();
         match r {
-            Ok(tcp) => self.connected(cx, tcp, rec, ev),
+            Ok(tcp) => {
+                // libcurl parity: Nagle would hold a request's later writes
+                // behind the origin's delayed ACK (~40 ms per small upload).
+                cx.tcp_set_nodelay(tcp);
+                self.connected(cx, tcp, rec, ev)
+            }
             // §6.2 step 9: the socket cap is 502 origin-start-failed.
             Err(DialError::Limit) => self.fail(cx, rec, start_failed("socket limit"), ev),
             Err(e) => {
