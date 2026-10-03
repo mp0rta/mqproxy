@@ -19,6 +19,7 @@ use std::future::{Future, pending};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use std::thread::{self, JoinHandle};
@@ -82,6 +83,9 @@ pub enum Then {
     /// The first connection answers `replies` heads, every later one none;
     /// then each behaves as `CloseAfterNextHead`.
     CloseEvery,
+    /// Reads head `replies + 1` and its body, writes the partial head
+    /// `HTTP/1.1 200` and closes (`IncompleteMessage` after response bytes).
+    PartialHeadAfterNextHead,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +165,8 @@ struct Shared {
     stop: watch::Sender<bool>,
     release: watch::Sender<bool>,
     frames: Mutex<Vec<(u8, u32)>>,
+    /// Connections accepted (the bridge's dials that reached the origin).
+    accepted: AtomicU32,
     /// `EarlyOkKeepBodyUnread`'s request bodies, by path.
     stash: Mutex<Vec<(String, Incoming)>>,
 }
@@ -190,6 +196,7 @@ impl OriginServer {
             stop: watch::Sender::new(false),
             release: watch::Sender::new(false),
             frames: Mutex::default(),
+            accepted: AtomicU32::new(0),
             stash: Mutex::default(),
         });
         let sh = shared.clone();
@@ -231,6 +238,11 @@ impl OriginServer {
             gone
         };
         drop(gone);
+    }
+
+    /// Connections accepted so far.
+    pub fn accepted(&self) -> u32 {
+        self.shared.accepted.load(Ordering::SeqCst)
     }
 
     /// `RawH2Tls`: the inbound frames so far, as (type, stream id).
@@ -332,7 +344,10 @@ fn serve(l: TcpListener, mode: OriginServerMode, sh: Arc<Shared>) {
         loop {
             let tcp = tokio::select! {
                 r = l.accept() => match r {
-                    Ok((tcp, _)) => tcp,
+                    Ok((tcp, _)) => {
+                        sh.accepted.fetch_add(1, Ordering::SeqCst);
+                        tcp
+                    }
                     Err(_) => continue,
                 },
                 _ = stop.wait_for(|s| *s) => return,
@@ -651,6 +666,7 @@ fn raw(l: TcpListener, mode: OriginServerMode, sh: &Shared) {
             thread::sleep(Duration::from_millis(2));
             continue;
         };
+        sh.accepted.fetch_add(1, Ordering::SeqCst);
         if tcp.set_nonblocking(false).is_err() || tcp.set_read_timeout(Some(POLL)).is_err() {
             continue;
         }
@@ -806,6 +822,11 @@ fn keep_alive(mut c: RawConn<'_>, replies: u32, then: Then) -> io::Result<()> {
     match then {
         Then::CloseAfterNextHead | Then::CloseEvery => {
             c.request()?;
+        }
+        Then::PartialHeadAfterNextHead => {
+            if c.request()? {
+                c.send(b"HTTP/1.1 200")?;
+            }
         }
         Then::CloseIdle(d) => thread::sleep(d),
     }

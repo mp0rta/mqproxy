@@ -144,7 +144,10 @@ fn cancel_while_assigned_moves_to_ended() {
     oh.with_host(|h, cx| h.pump(cx));
     assert_eq!(ended_records(&mut oh, conn), 0, "dropped once released");
     assert!(oh.events().is_empty(), "{:?}", oh.events());
-    assert!(closed_gracefully(&mut oh, tcp), "class C (5.5b)");
+    assert!(
+        closed_gracefully(&mut oh, tcp),
+        "tcp_close (class B or C: indistinguishable here)"
+    );
 
     // After the head, with the upload still incomplete.
     let mut oh = self::oh();
@@ -167,7 +170,7 @@ fn cancel_while_assigned_moves_to_ended() {
     assert_eq!(oh.events().len(), seen, "nothing after the cancel");
     assert!(
         pipe_dead(&mut oh, conn) && !oh.aborted(tcp),
-        "class C (5.5b)"
+        "tcp_close (class B or C: indistinguishable here)"
     );
     oh.tcp_out_all(tcp); // a graceful close follows the queued upload bytes
     assert!(closed_gracefully(&mut oh, tcp));

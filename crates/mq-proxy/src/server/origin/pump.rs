@@ -431,6 +431,8 @@ impl Origin {
                         }
                     }
                     Err(SendFailure { err, returned }) => {
+                        #[cfg(feature = "test-support")]
+                        self.classes.push(errors::classify(&err));
                         let rx = c.io.rx_since_send();
                         let retry = match returned {
                             // Handed back unsent: the idle conn had died.
@@ -493,6 +495,8 @@ impl Origin {
                         (ended, clean) = (true, true);
                     }
                     Poll::Ready(Some(Err(e))) => {
+                        #[cfg(feature = "test-support")]
+                        self.classes.push(errors::classify(&e));
                         *body = None;
                         let rx = c.io.rx_since_send();
                         ev.on_failure(cx, h3, failure(&e, true, proto, rx, https), true);

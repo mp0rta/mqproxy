@@ -291,7 +291,9 @@ fn h1_cancel_after_head_is_class_c() {
     oh.tcp_in(tcp, b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nok");
     assert_eq!(frames(&oh, h3), b"ok");
     oh.cancel(h3);
-    assert!(closed_gracefully(&mut oh, tcp), "class C: tcp_close");
+    // hyper also completes a dropped h1 exchange's conn, so B and C coincide
+    // here; C alone is pinned by `h1_rejected_response_conn_not_pooled_class_c`.
+    assert!(closed_gracefully(&mut oh, tcp), "tcp_close (class B or C)");
     assert!(!oh.aborted(tcp));
     assert!(pipe_dead(&mut oh, conn));
     assert_eq!(pool_len(&mut oh), 0);
@@ -311,12 +313,13 @@ fn removal_sets_pipe_dead_for_b_and_c() {
     assert!(closed_gracefully(&mut oh, tcp), "B: tcp_close");
     assert_eq!(socket_calls(&mut oh, tcp), 1);
 
-    // C: a cancelled exchange.
+    // A cancelled exchange: C, or B once hyper completed the conn — the
+    // same `tcp_close` (C alone: `h1_rejected_response_conn_not_pooled_class_c`).
     let mut oh = self::oh();
     let (h3, tcp, conn) = plain(&mut oh, get("http://o.test/"));
     oh.tcp_in(tcp, b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nok");
     oh.cancel(h3);
-    assert!(pipe_dead(&mut oh, conn), "C");
-    assert!(closed_gracefully(&mut oh, tcp), "C: tcp_close");
+    assert!(pipe_dead(&mut oh, conn), "B or C");
+    assert!(closed_gracefully(&mut oh, tcp), "B or C: tcp_close");
     assert_eq!(socket_calls(&mut oh, tcp), 1);
 }

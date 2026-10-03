@@ -18,6 +18,8 @@ pub mod tls;
 
 use accounting::{ConnAccounting, SweepClass};
 pub use body::{UploadBody, UploadBuf};
+#[cfg(feature = "test-support")]
+pub use errors::ErrClass;
 pub use events::{Accepted, BridgeEvents};
 pub use exec::Dirty;
 use exec::ShardExec;
@@ -411,6 +413,9 @@ pub struct Origin {
     /// Conns whose pipe was marked dead, kept past their removal (`pipe_dead`).
     #[cfg(feature = "test-support")]
     dead_marked: HashSet<OriginConnId>,
+    /// `classify` of every hyper error an exchange reported (`error_classes`).
+    #[cfg(feature = "test-support")]
+    classes: Vec<errors::ErrClass>,
 }
 
 impl Origin {
@@ -430,6 +435,8 @@ impl Origin {
             idle_timer: None,
             #[cfg(feature = "test-support")]
             dead_marked: HashSet::new(),
+            #[cfg(feature = "test-support")]
+            classes: Vec::new(),
         }
     }
 
@@ -1070,6 +1077,12 @@ impl Origin {
     /// Whether hyper called `poll_shutdown` on the conn's pipe.
     pub fn tx_shutdown(&self, id: OriginConnId) -> bool {
         self.conns.get(id).is_some_and(|c| c.io.tx_shutdown())
+    }
+
+    /// `classify` of every hyper error an exchange reported, in order: the
+    /// response future's (handed-back requests included) and the body's.
+    pub fn error_classes(&self) -> &[ErrClass] {
+        &self.classes
     }
 
     /// Pushes `fut` onto the bridge's executor.
