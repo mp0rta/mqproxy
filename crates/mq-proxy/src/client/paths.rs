@@ -83,6 +83,11 @@ impl Paths {
         }
     }
 
+    /// SP3 spec §5.7: `op` opens one of this connection's candidate sockets.
+    pub(super) fn owns(&self, op: SocketOpId) -> bool {
+        self.cands.iter().any(|c| c.1 == Cand::Opening(op))
+    }
+
     fn add(&mut self, cx: &mut Cx<'_>, conn: ConnId, i: usize, sock: UdpSocketId) {
         let ip = self.cands[i].0;
         self.cands[i].1 = match cx.add_path(conn, sock, self.standby) {

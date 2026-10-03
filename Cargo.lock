@@ -273,6 +273,7 @@ name = "mq-proxy"
 version = "0.0.4"
 dependencies = [
  "log",
+ "mq-http",
  "mq-proxy",
  "mq-runtime",
  "mq-transport-api",

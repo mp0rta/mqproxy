@@ -31,8 +31,15 @@ pub struct ClientConfig {
     pub auth_deadline: Duration,
     /// A request pending longer than this gets an error reply.
     pub pending_deadline: Duration,
-    /// An ingress request not complete within this is closed.
+    /// An ingress request not complete within this is closed (the fetch
+    /// head deadline too, SP3 spec §5.1).
     pub ingress_deadline: Duration,
+    /// SP3 spec §8: `--gateway ip:port` / `[Ingress] Gateway`; the fetch API and
+    /// its own H3 tunnel connection.
+    pub gateway: Option<SocketAddr>,
+    /// SP3 spec §5.7: a TCP ingress (`--socks5` / `--http-connect` / `--tproxy`)
+    /// is configured, so the raw tunnel is created (C `need_client`).
+    pub has_tcp_ingress: bool,
 }
 
 impl Default for ClientConfig {
@@ -50,6 +57,8 @@ impl Default for ClientConfig {
             auth_deadline: Duration::from_secs(10),
             pending_deadline: Duration::from_secs(30),
             ingress_deadline: Duration::from_secs(10),
+            gateway: None,
+            has_tcp_ingress: true,
         }
     }
 }
