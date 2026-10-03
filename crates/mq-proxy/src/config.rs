@@ -3,6 +3,7 @@
 use crate::udp::DEFAULT_IDLE;
 use mq_transport_api::Scheduler;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// spec §6.2: client settings.
@@ -78,6 +79,33 @@ pub struct ServerConfig {
     pub udp_enabled: bool,
     /// `--udp-idle-timeout`: a UDP session idle this long is closed.
     pub udp_idle_timeout: Duration,
+    /// SP3 spec §8: the HTTP gateway; `None` = `--no-gateway`.
+    pub gateway: Option<GatewayConfig>,
+}
+
+/// SP3 spec §8: server gateway settings (the rustls config is built at
+/// startup and handed to `Server::with_gateway`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayConfig {
+    /// `--origin-ca`: the only roots for origin TLS (§7.8).
+    pub origin_ca: Option<PathBuf>,
+    /// `--masquerade`: a bare 404 to unauthenticated requests (§6.5).
+    pub masquerade: bool,
+    /// `--request-metrics`: one `mq.req` line per request (§6.6).
+    pub request_metrics: bool,
+    /// DNS + TCP + TLS deadline (`MQ_GW_ORIGIN_CONNECT_TIMEOUT_S`).
+    pub origin_connect_timeout: Duration,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        GatewayConfig {
+            origin_ca: None,
+            masquerade: false,
+            request_metrics: false,
+            origin_connect_timeout: Duration::from_secs(10),
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -90,6 +118,7 @@ impl Default for ServerConfig {
             metrics_interval: None,
             udp_enabled: true,
             udp_idle_timeout: DEFAULT_IDLE,
+            gateway: None,
         }
     }
 }
