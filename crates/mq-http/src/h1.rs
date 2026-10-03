@@ -172,6 +172,62 @@ fn parse_complete(head: &[u8]) -> Option<Head<'_>> {
     })
 }
 
+// ---- serializer (spec §2.2), port of the `mq_http1_write_*` helpers ----
+
+/// `HTTP/1.1 <code> <reason>\r\n`; the fetch client passes an empty reason.
+pub fn write_status(out: &mut Vec<u8>, code: u16, reason: &str) {
+    out.extend_from_slice(format!("HTTP/1.1 {code} {reason}\r\n").as_bytes());
+}
+
+/// A header name or value contained CR, LF or NUL.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BadHeaderBytes;
+
+/// `name: value\r\n`; refuses CR/LF/NUL (response-splitting guard), writing nothing.
+pub fn write_header(out: &mut Vec<u8>, name: &[u8], value: &[u8]) -> Result<(), BadHeaderBytes> {
+    if name
+        .iter()
+        .chain(value)
+        .any(|&c| matches!(c, b'\r' | b'\n' | 0))
+    {
+        return Err(BadHeaderBytes);
+    }
+    out.extend_from_slice(name);
+    out.extend_from_slice(b": ");
+    out.extend_from_slice(value);
+    out.extend_from_slice(b"\r\n");
+    Ok(())
+}
+
+/// `<lowercase hex len>\r\n<data>\r\n`; never called with empty `data`.
+pub fn chunk_frame(out: &mut Vec<u8>, data: &[u8]) {
+    debug_assert!(!data.is_empty(), "a zero-length chunk would end the body");
+    out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// The chunked-body terminator `0\r\n\r\n`.
+pub fn chunk_end(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"0\r\n\r\n");
+}
+
+/// Listener/reject reply: status, `Connection: close`, `Content-Length: 0`,
+/// optional `X-Mq-Error`, blank line (C `gw_build_error`).
+pub fn error_reply(code: u16, reason: &str, xmq: Option<&str>) -> Vec<u8> {
+    let mut o = Vec::with_capacity(96);
+    write_status(&mut o, code, reason);
+    // fixed names/values: cannot fail
+    let _ = write_header(&mut o, b"Connection", b"close");
+    let _ = write_header(&mut o, b"Content-Length", b"0");
+    if let Some(x) = xmq {
+        // ponytail: a CR/LF/NUL in `x` drops the header; callers pass the §9.1 constants
+        let _ = write_header(&mut o, b"X-Mq-Error", x.as_bytes());
+    }
+    o.extend_from_slice(b"\r\n");
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +521,90 @@ mod tests {
         let (_, h) = done(b"GET / HTTP/1.1\r\nX-Mq-Tag: a\r\nX-Mq-Tag: b\r\n\r\n");
         let v: Vec<&[u8]> = h.headers.iter().map(|x| x.value).collect();
         assert_eq!(v, [b"a".as_slice(), b"b".as_slice()]);
+    }
+
+    // ---- serializer (spec §2.2) ----
+
+    fn bytes(f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut v = Vec::new();
+        f(&mut v);
+        v
+    }
+
+    #[test]
+    fn status_line_empty_reason_golden() {
+        assert_eq!(bytes(|o| write_status(o, 200, "")), b"HTTP/1.1 200 \r\n");
+    }
+
+    #[test]
+    fn status_line_with_reason() {
+        assert_eq!(
+            bytes(|o| write_status(o, 200, "OK")),
+            b"HTTP/1.1 200 OK\r\n"
+        );
+        assert_eq!(
+            bytes(|o| write_status(o, 411, "Length Required")),
+            b"HTTP/1.1 411 Length Required\r\n"
+        );
+    }
+
+    #[test]
+    fn write_header_golden_and_appends() {
+        let mut o = b"pre".to_vec();
+        write_header(&mut o, b"Content-Length", b"42").unwrap();
+        assert_eq!(o, b"preContent-Length: 42\r\n");
+    }
+
+    #[test]
+    fn write_header_rejects_cr_lf_nul() {
+        let mut o = Vec::new();
+        assert_eq!(
+            write_header(&mut o, b"X-Test", b"a\r\nEvil: x"),
+            Err(BadHeaderBytes)
+        );
+        assert_eq!(write_header(&mut o, b"X-Te\nst", b"v"), Err(BadHeaderBytes));
+        assert_eq!(
+            write_header(&mut o, b"X-Test", b"a\0b"),
+            Err(BadHeaderBytes)
+        );
+        assert!(o.is_empty(), "nothing written on error");
+        write_header(&mut o, b"X-Test", b"clean value").unwrap();
+        assert_eq!(o, b"X-Test: clean value\r\n");
+    }
+
+    #[test]
+    fn chunk_frame_hex_lowercase() {
+        assert_eq!(bytes(|o| chunk_frame(o, b"ab")), b"2\r\nab\r\n");
+        assert_eq!(bytes(|o| chunk_frame(o, b"hello")), b"5\r\nhello\r\n");
+        let big = [b'z'; 26];
+        let f = bytes(|o| chunk_frame(o, &big));
+        assert_eq!(&f[..4], b"1a\r\n");
+        assert_eq!(f.len(), 4 + 26 + 2);
+        let big = [b'z'; 4096];
+        let f = bytes(|o| chunk_frame(o, &big));
+        assert!(f.starts_with(b"1000\r\nzzz"));
+        assert!(f.ends_with(b"zz\r\n"));
+        assert_eq!(f.len(), 6 + 4096 + 2);
+    }
+
+    #[test]
+    fn chunk_end_golden() {
+        assert_eq!(bytes(chunk_end), b"0\r\n\r\n");
+    }
+
+    #[test]
+    fn error_reply_400_golden() {
+        assert_eq!(
+            error_reply(400, "Bad Request", None),
+            b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn error_reply_with_xmq_golden() {
+        assert_eq!(
+            error_reply(400, "Bad Request", Some("bad-target")),
+            b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\nX-Mq-Error: bad-target\r\n\r\n"
+        );
     }
 }
