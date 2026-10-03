@@ -8,7 +8,7 @@ use mq_proxy::server::origin::host::{BodySpec, BridgeEv, StartSpec, upload_byte}
 use mq_proxy::server::origin::{
     Accepted, Completion, OriginConnId, OriginFailure, OriginProto, PUMP_CAP, TlsOutcome,
 };
-use mq_runtime::TcpId;
+use mq_runtime::{IoResult, TcpId};
 use mq_transport_api::H3ReqId;
 use origin_harness::{OH, ORIGIN_CRT, ORIGIN_KEY, TlsPeer, cfg, get, tls};
 use std::cell::Cell;
@@ -116,9 +116,15 @@ fn plain_pump_moves_rx_and_tx_in_slices() {
         ..get("http://o.test/up")
     };
     let (h3, tcp, _) = plain(&mut oh, spec);
-    // The upload leaves through the 64 KiB send buffer; each drain is an
-    // `on_tcp_writable` that lets the pump write the next slices.
-    let mut wire = Vec::new();
+    assert_eq!(oh.sh.tcp_tx_buf(tcp).len(), 64 * KIB, "4 slices fill it");
+    // A partial drain frees 20 KiB: exactly one 16 KiB slice fits there (a
+    // single write of the whole `tx` would not fit at all).
+    let mut wire = oh.sh.tcp_tx_buf(tcp)[..20 * KIB].to_vec();
+    oh.sh.tcp_tx_commit(oh.now, tcp, IoResult::Bytes(20 * KIB));
+    oh.with_host(|h, cx| h.pump(cx));
+    assert_eq!(oh.sh.tcp_tx_buf(tcp).len(), (44 + 16) * KIB, "one slice");
+    // The upload leaves through the 64 KiB send buffer; each full drain is
+    // an `on_tcp_writable` that lets the pump write the next slices.
     loop {
         let out = oh.tcp_out_all(tcp);
         assert!(out.len() <= 64 * KIB, "never more than the send buffer");
