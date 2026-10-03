@@ -1,6 +1,6 @@
 //! Events and transmit view (spec §4.2).
 
-use crate::ids::{ConnId, StreamId};
+use crate::ids::{ConnId, PathId, StreamId};
 use std::net::SocketAddr;
 
 /// Transport output event (spec §4.2). `StreamReadable`, `StreamWritable`,
@@ -23,6 +23,9 @@ pub enum Event {
     /// A datagram is in the connection's receive ring; drain with
     /// `datagram_recv` until `None` (spec §3.1).
     DatagramReadable(ConnId),
+    /// xquic closed a path (peer abandon, path idle timeout, failed validation); the
+    /// connection lives on. Re-adding a path is up to the app: no `MpReady` follows.
+    PathRemoved(ConnId, PathId),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

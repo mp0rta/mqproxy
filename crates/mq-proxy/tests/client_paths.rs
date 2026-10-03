@@ -118,8 +118,11 @@ fn path_no_path_id_keeps_socket() {
     assert!(opens(&h.reqs()).is_empty(), "no new socket");
 }
 
+/// The first retry delay is at most 500 ms (backoff base 250 ms, jitter into `[d/2, d]`).
+const FIRST_RETRY: Duration = Duration::from_millis(500);
+
 #[test]
-fn path_other_error_closes_socket() {
+fn path_other_error_closes_socket_and_retries_after_backoff() {
     let mut h = H::new(paths_cfg());
     h.serving();
     h.reqs();
@@ -129,8 +132,86 @@ fn path_other_error_closes_socket() {
     let sock = h.sh.on_udp_socket(h.now, ops[0].0, Ok(local(A))).unwrap();
     assert!(h.reqs().contains(&IoRequest::CloseUdpSocket { sock }));
     h.event(Event::MpReady(h.conn));
-    assert_eq!(add_paths(&h).len(), 1, "given up for this connection");
+    assert_eq!(add_paths(&h).len(), 1, "not on MpReady: backing off");
     assert!(opens(&h.reqs()).is_empty());
+    h.advance(FIRST_RETRY);
+    let again = opens(&h.reqs());
+    assert_eq!(again.iter().map(|o| o.1).collect::<Vec<_>>(), [ip(A)]);
+}
+
+#[test]
+fn socket_open_error_retries_after_backoff() {
+    let mut h = H::new(paths_cfg());
+    h.serving();
+    h.reqs();
+    h.event(Event::MpReady(h.conn));
+    let ops = opens(&h.reqs());
+    assert_eq!(
+        h.sh.on_udp_socket(h.now, ops[0].0, Err(std::io::ErrorKind::AddrNotAvailable)),
+        None
+    );
+    h.event(Event::MpReady(h.conn));
+    assert!(opens(&h.reqs()).is_empty(), "backing off");
+    h.advance(FIRST_RETRY);
+    let again = opens(&h.reqs());
+    assert_eq!(again.iter().map(|o| o.1).collect::<Vec<_>>(), [ip(A)]);
+}
+
+#[test]
+fn removed_extra_path_reopens_its_socket_after_backoff() {
+    let mut h = H::new(paths_cfg());
+    h.serving();
+    h.reqs();
+    h.event(Event::MpReady(h.conn));
+    let ops = opens(&h.reqs());
+    h.t.expect_add_path(Ok(PathId(1)));
+    h.sh.on_udp_socket(h.now, ops[0].0, Ok(local(A))).unwrap();
+    h.event(Event::PathRemoved(h.conn, PathId(1)));
+    assert!(opens(&h.reqs()).is_empty(), "not at once");
+    h.advance(FIRST_RETRY);
+    let again = opens(&h.reqs());
+    assert_eq!(again.iter().map(|o| o.1).collect::<Vec<_>>(), [ip(A)]);
+    h.sh.on_udp_socket(h.now, again[0].0, Ok(local(A))).unwrap();
+    assert_eq!(add_paths(&h).len(), 2, "re-added");
+}
+
+#[test]
+fn removed_primary_path_is_readded_on_the_primary_socket() {
+    let mut h = H::new(paths_cfg());
+    h.serving();
+    h.reqs();
+    h.event(Event::PathRemoved(h.conn, PathId(0)));
+    h.advance(FIRST_RETRY);
+    assert!(opens(&h.reqs()).is_empty(), "no new socket");
+    assert_eq!(add_paths(&h), [false]);
+}
+
+#[test]
+fn unknown_or_stale_path_removal_is_ignored() {
+    let mut h = H::new(paths_cfg());
+    h.serving();
+    h.reqs();
+    h.event(Event::PathRemoved(h.conn, PathId(9)));
+    let other = h.t.new_conn_id();
+    h.event(Event::PathRemoved(other, PathId(0)));
+    h.advance(FIRST_RETRY);
+    assert!(opens(&h.reqs()).is_empty());
+    assert!(add_paths(&h).is_empty());
+}
+
+#[test]
+fn retry_timers_cancelled_on_conn_close() {
+    let mut h = H::new(paths_cfg());
+    h.serving();
+    h.reqs();
+    h.event(Event::PathRemoved(h.conn, PathId(0)));
+    h.event(closed_ev(&h));
+    h.reqs();
+    // The reconnect fires; the primary retry does not add a path to anything.
+    let c2 = h.t.new_conn_id();
+    h.t.expect_connect(Ok(c2));
+    h.advance(FIRST_RETRY.max(h.sh.next_timeout().unwrap() - h.now));
+    assert!(add_paths(&h).is_empty());
 }
 
 #[test]

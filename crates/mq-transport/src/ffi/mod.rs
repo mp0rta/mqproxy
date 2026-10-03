@@ -38,7 +38,7 @@ pub(crate) fn transport_callbacks() -> xqc_transport_callbacks_t {
         cert_verify_cb: Some(cert_verify),
         ready_to_create_path_notify: Some(ready_to_create_path_notify),
         path_created_notify: None,
-        path_removed_notify: None,
+        path_removed_notify: Some(path_removed_notify),
         conn_closing: None,
         conn_peer_addr_changed_notify: None,
         path_peer_addr_changed_notify: None,

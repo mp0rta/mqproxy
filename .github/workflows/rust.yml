@@ -192,6 +192,8 @@ jobs:
         run: MQPROXY_BIN=$PWD/target/release/mqproxy tests/integration/e2e_multipath.sh
       - name: e2e_tproxy (Rust)
         run: MQPROXY_BIN=$PWD/target/release/mqproxy tests/integration/e2e_tproxy.sh
+      - name: e2e_path_recovery (Rust)
+        run: MQPROXY_BIN=$PWD/target/release/mqproxy tests/integration/e2e_path_recovery.sh
       - name: Interop, C client -> Rust server
         run: |
           MQPROXY_BIN=$PWD/tests/integration/mqproxy-interop-wrapper.sh \

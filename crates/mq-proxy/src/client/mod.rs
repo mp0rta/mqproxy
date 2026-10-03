@@ -584,6 +584,7 @@ impl App for Client {
                 self.conn_gone(cx);
             }
             Event::MpReady(c) if self.current(c) => self.paths.on_mp_ready(cx, c),
+            Event::PathRemoved(c, p) if self.current(c) => self.paths.on_path_removed(cx, p),
             // spec §6.2: the protocol has no server-initiated streams.
             Event::NewStream(_, s, _) => cx.stream_reset(s),
             Event::StreamReadable(s) if self.ctrl_of(s) => self.ctrl_readable(cx, s),
@@ -765,7 +766,8 @@ impl App for Client {
 
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         let Some(tm) = self.timers.remove(&id) else {
-            return;
+            let conn = self.conn.as_ref().filter(|c| !c.closing).map(|c| c.id);
+            return self.paths.on_timer(cx, conn, id);
         };
         match tm {
             Tm::Auth => {
