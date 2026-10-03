@@ -28,7 +28,9 @@
 #   The WHOLE script exits 77 (SKIP) ONLY when the python3 TLS origin cannot be
 #   stood up (no python3, no ssl, port trouble) — without an origin there is
 #   nothing to test. Every OTHER failure is a real FAIL (exit 1). Case 8 alone
-#   skipping (no NET_ADMIN) does NOT skip the script.
+#   skipping (no NET_ADMIN) does NOT skip the script, unless
+#   MQPROXY_E2E_REQUIRE_NETADMIN=1 (set by the NET_ADMIN CI jobs): then a missing
+#   tc is a FAIL (exit 1), so cases 8 and 10 can never silently not run.
 #
 # HOW TO RUN:
 #   tests/integration/e2e_gateway.sh                 # cases 1-7 (+ case-8 skip)
@@ -921,6 +923,10 @@ if [ "$(id -u)" -eq 0 ] && tc qdisc add dev lo root netem delay 1ms 2>/dev/null;
 fi
 
 if [ "${can_tc}" -ne 1 ]; then
+    if [ "${MQPROXY_E2E_REQUIRE_NETADMIN:-0}" = 1 ]; then
+        note "case 8 FAIL: MQPROXY_E2E_REQUIRE_NETADMIN=1 but tc on lo is unavailable (root + NET_ADMIN needed for cases 8 and 10)."
+        exit 1
+    fi
     note "case 8 skipped (no NET_ADMIN): 2-path aggregation smoke needs tc on lo."
     note "RESULT = PASS (cases 1-7 + cases 9 + 11 + 12 + 13 + ${C14_RAN}; case 8 skipped)."
     exit 0

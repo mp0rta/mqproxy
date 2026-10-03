@@ -320,6 +320,9 @@ jobs:
                 -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
           cmake --build build -j"$(nproc)"
       - name: E2E tests (ctest, with NET_ADMIN)
+        env:
+          # e2e_gateway: no tc on lo (cases 8 and 10) is a failure here, not a skip.
+          MQPROXY_E2E_REQUIRE_NETADMIN: 1
         run: ctest --test-dir build -V
       - name: Upload e2e logs on failure
         if: failure()

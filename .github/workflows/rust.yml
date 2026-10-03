@@ -164,6 +164,9 @@ jobs:
     container:
       image: ubuntu:24.04
       options: --cap-add=NET_ADMIN
+    env:
+      # e2e_gateway: no tc on lo (cases 8 and 10) is a failure here, not a skip.
+      MQPROXY_E2E_REQUIRE_NETADMIN: 1
     steps:
       - name: Install git (needed before checkout for submodules)
         run: apt-get update && apt-get install -y git
