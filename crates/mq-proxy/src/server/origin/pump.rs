@@ -33,6 +33,7 @@ impl Origin {
                 changed |= self.pipe_to_tcp(cx, id);
             }
             changed |= self.refill(cx, ev);
+            changed |= self.rx_movable(cx);
             if !(changed | self.dirty.take()) {
                 break;
             }
@@ -47,6 +48,19 @@ impl Origin {
             }
         }
         self.settle(cx);
+    }
+
+    /// Liveness: step 1 could still move bytes — a live socket's `tcp_rx`
+    /// holds some, the pipe has room, and (TLS) rustls wants to read; one
+    /// more round then runs.
+    fn rx_movable(&self, cx: &Cx<'_>) -> bool {
+        self.conns.ids().into_iter().any(|id| {
+            let c = self.conns.get(id).expect("live conn");
+            !self.closing.contains(&id)
+                && !cx.tcp_rx(c.tcp).is_empty()
+                && c.io.rx_room() > 0
+                && c.tls.as_ref().is_none_or(|t| t.wants_read())
+        })
     }
 
     /// §7.7 settling point (Task 5.5a).
@@ -533,20 +547,28 @@ mod tests {
     /// spec §7.3: plain `rx_eof` waits until `tcp_rx` is empty, even when
     /// the pipe is full and nothing moves (an end-to-end test cannot see an
     /// early EOF: each round refills the pipe before hyper reads again).
-    #[test]
-    fn plain_eof_waits_for_tcp_rx() {
+    const NOW: Time = Time(1);
+
+    /// A shard with one live app socket whose `tcp_rx` holds `abc`.
+    fn socket_with_rx() -> (Shard<ScriptedTransport, RecordingApp>, TcpId) {
         let (t, _) = ScriptedTransport::new();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
         let mut sh = Shard::new(t, RecordingApp::new().0, addr, 7);
-        let now = Time::from_micros(1);
         let target = Target {
             host: Host::Ip(addr.ip()),
             port: 80,
         };
-        let op = sh.with_app(now, |_, cx| cx.dial(target, Duration::from_secs(1)));
-        let tcp = sh.on_dial_result(now, op, Ok(addr)).expect("a live dial");
+        let op = sh.with_app(NOW, |_, cx| cx.dial(target, Duration::from_secs(1)));
+        let tcp = sh.on_dial_result(NOW, op, Ok(addr)).expect("a live dial");
         sh.tcp_rx_buf(tcp)[..3].copy_from_slice(b"abc");
-        sh.tcp_rx_commit(now, tcp, IoResult::Bytes(3));
+        sh.tcp_rx_commit(NOW, tcp, IoResult::Bytes(3));
+        (sh, tcp)
+    }
+
+    #[test]
+    fn plain_eof_waits_for_tcp_rx() {
+        let (mut sh, tcp) = socket_with_rx();
+        let now = NOW;
         let mut origin = test_origin();
         sh.with_app(now, |_, cx| {
             let id = origin.conns.insert(|id| OriginConn {
@@ -564,6 +586,37 @@ mod tests {
             cx.tcp_consume(tcp, 3);
             assert!(origin.tcp_to_pipe(cx, id, &mut NoEvents), "now published");
             assert!(!origin.conns.get(id).unwrap().io.set_eof(), "already set");
+        });
+    }
+
+    /// Belt and braces: bytes step 1 could still move keep the pump going.
+    #[test]
+    fn rx_movable_needs_bytes_room_and_tls_interest() {
+        let (mut sh, tcp) = socket_with_rx();
+        let mut origin = test_origin();
+        sh.with_app(NOW, |_, cx| {
+            let id = origin.conns.insert(|id| OriginConn {
+                tcp,
+                ..bare_conn(id)
+            });
+            assert!(origin.rx_movable(cx), "plain: bytes and room");
+            let c = origin.conns.get(id).unwrap();
+            c.io.push_rx(&[0; PIPE_CAP]);
+            assert!(!origin.rx_movable(cx), "the pipe is full");
+            let (_, io) = pipe::pipe();
+            let c = origin.conns.get_mut(id).unwrap();
+            c.io = io;
+            let name = rustls::pki_types::ServerName::try_from("o.test").unwrap();
+            let tls = rustls::ClientConnection::new(origin.tls.clone(), name).unwrap();
+            assert!(
+                !tls.wants_read(),
+                "a fresh client has its ClientHello to send"
+            );
+            origin.conns.get_mut(id).unwrap().tls = Some(tls);
+            assert!(!origin.rx_movable(cx), "rustls does not want to read");
+            origin.closing.push(id);
+            origin.conns.get_mut(id).unwrap().tls = None;
+            assert!(!origin.rx_movable(cx), "a closing conn has no socket");
         });
     }
 }
