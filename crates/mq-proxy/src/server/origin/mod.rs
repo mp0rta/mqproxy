@@ -5,6 +5,8 @@
 mod body;
 mod events;
 mod exec;
+#[cfg(feature = "test-support")]
+pub mod host;
 mod pipe;
 
 pub use body::{UploadBody, UploadBuf};
@@ -21,6 +23,8 @@ use mq_runtime::{Cx, DialError, DialOpId, TcpEnd, TcpId, TimerId};
 use mq_transport_api::{H3ReqId, Time};
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(feature = "test-support")]
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -187,6 +191,13 @@ impl<T> Conns<T> {
         id
     }
 
+    fn get(&self, id: OriginConnId) -> Option<&T> {
+        match self.0.get(id.index as usize) {
+            Some((g, Some(c))) if *g == id.generation => Some(c),
+            _ => None,
+        }
+    }
+
     fn get_mut(&mut self, id: OriginConnId) -> Option<&mut T> {
         match self.0.get_mut(id.index as usize) {
             Some((g, Some(c))) if *g == id.generation => Some(c),
@@ -336,6 +347,9 @@ struct OriginConn {
     draining: bool,
     idle_since: Option<Time>,
     connect_ms: i64,
+    /// Test gate (5.1b `hold_public_poll`): pump step 2 skips the public
+    /// `Connection` future but still polls the executor tasks.
+    hold_public: bool,
 }
 
 #[allow(dead_code)] // Tasks 5.2–5.6c
@@ -354,6 +368,9 @@ pub struct Origin {
     dials: HashMap<DialOpId, OriginReq>,
     timers: HashMap<TimerId, OriginTimer>,
     idle_timer: Option<TimerId>,
+    /// Conns whose pipe was marked dead, kept past their removal (`pipe_dead`).
+    #[cfg(feature = "test-support")]
+    dead_marked: HashSet<OriginConnId>,
 }
 
 impl Origin {
@@ -371,6 +388,18 @@ impl Origin {
             dials: HashMap::new(),
             timers: HashMap::new(),
             idle_timer: None,
+            #[cfg(feature = "test-support")]
+            dead_marked: HashSet::new(),
+        }
+    }
+
+    /// spec §7.7 "every removal": the conn's reads and writes fail from now on.
+    #[allow(dead_code)] // Tasks 5.4/5.5a
+    fn mark_pipe_dead(&mut self, id: OriginConnId) {
+        if let Some(c) = self.conns.get(id) {
+            c.io.mark_dead();
+            #[cfg(feature = "test-support")]
+            self.dead_marked.insert(id);
         }
     }
 
@@ -444,9 +473,100 @@ impl Origin {
     }
 }
 
+/// A live record's state (test-support; an `Ended` record has no `h3`).
+#[cfg(feature = "test-support")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RecordState {
+    Connecting,
+    Assigned,
+}
+
+#[cfg(feature = "test-support")]
+impl Origin {
+    /// Conns in the pool, every key.
+    pub fn pool_len(&self) -> usize {
+        self.pool.values().map(Vec::len).sum()
+    }
+
+    pub fn closing_len(&self) -> usize {
+        self.closing.len()
+    }
+
+    /// Executor tasks spawned and not finished.
+    pub fn task_count(&self) -> usize {
+        self.exec.len()
+    }
+
+    /// Whether the conn's pipe was marked dead; still answerable after removal.
+    pub fn pipe_dead(&self, id: OriginConnId) -> bool {
+        self.dead_marked.contains(&id)
+    }
+
+    pub fn idle_timer_armed(&self) -> bool {
+        self.idle_timer.is_some()
+    }
+
+    /// `None` once the record is `Ended` or dropped.
+    pub fn record_state(&self, h3: H3ReqId) -> Option<RecordState> {
+        let rec = match *self.by_h3.get(&h3)? {
+            Where::Dial(op) => self.dials.get(&op),
+            Where::Conn(id) => {
+                let c = self.conns.get(id)?;
+                c.pending.iter().chain(&c.reqs).find(|r| match r {
+                    OriginReq::Connecting { h3: x, .. } | OriginReq::Assigned { h3: x, .. } => {
+                        *x == h3
+                    }
+                    OriginReq::Ended { .. } => false,
+                })
+            }
+        };
+        match rec? {
+            OriginReq::Connecting { .. } => Some(RecordState::Connecting),
+            OriginReq::Assigned { .. } => Some(RecordState::Assigned),
+            OriginReq::Ended { .. } => None,
+        }
+    }
+
+    pub fn ended_records(&self, id: OriginConnId) -> usize {
+        self.conns.get(id).map_or(0, |c| {
+            c.reqs
+                .iter()
+                .filter(|r| matches!(r, OriginReq::Ended { .. }))
+                .count()
+        })
+    }
+
+    pub fn conn_of(&self, h3: H3ReqId) -> Option<OriginConnId> {
+        match self.by_h3.get(&h3)? {
+            Where::Conn(id) => Some(*id),
+            Where::Dial(_) => None,
+        }
+    }
+
+    pub fn connect_ms(&self, id: OriginConnId) -> Option<i64> {
+        self.conns.get(id).map(|c| c.connect_ms)
+    }
+
+    /// While set, the pump skips the conn's public `Connection` future (5.6c);
+    /// the caller pumps after clearing it, as after `resume`.
+    pub fn hold_public_poll(&mut self, id: OriginConnId, on: bool) {
+        if let Some(c) = self.conns.get_mut(id) {
+            c.hold_public = on;
+        }
+    }
+
+    /// Pushes `fut` onto the bridge's executor.
+    pub fn spawn_test_task(&mut self, fut: Pin<Box<dyn Future<Output = ()>>>) {
+        hyper::rt::Executor::execute(&self.exec, fut);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mq_runtime::testing::{RecordingApp, ScriptedTransport};
+    use mq_runtime::{Host, Shard, Target};
+    use std::net::{Ipv4Addr, SocketAddr};
 
     #[test]
     fn conn_table_generational_ids_go_stale() {
@@ -469,6 +589,70 @@ mod tests {
         assert_eq!(t.remove(a), None, "nor remove the new occupant");
         assert_eq!(t.get_mut(c).copied(), Some("c"));
         assert_eq!(t.get_mut(b).copied(), Some("b"));
+    }
+
+    fn test_origin() -> Origin {
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let cfg = OriginCfg {
+            connect_timeout: Duration::from_secs(10),
+            sweep: SWEEP,
+        };
+        Origin::new(cfg, Arc::new(tls), Arc::new(Dirty::default()))
+    }
+
+    /// `TcpId`s are minted only by a shard: one dial result.
+    fn some_tcp() -> TcpId {
+        let (t, _) = ScriptedTransport::new();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
+        let mut sh = Shard::new(t, RecordingApp::new().0, addr, 7);
+        let now = Time::from_micros(1);
+        let target = Target {
+            host: Host::Ip(addr.ip()),
+            port: 80,
+        };
+        let op = sh.with_app(now, |_, cx| cx.dial(target, Duration::from_secs(1)));
+        sh.on_dial_result(now, op, Ok(addr)).expect("a live dial")
+    }
+
+    fn bare_conn(id: OriginConnId) -> OriginConn {
+        OriginConn {
+            id,
+            key: (Scheme::Http, "o.test".into(), 80),
+            tcp: some_tcp(),
+            tls: None,
+            io: pipe::pipe().1,
+            proto: None,
+            driver: Driver::Tls,
+            send: None,
+            pending: None,
+            reqs: Vec::new(),
+            out: Vec::new(),
+            tcp_eof: false,
+            busy: false,
+            active: 0,
+            draining: false,
+            idle_since: None,
+            connect_ms: 0,
+            hold_public: false,
+        }
+    }
+
+    #[test]
+    fn pipe_dead_survives_conn_removal() {
+        let mut origin = test_origin();
+        let id = origin.conns.insert(bare_conn);
+        assert!(!origin.pipe_dead(id), "never marked");
+        origin.mark_pipe_dead(id);
+        assert!(origin.pipe_dead(id));
+        origin.conns.remove(id);
+        assert!(origin.pipe_dead(id), "still answerable after removal");
+        let reused = origin.conns.insert(bare_conn);
+        assert!(
+            !origin.pipe_dead(reused),
+            "a reused slot is a different conn"
+        );
     }
 
     #[test]
