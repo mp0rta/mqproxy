@@ -244,6 +244,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mq-http"
+version = "0.0.4"
+
+[[package]]
 name = "mq-integration"
 version = "0.0.4"
 dependencies = [
