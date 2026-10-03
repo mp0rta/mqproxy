@@ -135,6 +135,10 @@ impl Gateway {
     }
 
     /// spec §6.7: every routed callback ends here.
+    // ponytail: every routed callback (each `on_h3_event`, TCP and timer event
+    // of the bridge) pumps every origin conn and every executor task, O(conns +
+    // tasks) per callback; fine at the benched scale, a dirty-conn set (pump
+    // only the conns the callback touched or whose waker fired) if it shows.
     pub(super) fn pump(&mut self, cx: &mut Cx<'_>) {
         self.origin.pump(cx, &mut self.core);
     }
