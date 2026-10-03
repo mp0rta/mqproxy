@@ -153,6 +153,12 @@ fn no_reconnect_is_terminal_and_502() {
     h.advance(Duration::from_secs(60));
     assert_eq!(h.connects(), 2, "no reconnect");
     assert_eq!(h.sh.exit_status(), None, "the process keeps running");
+    // spec §5.7: new requests get 502 `tunnel-unavailable`.
+    let tcp = h.accept(h.fetch, meta(None));
+    h.rx(tcp, &fetch_req("", b""));
+    assert_eq!(h.tx_all(tcp), gw_reject(502, "tunnel-unavailable"));
+    assert!(H::closed(&h.reqs(), tcp));
+    assert_eq!(h.count(|c| matches!(c, Call::OpenH3Request(_))), 0);
 }
 
 #[test]

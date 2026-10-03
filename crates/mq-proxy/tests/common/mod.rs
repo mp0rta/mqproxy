@@ -260,3 +260,28 @@ pub fn pad_to(frame: &[u8], total: usize) -> Vec<u8> {
     b.resize(total, 0);
     b
 }
+
+/// A valid fetch request head (`X-Mq-Auth` + `X-Mq-Target`) with `extra`
+/// header lines (each ending in CRLF), followed by `body`.
+pub fn fetch_req(extra: &str, body: &[u8]) -> Vec<u8> {
+    let mut b = format!(
+        "POST /_mqproxy/fetch HTTP/1.1\r\nHost: localhost\r\nX-Mq-Auth: Bearer secret\r\n\
+         X-Mq-Target: https://example.com/x\r\n{extra}\r\n"
+    )
+    .into_bytes();
+    b.extend_from_slice(body);
+    b
+}
+
+/// The gateway's byte-exact reject reply (spec §5.2, `h1::error_reply`).
+pub fn gw_reject(code: u16, xmq: &str) -> Vec<u8> {
+    let phrase = if code == 400 {
+        "Bad Request"
+    } else {
+        "Bad Gateway"
+    };
+    format!(
+        "HTTP/1.1 {code} {phrase}\r\nConnection: close\r\nContent-Length: 0\r\nX-Mq-Error: {xmq}\r\n\r\n"
+    )
+    .into_bytes()
+}

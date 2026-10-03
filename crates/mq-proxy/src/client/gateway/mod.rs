@@ -1,17 +1,28 @@
 //! SP3 spec §5: the client gateway — the fetch listener's requests and their own
 //! H3 tunnel connection (§5.7), composed into `Client` (§5.8).
 
+mod head;
+
 use super::backoff::Backoff;
 use super::paths::Paths;
 use super::{SNI, log_conn_metrics};
 use crate::config::ClientConfig;
-use mq_http::h1::HEAD_MAX;
-use mq_runtime::{AcceptMeta, Cx, SocketOpId, TcpEnd, TcpId, TimerId, UdpSocketId};
-use mq_transport_api::{ConnConfig, ConnId, ConnProto, Event, H3ReqId};
+use head::Head;
+use mq_http::h1::{self, HEAD_MAX, Progress};
+use mq_http::headers::{Reject, reject_status, reject_xmq};
+use mq_runtime::{AcceptMeta, Cx, SocketOpId, TCP_BUF, TcpEnd, TcpId, TimerId, UdpSocketId};
+use mq_transport_api::{ConnConfig, ConnId, ConnProto, Event, H3Header, H3ReqId};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
+
+/// SP3 spec §5.3/§5.4: one upload copy, one download read.
+const DL_CHUNK: usize = 16 * 1024;
+
+/// SP3 spec §5.1: the only request the fetch listener serves.
+const FETCH_METHOD: &[u8] = b"POST";
+const FETCH_PATH: &[u8] = b"/_mqproxy/fetch";
 
 /// SP3 spec §5.8: the gateway's timers (`Tm::GwReconnect` / `Tm::GwHead`).
 #[derive(Copy, Clone, Debug)]
@@ -24,6 +35,24 @@ pub enum GwTm {
 enum GwReq {
     /// Waiting for the complete request head (§5.2).
     Head { timer: TimerId },
+    /// The H3 request is open (§5.2 accept): upload §5.3, download §5.4.
+    Open { h3: H3ReqId, upload: Upload },
+}
+
+/// SP3 spec §5.3: the local request body still to send.
+struct Upload {
+    remaining: u64,
+}
+
+/// Write `reply` (it always fits: nothing else was written) and close (§5.2, §5.6).
+fn reply_close(cx: &mut Cx<'_>, tcp: TcpId, reply: &[u8]) {
+    let _ = cx.tcp_write(tcp, reply);
+    cx.tcp_close(tcp);
+}
+
+/// SP3 spec §2.2: the listener-owned replies carry no `X-Mq-Error`.
+fn listener_reply(cx: &mut Cx<'_>, tcp: TcpId, code: u16, phrase: &str) {
+    reply_close(cx, tcp, &h1::error_reply(code, phrase, None));
 }
 
 /// The settings the gateway reads.
@@ -78,10 +107,6 @@ impl Gateway {
 
     /// SP3 spec §5.7: the one tunnel connection, when established (the seam for
     /// a future route/policy/pool, §1.2).
-    #[cfg_attr(
-        not(feature = "test-support"),
-        expect(dead_code, reason = "the head path (Task 4.2) calls it")
-    )]
     fn pick_conn(&self) -> Option<ConnId> {
         self.tunnel.conn.filter(|_| self.tunnel.up)
     }
@@ -188,12 +213,117 @@ impl Gateway {
         self.reqs.contains_key(&tcp)
     }
 
-    /// SP3 spec §5.2–§5.3 (head parsing and upload arrive with Tasks 4.2/4.3).
-    pub fn on_tcp_data(&mut self, _cx: &mut Cx<'_>, _tcp: TcpId) {}
+    /// SP3 spec §5.2 (head) / §5.3 (upload).
+    pub fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        match self.reqs.get(&tcp) {
+            Some(GwReq::Head { .. }) => self.head_data(cx, tcp),
+            Some(GwReq::Open { .. }) => self.upload(cx, tcp),
+            None => {}
+        }
+    }
+
+    /// SP3 spec §5.2: parse the head; listener replies, then the reject
+    /// sequence, then open the H3 request and hand over to the upload.
+    fn head_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        let rx = cx.tcp_rx(tcp);
+        let parsed = match h1::parse_head(rx) {
+            Progress::Need if rx.len() < HEAD_MAX => return,
+            Progress::Done { consumed, head } => {
+                if head.method != FETCH_METHOD || head.target != FETCH_PATH {
+                    Err((404, "Not Found"))
+                } else if head.has_chunked_te {
+                    Err((411, "Length Required"))
+                } else {
+                    Ok((consumed, Head::from_h1(&head)))
+                }
+            }
+            Progress::Need | Progress::TooLarge | Progress::Bad => Err((400, "Bad Request")),
+        };
+        if let Some(GwReq::Head { timer }) = self.reqs.remove(&tcp) {
+            self.cancel(cx, timer);
+        }
+        let (consumed, head) = match parsed {
+            Ok(p) => p,
+            Err((code, phrase)) => return listener_reply(cx, tcp, code, phrase),
+        };
+        cx.tcp_consume(tcp, consumed);
+        let h3 = match self.open(cx, &head) {
+            Ok(h3) => h3,
+            Err(r) => {
+                let code = reject_status(r);
+                let phrase = if code == 400 {
+                    "Bad Request"
+                } else {
+                    "Bad Gateway"
+                };
+                return reply_close(cx, tcp, &h1::error_reply(code, phrase, Some(reject_xmq(r))));
+            }
+        };
+        let upload = Upload {
+            remaining: head.content_length,
+        };
+        self.reqs.insert(tcp, GwReq::Open { h3, upload });
+        self.by_h3.insert(h3, tcp);
+        cx.tcp_set_rx_limit(tcp, TCP_BUF);
+        // Body bytes from the head's read get no further `on_tcp_data`.
+        self.upload(cx, tcp);
+    }
+
+    /// SP3 spec §5.2 steps 1–10; on `Err` nothing is left open.
+    fn open(&self, cx: &mut Cx<'_>, head: &Head) -> Result<H3ReqId, Reject> {
+        let checked = head::check(head)?;
+        let conn = self.pick_conn().ok_or(Reject::TunnelUnavailable)?;
+        let h3 = cx
+            .open_h3_request(conn)
+            .map_err(|_| Reject::TunnelUnavailable)?;
+        let fwd = head::forwarded_headers(head, &checked);
+        let hs: Vec<H3Header<'_>> = fwd
+            .iter()
+            .map(|(name, value)| H3Header { name, value })
+            .collect();
+        // Fail closed, no retry (as C): `Blocked` too.
+        if cx
+            .h3_send_headers(h3, &hs, head.content_length == 0)
+            .is_err()
+        {
+            cx.h3_reset(h3);
+            return Err(Reject::TunnelUnavailable);
+        }
+        Ok(h3)
+    }
+
+    /// SP3 spec §5.3: send what `tcp_rx` holds, up to the remaining length,
+    /// the FIN riding the last byte. (Blocked/EOF/error handling: Task 4.3.)
+    fn upload(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        let Some(GwReq::Open { h3, upload }) = self.reqs.get_mut(&tcp) else {
+            return;
+        };
+        let mut buf = [0u8; DL_CHUNK];
+        loop {
+            let rx = cx.tcp_rx(tcp);
+            let take = usize::try_from(upload.remaining)
+                .unwrap_or(usize::MAX)
+                .min(rx.len())
+                .min(DL_CHUNK);
+            if take == 0 {
+                return;
+            }
+            buf[..take].copy_from_slice(&rx[..take]);
+            let fin = take as u64 == upload.remaining;
+            match cx.h3_send_body(*h3, &buf[..take], fin) {
+                Ok(n) if n > 0 => {
+                    cx.tcp_consume(tcp, n);
+                    upload.remaining -= n as u64;
+                }
+                _ => return,
+            }
+        }
+    }
 
     /// SP3 spec §5.2: an end before the head is complete closes silently.
     pub fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
-        if let Some(GwReq::Head { timer }) = self.reqs.remove(&tcp) {
+        if let Some(&GwReq::Head { timer }) = self.reqs.get(&tcp) {
+            self.reqs.remove(&tcp);
             self.cancel(cx, timer);
             if end == TcpEnd::ReadEof {
                 cx.tcp_close(tcp);
@@ -232,10 +362,10 @@ impl Gateway {
                     self.arm_reconnect(cx);
                 }
             }
+            // §5.1: only armed while in `Head` (cancelled on leaving it).
             GwTm::Head(tcp) => {
-                // The 400 reply arrives with Task 4.2.
                 if self.reqs.remove(&tcp).is_some() {
-                    cx.tcp_close(tcp);
+                    listener_reply(cx, tcp, 400, "Bad Request");
                 }
             }
         }
