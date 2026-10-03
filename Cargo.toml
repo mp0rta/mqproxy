@@ -27,8 +27,10 @@ static_assertions = "1"
 cmake = "0.1"
 cc = "1"
 # SP3 spec §8: the origin bridge (hyper polled from the shard).
-# h2 locked to 0.4.19 in Cargo.lock (spec §13 says 0.4.14; RUSTSEC-2026-0258).
 hyper = { version = "~1.10", default-features = false, features = ["client", "http1", "http2", "server"] }
+# Not used directly: a manifest floor under hyper's h2 so the RUSTSEC-2026-0258
+# fix (0.4.19) is an invariant, not just the lockfile (spec §13 says 0.4.14).
+h2 = "0.4.19"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"

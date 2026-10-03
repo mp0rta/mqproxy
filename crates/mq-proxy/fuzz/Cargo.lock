@@ -299,6 +299,7 @@ name = "mq-proxy"
 version = "0.0.4"
 dependencies = [
  "bytes",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
