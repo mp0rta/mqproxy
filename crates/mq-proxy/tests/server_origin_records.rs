@@ -311,7 +311,7 @@ fn settle_runs_at_end_of_every_pump_even_when_capped() {
 #[test]
 fn shutdown_marks_every_pipe_dead_and_cancels_dials() {
     let mut oh = oh();
-    let (_, tcp_a, conn_a) = plain(&mut oh, get("http://o.test/a"));
+    let (h3_a, tcp_a, conn_a) = plain(&mut oh, get("http://o.test/a"));
     let (h3_b, tcp_b, conn_b) = starved_tls(&mut oh);
     let h3_c = oh.start(get("http://o.test/c"));
     let (op_c, _, _) = oh.dial().unwrap();
@@ -328,12 +328,41 @@ fn shutdown_marks_every_pipe_dead_and_cancels_dials() {
     assert_eq!(record_state(&mut oh, h3_b), None);
     assert_eq!(record_state(&mut oh, h3_c), None);
     oh.advance(cfg().connect_timeout);
+    // `a`'s exchange is reported from the dead pipe; then nothing is left.
+    assert_eq!(closing_len(&mut oh), 0);
+    assert!(!armed(&mut oh));
+    assert_eq!(oh.sh.next_timeout(), None);
+    oh.cancel(h3_a);
+    assert_eq!(oh.with_host(|h, _| h.origin().conn_of(h3_a)), None);
     // No event for a dropped `Connecting` record (the gateway resets every
-    // request itself, §6.6); `a`'s exchange is reported from the dead pipe.
+    // request itself, §6.6).
     let ev = oh.events();
-    let late = |h3| {
-        ev.iter()
-            .any(|e| format!("{e:?}").contains(&format!("{h3:?}")))
+    let late = |x: H3ReqId| {
+        ev.iter().any(|e| match e {
+            BridgeEv::Response(h, _)
+            | BridgeEv::Frame(h, _)
+            | BridgeEv::End(h, _)
+            | BridgeEv::Failure(h, ..)
+            | BridgeEv::WantH3(h) => *h == x,
+        })
     };
+    assert!(late(h3_a), "{ev:?}");
     assert!(!late(h3_b) && !late(h3_c), "{ev:?}");
+}
+
+/// A conn already in `closing` (class E, its `tcp_abort` done) stays there
+/// at shutdown with no second socket action.
+#[test]
+fn shutdown_of_a_closing_conn_acts_once() {
+    let mut oh = oh();
+    let (_, tcp, conn, mut peer) = tls_h1(&mut oh);
+    oh.with_host(|h, _| h.push_accept(Accepted::Partial(0)));
+    peer.write_plain(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nabc");
+    peer.pump(&mut oh, tcp);
+    peer.write_raw(&mut oh, tcp, ALERT);
+    assert_eq!(closing_len(&mut oh), 1);
+    oh.with_host(|h, cx| h.origin_mut().shutdown(cx));
+    assert_eq!(closing_len(&mut oh), 1, "the record still keeps it");
+    assert!(pipe_dead(&mut oh, conn));
+    assert_eq!(socket_calls(&mut oh, tcp), 1, "one TcpClose");
 }

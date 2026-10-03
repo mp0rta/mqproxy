@@ -92,10 +92,12 @@ pub fn sweep_class(
 
 #[cfg(test)]
 mod tests {
+    use super::super::SWEEP;
     use super::*;
 
-    const SWEEP: Duration = Duration::from_secs(10);
     const T0: Time = Time(1_000_000_000);
+
+    const SEC: Duration = Duration::from_secs(1);
 
     fn at(s: u64) -> Time {
         T0 + Duration::from_secs(s)
@@ -185,11 +187,12 @@ mod tests {
     #[test]
     fn h2_sweep_classes_pure() {
         use SweepClass::*;
+        let (young, expired) = (T0 + (IDLE_MAX - SEC), T0 + IDLE_MAX);
         let rows = [
             // (acct, idle_since, newest_ended, now, want)
             (acct(0, 0, false), None, None, at(500), Keep),
-            (acct(0, 0, false), Some(at(0)), None, at(117), Keep),
-            (acct(0, 0, false), Some(at(0)), None, at(118), A),
+            (acct(0, 0, false), Some(at(0)), None, young, Keep),
+            (acct(0, 0, false), Some(at(0)), None, expired, A),
             (acct(1, 0, false), None, None, at(500), Keep), // live exchange
             (acct(2, 1, false), None, Some(at(0)), at(500), Keep), // one Assigned left
             // Identical counters: a young stuck record keeps, an aged one retires.

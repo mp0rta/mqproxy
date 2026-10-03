@@ -780,17 +780,20 @@ impl Origin {
     /// action. A class-B/E conn with an `Assigned` record waits in `closing`
     /// (hyper reports each exchange; B's `tcp_close` is deferred to the
     /// settling where the last one ended); any other conn is dropped with
-    /// its records. Idempotent for a conn already in `closing` (shutdown).
+    /// its records. A conn already in `closing` (shutdown) gets no second
+    /// socket action, unless its class-B `tcp_close` is still deferred.
     fn remove(&mut self, cx: &mut Cx<'_>, id: OriginConnId, class: Removal) {
         self.mark_pipe_dead(id);
         let Some(c) = self.conns.get_mut(id) else {
             return;
         };
         let (tcp, key) = (c.tcp, c.key.clone());
+        let acted = self.closing.contains(&id) && !c.close_due;
         let keep = matches!(class, Removal::B | Removal::E { .. })
             && c.reqs.iter().any(|r| r.assigned_h3().is_some());
         c.close_due = keep && class == Removal::B;
         match class {
+            _ if acted => {}
             Removal::A | Removal::C => cx.tcp_close(tcp),
             Removal::B if !keep => cx.tcp_close(tcp),
             Removal::D | Removal::EPrime | Removal::E { abort: true } => cx.tcp_abort(tcp),

@@ -96,7 +96,9 @@ impl ShardExec {
     /// Drops every task (§7.7 shutdown).
     pub fn clear(&mut self) {
         self.tasks.clear();
-        self.spawned.borrow_mut().clear();
+        // Dropped outside the borrow: a task's drop may reach `execute`.
+        let s = std::mem::take(&mut *self.spawned.borrow_mut());
+        drop(s);
     }
 
     pub fn is_empty(&self) -> bool {
