@@ -135,6 +135,17 @@ pub fn parse_method(s: &[u8]) -> Option<Method> {
     })
 }
 
+/// The method is `HEAD` (the head render and the body check).
+pub fn is_head(method: &Method) -> bool {
+    method.as_bytes() == b"HEAD"
+}
+
+/// The response may carry a body: the method is not `HEAD` and the
+/// status is not 1xx/204/304 (SP3 spec §5.4/§6.4 body check).
+pub fn body_check_applies(method: &Method, status: u16) -> bool {
+    !is_head(method) && !(100..200).contains(&status) && status != 204 && status != 304
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpVer {
     Default,
@@ -291,6 +302,19 @@ pub fn reject_status(r: Reject) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_check_exempts_head_1xx_204_304() {
+        let m = |s: &str| parse_method(s.as_bytes()).unwrap();
+        for st in [100, 101, 199, 204, 304] {
+            assert!(!body_check_applies(&m("GET"), st), "{st}");
+        }
+        for st in [200, 206, 404, 502] {
+            assert!(!body_check_applies(&m("HEAD"), st), "{st}");
+            assert!(body_check_applies(&m("GET"), st), "{st}");
+            assert!(body_check_applies(&m("POST"), st), "{st}");
+        }
+    }
 
     fn t(s: &str) -> Option<Target> {
         parse_target(s.as_bytes())

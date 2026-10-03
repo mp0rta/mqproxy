@@ -9,10 +9,9 @@ pub use super::origin::{Accepted, BridgeEvents, Completion, OriginFailure, Relay
 use super::origin::{
     BodyKind, Dirty, Origin, OriginCfg, SLICE, SWEEP, StartReq, UPLOAD_CAP, UploadBuf,
 };
-use crate::client::gateway::body_check_applies;
 use crate::config::GatewayConfig;
 use intake::{Capture, decide};
-use mq_http::headers::Method;
+use mq_http::headers::{Method, body_check_applies};
 use mq_runtime::{Cx, DialError, DialOpId, TcpEnd, TcpId, TimerId};
 use mq_transport_api::{ConnId, Event, H3Header, H3ReqId, StreamError};
 use std::cell::RefCell;
@@ -548,26 +547,25 @@ impl BridgeEvents for GwCore {
     /// spec §6.5: before the head, `send_error` (§6.2 step 9's socket cap,
     /// §7.5's `upstream-protocol`, else `curl:<n>`); after it, a reset.
     fn on_failure(&mut self, cx: &mut Cx<'_>, h3: H3ReqId, f: OriginFailure, after_head: bool) {
-        if f.start_failed {
-            return self.send_error(cx, h3, 502, "origin-start-failed");
-        }
+        // spec §8: one warn per origin failure; `curl:<n>`, or the x-mq-error
+        // token when there is no curl code.
+        let xmq = if f.start_failed {
+            "origin-start-failed".to_string()
+        } else if f.upstream_protocol {
+            "upstream-protocol".to_string()
+        } else {
+            format!("curl:{}", f.curl)
+        };
         if let Some(r) = self.reqs.get(&h3)
             && let (GwState::Origin { .. }, Some(m)) = (&r.state, &r.meta)
-            && f.curl != 0
         {
             let authority = String::from_utf8_lossy(&m.authority);
-            log::warn!(
-                "mq_gw_server: origin {authority} curl:{} ({})",
-                f.curl,
-                f.cause
-            );
+            log::warn!("mq_gw_server: origin {authority} {xmq} ({})", f.cause);
         }
         if after_head {
             self.reset(cx, h3);
-        } else if f.upstream_protocol {
-            self.send_error(cx, h3, 502, "upstream-protocol");
         } else {
-            self.send_error(cx, h3, f.status, &format!("curl:{}", f.curl));
+            self.send_error(cx, h3, f.status, &xmq);
         }
     }
 

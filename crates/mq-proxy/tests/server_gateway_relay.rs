@@ -340,6 +340,88 @@ fn want_h3_refill_from_h3() {
 }
 
 #[test]
+fn want_h3_refill_detects_cl_short_and_excess() {
+    let mut h = H::with_gateway(cfg());
+    for body in [&b"12345"[..], b"1234567890ab"] {
+        let (r, _) = admitted(
+            &mut h,
+            &[(":method", "POST"), ("content-length", "10")],
+            false,
+        );
+        let up = core(&mut h, |g, _| g.upload(r)).expect("live upload");
+        // Queued, not yet notified: only `want_h3` reads it.
+        h.t.inject_h3_body(r, body.to_vec(), true);
+        core(&mut h, |g, cx| g.want_h3(cx, r));
+        assert!(up.borrow().is_aborted(), "{} bytes", body.len());
+        assert!(!up.borrow().fin);
+        assert_eq!(calls(&h, Call::H3Reset(r)), 1);
+    }
+}
+
+#[test]
+fn send_headers_err_resets() {
+    let mut h = H::with_gateway(cfg());
+    let (r, _) = admitted(&mut h, &[], true);
+    h.t.expect_h3_send_headers(r, Err(StreamError::Reset));
+    core(&mut h, |g, cx| g.on_response(cx, r, head(200, &[], None)));
+    assert_eq!(calls(&h, Call::H3Reset(r)), 1);
+    assert!(core(&mut h, |g, _| g.upload(r).is_none()), "finished");
+}
+
+#[test]
+fn send_body_err_resets() {
+    let mut h = H::with_gateway(cfg());
+    let (r, _) = admitted(&mut h, &[], true);
+    core(&mut h, |g, cx| g.on_response(cx, r, head(200, &[], None)));
+    h.t.expect_h3_send_body(r, Err(StreamError::Reset));
+    let a = core(&mut h, |g, cx| g.on_body_frame(cx, r, b"abc"));
+    assert_eq!(a, Accepted::All, "discarded");
+    assert_eq!(calls(&h, Call::H3Reset(r)), 1);
+    assert_eq!(calls(&h, Call::H3Finish(r)), 0);
+}
+
+#[test]
+fn origin_failure_without_curl_warns_xmq_token() {
+    log_capture::install();
+    let mut h = H::with_gateway(cfg());
+    let warns = || -> Vec<String> {
+        log_capture::take()
+            .into_iter()
+            .filter(|l| l.starts_with("WARN"))
+            .collect()
+    };
+    let (r, _) = admitted(&mut h, &[], true);
+    warns();
+    let f = OriginFailure {
+        upstream_protocol: true,
+        cause: "101 response".into(),
+        ..failure(0, 502)
+    };
+    core(&mut h, |g, cx| g.on_failure(cx, r, f, false));
+    assert_eq!(
+        warns(),
+        ["WARN mq_gw_server: origin o.test upstream-protocol (101 response)"]
+    );
+    let (r, _) = admitted(&mut h, &[], true);
+    warns();
+    let f = OriginFailure {
+        start_failed: true,
+        proto: None,
+        cause: "socket limit".into(),
+        ..failure(0, 502)
+    };
+    core(&mut h, |g, cx| g.on_failure(cx, r, f, false));
+    assert_eq!(
+        h.t.h3_headers_sent(r),
+        error_reply("502", "origin-start-failed")
+    );
+    assert_eq!(
+        warns(),
+        ["WARN mq_gw_server: origin o.test origin-start-failed (socket limit)"]
+    );
+}
+
+#[test]
 fn origin_failure_before_head_send_error_curl_n() {
     log_capture::install();
     let mut h = H::with_gateway(cfg());

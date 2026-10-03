@@ -1,9 +1,9 @@
 //! SP3 spec §5.4: the fetch download's response head — collected from the H3
 //! header section under C's caps (`dl_each_header`), rendered as the local
-//! HTTP/1.1 head (`adp_resp_head`) — and the body check's exemptions.
+//! HTTP/1.1 head (`adp_resp_head`).
 
 use mq_http::h1;
-use mq_http::headers::{Method, is_hop_by_hop};
+use mq_http::headers::is_hop_by_hop;
 
 /// C `MQ_GW_RESP_NAME_CAP` / `MQ_GW_RESP_VAL_CAP`: a name ≥ 128 or a value
 /// ≥ 2048 bytes is malformed.
@@ -132,21 +132,9 @@ pub fn render_head(h: &RespHead, fetch_method_is_head: bool) -> Result<Vec<u8>, 
     Ok(o)
 }
 
-/// The fetch method is `HEAD` (the head render and the body check).
-pub fn is_head(method: &Method) -> bool {
-    method.as_bytes() == b"HEAD"
-}
-
-/// The response may carry a body: the fetch method is not `HEAD` and the
-/// status is not 1xx/204/304 (spec §5.4 body check).
-pub fn body_check_applies(method: &Method, status: u16) -> bool {
-    !is_head(method) && !(100..200).contains(&status) && status != 204 && status != 304
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mq_http::headers::parse_method;
 
     fn collect(hs: &[(&str, &str)], fin: bool) -> Result<RespHead, Malformed> {
         let mut c = HeadCollector::default();
@@ -336,18 +324,5 @@ mod tests {
             "not single"
         );
         assert_eq!(cl(&[]), (None, false));
-    }
-
-    #[test]
-    fn body_check_exempts_head_1xx_204_304() {
-        let m = |s: &str| parse_method(s.as_bytes()).unwrap();
-        for st in [100, 101, 199, 204, 304] {
-            assert!(!body_check_applies(&m("GET"), st), "{st}");
-        }
-        for st in [200, 206, 404, 502] {
-            assert!(!body_check_applies(&m("HEAD"), st), "{st}");
-            assert!(body_check_applies(&m("GET"), st), "{st}");
-            assert!(body_check_applies(&m("POST"), st), "{st}");
-        }
     }
 }

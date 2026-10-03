@@ -8,11 +8,10 @@ use super::backoff::Backoff;
 use super::paths::Paths;
 use super::{SNI, log_conn_metrics};
 use crate::config::ClientConfig;
-pub(crate) use download::body_check_applies;
-use download::{HeadCollector, Malformed, is_head, render_head};
+use download::{HeadCollector, Malformed, render_head};
 use head::{Head, synth_error};
 use mq_http::h1::{self, HEAD_MAX, Progress};
-use mq_http::headers::{Method, Reject, reject_status, reject_xmq};
+use mq_http::headers::{Method, Reject, body_check_applies, is_head, reject_status, reject_xmq};
 use mq_runtime::{AcceptMeta, Cx, SocketOpId, TCP_BUF, TcpEnd, TcpId, TimerId, UdpSocketId};
 use mq_transport_api::{
     ConnConfig, ConnId, ConnProto, Event, H3Header, H3ReqId, StreamError, Unread,
