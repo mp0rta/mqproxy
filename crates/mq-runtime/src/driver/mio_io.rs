@@ -902,8 +902,10 @@ mod tests {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let op = DialOpId::from_slot(mq_transport_api::SlotId::new(1, 1)).unwrap();
         io.start_connect(op, l.local_addr().unwrap());
+        let deadline = io.now() + std::time::Duration::from_secs(10);
         let s = loop {
-            let ev = io.wait(Wait::Forever);
+            assert!(io.now() < deadline, "no Connected within 10 s");
+            let ev = io.wait(Wait::Until(deadline));
             if let Some(s) = ev.into_iter().find_map(|e| match e {
                 IoEvent::Connected { r, .. } => Some(r.unwrap()),
                 _ => None,
