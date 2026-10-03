@@ -960,7 +960,7 @@ mod tests {
         assert_eq!(t.get_mut(b).copied(), Some("b"));
     }
 
-    fn test_origin() -> Origin {
+    pub(super) fn test_origin() -> Origin {
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
@@ -985,7 +985,7 @@ mod tests {
         sh.on_dial_result(now, op, Ok(addr)).expect("a live dial")
     }
 
-    fn bare_conn(id: OriginConnId) -> OriginConn {
+    pub(super) fn bare_conn(id: OriginConnId) -> OriginConn {
         let (hyper_io, io) = pipe::pipe();
         OriginConn {
             id,
@@ -1094,7 +1094,7 @@ mod tests {
     }
 
     /// A sink no test here expects to be called.
-    struct NoEvents;
+    pub(super) struct NoEvents;
     impl BridgeEvents for NoEvents {
         fn on_response(&mut self, _: &mut Cx<'_>, _: H3ReqId, _: RelayHead) {
             unreachable!()

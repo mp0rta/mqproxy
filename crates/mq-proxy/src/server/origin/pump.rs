@@ -521,3 +521,49 @@ fn flush_out(cx: &mut Cx<'_>, tcp: TcpId, out: &mut Vec<u8>) {
     }
     out.drain(..sent);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{NoEvents, bare_conn, test_origin};
+    use super::*;
+    use mq_runtime::testing::{RecordingApp, ScriptedTransport};
+    use mq_runtime::{Host, IoResult, Shard};
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    /// spec §7.3: plain `rx_eof` waits until `tcp_rx` is empty, even when
+    /// the pipe is full and nothing moves (an end-to-end test cannot see an
+    /// early EOF: each round refills the pipe before hyper reads again).
+    #[test]
+    fn plain_eof_waits_for_tcp_rx() {
+        let (t, _) = ScriptedTransport::new();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4433));
+        let mut sh = Shard::new(t, RecordingApp::new().0, addr, 7);
+        let now = Time::from_micros(1);
+        let target = Target {
+            host: Host::Ip(addr.ip()),
+            port: 80,
+        };
+        let op = sh.with_app(now, |_, cx| cx.dial(target, Duration::from_secs(1)));
+        let tcp = sh.on_dial_result(now, op, Ok(addr)).expect("a live dial");
+        sh.tcp_rx_buf(tcp)[..3].copy_from_slice(b"abc");
+        sh.tcp_rx_commit(now, tcp, IoResult::Bytes(3));
+        let mut origin = test_origin();
+        sh.with_app(now, |_, cx| {
+            let id = origin.conns.insert(|id| OriginConn {
+                tcp,
+                tcp_eof: true,
+                ..bare_conn(id)
+            });
+            let c = origin.conns.get(id).unwrap();
+            assert_eq!(c.io.push_rx(&[0; PIPE_CAP]), PIPE_CAP, "pipe full");
+            assert!(
+                !origin.tcp_to_pipe(cx, id, &mut NoEvents),
+                "nothing moved, no EOF while tcp_rx holds bytes"
+            );
+            assert_eq!(cx.tcp_rx(tcp), b"abc");
+            cx.tcp_consume(tcp, 3);
+            assert!(origin.tcp_to_pipe(cx, id, &mut NoEvents), "now published");
+            assert!(!origin.conns.get(id).unwrap().io.set_eof(), "already set");
+        });
+    }
+}
