@@ -86,14 +86,37 @@ fn h3_conn_counts_toward_max_conns() {
     };
     let count = |s: &Peer| s.call(T0, |t, _| (t.conn_count(), t.n_provisional()));
 
-    let (c1, id1) = client(0, now);
-    run(&[&c1, &server], &mut now, 5);
-    assert!(c1.drain_events().contains(&Event::ConnEstablished(id1)));
+    let (c0, id0) = client(3, now);
+    run(&[&c0, &server], &mut now, 5);
+    assert!(c0.drain_events().contains(&Event::ConnEstablished(id0)));
     let news = new_conns(&server.drain_events());
     assert!(matches!(news[..], [(_, ConnProto::H3)]), "{news:?}");
     assert_eq!(count(&server), (1, 0));
 
-    // The second H3 client is refused at the shared cap, before any slot.
+    // spec §4.7: an unauthenticated H3 conn (no request yet) is evicted by a newcomer.
+    let (c1, id1) = client(0, now);
+    let (mut sev, mut c0ev) = (Vec::new(), Vec::new());
+    for _ in 0..1000 {
+        run(&[&c0, &c1, &server], &mut now, 10);
+        sev.extend(server.drain_events());
+        c0ev.extend(c0.drain_events());
+        if c0ev.iter().any(|e| matches!(e, Event::ConnClosed(..))) {
+            break;
+        }
+    }
+    assert!(c1.drain_events().contains(&Event::ConnEstablished(id1)));
+    assert!(
+        c0ev.iter()
+            .any(|e| matches!(e, Event::ConnClosed(c, r) if *c == id0 && r.code == 0x1002)),
+        "{c0ev:?}"
+    );
+    let news = new_conns(&sev);
+    assert!(matches!(news[..], [(_, ConnProto::H3)]), "{news:?}");
+    assert_eq!(count(&server), (1, 0));
+    let s1 = news[0].0;
+    server.call(now, move |t, _| t.mark_conn_authed(s1));
+
+    // The second H3 client is refused at the shared cap, before any slot: s1 is authed.
     let (c2, id2) = client(1, now);
     run(&[&c1, &c2, &server], &mut now, 50);
     assert!(!c2.drain_events().contains(&Event::ConnEstablished(id2)));

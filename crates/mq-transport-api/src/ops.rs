@@ -52,6 +52,9 @@ pub trait TransportOps {
     fn stream_reset(&mut self, now: Time, s: StreamId);
     fn add_path(&mut self, now: Time, conn: ConnId, standby: bool) -> Result<PathId, PathError>;
     fn close_conn(&mut self, now: Time, conn: ConnId);
+    /// The app authenticated the peer: at `max_conns` the server evicts only
+    /// connections never marked (spec §4.7). A no-op on a stale id.
+    fn mark_conn_authed(&mut self, conn: ConnId);
     fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error>;
     fn stream_info(&self, s: StreamId) -> Result<StreamInfo, Error>;
 

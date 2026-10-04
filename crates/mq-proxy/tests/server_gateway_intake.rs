@@ -70,6 +70,24 @@ fn bare_404() -> Vec<(Hs, bool)> {
     vec![(hs(&[(":status", "404"), ("content-length", "0")]), true)]
 }
 
+/// spec §4.7: the first authenticated request exempts its conn from eviction.
+#[test]
+fn authenticated_request_marks_conn_authed() {
+    let mut h = H::with_gateway(cfg());
+    let marks = |h: &H| h.count(|x| matches!(x, Call::MarkConnAuthed(_)));
+    open(&mut h, request("Bearer nope", &[]), true);
+    open(&mut h, request(OK, &[("x(y", "v")]), true); // rejected before auth
+    assert_eq!(marks(&h), 0);
+    // Authenticated, even though the request itself then fails.
+    let c = h.h3_conn();
+    let r = h.t.new_h3_request(c);
+    h.t.inject_h3_headers(r, request(OK, &[(":method", "CONNECT")]), true);
+    h.drive();
+    assert_eq!(h.t.h3_headers_sent(r), error_reply("400", "bad-request"));
+    assert_eq!(h.count(|x| *x == Call::MarkConnAuthed(c)), 1);
+    assert_eq!(marks(&h), 1);
+}
+
 #[test]
 fn recv_headers_error_is_400_bad_request() {
     let mut h = H::with_gateway(cfg());

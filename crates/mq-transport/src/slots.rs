@@ -92,6 +92,12 @@ pub(crate) struct ConnSlot {
     /// Scheduling input for `next_timeout()`; cleared when the deadline closes the connection.
     pub provisional_deadline: Option<Time>,
     pub streams: u32,
+    /// The app authenticated its peer (`mark_conn_authed`): never an eviction victim (spec §4.7).
+    pub authed: bool,
+    /// Picked as an eviction victim; still counted until its close notification (spec §4.7).
+    pub evicting: bool,
+    /// Admission order, for picking the oldest victim (spec §4.7).
+    pub admitted: u64,
     pub pending_close: Option<u64>,
     /// We closed it before any peer CONNECTION_CLOSE arrived: its `ConnClosed` reports
     /// `ErrType::Unknown` even if the peer echoes a close back (spec §4.2).
@@ -116,6 +122,9 @@ impl ConnSlot {
             provisional: false,
             provisional_deadline: None,
             streams: 0,
+            authed: false,
+            evicting: false,
+            admitted: 0,
             pending_close: None,
             closed_locally: false,
             mp_ready_queued: false,

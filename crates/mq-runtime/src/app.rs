@@ -262,6 +262,10 @@ impl<'a> Cx<'a> {
         let now = self.now;
         self.tm().close_conn(now, conn)
     }
+    /// spec §4.7: exempts the conn from eviction at `max_conns`.
+    pub fn mark_conn_authed(&mut self, conn: ConnId) {
+        self.tm().mark_conn_authed(conn)
+    }
     /// spec §5.4.
     pub fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error> {
         self.t.conn_stats(conn)

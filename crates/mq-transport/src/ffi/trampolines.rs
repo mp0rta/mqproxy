@@ -23,6 +23,8 @@ use xquic_sys::*;
 pub(crate) const STREAM_CEILING: u32 = 8192;
 /// spec §4.2: application error code for a connection over the stream ceiling.
 pub(crate) const CEILING_CLOSE_CODE: u64 = 0x1001;
+/// spec §4.7: application error code for an unauthenticated connection evicted at the cap.
+pub(crate) const EVICT_CLOSE_CODE: u64 = 0x1002;
 /// spec §4.7: absolute lifetime of a provisional connection before closing starts.
 pub(crate) const PROVISIONAL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -70,17 +72,31 @@ fn now() -> Time {
 
 // ── bookkeeping (spec §4.7, §4.8 slot lifetime tables) ──────────────────
 
-/// The second, authoritative cap check (spec §4.7): refuses at `max_conns` (0 = unlimited),
-/// otherwise counts the connection.
-pub(crate) fn admit_established(max_conns: u32, n_counted: &mut u32) -> bool {
-    if max_conns != 0 && *n_counted >= max_conns {
-        return false;
+/// The `max_conns` cap (spec §4.7; 0 = unlimited). `Ok(None)`: room. `Ok(Some(v))`: full, but
+/// admitting is allowed by evicting `v`, the oldest counted connection that is neither
+/// authenticated nor already evicting. `Err(())`: full. Evicting connections stay counted
+/// until their close notification but do not hold the cap.
+fn cap_check(inner: &Inner) -> Result<Option<SlotId>, ()> {
+    let max = inner.cfg.max_conns;
+    if max == 0 || inner.n_counted < max {
+        return Ok(None);
     }
-    *n_counted += 1;
-    true
+    // ponytail: two O(conns) scans, only at the cap; conns ≈ max_conns there.
+    let live = inner.conns.iter_live();
+    let evicting = live.filter(|(_, c)| c.evicting).count() as u32;
+    if inner.n_counted - evicting < max {
+        return Ok(None);
+    }
+    let victim = inner
+        .conns
+        .iter_live()
+        .filter(|(_, c)| c.counted && !c.authed && !c.evicting)
+        .min_by_key(|(_, c)| c.admitted);
+    victim.map(|(s, _)| Some(s)).ok_or(())
 }
 
-/// `server_accept`: both caps, then a provisional slot. `None` → refuse.
+/// `server_accept`: both caps, then a provisional slot. `None` → refuse. The eviction itself
+/// waits for the create notification (a completed handshake).
 pub(crate) fn on_server_accept(
     inner: &mut Inner,
     conn: *mut xqc_connection_t,
@@ -88,9 +104,7 @@ pub(crate) fn on_server_accept(
     now: Time,
 ) -> Option<SlotId> {
     let max = inner.cfg.max_conns;
-    if max != 0 && inner.n_counted >= max {
-        return None;
-    }
+    cap_check(inner).ok()?;
     if inner.n_provisional >= 64.max(max.saturating_mul(4)) {
         return None;
     }
@@ -122,7 +136,8 @@ pub(crate) fn on_server_refuse(inner: &mut Inner, s: SlotId) {
     }
 }
 
-/// ALPN (raw or H3) create notification. `false` → return -1. Server: the second cap check;
+/// ALPN (raw or H3) create notification. `false` → return -1. Server: the second,
+/// authoritative cap check, evicting a victim through the next `drive` (no xquic call here);
 /// a refusal changes nothing. Client: records the connection pointer and cid.
 pub(crate) fn on_conn_create(
     inner: &mut Inner,
@@ -131,21 +146,34 @@ pub(crate) fn on_conn_create(
     s: SlotId,
     proto: ConnProto,
 ) -> bool {
+    let Some(server) = inner.conns.get(s).map(|c| c.server) else {
+        return false;
+    };
+    if server {
+        match cap_check(inner) {
+            Err(()) => return false,
+            Ok(Some(v)) => {
+                let v = inner.conns.get_mut(v).expect("a live victim");
+                v.evicting = true;
+                v.pending_close.get_or_insert(EVICT_CLOSE_CODE);
+                log::info!("mq_transport: conn cap reached, evicting an unauthenticated conn");
+            }
+            Ok(None) => {}
+        }
+    }
     let Inner {
         conns,
         n_counted,
         n_provisional,
-        cfg,
+        n_admitted,
         events,
         ..
     } = inner;
-    let Some(slot) = conns.get_mut(s) else {
-        return false;
-    };
-    if slot.server {
-        if !admit_established(cfg.max_conns, n_counted) {
-            return false;
-        }
+    let slot = conns.get_mut(s).expect("checked live");
+    if server {
+        *n_counted += 1;
+        *n_admitted += 1;
+        slot.admitted = *n_admitted;
         if slot.provisional {
             *n_provisional -= 1;
         }
@@ -907,13 +935,9 @@ mod tests {
         let mut i = inner(1);
         let (a, b) = (accept(&mut i), accept(&mut i));
         assert_eq!(i.n_provisional, 2);
-        let mut n = 0;
-        assert!(admit_established(1, &mut n));
-        assert!(!admit_established(1, &mut n));
-        assert_eq!(n, 1);
-        assert!(admit_established(0, &mut n), "0 = unlimited");
         // Through the create notification: the first is admitted, the second refused.
         assert!(create(&mut i, a, ConnProto::Raw));
+        i.conns.get_mut(a).unwrap().authed = true; // no eviction victim
         assert!(!create(&mut i, b, ConnProto::Raw));
         assert_eq!((i.n_counted, i.n_provisional), (1, 1));
     }
@@ -924,6 +948,7 @@ mod tests {
         // Both pass server_accept (half-open, uncounted); `a` then takes the only unit.
         let (a, b) = (accept(&mut i), accept(&mut i));
         assert!(create(&mut i, a, ConnProto::Raw));
+        i.conns.get_mut(a).unwrap().authed = true; // no eviction victim
         assert_eq!(i.n_provisional, 1);
         assert!(!create(&mut i, b, ConnProto::Raw));
         let slot = i.conns.get(b).expect("slot stays live");
@@ -1017,6 +1042,95 @@ mod tests {
             code: 0x1001,
         };
         assert_eq!(closes, vec![(conn_id(a), unknown), (conn_id(b), echoed)]);
+    }
+
+    fn admitted(i: &mut Inner, proto: ConnProto) -> SlotId {
+        let s = accept(i);
+        assert!(create(i, s, proto));
+        s
+    }
+
+    fn evicting(i: &Inner, s: SlotId) -> bool {
+        i.conns.get(s).unwrap().evicting
+    }
+
+    fn close(i: &mut Inner, s: SlotId) {
+        let r = CloseReason {
+            err_type: ErrType::Unknown,
+            code: 0,
+        };
+        on_conn_close(i, s, r);
+    }
+
+    #[test]
+    fn at_cap_admission_evicts_the_oldest_unauthed_conn() {
+        let mut i = inner(3);
+        let a = admitted(&mut i, ConnProto::Raw);
+        let b = admitted(&mut i, ConnProto::H3);
+        let c = admitted(&mut i, ConnProto::H3);
+        i.conns.get_mut(a).unwrap().authed = true;
+        // At cap: accept passes (a victim exists), create evicts b, the oldest unauthed.
+        let d = admitted(&mut i, ConnProto::H3);
+        assert!(!evicting(&i, a) && evicting(&i, b) && !evicting(&i, c) && !evicting(&i, d));
+        assert_eq!(
+            i.conns.get(b).unwrap().pending_close,
+            Some(EVICT_CLOSE_CODE)
+        );
+        assert_eq!(i.conns.get(c).unwrap().pending_close, None);
+        assert_eq!(i.n_counted, 4, "over cap until b's close notification");
+        // b is not picked twice: the next one evicts c.
+        let e = admitted(&mut i, ConnProto::Raw);
+        assert!(evicting(&i, c) && !evicting(&i, d) && !evicting(&i, e));
+        // b's close releases its unit; the effective count stays at the cap.
+        close(&mut i, b);
+        assert_eq!(i.n_counted, 4);
+        assert!(!i.conns.is_live(b));
+    }
+
+    #[test]
+    fn authed_conns_are_never_evicted() {
+        let mut i = inner(2);
+        let a = admitted(&mut i, ConnProto::H3);
+        let b = admitted(&mut i, ConnProto::Raw);
+        i.conns.get_mut(a).unwrap().authed = true;
+        i.conns.get_mut(b).unwrap().authed = true;
+        assert!(on_server_accept(&mut i, core::ptr::null_mut(), cid(), Time(0)).is_none());
+        // One that passed accept earlier is refused at create.
+        let mut i = inner(1);
+        let late = accept(&mut i);
+        let a = admitted(&mut i, ConnProto::H3);
+        i.conns.get_mut(a).unwrap().authed = true;
+        assert!(!create(&mut i, late, ConnProto::H3));
+        assert!(!evicting(&i, a));
+        assert_eq!(i.n_counted, 1);
+    }
+
+    #[test]
+    fn evicting_conns_neither_hold_the_cap_nor_are_victims_again() {
+        let mut i = inner(1);
+        let a = admitted(&mut i, ConnProto::H3);
+        let b = admitted(&mut i, ConnProto::H3); // evicts a
+        assert!(evicting(&i, a) && !evicting(&i, b));
+        i.conns.get_mut(b).unwrap().authed = true;
+        // a is leaving and b is authed: full, no victim.
+        assert!(on_server_accept(&mut i, core::ptr::null_mut(), cid(), Time(0)).is_none());
+        close(&mut i, a);
+        assert_eq!(i.n_counted, 1);
+        assert!(on_server_accept(&mut i, core::ptr::null_mut(), cid(), Time(0)).is_none());
+        // A refused create of an evicting conn's slot still balances (server_refuse path).
+        let mut i = inner(1);
+        let a = admitted(&mut i, ConnProto::H3);
+        admitted(&mut i, ConnProto::H3);
+        on_server_refuse(&mut i, a);
+        assert_eq!(i.n_counted, 1);
+    }
+
+    #[test]
+    fn unlimited_cap_never_evicts() {
+        let mut i = inner(0);
+        let a = admitted(&mut i, ConnProto::H3);
+        admitted(&mut i, ConnProto::H3);
+        assert!(!evicting(&i, a));
     }
 
     #[test]
@@ -1124,6 +1238,7 @@ mod tests {
         let mut i = inner(1);
         let (a, b) = (accept(&mut i), accept(&mut i));
         assert!(create(&mut i, a, ConnProto::H3));
+        i.conns.get_mut(a).unwrap().authed = true; // no eviction victim
         assert!(!create(&mut i, b, ConnProto::H3));
         assert_eq!((i.n_counted, i.n_provisional), (1, 1));
         let evs: Vec<_> =

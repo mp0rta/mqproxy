@@ -46,6 +46,7 @@ pub enum Call {
         standby: bool,
     },
     CloseConn(ConnId),
+    MarkConnAuthed(ConnId),
     /// `bytes` is what was offered, whether or not the call succeeded.
     DatagramSend {
         conn: ConnId,
@@ -664,6 +665,10 @@ impl TransportOps for ScriptedTransport {
                 code: 0,
             },
         ));
+    }
+
+    fn mark_conn_authed(&mut self, conn: ConnId) {
+        self.st().log.push(Call::MarkConnAuthed(conn));
     }
 
     fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error> {
