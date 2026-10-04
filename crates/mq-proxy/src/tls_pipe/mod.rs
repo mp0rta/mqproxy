@@ -4,11 +4,13 @@
 
 mod exec;
 mod pipe;
+mod tls_io;
 
 pub use exec::{Dirty, ShardExec};
 #[cfg(any(test, feature = "test-support"))]
 pub use pipe::pipe_pair;
 pub use pipe::{PipeHandle, PipeIo, pipe};
+pub use tls_io::{In, TlsIo};
 
 /// spec §7.1/§9.3: each direction of the pipe.
 pub const PIPE_CAP: usize = 64 * 1024;

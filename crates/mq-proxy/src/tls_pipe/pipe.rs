@@ -49,8 +49,8 @@ pub struct PipeIo {
     peer: Option<Rc<RefCell<PipeState>>>,
 }
 
-/// The pump's end of the pipe.
-#[derive(Debug)]
+/// The pump's end of the pipe (cloneable: a `TlsIo` and its conn share it).
+#[derive(Clone, Debug)]
 pub struct PipeHandle(Rc<RefCell<PipeState>>);
 
 /// A fresh pipe: the IO end and the pump's.
@@ -86,6 +86,11 @@ impl PipeHandle {
             st.wake_reader();
         }
         n
+    }
+
+    /// Plaintext hyper wrote that the pump has not taken yet.
+    pub fn tx_len(&self) -> usize {
+        self.0.borrow().tx.len()
     }
 
     /// Free room in `rx`.

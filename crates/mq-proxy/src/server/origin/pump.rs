@@ -4,7 +4,6 @@
 
 use super::*;
 use http_body::Body;
-use std::io::{self, Read, Write};
 
 impl Origin {
     /// spec §7.3: steps 1–3 repeated while the `Dirty` flag was set or any
@@ -196,45 +195,29 @@ impl Origin {
             return n > 0 || eof;
         };
         let connecting = matches!(c.driver, Driver::Tls(_));
-        let mut moved = drain_plaintext(tls, &c.io);
-        let mut failed = None;
-        while tls.wants_read() && !cx.tcp_rx(tcp).is_empty() {
-            let mut rx = cx.tcp_rx(tcp);
-            match tls.read_tls(&mut rx) {
-                Ok(0) => break,
-                Ok(n) => cx.tcp_consume(tcp, n),
-                // Never "plaintext full" here (`wants_read` requires empty
-                // plaintext): the deframer's sticky "message buffer full",
-                // e.g. an oversized handshake message. Fatal in both phases;
-                // waiting would hang the request.
-                Err(e) => {
-                    failed = Some(rustls::Error::General(e.to_string()));
-                    break;
+        let tcp_eof = c.tcp_eof;
+        let mut moved = match tls.input(cx.tcp_rx(tcp), tcp_eof) {
+            Ok(r) => {
+                cx.tcp_consume(tcp, r.consumed);
+                r.moved
+            }
+            Err(e) => {
+                if connecting {
+                    let curl = match e {
+                        rustls::Error::InvalidCertificate(_) => 60,
+                        _ => 35,
+                    };
+                    self.fail_conn(cx, id, curl, e.to_string(), ev);
+                } else {
+                    // Fatal and sticky in rustls: the socket is useless (§7.3).
+                    self.remove(cx, id, Removal::E { abort: true });
                 }
+                return true;
             }
-            moved = true;
-            if let Err(e) = tls.process_new_packets() {
-                failed = Some(e);
-                break;
-            }
-            moved |= drain_plaintext(tls, &c.io);
-        }
-        if let Some(e) = failed {
-            if connecting {
-                let curl = match e {
-                    rustls::Error::InvalidCertificate(_) => 60,
-                    _ => 35,
-                };
-                self.fail_conn(cx, id, curl, e.to_string(), ev);
-            } else {
-                // Fatal and sticky in rustls: the socket is useless (§7.3).
-                self.remove(cx, id, Removal::E { abort: true });
-            }
-            return true;
-        }
-        let eof = c.tcp_eof && cx.tcp_rx(tcp).is_empty();
-        if connecting && !tls.is_handshaking() {
-            let proto = match tls.alpn_protocol() {
+        };
+        let eof = tcp_eof && cx.tcp_rx(tcp).is_empty();
+        if connecting && !tls.tls.is_handshaking() {
+            let proto = match tls.tls.alpn_protocol() {
                 Some(b"h2") => OriginProto::H2,
                 _ => OriginProto::H1,
             };
@@ -244,13 +227,6 @@ impl Origin {
             let cause = "EOF during the TLS handshake".to_string();
             self.fail_conn(cx, id, 35, cause, ev);
             return true;
-        }
-        if eof {
-            let c = self.conns.get_mut(id).expect("live conn");
-            let tls = c.tls.as_mut().expect("TLS conn");
-            // `Err` while rustls's plaintext is full: retried on a later pump.
-            let _ = tls.read_tls(&mut &[][..]);
-            moved |= drain_plaintext(tls, &c.io);
         }
         moved
     }
@@ -262,10 +238,7 @@ impl Origin {
         if self.closing.contains(&id) {
             return false;
         }
-        let Some(OriginConn {
-            tcp, tls, io, out, ..
-        }) = self.conns.get_mut(id)
-        else {
+        let Some(OriginConn { tcp, tls, io, .. }) = self.conns.get_mut(id) else {
             return false;
         };
         let tcp = *tcp;
@@ -280,20 +253,7 @@ impl Origin {
             }
             return moved;
         };
-        let before = out.len();
-        let mut fed = false;
-        loop {
-            while tls.wants_write() && tls.write_tls(out).is_ok() {}
-            if out.len() >= PIPE_CAP
-                || io.with_tx(SLICE, |s| tls.writer().write(s).unwrap_or(0)) == 0
-            {
-                break;
-            }
-            fed = true;
-        }
-        let staged = out.len();
-        flush_out(cx, tcp, out);
-        fed || staged != before || out.len() != staged
+        tls.output(cx, tcp)
     }
 
     /// §7.3 step 2 for one conn's driver: a `Handshaking` future (done →
@@ -654,43 +614,6 @@ fn send_request(send: &mut Sender, req: Request<UploadBody>, reused: bool) -> Re
     }
 }
 
-/// §7.3 step 1: rustls's plaintext → `rx` while the pipe has room; a
-/// `close_notify` (`Ok(0)`) or a close_notify-less EOF (`UnexpectedEof`,
-/// after the buffered plaintext) publishes `rx_eof`. Returns whether
-/// anything moved.
-fn drain_plaintext(tls: &mut rustls::ClientConnection, io: &PipeHandle) -> bool {
-    let mut buf = [0u8; SLICE];
-    let mut moved = false;
-    loop {
-        let room = io.rx_room().min(SLICE);
-        if room == 0 {
-            return moved;
-        }
-        match tls.reader().read(&mut buf[..room]) {
-            Ok(0) => return io.set_eof() || moved,
-            Ok(n) => {
-                io.push_rx(&buf[..n]);
-                moved = true;
-            }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return io.set_eof() || moved,
-            Err(_) => return moved, // WouldBlock: nothing buffered
-        }
-    }
-}
-
-/// §7.3 step 3: `tcp_write` is all-or-nothing, so `out` goes in slices of
-/// ≤ `SLICE` until one does not fit; the rest waits for `on_tcp_writable`.
-fn flush_out(cx: &mut Cx<'_>, tcp: TcpId, out: &mut Vec<u8>) {
-    let mut sent = 0;
-    for chunk in out.chunks(SLICE) {
-        if cx.tcp_write(tcp, chunk).is_err() {
-            break;
-        }
-        sent += chunk.len();
-    }
-    out.drain(..sent);
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::tests::{NoEvents, bare_conn, test_origin};
@@ -854,9 +777,12 @@ mod tests {
         let mut origin = test_origin();
         sh.with_app(NOW, |_, cx| {
             // TLS: 10 KiB decrypted, 4 KiB of pipe room.
+            let (mut hyper_end, io) = pipe();
+            let tls = TlsIo::new(client_with_plaintext(10 * 1024), io.clone());
             let id = origin.conns.insert(OriginConn {
                 tcp,
-                tls: Some(client_with_plaintext(10 * 1024)),
+                tls: Some(tls),
+                io,
                 driver: Driver::Completed,
                 ..bare_conn()
             });
@@ -864,7 +790,17 @@ mod tests {
             c.io.push_rx(&[0; PIPE_CAP - 4096]);
             assert!(origin.tcp_to_pipe(cx, id, &mut NoEvents), "4 KiB moved");
             assert!(!origin.rx_movable(), "blocked, the pipe still full");
-            free_room(&mut origin, id);
+            // hyper reads everything: the conn's `io` and the `TlsIo`'s pipe
+            // are one state.
+            let mut sink = vec![0; PIPE_CAP];
+            let mut rb = hyper::rt::ReadBuf::new(&mut sink);
+            let waker = std::task::Waker::noop();
+            let polled = hyper::rt::Read::poll_read(
+                Pin::new(&mut hyper_end),
+                &mut Context::from_waker(waker),
+                rb.unfilled(),
+            );
+            assert!(polled.is_ready() && rb.filled().len() == PIPE_CAP);
             assert!(cx.tcp_rx(tcp).is_empty());
             assert!(origin.rx_movable(), "TLS: residual plaintext, room freed");
             assert!(origin.tcp_to_pipe(cx, id, &mut NoEvents), "the 6 KiB rest");

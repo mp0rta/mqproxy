@@ -15,7 +15,7 @@ mod response;
 pub mod tls;
 
 pub use crate::tls_pipe::{Dirty, PIPE_CAP, SLICE};
-use crate::tls_pipe::{PipeHandle, PipeIo, ShardExec, pipe};
+use crate::tls_pipe::{PipeHandle, PipeIo, ShardExec, TlsIo, pipe};
 use accounting::{ConnAccounting, SweepClass};
 pub use body::{UploadBody, UploadBuf};
 #[cfg(feature = "test-support")]
@@ -366,7 +366,8 @@ enum OriginReq {
 struct OriginConn {
     key: ConnKey,
     tcp: TcpId,
-    tls: Option<rustls::ClientConnection>,
+    /// `Some` for https; its pipe is a clone of `io` (plain conns use `io` raw).
+    tls: Option<TlsIo<rustls::ClientConnection>>,
     io: PipeHandle,
     proto: Option<OriginProto>,
     driver: Driver,
@@ -376,8 +377,6 @@ struct OriginConn {
     pending: Option<OriginReq>,
     /// `Assigned` / `Ended` records once the conn is up.
     reqs: Vec<OriginReq>,
-    /// TLS ciphertext staging (§7.3).
-    out: Vec<u8>,
     tcp_eof: bool,
     /// h1: the conn has an `Assigned` record.
     busy: bool,
@@ -732,14 +731,13 @@ impl Origin {
         let id = self.conns.insert(OriginConn {
             key: key.clone(),
             tcp,
-            tls,
+            tls: tls.map(|t| TlsIo::new(t, io.clone())),
             io,
             proto: None,
             driver: Driver::Tls(hyper_io),
             send: None,
             pending: Some(rec),
             reqs: Vec::new(),
-            out: Vec::new(),
             tcp_eof: false,
             busy: false,
             acct: ConnAccounting::default(),
@@ -1214,7 +1212,6 @@ mod tests {
             send: None,
             pending: None,
             reqs: Vec::new(),
-            out: Vec::new(),
             tcp_eof: false,
             busy: false,
             acct: ConnAccounting::default(),
