@@ -209,13 +209,9 @@ if [ ! -x "${MQPROXY_BIN}" ]; then
     note "  Build first (cmake --build build) or set MQPROXY_BIN."
     exit 1
 fi
-# The binary MUST be MITM-capable (built with BoringSSL archives). If --mitm is
-# unavailable the binary hard-errors at validation — detect that here and SKIP
-# rather than FAIL, so a no-archive build does not red the suite.
-if "${MQPROXY_BIN}" client --help 2>&1 | grep -q -- '--mitm'; then
-    : # MITM flag present in help — capable build (help always lists it; the
-      # runtime hard-error is the real gate, checked by the readiness wait below)
-fi
+# MITM capability is gated at runtime, not here: the Rust binary always has it;
+# a C binary built without the BoringSSL archives hard-errors on --mitm
+# ("--mitm unavailable"), which wait_mitm_ready below turns into a SKIP.
 for f in "${MITM_CA_CRT}" "${MITM_CA_KEY}" "${MQPROXY_CERT}" "${MQPROXY_KEY}"; do
     if [ ! -f "${f}" ]; then
         note "ERROR: cert/key missing: ${f} (CMake generates the MITM CA; set MQ_MITM_CA_*)."
