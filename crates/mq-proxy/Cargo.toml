@@ -26,6 +26,7 @@ rustls-native-certs = { workspace = true }
 [dev-dependencies]
 mq-runtime = { path = "../mq-runtime", features = ["test-support"] }
 mq-proxy = { path = ".", features = ["test-support"] }
+proptest = { workspace = true }
 
 [features]
 test-support = []

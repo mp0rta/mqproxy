@@ -2,9 +2,6 @@
 //! the complete list (pseudo and control headers included) passed the shared
 //! limits; this is the single place where request sizes are checked.
 
-// Consumed by `Exchanges::open` (Task 4.2).
-#![allow(dead_code)]
-
 use super::{BodyLen, ReqHead};
 use mq_http::headers::Reject;
 use mq_http::limits::SectionBudget;

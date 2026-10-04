@@ -464,6 +464,7 @@ dependencies = [
  "mq-runtime",
  "mq-transport-api",
  "mq-wire",
+ "proptest",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
