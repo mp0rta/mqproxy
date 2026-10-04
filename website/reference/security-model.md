@@ -10,12 +10,15 @@ The HTTP Request Execution Gateway is an explicit delegation model — the clien
 
 Its trust assumptions:
 
-- The **CA private key is the anchor** (loaded with `O_NOFOLLOW`/`O_CLOEXEC`, refused if encrypted or group/world-readable).
+- The **CA private key is the anchor**: it must be an unencrypted PKCS#8 file owned by the running user, not group/other accessible, and not a symlink. It stays in memory while mqproxy runs.
+- A CA can be limited to your own domains with an X.509 `nameConstraints` extension; mqproxy relays out-of-scope hosts opaquely.
 - Browser-supplied `X-Mq-*` headers are **always stripped** (never interpreted as controls — the client injects its own `x-mq-auth`).
-- Vendored-BoringSSL symbols are **isolated** from libcurl's system OpenSSL.
-- The feature is **fail-closed** (misconfiguration is a startup error, never silent passthrough, with a bounded ClientHello drain and H2 resource limits).
+- The feature is **fail-closed** (misconfiguration is a startup error, never silent passthrough), with a bounded ClientHello read and header, stream and connection limits.
+- Anything that is not positively an HTTP/2 TLS client for a valid host name (non-h2, non-TLS, no SNI, ignored hosts, …) is relayed opaquely and never inspected.
 
-Cert-pinned hosts can be excluded with `--ignore-host(s)`, which splices them opaquely so the origin's real certificate reaches the client. See the [TLS MITM guide](/guide/tls-mitm) for the operational details.
+Cert-pinned hosts can be excluded with `--ignore-host(s)`, which relays them opaquely so the origin's real certificate reaches the client.
+
+Known limitation: the client's HTTP/3 receive side buffers a large download in memory if the device consuming it is slower than the tunnel, until an upstream xquic fix lands (details in the guide). See the [TLS MITM guide](/guide/tls-mitm) for the operational details.
 
 ## License
 

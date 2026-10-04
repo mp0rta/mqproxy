@@ -117,11 +117,13 @@ At least one client ingress flag (`--socks5`, `--http-connect`, `--gateway`, or 
 
 | Flag | Description |
 |---|---|
-| `--mitm` | Terminate TLS on the transparent-capture path (forge a leaf per SNI, speak h2, feed the Gateway tunnel) instead of relaying opaquely. **Requires `--tproxy`, `--ca-cert`, and `--ca-key`** and a binary built with the BoringSSL archives (`scripts/build-xquic.sh`); any of these missing is a fail-closed startup error. |
-| `--ca-cert <pem>` | Signing CA certificate (PEM). The operator's CA must be trusted by the device. |
-| `--ca-key <pem>` | Signing CA private key (PEM). Must be unencrypted and not group/world-readable; opened with `O_NOFOLLOW`/`O_CLOEXEC`. |
-| `--ignore-host <host>` | Host to splice **opaquely** (bypass MITM — relay raw TLS so the origin's real cert reaches the client; for cert-pinned apps). **Repeatable.** Match is exact or leading-dot suffix on the normalized SNI. |
-| `--ignore-hosts <a,b,c>` | Same as `--ignore-host` but a comma-separated list. CLI and `[Mitm] IgnoreHosts` config entries union. |
+| `--mitm` | Terminate TLS on the transparent-capture path (forge a leaf per SNI, speak h2, feed the Gateway tunnel) instead of relaying opaquely. **Requires `--tproxy`, `--ca-cert`, and `--ca-key`**; any of these missing is a fail-closed startup error (exit 2). Flows that cannot be MITM'd are relayed opaquely — see the [guide](/guide/tls-mitm#what-is-relayed-opaquely). |
+| `--ca-cert <pem>` | Signing CA certificate (PEM). The operator's CA must be trusted by the device. A CA with `nameConstraints` is supported; hosts outside its scope are relayed opaquely. |
+| `--ca-key <pem>` | Signing CA private key: **unencrypted PKCS#8** PEM (PKCS#1/SEC1 are rejected with the `openssl pkcs8 -topk8 -nocrypt` conversion hint). Must be owned by the running user, not group/other accessible, and not a symlink. |
+| `--ignore-host <host>` | Host to relay **opaquely** (bypass MITM — the origin's real cert reaches the client; for cert-pinned apps). **Repeatable.** `example.com` matches that host only; `.example.com` matches strict subdomains only. An invalid entry is a startup error naming it. |
+| `--ignore-hosts <a,b,c>` | Same as `--ignore-host` but a comma-separated list (no spaces). CLI and `[Mitm] IgnoreHosts` config entries combine. |
+
+In the config file these are `[Mitm]` `Enabled`, `CACert`, `CAKey` and `IgnoreHosts` (a repeatable key, one host per line).
 
 ::: warning
 The test certificate under `tests/certs` is for local testing only. For real deployments, pass your own `--cert`/`--key` and a strong `--token`.

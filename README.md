@@ -256,13 +256,34 @@ sudo ./build/mqproxy client \
 
 ### TLS MITM mode
 
-`--mitm` turns the transparent-capture path into a **TLS-terminating L7 proxy**. For each captured connection the client peeks the TLS ClientHello SNI, forges a per-host leaf certificate signed by the operator's CA (`--ca-cert`/`--ca-key`), terminates TLS speaking **HTTP/2**, and maps each H2 request stream onto the existing MPQUIC Gateway tunnel (the `X-Mq-Auth` control plane) to the server, which fetches the origin. The browser↔client side speaks plain h2; the client↔server tunnel is unchanged MPQUIC, so each request still gets within-stream multipath aggregation.
+`--mitm` turns the transparent-capture path into a **TLS-terminating L7 proxy**. For each captured connection the client peeks the TLS ClientHello SNI, forges a per-host leaf certificate signed by the operator's CA (`--ca-cert`/`--ca-key`), terminates TLS speaking **HTTP/2**, and maps each H2 request onto its own H3 request on the MPQUIC tunnel; the server's gateway fetches the origin. The browser↔client side speaks plain h2; the client↔server tunnel is MPQUIC, so every request gets its own stream (no head-of-line blocking across requests) and its own multipath scheduling.
 
-> **Trust model.** This is an **operator-controlled / consenting-endpoint** MITM (a corporate-proxy or personal-VPN posture), not an attack tool. It only works because the operator has installed their own CA on the device so the browser trusts the forged leaves. The CA private key is the trust anchor — protect it: mqproxy opens it with `O_NOFOLLOW`/`O_CLOEXEC` and refuses an encrypted or group/world-readable key.
+> **Trust model.** This is an **operator-controlled / consenting-endpoint** MITM (a corporate-proxy or personal-VPN posture), not an attack tool. It only works because the operator has installed their own CA on the device so the browser trusts the forged leaves. The CA private key is the trust anchor — protect it: mqproxy refuses a key file that is a symlink, is not owned by the user running mqproxy, or is readable by group or others.
+
+**Create a CA.** mqproxy needs a CA certificate and its **unencrypted PKCS#8** private key (`-----BEGIN PRIVATE KEY-----`):
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout mitm-ca.key -out mitm-ca.crt -days 825 -subj "/CN=mqproxy MITM CA" \
+  -addext basicConstraints=critical,CA:TRUE \
+  -addext keyUsage=critical,keyCertSign
+chmod 600 mitm-ca.key
+```
+
+Install `mitm-ca.crt` in the trust store of every device whose traffic you capture. EC (P-256, P-384), Ed25519 and RSA CAs work. **PKCS#8 only:** a PKCS#1 (`BEGIN RSA PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`) key is a startup error that tells you to convert it with `openssl pkcs8 -topk8 -nocrypt -in old.key -out mitm-ca.key`; an encrypted key is rejected too.
+
+To limit the CA to your own domains, add a `nameConstraints` extension to the command above (browsers enforce it, and mqproxy relays every other host opaquely instead of forging a certificate the browser would reject):
+
+```bash
+  -addext "nameConstraints=critical,permitted;DNS:example.com,permitted;DNS:example.org"
+```
+
+`DNS:example.com` permits that name and all its subdomains; `DNS:.example.com` permits subdomains only. Only `DNS` and `IP` constraints are supported.
 
 ```bash
 # Server — unchanged; the gateway origin bridge does the origin fetch.
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123
+./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+  --cert /etc/mqproxy/tls/server.pem --key /etc/mqproxy/tls/server.key
 
 # Client — transparent capture + MITM. Requires --tproxy and a signing CA.
 sudo ./build/mqproxy client \
@@ -279,9 +300,18 @@ sudo ./build/mqproxy client \
 curl https://example.com/
 ```
 
-**Requirements (fail-closed):** `--mitm` requires `--tproxy` (transparent capture is the only MITM ingress in v1) **and** `--ca-cert <pem>` + `--ca-key <pem>`. Missing any of these — or a binary built without the BoringSSL archives (run `scripts/build-xquic.sh` first) — is a startup error with a non-zero exit; mqproxy never silently falls back to opaque passthrough. `--mitm` is client-only (the server subcommand rejects it).
+**Requirements (fail-closed):** `--mitm` requires `--tproxy` (transparent capture is the only MITM ingress) **and** `--ca-cert <pem>` + `--ca-key <pem>`. Any of these missing, a CA that cannot be loaded, or an invalid ignore entry is a startup error (exit code 2) with a message naming the problem; mqproxy never silently falls back to opaque passthrough because of a configuration mistake. `--mitm` is client-only (the server subcommand rejects it; a `[Mitm]` section in a server config is skipped with a warning).
 
-**Ignore-hosts (opaque-splice bypass):** `--ignore-host <host>` (repeatable) and `--ignore-hosts <a,b,c>` (comma-separated) list hosts to **splice opaquely** — the raw TLS is relayed untouched so the origin's real certificate reaches the client (use this for cert-pinned apps that would reject a forged leaf). Matching is on the normalized (lowercased, trailing-dot-stripped) SNI and is either **exact** (`signal.org` matches only `signal.org`) or a **leading-dot suffix** (`.apple.com` matches `x.apple.com` and `a.b.apple.com` but **not** `apple.com` itself). CLI and config entries accumulate (union).
+**What is relayed opaquely.** MITM is applied only when everything is positively confirmed. Everything else is relayed **opaquely** — byte for byte, so the client sees the origin's real certificate — and keeps working instead of being dropped:
+
+- the client does not offer `h2` in ALPN (this includes `curl --http1.1`, most non-browser clients, and **WebSocket**, which arrives as HTTP/1.1);
+- the traffic is not TLS, or there is no SNI, an invalid SNI, or an IP-literal SNI;
+- the host is in the ignore list, or outside the scope of a `nameConstraints` CA;
+- the client's TLS settings are incompatible with the forged certificate;
+- the ClientHello takes longer than 5 seconds, is larger than 8 KiB, or the client closes before it is complete;
+- 256 connections are already in MITM (extra connections degrade to opaque relay).
+
+**Ignore-hosts.** `--ignore-host <host>` (repeatable) and `--ignore-hosts <a,b,c>` (comma-separated, no spaces) list hosts to relay opaquely — use this for cert-pinned apps that would reject a forged leaf. Matching is on the lowercased SNI without a trailing dot: `example.com` matches that host **only**; `.example.com` matches **strict subdomains only** (`www.example.com`, `a.b.example.com`, but not `example.com`). To exclude a site and its subdomains, list both. CLI and config entries are combined. An entry that is not a valid host name (an IP address, a wildcard, an empty entry, …) is a **startup error** (exit code 2) naming the entry.
 
 **Config** (`[Mitm]`, client-only — see [Configuration file](#configuration-file)):
 
@@ -294,14 +324,42 @@ IgnoreHosts = .apple.com
 IgnoreHosts = signal.org
 ```
 
-`IgnoreHosts` is repeatable — one host per line, like `[Multipath] Path`. CLI `--ignore-host(s)` and these entries union together.
+`IgnoreHosts` is a repeatable key with **one host per line** (not a comma-separated list), like `[Multipath] Path`. CLI `--ignore-host(s)` and these entries are combined.
+
+**Block UDP/443.** mqproxy MITMs TCP only. A browser that learns of HTTP/3 (an `Alt-Svc` header or a cached HTTPS DNS record) may switch a site to QUIC over UDP/443 and bypass the proxy entirely. mqproxy strips `alt-svc` from the responses it relays, but you should also block UDP/443 on the capture path so browsers fall back to TCP/TLS. On a router:
+
+```bash
+nft add table inet mqproxy_block
+nft add chain inet mqproxy_block fwd '{ type filter hook forward priority 0; }'
+nft add rule  inet mqproxy_block fwd udp dport 443 reject
+```
+
+(For the local machine's own browsers, hook `output` instead of `forward`.)
+
+**Request handling and limits:**
+
+- **One host per connection.** A request whose `:authority` differs from the connection's SNI gets `421 Misdirected Request`; the browser retries on a connection of its own.
+- **Header limits** (same on both ends of the gateway tunnel): a header field (name + value) up to 8 KiB, a header section up to 32 KiB, up to 256 fields, a request path with query up to about 8 KiB. A browser request head over the limits gets `431` from the h2 layer. Large cookies, long URLs and big CSP headers within these limits pass.
+- **HTTP/2:** up to 128 concurrent streams per connection; 256 KiB receive window per stream, 512 KiB per connection.
+- **Connections:** at most 256 in MITM; a connection with no open streams is closed after 60 seconds idle, and a peer silent for 60 seconds while streams are open is pinged and closed after 90 seconds of silence (long-lived responses such as server-sent events are fine).
+- Methods keep their case (up to 32 bytes); `CONNECT` and asterisk-form requests get `400`. A browser's split `cookie` fields are joined; `Cookie` and `Authorization` are forwarded; `alt-svc` is removed from responses.
+
+**Metrics.** With `--metrics-interval`, the client also prints a `mq.mitm` line on every tick and at shutdown (nothing while every counter is zero):
+
+```
+mq.mitm conns=<live> streams=<open> mitm=<n> opaque_not_tls=<n> opaque_no_sni=<n> opaque_bad_sni=<n> opaque_no_h2=<n> opaque_ignored=<n> opaque_ca_scope=<n> opaque_tls_incompat=<n> opaque_timeout=<n> opaque_too_large=<n> opaque_eof=<n> opaque_capacity=<n> tls_fail=<n> h2_fail=<n> dead=<n> leaf_hit=<n> leaf_miss=<n> reqs=<n> rejects=<n>
+```
+
+`conns` and `streams` are what is open now; the rest are cumulative. Each `opaque_*` counter counts connections relayed opaquely for one reason above; `leaf_hit`/`leaf_miss` are forged-certificate cache hits and misses; `reqs`/`rejects` are requests mapped onto the tunnel and requests answered locally with an error.
 
 **Security posture:**
 
 - **Untrusted browser headers.** All browser-supplied `X-Mq-*` headers are stripped — they are never interpreted as proxy controls; the client injects its own `x-mq-auth` / `x-mq-forward-cookie`. `Cookie` and `Authorization` are forwarded so normal browsing works.
-- **Dual-ABI symbol isolation.** The MITM crypto core links the vendored BoringSSL, whose symbols are hidden from the executable's dynamic table (`-Wl,--exclude-libs`) so they cannot interpose libcurl's system OpenSSL.
-- **Fail-closed & bounded.** Misconfigured/unavailable MITM is a startup error, never a silent passthrough. The ClientHello drain is bounded (8 KiB cap + deadline), and HTTP/2 resource limits (concurrent streams, frame size, header-list size) bound the new ingress.
-- **HTTP/2 only.** The browser must offer ALPN `h2`; non-h2, non-TLS, or no-SNI connections hard-fail when MITM is on.
+- **Fail-closed & bounded.** A misconfigured MITM is a startup error, never a silent passthrough. The ClientHello is read with a size cap and a deadline, and the limits above bound the new ingress.
+- **Leaf certificates** are forged per SNI, live 24 hours, are signed by your CA and are cached in memory. The CA key stays in memory while mqproxy runs.
+- **HTTP/2 only.** Other protocols are relayed opaquely, not inspected.
+
+> **Known limitation — large downloads to slow devices.** The client's HTTP/3 receive side does not yet apply end-to-end back-pressure: xquic copies response data into client memory as it arrives and returns flow-control credit to the server immediately. If a browser (or the device it runs on) consumes a large download more slowly than the tunnel delivers it, the client buffers the difference in memory. The same applies to the gateway fetch ingress. The fix is tracked upstream ([alibaba/xquic#959](https://github.com/alibaba/xquic/issues/959), [PR #960](https://github.com/alibaba/xquic/pull/960)) and will be picked up when it lands. On memory-constrained routers, watch the client's memory during large downloads to slow clients, or add the affected hosts to the ignore list.
 
 ### Resilience: reconnect and keepalive
 
@@ -528,11 +586,11 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 
 | Flag | Description |
 |---|---|
-| `--mitm` | Terminate TLS on the transparent-capture path (forge a leaf per SNI, speak h2, feed the Gateway tunnel) instead of relaying opaquely. **Requires `--tproxy`, `--ca-cert`, and `--ca-key`** and a binary built with the BoringSSL archives (`scripts/build-xquic.sh`); any of these missing is a fail-closed startup error. |
-| `--ca-cert <pem>` | Signing CA certificate (PEM). The operator's CA must be trusted by the device. |
-| `--ca-key <pem>` | Signing CA private key (PEM). Must be unencrypted and not group/world-readable; opened with `O_NOFOLLOW`/`O_CLOEXEC`. |
-| `--ignore-host <host>` | Host to splice **opaquely** (bypass MITM — relay raw TLS so the origin's real cert reaches the client; for cert-pinned apps). **Repeatable.** Match is exact or leading-dot suffix on the normalized SNI. |
-| `--ignore-hosts <a,b,c>` | Same as `--ignore-host` but a comma-separated list. CLI and `[Mitm] IgnoreHosts` config entries union. |
+| `--mitm` | Terminate TLS on the transparent-capture path (forge a leaf per SNI, speak h2, feed the Gateway tunnel) instead of relaying opaquely. **Requires `--tproxy`, `--ca-cert`, and `--ca-key`**; any of these missing is a fail-closed startup error (exit 2). Flows that cannot be MITM'd are relayed opaquely — see [TLS MITM mode](#tls-mitm-mode). |
+| `--ca-cert <pem>` | Signing CA certificate (PEM). The operator's CA must be trusted by the device. A CA with `nameConstraints` is supported; hosts outside its scope are relayed opaquely. |
+| `--ca-key <pem>` | Signing CA private key: **unencrypted PKCS#8** PEM (PKCS#1/SEC1 are rejected with the `openssl pkcs8 -topk8 -nocrypt` conversion hint). Must be owned by the running user, not group/other accessible, and not a symlink. |
+| `--ignore-host <host>` | Host to relay **opaquely** (bypass MITM — the origin's real cert reaches the client; for cert-pinned apps). **Repeatable.** `example.com` matches that host only; `.example.com` matches strict subdomains only. An invalid entry is a startup error naming it. |
+| `--ignore-hosts <a,b,c>` | Same as `--ignore-host` but a comma-separated list (no spaces). CLI and `[Mitm] IgnoreHosts` config entries combine. |
 
 > The test certificate under `tests/certs` is for local testing only. For real deployments, pass your own `--cert`/`--key` and a strong `--token`.
 
@@ -554,7 +612,7 @@ Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts conf
 
 mqproxy uses a **trusted proxy** model: mqproxy-client, mqproxy-server, and the MPQUIC connection between them are trusted. In TCP Proxy Mode and Transparent Capture mode (without `--mitm`), application↔origin TLS is preserved end-to-end (mqproxy never sees plaintext — it relays raw TLS bytes opaquely). Applications with certificate pinning continue to work. The HTTP Request Execution Gateway is an explicit delegation model — the client delegates HTTP request execution to a trusted gateway that establishes (and always verifies) the origin TLS — not a transparent MITM. Gateway requests are authenticated individually (`X-Mq-Auth`, per-request); `Authorization` is reserved for the origin and forwarded, while `Cookie` and `X-Mq-*` never leave the gateway.
 
-**TLS MITM ingress** (`--mitm`, opt-in) is an **operator-controlled / consenting-endpoint** model for managed devices where the operator's CA is installed locally — a corporate-proxy or personal-VPN posture, not a transparent attack on third parties. The client forges per-host leaves from that CA, terminates the browser's TLS as HTTP/2, and maps each request onto the Gateway tunnel. Its trust assumptions: the **CA private key is the anchor** (loaded with `O_NOFOLLOW`/`O_CLOEXEC`, refused if encrypted or group/world-readable); browser-supplied `X-Mq-*` headers are **always stripped** (never interpreted as controls — the client injects its own `x-mq-auth`); vendored-BoringSSL symbols are **isolated** from libcurl's system OpenSSL; and the feature is **fail-closed** (misconfiguration is a startup error, never silent passthrough, with a bounded ClientHello drain and H2 resource limits). Cert-pinned hosts can be excluded with `--ignore-host(s)`, which splices them opaquely so the origin's real certificate reaches the client.
+**TLS MITM ingress** (`--mitm`, opt-in) is an **operator-controlled / consenting-endpoint** model for managed devices where the operator's CA is installed locally — a corporate-proxy or personal-VPN posture, not a transparent attack on third parties. The client forges per-host leaves from that CA, terminates the browser's TLS as HTTP/2, and maps each request onto the Gateway tunnel. Its trust assumptions: the **CA private key is the anchor** (an unencrypted PKCS#8 file owned by the running user, not group/other accessible, not a symlink; it stays in memory while mqproxy runs); a CA can be limited to your own domains with an X.509 `nameConstraints` extension; browser-supplied `X-Mq-*` headers are **always stripped** (never interpreted as controls — the client injects its own `x-mq-auth`); and the feature is **fail-closed** (misconfiguration is a startup error, never silent passthrough, with a bounded ClientHello read and header, stream and connection limits). Anything that is not positively an HTTP/2 TLS client for a valid host name is relayed opaquely and never inspected. Cert-pinned hosts can be excluded with `--ignore-host(s)`, which relays them opaquely so the origin's real certificate reaches the client. Known limitation: the client's HTTP/3 receive side buffers a large download in memory when the consuming device is slower than the tunnel, until an upstream xquic fix lands (see [TLS MITM mode](#tls-mitm-mode)).
 
 ## License
 
