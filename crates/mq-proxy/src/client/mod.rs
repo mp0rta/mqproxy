@@ -11,6 +11,7 @@
 //! control stream is Connecting, with one but not `authed` is Authing.
 
 pub mod backoff;
+pub mod exchange;
 pub mod gateway;
 mod ingress_glue;
 mod paths;
