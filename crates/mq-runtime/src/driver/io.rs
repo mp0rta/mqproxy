@@ -1,7 +1,7 @@
 //! The `Io` trait (spec §5.3 "Loop core and `Io`"). Handles are opaque keys
 //! owned by the `Io` implementation.
 
-use crate::app::{AcceptMeta, IoResult};
+use crate::app::{AcceptMeta, IoResult, KeepAlive};
 use crate::ids::DialOpId;
 use mq_transport_api::{Time, Transmit};
 use std::io;
@@ -98,6 +98,7 @@ pub trait Io {
     fn open_udp(&mut self, local_ip: IpAddr) -> io::Result<(UdpSock, SocketAddr)>;
     fn shutdown_write(&mut self, s: TcpSock) -> io::Result<()>;
     fn set_nodelay(&mut self, s: TcpSock) -> io::Result<()>;
+    fn set_keepalive(&mut self, s: TcpSock, ka: KeepAlive) -> io::Result<()>;
     /// abort: mq_linux::set_linger_zero then close → the peer sees ECONNRESET.
     fn close_tcp(&mut self, s: TcpSock, abort: bool);
     fn close_udp(&mut self, s: UdpSock);

@@ -607,6 +607,13 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
                     }
                 }
             }
+            IoRequest::TcpSetKeepalive { tcp, ka } => {
+                if let Some(&s) = self.tcp.get(&tcp) {
+                    if let Err(e) = self.io.set_keepalive(s, ka) {
+                        log::debug!("setsockopt(SO_KEEPALIVE): {e}");
+                    }
+                }
+            }
             IoRequest::TcpClose { tcp, abort } => {
                 if let Some(s) = self.tcp.remove(&tcp) {
                     self.unregister(s.0);

@@ -4,10 +4,13 @@
 //! (port of `src/ingress/mq_listener.c`); `set_linger_zero` makes the next
 //! close abort with RST (spec §5.2).
 
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 /// `original_dst` of a socket: `getsockopt(SOL_IP, SO_ORIGINAL_DST)`. IPv4
 /// only in SP1 (an IPv6 flow would need `IP6T_SO_ORIGINAL_DST`).
@@ -32,6 +35,33 @@ pub fn set_linger_zero(fd: &impl AsRawFd) -> io::Result<()> {
         l_linger: 0,
     };
     setsockopt_raw(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, &l)
+}
+
+/// `SO_KEEPALIVE` with `TCP_KEEPIDLE`/`KEEPINTVL`/`KEEPCNT` (seconds) and
+/// `TCP_USER_TIMEOUT` (ms). SP4 spec §7.8.
+pub fn set_keepalive(
+    fd: &impl AsRawFd,
+    idle_s: u32,
+    intvl_s: u32,
+    cnt: u32,
+    user_timeout_ms: u32,
+) -> io::Result<()> {
+    let fd = fd.as_raw_fd();
+    let t = libc::IPPROTO_TCP;
+    setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    setsockopt_int(fd, t, libc::TCP_KEEPIDLE, idle_s as _)?;
+    setsockopt_int(fd, t, libc::TCP_KEEPINTVL, intvl_s as _)?;
+    setsockopt_int(fd, t, libc::TCP_KEEPCNT, cnt as _)?;
+    setsockopt_int(fd, t, libc::TCP_USER_TIMEOUT, user_timeout_ms as _)
+}
+
+/// Opens `path` read-only, failing with `ELOOP` if the final component is a
+/// symlink (`O_NOFOLLOW`). SP4 spec §7.
+pub fn open_nofollow(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
 }
 
 pub(crate) fn setsockopt_int(
@@ -150,6 +180,42 @@ pub(crate) fn from_sockaddr_storage(ss: &libc::sockaddr_storage) -> io::Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn get_int(fd: &impl AsRawFd, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        let mut v: libc::c_int = -1;
+        getsockopt_raw(fd.as_raw_fd(), level, name, &mut v).unwrap();
+        v
+    }
+
+    #[test]
+    fn set_keepalive_readback() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let s = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        set_keepalive(&s, 60, 10, 3, 90_000).unwrap();
+        let t = libc::IPPROTO_TCP;
+        assert_eq!(get_int(&s, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+        assert_eq!(get_int(&s, t, libc::TCP_KEEPIDLE), 60);
+        assert_eq!(get_int(&s, t, libc::TCP_KEEPINTVL), 10);
+        assert_eq!(get_int(&s, t, libc::TCP_KEEPCNT), 3);
+        assert_eq!(get_int(&s, t, libc::TCP_USER_TIMEOUT), 90_000);
+    }
+
+    #[test]
+    fn open_nofollow_refuses_symlink() {
+        use std::io::Read;
+        let d = std::env::temp_dir().join(format!("mq-linux-nofollow-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (f, l) = (d.join("f"), d.join("l"));
+        std::fs::write(&f, b"ok").unwrap();
+        let _ = std::fs::remove_file(&l);
+        std::os::unix::fs::symlink(&f, &l).unwrap();
+        let mut buf = String::new();
+        open_nofollow(&f).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "ok");
+        let e = open_nofollow(&l).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ELOOP));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 
     #[test]
     fn sockaddr_conversion_rejects_unix_family() {

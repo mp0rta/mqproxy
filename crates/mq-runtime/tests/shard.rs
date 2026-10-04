@@ -5,9 +5,9 @@ use mq_runtime::testing::{
     Call, RecordHandle, Recorded, RecordingApp, ScriptedHandle, ScriptedTransport,
 };
 use mq_runtime::{
-    AcceptMeta, Cx, DialError, Host, Interest, IoRequest, IoResult, ListenerId, ListenerTag,
-    PrereadTooLarge, RELAY_BUF, SendBufFull, Shard, StreamPreread, TCP_BUF, Target, TcpEnd, TcpId,
-    UdpSocketId,
+    AcceptMeta, Cx, DialError, Host, Interest, IoRequest, IoResult, KeepAlive, ListenerId,
+    ListenerTag, PrereadTooLarge, RELAY_BUF, SendBufFull, Shard, StreamPreread, TCP_BUF, Target,
+    TcpEnd, TcpId, UdpSocketId,
 };
 use mq_transport_api::{
     CloseReason, ConnId, ErrType, Event, PathError, PathId, StreamError, StreamId, StreamInfo,
@@ -347,6 +347,29 @@ fn tcp_set_nodelay_requested_for_app_socket_only() {
     h.sh.with_app(T0, |_, cx| {
         cx.tcp_abort(tcp);
         cx.tcp_set_nodelay(tcp);
+    });
+    assert_eq!(
+        h.reqs(),
+        [IoRequest::TcpClose { tcp, abort: true }],
+        "a stale id is ignored"
+    );
+}
+
+#[test]
+fn tcp_set_keepalive_requested_for_app_socket_only() {
+    let mut h = setup();
+    let tcp = h.accept();
+    let ka = KeepAlive {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(10),
+        count: 3,
+        user_timeout: Duration::from_secs(90),
+    };
+    h.sh.with_app(T0, |_, cx| cx.tcp_set_keepalive(tcp, ka));
+    assert_eq!(h.reqs(), [IoRequest::TcpSetKeepalive { tcp, ka }]);
+    h.sh.with_app(T0, |_, cx| {
+        cx.tcp_abort(tcp);
+        cx.tcp_set_keepalive(tcp, ka);
     });
     assert_eq!(
         h.reqs(),
