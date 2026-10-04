@@ -11,7 +11,7 @@ use mq_proxy::server::Server;
 use mq_runtime::UdpSocketId;
 use mq_runtime::testing::{Recorded, RecordingApp};
 use mq_transport_api::fabric::Packet;
-use mq_transport_api::{ConnConfig, Event, Role, Time, TransportOps};
+use mq_transport_api::{ConnConfig, ConnProto, Event, Role, Time, TransportOps};
 use std::net::SocketAddr;
 
 /// An authenticated pair whose server's UDP target echoes.
@@ -212,6 +212,7 @@ fn deferred_flush_same_iteration() {
         peer: server_addr(),
         sni: "mqproxy",
         idle_timeout: None,
+        proto: ConnProto::Raw,
     };
     let c = cli.call(move |n| n.with_app(|_, cx| cx.connect(&cfg)).expect("connect"));
     feed(&cli, T0, Vec::new());

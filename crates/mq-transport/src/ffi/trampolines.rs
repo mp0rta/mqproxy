@@ -7,13 +7,14 @@
 //! xquic getters/setters a trampoline needs run before or after that scope.
 
 use super::{from_sockaddr, guard};
-use crate::slots::{ConnSlot, StreamSlot};
+use crate::slots::{ConnSlot, H3ReqSlot, StreamSlot};
 use crate::txq::Refusal;
 use crate::{Inner, clock, datagram, stream};
 use core::ffi::{c_int, c_uchar, c_void};
 use libc::{sockaddr, socklen_t};
 use mq_transport_api::{
-    CloseReason, ConnId, ErrType, Event, PathId, SlotId, StreamId, StreamInfo, StreamKind, Time,
+    CloseReason, ConnId, ConnProto, ErrType, Event, H3Close, H3ReqId, H3ReqStats, PathId, Role,
+    SlotId, StreamId, StreamInfo, StreamKind, Time, Unread,
 };
 use std::time::Duration;
 use xquic_sys::*;
@@ -40,6 +41,14 @@ fn conn_id(s: SlotId) -> ConnId {
 fn stream_id(s: SlotId) -> StreamId {
     StreamId::from_slot(s).expect("live slot ids have a non-zero generation")
 }
+
+pub(crate) fn req_id(s: SlotId) -> H3ReqId {
+    H3ReqId::from_slot(s).expect("live slot ids have a non-zero generation")
+}
+
+/// spec §3.4: the `XQC_REQ_NOTIFY_READ_*` bits the transport acts on.
+pub(crate) const READ_HEADER: u8 = XQC_REQ_NOTIFY_READ_HEADER as u8;
+pub(crate) const READ_TRAILER: u8 = XQC_REQ_NOTIFY_READ_TRAILER as u8;
 
 /// Runs `f` on the transport that entered xquic; `default` outside a transport call.
 fn with_inner<R>(default: R, f: impl FnOnce(&mut Inner) -> R) -> R {
@@ -92,7 +101,9 @@ pub(crate) fn on_server_accept(
     Some(inner.conns.insert(slot))
 }
 
-/// `server_refuse`: release an accepted connection that never got an ALPN slot (never counted).
+/// `server_refuse`: release an accepted connection without an ALPN close notification. A
+/// counted one is an H3 connection whose xquic-side create failed after ours admitted it
+/// (spec §3.3): balance the count and report the close its `NewConn` promised.
 pub(crate) fn on_server_refuse(inner: &mut Inner, s: SlotId) {
     let Some(slot) = inner.conns.remove(s) else {
         return;
@@ -101,15 +112,24 @@ pub(crate) fn on_server_refuse(inner: &mut Inner, s: SlotId) {
     if slot.provisional {
         inner.n_provisional -= 1;
     }
+    if slot.counted {
+        inner.n_counted -= 1;
+        let reason = CloseReason {
+            err_type: ErrType::Unknown,
+            code: 0,
+        };
+        inner.events.push(Event::ConnClosed(conn_id(s), reason));
+    }
 }
 
-/// ALPN create notification. `false` → return -1. Server: the second cap check; a refusal
-/// changes nothing. Client: records the connection pointer and cid.
+/// ALPN (raw or H3) create notification. `false` → return -1. Server: the second cap check;
+/// a refusal changes nothing. Client: records the connection pointer and cid.
 pub(crate) fn on_conn_create(
     inner: &mut Inner,
     conn: *mut xqc_connection_t,
     cid: Option<xqc_cid_t>,
     s: SlotId,
+    proto: ConnProto,
 ) -> bool {
     let Inner {
         conns,
@@ -132,13 +152,14 @@ pub(crate) fn on_conn_create(
         slot.provisional = false;
         slot.provisional_deadline = None;
         slot.counted = true;
-        events.push(Event::NewConn(conn_id(s)));
+        events.push(Event::NewConn(conn_id(s), proto));
     } else {
         slot.xqc = conn;
         if let Some(cid) = cid {
             slot.cid = cid;
         }
     }
+    slot.proto = proto;
     true
 }
 
@@ -167,6 +188,17 @@ pub(crate) fn on_conn_close(inner: &mut Inner, s: SlotId, reason: CloseReason) {
     inner.txq.drop_conn(id);
 }
 
+/// A peer-opened stream or H3 request: the per-connection ceiling both share, checked before
+/// allocating (spec §4.2, §3.3). Over it, the next `drive` closes the connection.
+fn admit_peer(c: &mut ConnSlot) -> bool {
+    if c.streams >= STREAM_CEILING {
+        c.pending_close = Some(CEILING_CLOSE_CODE);
+        return false;
+    }
+    c.streams += 1;
+    true
+}
+
 /// Peer-initiated stream (null user data): ceiling check BEFORE allocating (spec §4.8).
 /// `None` → return -1 (xquic marks the stream DISCARDED).
 pub(crate) fn on_peer_stream_create(
@@ -176,12 +208,9 @@ pub(crate) fn on_peer_stream_create(
     quic_id: u64,
     kind: StreamKind,
 ) -> Option<SlotId> {
-    let c = inner.conns.get_mut(conn)?;
-    if c.streams >= STREAM_CEILING {
-        c.pending_close = Some(CEILING_CLOSE_CODE);
+    if !admit_peer(inner.conns.get_mut(conn)?) {
         return None;
     }
-    c.streams += 1;
     let s = inner
         .streams
         .insert(StreamSlot::new(conn, xs, quic_id, kind));
@@ -221,6 +250,138 @@ pub(crate) fn on_stream_close(inner: &mut Inner, s: SlotId) {
         c.streams -= 1;
     }
     inner.events.push(Event::StreamClosed(stream_id(s)));
+}
+
+/// Server: the peer opened a request (spec §3.3). `None` = refused: the request keeps NULL
+/// user data, so every later notification for it is a no-op, and the connection closes at the
+/// next `drive` (xquic ignores the create notification's return value).
+pub(crate) fn on_h3_request_create(
+    inner: &mut Inner,
+    conn: SlotId,
+    h3r: *mut xqc_h3_request_t,
+    quic_id: u64,
+) -> Option<SlotId> {
+    if !admit_peer(inner.conns.get_mut(conn)?) {
+        return None;
+    }
+    let s = inner.h3reqs.insert(H3ReqSlot::new(conn, h3r, quic_id));
+    inner
+        .events
+        .push(Event::H3Request(conn_id(conn), req_id(s)));
+    Some(s)
+}
+
+/// spec §3.3/§3.4: accumulate the read flags and queue `H3Readable`. `true` → the trampoline
+/// drains (and discards) the trailer section now: the app already read the header section.
+/// A trailer that arrives before that keeps its bit for `h3_recv_headers`.
+pub(crate) fn on_h3_read(inner: &mut Inner, s: SlotId, flag: u8) -> bool {
+    let Some(r) = inner.h3reqs.get_mut(s) else {
+        return false;
+    };
+    r.read_flags |= flag;
+    let drain = r.header_consumed && r.read_flags & READ_TRAILER != 0;
+    if drain {
+        r.read_flags &= !READ_TRAILER;
+    }
+    inner.events.push_h3_readable(&mut inner.h3reqs, req_id(s));
+    drain
+}
+
+/// Request close notification: every request slot is released here (spec §3.3, §3.5). The
+/// connection slot may already be gone (a QPACK-blocked request outlives its connection).
+pub(crate) fn on_h3_request_close(
+    inner: &mut Inner,
+    s: SlotId,
+    stats: H3ReqStats,
+    unread: Option<Unread>,
+) {
+    let Some(r) = inner.h3reqs.remove(s) else {
+        return;
+    };
+    if let Some(c) = inner.conns.get_mut(r.conn) {
+        c.streams -= 1;
+    }
+    let close = Box::new(H3Close { stats, unread });
+    inner.events.push(Event::H3Closed(req_id(s), close));
+}
+
+/// spec §3.3 close row: a client request whose fin the app has not consumed is drained before
+/// the release; `Some(read_flags)` then.
+fn rescue_flags(inner: &Inner, s: SlotId) -> Option<u8> {
+    if inner.cfg.role != Role::Client {
+        return None;
+    }
+    inner
+        .h3reqs
+        .get(s)
+        .filter(|r| !r.fin_consumed)
+        .map(|r| r.read_flags)
+}
+
+/// spec §3.7: drains the pending header section (when `header`) and the whole body; `Some` only
+/// when the drain ends with xquic's fin — a partial body is never rescued.
+///
+/// # Safety
+/// `h3r` is the request inside its close notification (intact until it returns).
+unsafe fn drain_unread(h3r: *mut xqc_h3_request_t, header: bool) -> Option<Unread> {
+    let headers = if header {
+        let mut fin = 0u8; // xquic logs it before writing it
+        // SAFETY: guaranteed by the caller.
+        let hs = unsafe { xqc_h3_request_recv_headers(h3r, &mut fin) };
+        if hs.is_null() {
+            return None;
+        }
+        let mut v = Vec::new();
+        // SAFETY: the section just returned, unchanged for this call.
+        unsafe { crate::h3::for_each_header(hs, &mut |n, x| v.push((n.to_vec(), x.to_vec()))) };
+        Some(v)
+    } else {
+        None
+    };
+    const CHUNK: usize = 64 * 1024;
+    let mut body = Vec::new();
+    loop {
+        let len = body.len();
+        body.resize(len + CHUNK, 0);
+        let mut fin = 0u8;
+        // SAFETY: guaranteed by the caller; `CHUNK` writable bytes at `len`.
+        let n =
+            unsafe { xqc_h3_request_recv_body(h3r, body.as_mut_ptr().add(len), CHUNK, &mut fin) };
+        if n < 0 {
+            return None; // EAGAIN: no fin behind the buffered body
+        }
+        body.truncate(len + n as usize);
+        if fin != 0 {
+            return Some(Unread { headers, body });
+        }
+    }
+}
+
+/// spec §3.1: the fields C's call site reads; `close_msg` copied up to 64 bytes.
+///
+/// # Safety
+/// `st.stream_close_msg` is null or a NUL-terminated string (xquic's static messages).
+pub(crate) unsafe fn h3_stats(st: &xqc_request_stats_t) -> H3ReqStats {
+    let msg = st.stream_close_msg.cast::<u8>();
+    let close_msg = (!msg.is_null()).then(|| {
+        // SAFETY: guaranteed by the caller; reading stops at the NUL (or after 64 bytes).
+        let bytes: Vec<u8> = (0..64)
+            .map(|k| unsafe { *msg.add(k) })
+            .take_while(|&b| b != 0)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    H3ReqStats {
+        send_body: st.send_body_size as u64,
+        recv_body: st.recv_body_size as u64,
+        begin_us: st.h3r_begin_time,
+        header_send_us: st.h3r_header_send_time,
+        fin_send_us: st.stream_fin_send_time,
+        fin_ack_us: st.stream_fin_ack_time,
+        mp_state: st.mp_state,
+        stream_err: st.stream_err,
+        close_msg,
+    }
 }
 
 /// SP2 spec §3.2: into the connection's receive ring; a stale slot drops it, a full ring
@@ -425,7 +586,7 @@ pub(super) unsafe extern "C" fn conn_create_notify(
     // SAFETY: `cid` is null or valid for this call; copied.
     let cid = (!cid.is_null()).then(|| unsafe { cid.read_unaligned() });
     let s = slot_of(ud);
-    if !with_inner(false, |i| on_conn_create(i, conn, cid, s)) {
+    if !with_inner(false, |i| on_conn_create(i, conn, cid, s, ConnProto::Raw)) {
         return -1;
     }
     // SAFETY: plain setters on the connection being created.
@@ -443,18 +604,33 @@ pub(super) unsafe extern "C" fn conn_close_notify(
     _ud: *mut c_void,
     proto: *mut c_void,
 ) -> c_int {
-    // SAFETY: plain getters on the connection being destroyed.
+    // SAFETY: the connection being destroyed.
+    let reason = unsafe { close_reason(conn) };
+    with_inner((), |i| on_conn_close(i, slot_of(proto), reason));
+    0
+}
+
+/// # Safety
+/// `conn` is a live connection (plain getters).
+unsafe fn close_reason(conn: *mut xqc_connection_t) -> CloseReason {
+    // SAFETY: guaranteed by the caller.
     let (ty, errno) = unsafe { (xqc_conn_get_err_type(conn), xqc_conn_get_errno(conn)) };
-    let reason = CloseReason {
+    CloseReason {
         err_type: match ty {
             XQC_CONN_ERR_TYPE_TRANSPORT => ErrType::Transport,
             XQC_CONN_ERR_TYPE_APPLICATION => ErrType::Application,
             _ => ErrType::Unknown,
         },
         code: errno as u32 as u64,
-    };
-    with_inner((), |i| on_conn_close(i, slot_of(proto), reason));
-    0
+    }
+}
+
+fn established(s: SlotId) {
+    with_inner((), |i| {
+        if i.conns.is_live(s) {
+            i.events.push(Event::ConnEstablished(conn_id(s)));
+        }
+    })
 }
 
 pub(super) unsafe extern "C" fn conn_handshake_finished(
@@ -462,12 +638,133 @@ pub(super) unsafe extern "C" fn conn_handshake_finished(
     _ud: *mut c_void,
     proto: *mut c_void,
 ) {
-    with_inner((), |i| {
-        if i.conns.is_live(slot_of(proto)) {
-            i.events
-                .push(Event::ConnEstablished(conn_id(slot_of(proto))));
+    established(slot_of(proto))
+}
+
+// ── H3 connection callbacks (spec §3.3): `ud` is the transport user data = the conn slot.
+// Never `xqc_h3_conn_set_user_data` (it overwrites that user data, spec §3.2).
+
+pub(super) unsafe extern "C" fn h3_conn_create_notify(
+    h3c: *mut xqc_h3_conn_t,
+    cid: *const xqc_cid_t,
+    ud: *mut c_void,
+) -> c_int {
+    // SAFETY: `cid` is null or valid for this call; copied. `h3c` is being created: a getter.
+    let (cid, conn) = unsafe {
+        (
+            (!cid.is_null()).then(|| cid.read_unaligned()),
+            xqc_h3_conn_get_xqc_conn(h3c),
+        )
+    };
+    let s = slot_of(ud);
+    let ok = with_inner(false, |i| {
+        if !on_conn_create(i, conn, cid, s, ConnProto::H3) {
+            return false;
         }
-    })
+        if let Some(slot) = i.conns.get_mut(s) {
+            slot.h3c = h3c;
+        }
+        true
+    });
+    if ok { 0 } else { -1 }
+}
+
+pub(super) unsafe extern "C" fn h3_conn_close_notify(
+    h3c: *mut xqc_h3_conn_t,
+    _cid: *const xqc_cid_t,
+    ud: *mut c_void,
+) -> c_int {
+    // SAFETY: the H3 connection being destroyed and its live QUIC connection.
+    let reason = unsafe { close_reason(xqc_h3_conn_get_xqc_conn(h3c)) };
+    with_inner((), |i| on_conn_close(i, slot_of(ud), reason));
+    0
+}
+
+pub(super) unsafe extern "C" fn h3_conn_handshake_finished(
+    _h3c: *mut xqc_h3_conn_t,
+    ud: *mut c_void,
+) {
+    established(slot_of(ud))
+}
+
+// Request callbacks (spec §3.3): `ud` is the request's user data = its slot, or NULL for a
+// request we refused (every notification for it is then a no-op).
+
+/// The role decides: a server's `ud` is NULL on both xquic creation paths and the peer opened
+/// the request; a client's `ud` is the slot `open_h3_request` preallocated.
+pub(super) unsafe extern "C" fn h3_request_create_notify(
+    h3r: *mut xqc_h3_request_t,
+    ud: *mut c_void,
+) -> c_int {
+    // SAFETY: plain getters on the request being created.
+    let (conn, quic_id) = unsafe {
+        (
+            slot_of(xqc_h3_get_conn_user_data_by_request(h3r)),
+            xqc_h3_stream_id(h3r),
+        )
+    };
+    let admitted = with_inner(None, |i| {
+        if matches!(i.cfg.role, Role::Server { .. }) {
+            return on_h3_request_create(i, conn, h3r, quic_id);
+        }
+        if let Some(r) = i.h3reqs.get_mut(slot_of(ud)) {
+            r.xqc = h3r;
+            r.quic_id = quic_id;
+        }
+        None
+    });
+    if let Some(s) = admitted {
+        // SAFETY: a plain setter on the request being created.
+        unsafe { xqc_h3_request_set_user_data(h3r, ud_of(s)) };
+    }
+    0 // ignored by xquic
+}
+
+pub(super) unsafe extern "C" fn h3_request_close_notify(
+    h3r: *mut xqc_h3_request_t,
+    ud: *mut c_void,
+) -> c_int {
+    let s = slot_of(ud);
+    if s.is_none() {
+        return 0;
+    }
+    // SAFETY: the request is intact for the duration of its close notification (spec §3.7);
+    // xquic's close messages are static strings.
+    let stats = unsafe { h3_stats(&xqc_h3_request_get_stats(h3r)) };
+    let unread = with_inner(None, |i| rescue_flags(i, s))
+        // SAFETY: as above; the drain calls getters that fire no notification.
+        .and_then(|flags| unsafe { drain_unread(h3r, flags & READ_HEADER != 0) });
+    with_inner((), |i| on_h3_request_close(i, s, stats, unread));
+    0
+}
+
+pub(super) unsafe extern "C" fn h3_request_read_notify(
+    h3r: *mut xqc_h3_request_t,
+    flag: xqc_request_notify_flag_t,
+    ud: *mut c_void,
+) -> c_int {
+    let s = slot_of(ud);
+    if s.is_none() {
+        return 0;
+    }
+    if with_inner(false, |i| on_h3_read(i, s, flag as u8)) {
+        let mut fin = 0u8; // xquic logs it before writing it
+        // SAFETY: the request being notified; a getter that fires no notification. The trailer
+        // section is discarded and its fin ignored (spec §3.3).
+        unsafe { xqc_h3_request_recv_headers(h3r, &mut fin) };
+    }
+    0
+}
+
+pub(super) unsafe extern "C" fn h3_request_write_notify(
+    _h3r: *mut xqc_h3_request_t,
+    ud: *mut c_void,
+) -> c_int {
+    let s = slot_of(ud);
+    if !s.is_none() {
+        with_inner((), |i| i.events.push_h3_writable(&mut i.h3reqs, req_id(s)));
+    }
+    0
 }
 
 pub(super) unsafe extern "C" fn stream_create_notify(
@@ -585,6 +882,7 @@ mod tests {
                 scheduler: Scheduler::MinRtt,
                 cc: CongestionControl::Bbr,
                 realtime_offset_us: 0,
+                h3: false,
             },
             CString::new("mqproxy-tcp/1").unwrap(),
         )
@@ -599,6 +897,10 @@ mod tests {
         on_server_accept(i, core::ptr::null_mut(), cid(), Time(0)).expect("accepted")
     }
 
+    fn create(i: &mut Inner, s: SlotId, proto: ConnProto) -> bool {
+        on_conn_create(i, core::ptr::null_mut(), None, s, proto)
+    }
+
     #[test]
     fn second_cap_check_refuses_when_two_half_open_pass_the_first() {
         // Two connections pass server_accept while nothing is counted yet.
@@ -611,8 +913,8 @@ mod tests {
         assert_eq!(n, 1);
         assert!(admit_established(0, &mut n), "0 = unlimited");
         // Through the create notification: the first is admitted, the second refused.
-        assert!(on_conn_create(&mut i, core::ptr::null_mut(), None, a));
-        assert!(!on_conn_create(&mut i, core::ptr::null_mut(), None, b));
+        assert!(create(&mut i, a, ConnProto::Raw));
+        assert!(!create(&mut i, b, ConnProto::Raw));
         assert_eq!((i.n_counted, i.n_provisional), (1, 1));
     }
 
@@ -621,9 +923,9 @@ mod tests {
         let mut i = inner(1);
         // Both pass server_accept (half-open, uncounted); `a` then takes the only unit.
         let (a, b) = (accept(&mut i), accept(&mut i));
-        assert!(on_conn_create(&mut i, core::ptr::null_mut(), None, a));
+        assert!(create(&mut i, a, ConnProto::Raw));
         assert_eq!(i.n_provisional, 1);
-        assert!(!on_conn_create(&mut i, core::ptr::null_mut(), None, b));
+        assert!(!create(&mut i, b, ConnProto::Raw));
         let slot = i.conns.get(b).expect("slot stays live");
         assert!(slot.provisional && !slot.counted);
         assert_eq!(
@@ -631,8 +933,16 @@ mod tests {
             Some(Time(0) + PROVISIONAL_TIMEOUT)
         );
         assert_eq!((i.n_provisional, i.n_counted), (1, 1));
-        assert!(i.events.pop(&mut i.streams, &mut i.conns).is_some()); // a's NewConn
-        assert!(i.events.pop(&mut i.streams, &mut i.conns).is_none());
+        assert!(
+            i.events
+                .pop(&mut i.streams, &mut i.conns, &mut i.h3reqs)
+                .is_some()
+        ); // a's NewConn
+        assert!(
+            i.events
+                .pop(&mut i.streams, &mut i.conns, &mut i.h3reqs)
+                .is_none()
+        );
         on_server_refuse(&mut i, b);
         assert!(!i.conns.is_live(b));
         assert_eq!((i.n_provisional, i.n_counted), (0, 1));
@@ -662,7 +972,7 @@ mod tests {
     fn close_releases_counted_once() {
         let mut i = inner(0);
         let a = accept(&mut i);
-        assert!(on_conn_create(&mut i, core::ptr::null_mut(), None, a));
+        assert!(create(&mut i, a, ConnProto::Raw));
         let r = CloseReason {
             err_type: ErrType::Unknown,
             code: 0,
@@ -671,10 +981,14 @@ mod tests {
         on_conn_close(&mut i, a, r);
         assert_eq!(i.n_counted, 0);
         let evs: Vec<_> =
-            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns)).collect();
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
         assert_eq!(
             evs,
-            vec![Event::NewConn(conn_id(a)), Event::ConnClosed(conn_id(a), r)]
+            vec![
+                Event::NewConn(conn_id(a), ConnProto::Raw),
+                Event::ConnClosed(conn_id(a), r)
+            ]
         );
     }
 
@@ -682,8 +996,8 @@ mod tests {
     fn local_close_reports_unknown_even_after_a_peer_echo() {
         let mut i = inner(0);
         let (a, b) = (accept(&mut i), accept(&mut i));
-        assert!(on_conn_create(&mut i, core::ptr::null_mut(), None, a));
-        assert!(on_conn_create(&mut i, core::ptr::null_mut(), None, b));
+        assert!(create(&mut i, a, ConnProto::Raw));
+        assert!(create(&mut i, b, ConnProto::Raw));
         i.conns.get_mut(a).unwrap().closed_locally = true;
         let echoed = CloseReason {
             err_type: ErrType::Application,
@@ -691,12 +1005,13 @@ mod tests {
         };
         on_conn_close(&mut i, a, echoed);
         on_conn_close(&mut i, b, echoed);
-        let closes: Vec<_> = std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns))
-            .filter_map(|e| match e {
-                Event::ConnClosed(c, r) => Some((c, r)),
-                _ => None,
-            })
-            .collect();
+        let closes: Vec<_> =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .filter_map(|e| match e {
+                    Event::ConnClosed(c, r) => Some((c, r)),
+                    _ => None,
+                })
+                .collect();
         let unknown = CloseReason {
             err_type: ErrType::Unknown,
             code: 0x1001,
@@ -708,14 +1023,14 @@ mod tests {
     fn ceiling_checked_per_callback_not_per_drive() {
         let mut i = inner(0);
         let c = accept(&mut i);
-        assert!(on_conn_create(&mut i, core::ptr::null_mut(), None, c));
+        assert!(create(&mut i, c, ConnProto::Raw));
         i.conns.get_mut(c).unwrap().streams = STREAM_CEILING - 1;
-        let _ = i.events.pop(&mut i.streams, &mut i.conns); // NewConn
+        let _ = i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs); // NewConn
         let first = on_peer_stream_create(&mut i, c, core::ptr::null_mut(), 4, StreamKind::Bidi);
         let s = first.expect("the 8192nd stream is admitted");
         assert_eq!(i.streams.len_live(), 1);
         assert!(matches!(
-            i.events.pop(&mut i.streams, &mut i.conns),
+            i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs),
             Some(Event::NewStream(_, id, _)) if id == stream_id(s)
         ));
         assert_eq!(i.conns.get(c).unwrap().streams, STREAM_CEILING);
@@ -734,7 +1049,9 @@ mod tests {
             assert_eq!(conn.pending_close, Some(CEILING_CLOSE_CODE));
             assert_eq!(i.streams.len_live(), 1, "nothing allocated");
             assert!(
-                i.events.pop(&mut i.streams, &mut i.conns).is_none(),
+                i.events
+                    .pop(&mut i.streams, &mut i.conns, &mut i.h3reqs)
+                    .is_none(),
                 "nothing queued"
             );
         }
@@ -744,14 +1061,15 @@ mod tests {
     fn stream_close_releases_and_reports() {
         let mut i = inner(0);
         let c = accept(&mut i);
-        assert!(on_conn_create(&mut i, core::ptr::null_mut(), None, c));
+        assert!(create(&mut i, c, ConnProto::Raw));
         let s =
             on_peer_stream_create(&mut i, c, core::ptr::null_mut(), 0, StreamKind::Uni).unwrap();
         on_stream_close(&mut i, s);
         on_stream_close(&mut i, s);
         assert_eq!(i.conns.get(c).unwrap().streams, 0);
         let evs: Vec<_> =
-            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns)).collect();
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
         assert_eq!(evs.last(), Some(&Event::StreamClosed(stream_id(s))));
         assert_eq!(evs.len(), 3); // NewConn, NewStream, StreamClosed
     }
@@ -762,7 +1080,11 @@ mod tests {
         let c = accept(&mut i);
         on_server_refuse(&mut i, c);
         on_datagram_read(&mut i, c, b"x");
-        assert!(i.events.pop(&mut i.streams, &mut i.conns).is_none());
+        assert!(
+            i.events
+                .pop(&mut i.streams, &mut i.conns, &mut i.h3reqs)
+                .is_none()
+        );
     }
 
     #[test]
@@ -781,5 +1103,217 @@ mod tests {
         assert_eq!(on_write(&mut i, SlotId::NONE, 0, true, dst, &big), 1200);
         assert_eq!(on_write(&mut i, c, 0, false, dst, &big), 1200);
         assert_eq!(on_write(&mut i, c, 0, true, None, &big), 1200);
+    }
+
+    #[test]
+    fn h3_create_admits_and_counts() {
+        let mut i = inner(0);
+        let a = accept(&mut i);
+        assert!(create(&mut i, a, ConnProto::H3));
+        assert_eq!((i.n_counted, i.n_provisional), (1, 0));
+        let slot = i.conns.get(a).unwrap();
+        assert!(slot.counted && slot.proto == ConnProto::H3);
+        assert_eq!(
+            i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs),
+            Some(Event::NewConn(conn_id(a), ConnProto::H3))
+        );
+    }
+
+    #[test]
+    fn h3_create_refused_at_cap() {
+        let mut i = inner(1);
+        let (a, b) = (accept(&mut i), accept(&mut i));
+        assert!(create(&mut i, a, ConnProto::H3));
+        assert!(!create(&mut i, b, ConnProto::H3));
+        assert_eq!((i.n_counted, i.n_provisional), (1, 1));
+        let evs: Vec<_> =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
+        assert_eq!(evs, vec![Event::NewConn(conn_id(a), ConnProto::H3)]);
+    }
+
+    /// spec §3.3: xquic's H3 create can fail after ours counted the connection; xquic then
+    /// calls `server_refuse`, which must balance the count and report the close.
+    #[test]
+    fn server_refuse_after_counted_balances() {
+        let mut i = inner(0);
+        let a = accept(&mut i);
+        assert!(create(&mut i, a, ConnProto::H3));
+        on_server_refuse(&mut i, a);
+        assert!(!i.conns.is_live(a));
+        assert_eq!((i.n_counted, i.n_provisional), (0, 0));
+        let evs: Vec<_> =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
+        let unknown = CloseReason {
+            err_type: ErrType::Unknown,
+            code: 0,
+        };
+        assert_eq!(
+            evs,
+            vec![
+                Event::NewConn(conn_id(a), ConnProto::H3),
+                Event::ConnClosed(conn_id(a), unknown)
+            ]
+        );
+    }
+
+    fn h3_conn(i: &mut Inner) -> SlotId {
+        let c = accept(i);
+        assert!(create(i, c, ConnProto::H3));
+        let _ = i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs); // NewConn
+        c
+    }
+
+    fn stats() -> H3ReqStats {
+        H3ReqStats {
+            send_body: 1,
+            recv_body: 2,
+            begin_us: 3,
+            header_send_us: 4,
+            fin_send_us: 5,
+            fin_ack_us: 6,
+            mp_state: 0,
+            stream_err: 0,
+            close_msg: None,
+        }
+    }
+
+    /// spec §3.3: the server's ceiling, shared with raw streams, is checked before allocating;
+    /// a refusal allocates and queues nothing and closes the connection at the next `drive`.
+    #[test]
+    fn h3_request_create_refused_at_ceiling() {
+        let mut i = inner(0);
+        let c = h3_conn(&mut i);
+        i.conns.get_mut(c).unwrap().streams = STREAM_CEILING - 1;
+        let s = on_h3_request_create(&mut i, c, core::ptr::null_mut(), 0).expect("admitted");
+        assert_eq!(
+            i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs),
+            Some(Event::H3Request(conn_id(c), req_id(s)))
+        );
+        assert_eq!(i.conns.get(c).unwrap().streams, STREAM_CEILING);
+        assert_eq!(
+            on_h3_request_create(&mut i, c, core::ptr::null_mut(), 4),
+            None
+        );
+        let conn = i.conns.get(c).unwrap();
+        assert_eq!(conn.streams, STREAM_CEILING);
+        assert_eq!(conn.pending_close, Some(CEILING_CLOSE_CODE));
+        assert_eq!(i.h3reqs.len_live(), 1, "nothing allocated");
+        assert!(
+            i.events
+                .pop(&mut i.streams, &mut i.conns, &mut i.h3reqs)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn h3_request_close_decrements_streams() {
+        let mut i = inner(0);
+        let c = h3_conn(&mut i);
+        let s = on_h3_request_create(&mut i, c, core::ptr::null_mut(), 0).unwrap();
+        assert_eq!(i.conns.get(c).unwrap().streams, 1);
+        on_h3_request_close(&mut i, s, stats(), None);
+        on_h3_request_close(&mut i, s, stats(), None); // stale: released once
+        assert_eq!(i.conns.get(c).unwrap().streams, 0);
+        assert!(!i.h3reqs.is_live(s));
+        let evs: Vec<_> =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
+        let close = Box::new(H3Close {
+            stats: stats(),
+            unread: None,
+        });
+        assert_eq!(
+            evs,
+            vec![
+                Event::H3Request(conn_id(c), req_id(s)),
+                Event::H3Closed(req_id(s), close)
+            ]
+        );
+    }
+
+    /// spec §3.5: a QPACK-blocked request can be destroyed after its connection closed.
+    #[test]
+    fn h3_close_tolerates_gone_conn_slot() {
+        let mut i = inner(0);
+        let c = h3_conn(&mut i);
+        let s = on_h3_request_create(&mut i, c, core::ptr::null_mut(), 0).unwrap();
+        let r = CloseReason {
+            err_type: ErrType::Unknown,
+            code: 0,
+        };
+        on_conn_close(&mut i, c, r);
+        on_h3_request_close(&mut i, s, stats(), None);
+        assert!(!i.h3reqs.is_live(s));
+        let last =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs)).last();
+        assert!(matches!(last, Some(Event::H3Closed(id, _)) if id == req_id(s)));
+    }
+
+    /// spec §3.3/§3.4: a trailer is drained in the notification only once the header section
+    /// was consumed; `H3Readable` coalesces.
+    #[test]
+    fn h3_trailer_drain_waits_for_header_section() {
+        let mut i = inner(0);
+        let c = h3_conn(&mut i);
+        let s = on_h3_request_create(&mut i, c, core::ptr::null_mut(), 0).unwrap();
+        let _ = i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs); // H3Request
+        assert!(!on_h3_read(&mut i, s, READ_HEADER | READ_TRAILER));
+        assert_eq!(
+            i.h3reqs.get(s).unwrap().read_flags,
+            READ_HEADER | READ_TRAILER
+        );
+        let r = i.h3reqs.get_mut(s).unwrap();
+        r.read_flags = 0;
+        r.header_consumed = true;
+        assert!(on_h3_read(&mut i, s, READ_TRAILER));
+        assert_eq!(i.h3reqs.get(s).unwrap().read_flags, 0);
+        let evs: Vec<_> =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
+        assert_eq!(evs, vec![Event::H3Readable(req_id(s))]);
+        assert!(
+            !on_h3_read(&mut i, SlotId::NONE, READ_TRAILER),
+            "stale: no-op"
+        );
+    }
+
+    #[test]
+    fn h3_stats_maps_fields_and_caps_close_msg() {
+        // SAFETY: a plain C struct; all-zero is valid (null close message).
+        let mut st: xqc_request_stats_t = unsafe { core::mem::zeroed() };
+        st.send_body_size = 5;
+        st.recv_body_size = 7;
+        st.h3r_begin_time = 1;
+        st.h3r_header_send_time = 2;
+        st.stream_fin_send_time = 3;
+        st.stream_fin_ack_time = 4;
+        st.mp_state = 3;
+        st.stream_err = 0x10c;
+        // SAFETY: null close message.
+        let got = unsafe { h3_stats(&st) };
+        let want = H3ReqStats {
+            send_body: 5,
+            recv_body: 7,
+            begin_us: 1,
+            header_send_us: 2,
+            fin_send_us: 3,
+            fin_ack_us: 4,
+            mp_state: 3,
+            stream_err: 0x10c,
+            close_msg: None,
+        };
+        assert_eq!(got, want);
+        let long = std::ffi::CString::new("m".repeat(100)).unwrap();
+        st.stream_close_msg = long.as_ptr();
+        // SAFETY: a NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { h3_stats(&st) }.close_msg, Some("m".repeat(64)));
+        st.stream_close_msg = c"remote reset".as_ptr();
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { h3_stats(&st) }.close_msg.as_deref(),
+            Some("remote reset")
+        );
     }
 }

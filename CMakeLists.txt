@@ -359,28 +359,55 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         endif()
     endif()
 
-    # Origin TLS cert/key for the gateway e2e (e2e_gateway.sh). UNLIKE test.crt
-    # this cert carries subjectAltName=IP:127.0.0.1,DNS:localhost so the gateway
-    # server can verify the origin's hostname (we NEVER disable verification — the
-    # server gets --origin-ca pointed at this cert). The DNS:localhost SAN lets the
-    # gated h3 sub-case target https://localhost (curl sends SNI for a hostname but
-    # NOT for an IP literal, and xquic's demo_server REQUIRES SNI). Test-only;
-    # regenerated if missing.
+    # Origin TLS material for the gateway e2e (e2e_gateway.sh): a test CA
+    # (origin-ca.crt, CA:TRUE) and a leaf (origin.crt/origin.key) signed by it with
+    # basicConstraints=CA:FALSE, extendedKeyUsage=serverAuth and
+    # subjectAltName=IP:127.0.0.1,DNS:localhost. The CA/leaf split is required:
+    # rustls-webpki rejects a CA:TRUE certificate used as an end entity. The
+    # gateway server verifies the origin against the CA (--origin-ca; we NEVER
+    # disable verification). The DNS:localhost SAN lets the gated h3 sub-case
+    # target https://localhost (curl sends SNI for a hostname but NOT for an IP
+    # literal, and xquic's demo_server REQUIRES SNI). Test-only; all four files are
+    # COMMITTED (like test.key) — a missing key would regenerate on every configure
+    # and dirty the tree. Regenerated when ANY of the four is missing.
+    set(MQ_ORIGIN_CA_FILE "${MQ_CERT_DIR}/origin-ca.crt")
+    set(MQ_ORIGIN_CA_KEY_FILE "${MQ_CERT_DIR}/origin-ca.key")
     set(MQ_ORIGIN_CERT_FILE "${MQ_CERT_DIR}/origin.crt")
     set(MQ_ORIGIN_KEY_FILE "${MQ_CERT_DIR}/origin.key")
-    if(NOT EXISTS "${MQ_ORIGIN_CERT_FILE}" OR NOT EXISTS "${MQ_ORIGIN_KEY_FILE}")
+    if(NOT EXISTS "${MQ_ORIGIN_CA_FILE}" OR NOT EXISTS "${MQ_ORIGIN_CA_KEY_FILE}"
+       OR NOT EXISTS "${MQ_ORIGIN_CERT_FILE}" OR NOT EXISTS "${MQ_ORIGIN_KEY_FILE}")
         find_program(OPENSSL_BIN openssl REQUIRED)
         file(MAKE_DIRECTORY "${MQ_CERT_DIR}")
-        message(STATUS "Generating self-signed origin cert (SAN=IP:127.0.0.1,DNS:localhost) in ${MQ_CERT_DIR}")
+        message(STATUS "Generating origin CA + leaf (SAN=IP:127.0.0.1,DNS:localhost) in ${MQ_CERT_DIR}")
+        # CSR and extension file live in the build tree, not in tests/certs.
+        set(_origin_csr "${CMAKE_BINARY_DIR}/origin.csr")
+        set(_origin_ext "${CMAKE_BINARY_DIR}/origin.ext")
+        file(WRITE "${_origin_ext}"
+            "basicConstraints=critical,CA:FALSE\n"
+            "extendedKeyUsage=serverAuth\n"
+            "subjectAltName=IP:127.0.0.1,DNS:localhost\n")
         execute_process(
             COMMAND ${OPENSSL_BIN} req -x509 -newkey rsa:2048 -nodes
-                    -keyout "${MQ_ORIGIN_KEY_FILE}" -out "${MQ_ORIGIN_CERT_FILE}"
-                    -days 3650 -subj "/CN=mqproxy-origin"
-                    -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
+                    -keyout "${MQ_ORIGIN_CA_KEY_FILE}" -out "${MQ_ORIGIN_CA_FILE}"
+                    -days 3650 -subj "/CN=origin-ca"
+                    -addext "basicConstraints=critical,CA:TRUE"
+            RESULT_VARIABLE _origin_ca_rc
+            OUTPUT_QUIET ERROR_QUIET)
+        execute_process(
+            COMMAND ${OPENSSL_BIN} req -new -newkey rsa:2048 -nodes
+                    -keyout "${MQ_ORIGIN_KEY_FILE}" -out "${_origin_csr}"
+                    -subj "/CN=mqproxy-origin"
+            RESULT_VARIABLE _origin_csr_rc
+            OUTPUT_QUIET ERROR_QUIET)
+        execute_process(
+            COMMAND ${OPENSSL_BIN} x509 -req -in "${_origin_csr}"
+                    -CA "${MQ_ORIGIN_CA_FILE}" -CAkey "${MQ_ORIGIN_CA_KEY_FILE}"
+                    -set_serial 2 -days 3650 -extfile "${_origin_ext}"
+                    -out "${MQ_ORIGIN_CERT_FILE}"
             RESULT_VARIABLE _origin_cert_rc
             OUTPUT_QUIET ERROR_QUIET)
-        if(NOT _origin_cert_rc EQUAL 0)
-            message(FATAL_ERROR "openssl failed to generate origin test cert")
+        if(NOT _origin_ca_rc EQUAL 0 OR NOT _origin_csr_rc EQUAL 0 OR NOT _origin_cert_rc EQUAL 0)
+            message(FATAL_ERROR "openssl failed to generate origin CA/leaf test certs")
         endif()
     endif()
 
@@ -917,6 +944,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
             MQPROXY_CERT=${MQ_CERT_FILE}
             MQPROXY_KEY=${MQ_KEY_FILE}
+            MQPROXY_ORIGIN_CA=${MQ_ORIGIN_CA_FILE}
             MQPROXY_ORIGIN_CERT=${MQ_ORIGIN_CERT_FILE}
             MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_gateway.sh)
@@ -927,7 +955,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
     # python3 TLS origin on 127.0.0.1:443:
     #   case 1: TLS opacity proof — curl as nobody through the nft REDIRECT rule
     #           → tunnel → server relay → origin; curl verifies the origin's cert
-    #           (--cacert origin.crt); a MITM would break cert verification.
+    #           (--cacert origin-ca.crt); a MITM would break cert verification.
     #   case 2: (NET_ADMIN) 2-path multipath smoke — same capture with tc shaping.
     #   case 3: teardown assertion — nft table gone after client exit.
     # REQUIRES root + CAP_NET_ADMIN (nft + IP_TRANSPARENT + port 443).
@@ -937,6 +965,7 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
             MQPROXY_BIN=$<TARGET_FILE:mqproxy_cli>
             MQPROXY_CERT=${MQ_CERT_FILE}
             MQPROXY_KEY=${MQ_KEY_FILE}
+            MQPROXY_ORIGIN_CA=${MQ_ORIGIN_CA_FILE}
             MQPROXY_ORIGIN_CERT=${MQ_ORIGIN_CERT_FILE}
             MQPROXY_ORIGIN_KEY=${MQ_ORIGIN_KEY_FILE}
             bash ${CMAKE_SOURCE_DIR}/tests/integration/e2e_tproxy.sh)

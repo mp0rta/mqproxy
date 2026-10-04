@@ -1,0 +1,6 @@
+POST /gw HTTP/1.1
+Host: h
+X-Mq-Target: https://h/
+X-Mq-Auth: Bearer t
+Content-Length: 0
+

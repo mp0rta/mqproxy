@@ -1,0 +1,39 @@
+[package]
+name = "mq-http-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.mq-http]
+path = ".."
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "h1_head"
+path = "fuzz_targets/h1_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_target"
+path = "fuzz_targets/parse_target.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_req"
+path = "fuzz_targets/format_req.rs"
+test = false
+doc = false
+bench = false

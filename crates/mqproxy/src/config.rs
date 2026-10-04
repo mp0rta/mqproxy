@@ -24,8 +24,7 @@ const SECTIONS: &[&str] = &[
 ];
 
 /// What the file set; `None`/`false`/empty = not set. Accepted-no-effect keys
-/// (`[Gateway] Enabled`, `[Mitm] CACert/CAKey/IgnoreHosts`) are recognised and
-/// dropped.
+/// (`[Mitm] CACert/CAKey/IgnoreHosts`) are recognised and dropped.
 #[derive(Debug, Default)]
 pub struct FileConfig {
     pub warnings: Vec<String>,
@@ -41,6 +40,7 @@ pub struct FileConfig {
     pub max_conns: Option<u32>,
     pub cert: Option<String>,
     pub key: Option<String>,
+    pub gateway_enabled: Option<bool>,
     pub origin_ca: Option<String>,
     pub masquerade: bool,
     pub cache_max_bytes: Option<u64>,
@@ -173,8 +173,7 @@ impl FileConfig {
                     self.udp_idle_timeout = Some(n as u64);
                 }
             }
-            // Accepted, no effect: the gateway is off in this build.
-            ("Gateway", "enabled") if s => {}
+            ("Gateway", "enabled") if s => self.gateway_enabled = Some(bool_(v)),
             // client
             ("Server", "address") if c => self.server = text(),
             ("Server", "clientid") if c => self.client_id = text(),

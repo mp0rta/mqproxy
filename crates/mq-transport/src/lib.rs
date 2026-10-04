@@ -12,15 +12,17 @@ mod datagram;
 mod engine;
 mod events;
 mod ffi;
+mod h3;
 mod slots;
 mod stream;
 mod txq;
 
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Event, PathError, PathId,
-    StreamError, StreamId, StreamInfo, Time, Transmit, TransportConfig, TransportOps, TxKey,
+    ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, Event, H3Header, H3ReqId,
+    H3ReqInfo, PathError, PathId, StreamError, StreamId, StreamInfo, Time, Transmit,
+    TransportConfig, TransportOps, TxKey,
 };
-use slots::{ConnSlot, Slots, StreamSlot};
+use slots::{ConnSlot, H3ReqSlot, Slots, StreamSlot};
 use std::ffi::CString;
 use std::fs::File;
 use std::net::SocketAddr;
@@ -40,6 +42,7 @@ pub(crate) struct Inner {
     n_provisional: u32,
     conns: Slots<ConnSlot>,
     streams: Slots<StreamSlot>,
+    h3reqs: Slots<H3ReqSlot>,
     txq: txq::TxQueues,
     events: events::Events,
     /// Recorded by `set_event_timer` (spec §4.3).
@@ -60,6 +63,7 @@ impl Inner {
             n_provisional: 0,
             conns: Default::default(),
             streams: Default::default(),
+            h3reqs: Default::default(),
             txq: Default::default(),
             events: Default::default(),
             deadline: None,
@@ -134,20 +138,24 @@ impl TransportOps for Transport {
             events,
             streams,
             conns,
+            h3reqs,
             ..
         } = &mut *self.inner;
         loop {
-            let e = events.pop(streams, conns)?;
+            let e = events.pop(streams, conns, h3reqs)?;
             let live = match &e {
                 Event::ConnEstablished(c)
-                | Event::NewConn(c)
+                | Event::NewConn(c, _)
                 | Event::MpReady(c)
                 | Event::DatagramReadable(c)
                 | Event::PathRemoved(c, _) => conns.is_live(c.slot()),
                 Event::NewStream(_, s, _) | Event::StreamReadable(s) | Event::StreamWritable(s) => {
                     streams.is_live(s.slot())
                 }
-                Event::ConnClosed(..) | Event::StreamClosed(_) => true,
+                Event::H3Request(_, r) | Event::H3Readable(r) | Event::H3Writable(r) => {
+                    h3reqs.is_live(r.slot())
+                }
+                Event::ConnClosed(..) | Event::StreamClosed(_) | Event::H3Closed(..) => true,
             };
             if live {
                 return Some(e);
@@ -216,6 +224,64 @@ impl TransportOps for Transport {
 
     fn datagram_recv(&mut self, c: ConnId, buf: &mut [u8]) -> Option<usize> {
         datagram::ring_pop(self.inner.conns.get_mut(c.slot())?, buf)
+    }
+
+    fn open_h3_request(
+        &mut self,
+        now: Time,
+        c: ConnId,
+    ) -> Result<H3ReqId, mq_transport_api::Error> {
+        h3::open_h3_request(self, now, c)
+    }
+
+    fn h3_send_headers(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        hs: &[H3Header<'_>],
+        fin: bool,
+    ) -> Result<(), StreamError> {
+        h3::h3_send_headers(self, now, r, hs, fin)
+    }
+
+    fn h3_send_body(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<usize, StreamError> {
+        h3::h3_send_body(self, now, r, data, fin)
+    }
+
+    fn h3_finish(&mut self, now: Time, r: H3ReqId) -> Result<(), StreamError> {
+        h3::h3_finish(self, now, r)
+    }
+
+    fn h3_recv_headers(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        each: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<bool, StreamError> {
+        h3::h3_recv_headers(self, now, r, each)
+    }
+
+    fn h3_recv_body(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        buf: &mut [u8],
+    ) -> Result<(usize, bool), StreamError> {
+        h3::h3_recv_body(self, now, r, buf)
+    }
+
+    fn h3_reset(&mut self, now: Time, r: H3ReqId) {
+        h3::h3_reset(self, now, r)
+    }
+
+    fn h3_req_info(&self, r: H3ReqId) -> Result<H3ReqInfo, mq_transport_api::Error> {
+        h3::h3_req_info(self, r)
     }
 }
 

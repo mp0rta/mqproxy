@@ -9,7 +9,9 @@ use mq_integration::loopback::LoopbackPair;
 use mq_runtime::Shard;
 use mq_runtime::testing::{RecordHandle, Recorded, RecordingApp};
 use mq_transport::Transport;
-use mq_transport_api::{CongestionControl, ConnConfig, Event, Role, Scheduler, TransportConfig};
+use mq_transport_api::{
+    CongestionControl, ConnConfig, ConnProto, Event, Role, Scheduler, TransportConfig,
+};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,7 @@ fn cfg(role: Role) -> TransportConfig {
         scheduler: Scheduler::MinRtt,
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
+        h3: false,
     }
 }
 
@@ -78,6 +81,7 @@ fn loop_engine_boot() {
                         peer: server,
                         sni: "mqproxy",
                         idle_timeout: None,
+                        proto: ConnProto::Raw,
                     };
                     cx.connect(&peer).expect("connect");
                 }
@@ -91,7 +95,7 @@ fn loop_engine_boot() {
     }
 
     let est = |r: &Recorded| matches!(r, Recorded::TransportEvent(Event::ConnEstablished(_)));
-    let new = |r: &Recorded| matches!(r, Recorded::TransportEvent(Event::NewConn(_)));
+    let new = |r: &Recorded| matches!(r, Recorded::TransportEvent(Event::NewConn(..)));
     assert!(
         wait_for(&pair.client.handle, est),
         "client: {:?}",

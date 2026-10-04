@@ -19,7 +19,7 @@ fn conn_handshake() {
     assert_eq!(
         p.sev
             .iter()
-            .filter(|e| matches!(e, Event::NewConn(_)))
+            .filter(|e| matches!(e, Event::NewConn(..)))
             .count(),
         1
     );

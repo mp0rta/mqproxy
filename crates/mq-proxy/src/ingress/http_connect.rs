@@ -85,7 +85,7 @@ fn parse_port(t: &[u8]) -> Option<u16> {
     u16::try_from(v).ok().filter(|&p| p != 0)
 }
 
-fn parse_host(h: &[u8]) -> Option<Host> {
+pub(crate) fn parse_host(h: &[u8]) -> Option<Host> {
     let s = std::str::from_utf8(h).ok()?;
     if let Some(inner) = s.strip_prefix('[') {
         // A bracket must close and hold an IPv6 literal.

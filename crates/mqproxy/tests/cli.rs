@@ -1,6 +1,7 @@
 //! spec §6.4: the CLI flag table, in process through `cli::parse`; only the last
 //! three tests spawn the binary.
 
+use mq_proxy::config::GatewayConfig;
 use mq_runtime::ListenKind;
 use mq_transport_api::{CongestionControl, Scheduler};
 use mqproxy::cli::{self, Client, Exit, Mode, Resolved, Server};
@@ -224,11 +225,171 @@ fn client_implemented_flags_resolve() {
     assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
 }
 
+/// spec §8: the gateway is on by default, with `GatewayConfig`'s defaults, H3
+/// enabled and the `mq_origin:` startup line.
 #[test]
-fn server_accepted_no_effect_flags() {
-    let r = parse(SERVER, &["--no-gateway"]).unwrap();
+fn server_gateway_on_by_default() {
+    let r = parse(SERVER, &[]).unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-    assert_eq!(r, parse(SERVER, &[]).unwrap());
+    assert_eq!(server(&r).config.gateway, Some(GatewayConfig::default()));
+    assert!(cli::wants_h3(&r));
+    assert_eq!(
+        r.startup_lines,
+        vec!["mq_origin: hyper 1.10 + rustls (HTTP3=no)".to_string()]
+    );
+    // The gateway flags reach `GatewayConfig`.
+    let r = parse(
+        SERVER,
+        &[
+            "--origin-ca",
+            "/ca.pem",
+            "--masquerade",
+            "--request-metrics",
+        ],
+    )
+    .unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(
+        server(&r).config.gateway,
+        Some(GatewayConfig {
+            origin_ca: Some(PathBuf::from("/ca.pem")),
+            masquerade: true,
+            request_metrics: true,
+            ..GatewayConfig::default()
+        })
+    );
+}
+
+/// spec §8: `--no-gateway` → `gateway = None`, no H3, no `mq_origin:` line;
+/// `--masquerade` / `--request-metrics` with it warn and are ignored (C text).
+#[test]
+fn no_gateway_disables_h3_and_warns_masquerade_and_metrics() {
+    let r = parse(SERVER, &["--no-gateway", "--origin-ca", "/ca.pem"]).unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(server(&r).config.gateway, None);
+    assert!(!cli::wants_h3(&r));
+    assert!(r.startup_lines.is_empty(), "{:?}", r.startup_lines);
+    // C's order: request-metrics, cache, masquerade.
+    let r = parse(
+        SERVER,
+        &[
+            "--masquerade",
+            "--cache-max-bytes",
+            "1",
+            "--no-gateway",
+            "--request-metrics",
+        ],
+    )
+    .unwrap();
+    assert_eq!(server(&r).config.gateway, None);
+    assert_eq!(
+        r.warnings,
+        vec![
+            "--request-metrics has no effect with --no-gateway (request metrics are gateway-only); ignoring",
+            "--cache-max-bytes ([Gateway] CacheMaxBytes) is ignored: the origin response cache was removed",
+            "--masquerade has no effect with --no-gateway (masquerade is gateway-only); ignoring",
+        ]
+    );
+}
+
+/// spec §8: `--gateway` alone is an ingress; it is not a TCP ingress.
+#[test]
+fn client_gateway_counts_as_ingress() {
+    let r = cli::parse(&[
+        "mqproxy",
+        "client",
+        "--server",
+        "1.2.3.4:5",
+        "--token",
+        "t",
+        "--gateway",
+        "127.0.0.1:8081",
+    ])
+    .unwrap();
+    let c = client(&r);
+    assert_eq!(c.config.gateway, Some(addr("127.0.0.1:8081")));
+    assert!(!c.config.has_tcp_ingress);
+    let r = parse(CLIENT, &["--gateway", "[::1]:8081"]).unwrap();
+    assert_eq!(client(&r).config.gateway, Some(addr("[::1]:8081")));
+    assert!(client(&r).config.has_tcp_ingress);
+    for extra in [
+        &["--http-connect", "127.0.0.1:1"][..],
+        &["--tproxy", "127.0.0.1:2"],
+    ] {
+        let argv = [
+            &["mqproxy", "client", "--server", "1.2.3.4:5", "--token", "t"][..],
+            extra,
+        ]
+        .concat();
+        assert!(
+            client(&cli::parse(&argv).unwrap()).config.has_tcp_ingress,
+            "{extra:?}"
+        );
+    }
+    // C's validation order: server, socks5, http-connect, gateway, tproxy.
+    for (extra, first) in [
+        (&["--server", "x", "--socks5", "y"][..], "--server"),
+        (&["--socks5", "x", "--gateway", "y"], "--socks5"),
+        (&["--http-connect", "x", "--gateway", "y"], "--http-connect"),
+        (&["--gateway", "x", "--tproxy", "y"], "--gateway"),
+    ] {
+        let e = exit(parse(CLIENT, extra));
+        assert!(
+            e.message.contains(&format!("invalid {first} address")),
+            "{extra:?}: {}",
+            e.message
+        );
+    }
+    let e = exit(parse(CLIENT, &["--gateway", "127.0.0.1"]));
+    assert_eq!(e.code, 2);
+    assert!(
+        e.message.contains("invalid --gateway address"),
+        "{}",
+        e.message
+    );
+}
+
+/// spec §8: the client's H3 ctx exists only with `--gateway` (`xqc_h3_connect`).
+#[test]
+fn client_gateway_enables_h3() {
+    let r = parse(CLIENT, &[]).unwrap();
+    assert!(!cli::wants_h3(&r));
+    assert!(r.startup_lines.is_empty(), "{:?}", r.startup_lines);
+    assert!(cli::wants_h3(
+        &parse(CLIENT, &["--gateway", "127.0.0.1:8081"]).unwrap()
+    ));
+}
+
+/// spec §8: `MQ_GW_ORIGIN_CONNECT_TIMEOUT_S` is an integer in [1, 600], else 10 s.
+#[test]
+fn origin_connect_timeout_pure() {
+    for v in [
+        None,
+        Some(""),
+        Some("abc"),
+        Some("0"),
+        Some("601"),
+        Some("-5"),
+        Some("5x"),
+    ] {
+        assert_eq!(
+            cli::origin_connect_timeout(v),
+            Duration::from_secs(10),
+            "{v:?}"
+        );
+    }
+    assert_eq!(
+        cli::origin_connect_timeout(Some("2")),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        cli::origin_connect_timeout(Some("1")),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        cli::origin_connect_timeout(Some("600")),
+        Duration::from_secs(600)
+    );
 }
 
 /// spec §8: `--no-udp` and `--udp-idle-timeout` reach `ServerConfig` (C defaults: on, 60 s).
@@ -278,53 +439,32 @@ fn client_accepted_no_effect_flags() {
     assert_eq!(r, parse(CLIENT, &[]).unwrap());
 }
 
+/// spec §8: `--mitm` stays a startup error (SP4), with or without `--gateway`.
 #[test]
-fn server_unavailable_flags_exit_2() {
-    for extra in [
-        &["--origin-ca", "ca.pem"][..],
-        &["--masquerade"],
-        &["--request-metrics"],
-    ] {
-        let e = exit(parse(SERVER, extra));
+fn mitm_still_unavailable() {
+    for extra in [&["--mitm"][..], &["--gateway", "127.0.0.1:8081", "--mitm"]] {
+        let e = exit(parse(CLIENT, extra));
         assert_eq!(e.code, 2, "{extra:?}");
-        assert!(e.message.contains(extra[0]), "{}", e.message);
+        assert!(e.message.contains("--mitm"), "{}", e.message);
         assert!(e.message.contains("not available"), "{}", e.message);
         assert!(e.message.contains("Usage"), "{}", e.message);
     }
 }
 
-#[test]
-fn client_unavailable_flags_exit_2() {
-    for extra in [&["--gateway", "127.0.0.1:8081"][..], &["--mitm"]] {
-        let e = exit(parse(CLIENT, extra));
-        assert_eq!(e.code, 2, "{extra:?}");
-        assert!(e.message.contains(extra[0]), "{}", e.message);
-        assert!(e.message.contains("not available"), "{}", e.message);
-    }
-}
-
+/// The cache was removed: one warning, gateway on or off (it replaces C's
+/// "no effect with --no-gateway" warning for this flag).
 #[test]
 fn cache_max_bytes_warns() {
-    let r = parse(SERVER, &["--cache-max-bytes", "67108864"]).unwrap();
-    assert_eq!(r.warnings.len(), 1);
-    assert!(
-        r.warnings[0].contains("--cache-max-bytes"),
-        "{:?}",
-        r.warnings
-    );
-}
-
-#[test]
-fn server_gateway_off_startup_line() {
-    let r = parse(SERVER, &[]).unwrap();
-    assert_eq!(r.startup_lines.len(), 1);
-    assert!(
-        r.startup_lines[0].contains("gateway"),
-        "{:?}",
-        r.startup_lines
-    );
-    assert!(!r.startup_lines[0].contains("UDP"), "{:?}", r.startup_lines);
-    assert!(parse(CLIENT, &[]).unwrap().startup_lines.is_empty());
+    for extra in [&[][..], &["--no-gateway"]] {
+        let argv = [extra, &["--cache-max-bytes", "67108864"]].concat();
+        let r = parse(SERVER, &argv).unwrap();
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(
+            r.warnings[0].contains("--cache-max-bytes"),
+            "{:?}",
+            r.warnings
+        );
+    }
 }
 
 #[test]
@@ -420,12 +560,12 @@ fn no_ingress_rejected() {
     // C text, naming --gateway too (tests/test_cli_help.sh greps for it).
     assert!(
         e.message.contains(
-            "at least one ingress is required (--socks5, --http-connect, --tproxy, or --gateway; \
-             --gateway is not available in this build)"
+            "at least one ingress is required (--socks5, --http-connect, --gateway, or --tproxy)"
         ),
         "{}",
         e.message
     );
+    assert!(!e.message.contains("not available"), "{}", e.message);
     // Other missing required flags / unknown subcommand.
     for argv in [
         &[
@@ -633,15 +773,13 @@ fn run(args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+/// spec §11.5: every C long option is listed; only `--mitm` still says "not
+/// available in this build", and no gateway flag carries an old SP1 marker.
 #[test]
 fn help_lists_every_longopt() {
     for (sub, opts, unavailable) in [
-        (
-            "server",
-            SERVER_LONGOPTS,
-            &["--origin-ca", "--masquerade", "--request-metrics"][..],
-        ),
-        ("client", CLIENT_LONGOPTS, &["--gateway", "--mitm"]),
+        ("server", SERVER_LONGOPTS, &[][..]),
+        ("client", CLIENT_LONGOPTS, &["--mitm"]),
     ] {
         let out = run(&[sub, "--help"]);
         assert_eq!(out.status.code(), Some(0));
@@ -656,14 +794,43 @@ fn help_lists_every_longopt() {
                 "{sub} --help lacks {flag}:\n{text}"
             );
         }
-        // The entry of each unavailable flag says so.
-        for flag in unavailable {
+        // C's wording now that the gateway conn exists.
+        let metrics = match sub {
+            "server" => "Logs the most-recently-accepted TCP and gateway conn",
+            _ => "Logs the proxy conn (and the gateway conn with --gateway)",
+        };
+        assert!(text.contains(metrics), "{sub}: {text}");
+        let entry = |flag: &str| {
             let start = text
                 .find(&format!("  {flag} "))
                 .unwrap_or_else(|| panic!("{flag}"));
+            // Up to the next line that starts an option.
             let entry = &text[start + 2..];
-            let entry = &entry[..entry.find("\n  -").unwrap_or(entry.len())];
-            assert!(entry.contains("not available in this build"), "{entry}");
+            let end = entry
+                .match_indices('\n')
+                .find(|(i, _)| entry[i + 1..].trim_start().starts_with('-'))
+                .map_or(entry.len(), |(i, _)| i);
+            entry[..end].to_string()
+        };
+        // The entry of each unavailable flag says so.
+        for flag in unavailable {
+            assert!(
+                entry(flag).contains("not available in this build"),
+                "{flag}"
+            );
+        }
+        for flag in [
+            "--origin-ca",
+            "--no-gateway",
+            "--masquerade",
+            "--request-metrics",
+            "--gateway",
+        ] {
+            if opts.contains(&&flag[2..]) {
+                let e = entry(flag);
+                assert!(!e.contains("not available"), "{e}");
+                assert!(!e.contains("(accepted, no effect"), "{e}");
+            }
         }
     }
 }
@@ -701,10 +868,21 @@ fn usage_error_exits_2() {
 mod common;
 use common::{Proc, cert, free_tcp, free_udp};
 
+/// `--origin-ca` keeps the gateway-on server independent of the native store.
 fn server_args(listen: &str, extra: &[&str]) -> Vec<String> {
-    let (c, k) = (cert("test.crt"), cert("test.key"));
+    let (c, k, ca) = (cert("test.crt"), cert("test.key"), cert("origin-ca.crt"));
     let base = [
-        "server", "--listen", listen, "--token", "t", "--cert", &c, "--key", &k,
+        "server",
+        "--listen",
+        listen,
+        "--token",
+        "t",
+        "--cert",
+        &c,
+        "--key",
+        &k,
+        "--origin-ca",
+        &ca,
     ];
     base.iter().chain(extra).map(|s| s.to_string()).collect()
 }
@@ -714,10 +892,10 @@ fn spawn(args: &[String]) -> Proc {
 }
 
 #[test]
-fn gateway_udp_off_line_logged() {
+fn gateway_on_and_udp_lines_logged() {
     let mut p = spawn(&server_args(&format!("127.0.0.1:{}", free_udp()), &[]));
-    p.wait_line("[INFO] HTTP gateway is not available in this build");
-    p.wait_line("gateway=off, udp=on, udp-idle=60s)");
+    p.wait_line("[INFO] mq_origin: hyper 1.10 + rustls (HTTP3=no)");
+    p.wait_line("gateway=on, udp=on, udp-idle=60s)");
     assert_eq!(p.term(), 0, "{:#?}", p.lines);
 }
 

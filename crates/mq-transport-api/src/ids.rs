@@ -69,6 +69,10 @@ gen_id!(
     /// A stream, by facade slot (spec §4.1). Not the QUIC stream id; see `StreamInfo`.
     StreamId
 );
+gen_id!(
+    /// An H3 request, by facade slot (spec §3.1). Stale after `H3Closed`.
+    H3ReqId
+);
 
 /// xquic's path id; meaningful only together with a `ConnId` (spec §4.1).
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, PartialOrd, Ord)]

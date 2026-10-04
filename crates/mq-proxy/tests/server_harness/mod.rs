@@ -2,15 +2,20 @@
 //! with dial completions fed by hand as the driver would.
 #![allow(dead_code)]
 
-use mq_proxy::config::ServerConfig;
+use mq_proxy::config::{GatewayConfig, ServerConfig};
 use mq_proxy::server::Server;
+use mq_proxy::server::origin::build_client_config;
 use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
-use mq_runtime::{DialError, DialOpId, IoRequest, Shard, SocketOpId, Target, TcpId, UdpSocketId};
+use mq_runtime::{
+    DialError, DialOpId, IoRequest, IoResult, Shard, SocketOpId, Target, TcpId, UdpSocketId,
+};
 use mq_transport_api::{
-    CloseReason, ConnId, ErrType, Event, StreamId, StreamInfo, StreamKind, Time,
+    CloseReason, ConnId, ConnProto, ErrType, Event, StreamId, StreamInfo, StreamKind, Time,
 };
 use mq_wire::frames::{AddrType, AuthReq, ConnectTcpResp, UdpSessionOpen, UdpSessionResp};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Stream type 0x01 then C `mq_encode_connect_tcp_req` for example.com:443.
@@ -40,6 +45,16 @@ pub fn cfg() -> ServerConfig {
         token: "secret".into(),
         ..ServerConfig::default()
     }
+}
+
+/// A file of the repository's `tests/certs`.
+pub fn cert_path(name: &str) -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/certs")).join(name)
+}
+
+/// The origin client config trusting only the test origin CA.
+pub fn test_tls() -> Arc<rustls::ClientConfig> {
+    build_client_config(Some(&cert_path("origin-ca.crt")), &|| vec![]).unwrap()
 }
 
 pub fn auth_req(token: &[u8]) -> Vec<u8> {
@@ -121,7 +136,20 @@ pub struct H {
 impl H {
     /// A server started at t = 1 s.
     pub fn new(cfg: ServerConfig) -> H {
-        let auth_ok = if cfg.udp_enabled {
+        let udp = cfg.udp_enabled;
+        H::start(Server::new(cfg), udp)
+    }
+
+    /// `new` with the gateway composed in (`GatewayConfig::default()` when
+    /// `cfg.gateway` is `None`).
+    pub fn with_gateway(mut cfg: ServerConfig) -> H {
+        cfg.gateway.get_or_insert_with(GatewayConfig::default);
+        let udp = cfg.udp_enabled;
+        H::start(Server::with_gateway(cfg, test_tls()), udp)
+    }
+
+    fn start(server: Server, udp_enabled: bool) -> H {
+        let auth_ok = if udp_enabled {
             AUTH_OK_C
         } else {
             AUTH_OK_NO_UDP_C
@@ -129,7 +157,7 @@ impl H {
         let (transport, t) = ScriptedTransport::new();
         let mut sh = Shard::new(
             transport,
-            Server::new(cfg),
+            server,
             SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
             7,
         );
@@ -193,7 +221,14 @@ impl H {
     /// `NewConn`.
     pub fn conn(&mut self) -> ConnId {
         let c = self.t.new_conn_id();
-        self.event(Event::NewConn(c));
+        self.event(Event::NewConn(c, ConnProto::Raw));
+        c
+    }
+
+    /// `NewConn` of an H3 connection.
+    pub fn h3_conn(&mut self) -> ConnId {
+        let c = self.t.new_conn_id();
+        self.event(Event::NewConn(c, ConnProto::H3));
         c
     }
 
@@ -323,6 +358,31 @@ impl H {
     /// Bytes queued toward the origin socket (a relay's preread lands here).
     pub fn tcp_out(&mut self, tcp: TcpId) -> Vec<u8> {
         self.sh.tcp_tx_buf(tcp).to_vec()
+    }
+    /// The driver's read: `bytes` arrive on the app socket `tcp`.
+    pub fn tcp_in(&mut self, tcp: TcpId, bytes: &[u8]) {
+        let buf = self.sh.tcp_rx_buf(tcp);
+        assert!(buf.len() >= bytes.len(), "rx buffer room");
+        buf[..bytes.len()].copy_from_slice(bytes);
+        self.sh
+            .tcp_rx_commit(self.now, tcp, IoResult::Bytes(bytes.len()));
+    }
+    /// The driver's write: everything queued for `tcp`, committed.
+    pub fn tcp_out_all(&mut self, tcp: TcpId) -> Vec<u8> {
+        let out = self.sh.tcp_tx_buf(tcp).to_vec();
+        if !out.is_empty() {
+            self.sh
+                .tcp_tx_commit(self.now, tcp, IoResult::Bytes(out.len()));
+        }
+        out
+    }
+    /// The driver's read returned 0 on the app socket `tcp`.
+    pub fn tcp_eof(&mut self, tcp: TcpId) {
+        self.sh.tcp_rx_commit(self.now, tcp, IoResult::Eof);
+    }
+    /// A socket error on the app socket `tcp`.
+    pub fn tcp_error(&mut self, tcp: TcpId, kind: std::io::ErrorKind) {
+        self.sh.on_tcp_error(self.now, tcp, kind);
     }
     /// `n` data streams on `conn` that never send their request, in one drive.
     pub fn idle_streams(&mut self, conn: ConnId, n: usize) -> Vec<StreamId> {

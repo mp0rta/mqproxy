@@ -2,7 +2,7 @@
 //! driven by hand on the socket side as the driver would.
 #![allow(dead_code)]
 
-use mq_proxy::client::{Client, HTTP_CONNECT, SOCKS5, TRANSPARENT};
+use mq_proxy::client::{Client, FETCH, HTTP_CONNECT, SOCKS5, TRANSPARENT};
 use mq_proxy::config::ClientConfig;
 use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
 use mq_runtime::{AcceptMeta, IoRequest, IoResult, ListenerId, Shard, TcpId};
@@ -96,8 +96,12 @@ pub struct H {
     pub socks: ListenerId,
     pub http: ListenerId,
     pub tproxy: ListenerId,
-    /// The connection the next `connect` returns (scripted at setup).
+    pub fetch: ListenerId,
+    /// The connection the raw tunnel's first `connect` returns (scripted at
+    /// setup when `cfg.has_tcp_ingress`).
     pub conn: ConnId,
+    /// The gateway tunnel's first connection (scripted when `cfg.gateway` is set).
+    pub gw_conn: Option<ConnId>,
 }
 
 impl H {
@@ -106,15 +110,25 @@ impl H {
         H::start(cfg, None)
     }
 
-    /// As `new`; with `fail`, the first `connect` fails synchronously with it.
-    pub fn start(cfg: ClientConfig, fail: Option<ConnectError>) -> H {
+    /// As `new`; with `fail`, the first scripted `connect` fails synchronously
+    /// with it: the raw tunnel's when `cfg.has_tcp_ingress`, else the gateway's.
+    /// The raw tunnel connects first (FIFO script).
+    pub fn start(cfg: ClientConfig, mut fail: Option<ConnectError>) -> H {
         let (transport, t) = ScriptedTransport::new();
         let conn = t.new_conn_id();
-        t.expect_connect(fail.map_or(Ok(conn), Err));
+        if cfg.has_tcp_ingress {
+            t.expect_connect(fail.take().map_or(Ok(conn), Err));
+        }
+        let gw_conn = cfg.gateway.map(|_| {
+            let c = t.new_conn_id();
+            t.expect_connect(fail.take().map_or(Ok(c), Err));
+            c
+        });
         let mut sh = Shard::new(transport, Client::new(cfg), addr(4433), SEED);
         let socks = sh.add_listener(SOCKS5);
         let http = sh.add_listener(HTTP_CONNECT);
         let tproxy = sh.add_listener(TRANSPARENT);
+        let fetch = sh.add_listener(FETCH);
         let now = Time::from_micros(1_000_000);
         sh.start(now);
         H {
@@ -124,7 +138,9 @@ impl H {
             socks,
             http,
             tproxy,
+            fetch,
             conn,
+            gw_conn,
         }
     }
 
@@ -228,7 +244,7 @@ impl H {
         self.count(|x| *x == Call::CloseConn(c))
     }
     pub fn connects(&self) -> usize {
-        self.count(|x| *x == Call::Connect)
+        self.count(|x| matches!(x, Call::Connect(_)))
     }
     pub fn opens(&self) -> usize {
         self.count(|x| matches!(x, Call::OpenStream(_)))
@@ -243,4 +259,29 @@ pub fn pad_to(frame: &[u8], total: usize) -> Vec<u8> {
     b.extend_from_slice(&[0x40 | (p >> 8) as u8, p as u8]);
     b.resize(total, 0);
     b
+}
+
+/// A valid fetch request head (`X-Mq-Auth` + `X-Mq-Target`) with `extra`
+/// header lines (each ending in CRLF), followed by `body`.
+pub fn fetch_req(extra: &str, body: &[u8]) -> Vec<u8> {
+    let mut b = format!(
+        "POST /_mqproxy/fetch HTTP/1.1\r\nHost: localhost\r\nX-Mq-Auth: Bearer secret\r\n\
+         X-Mq-Target: https://example.com/x\r\n{extra}\r\n"
+    )
+    .into_bytes();
+    b.extend_from_slice(body);
+    b
+}
+
+/// The gateway's byte-exact reject reply (spec §5.2, `h1::error_reply`).
+pub fn gw_reject(code: u16, xmq: &str) -> Vec<u8> {
+    let phrase = if code == 400 {
+        "Bad Request"
+    } else {
+        "Bad Gateway"
+    };
+    format!(
+        "HTTP/1.1 {code} {phrase}\r\nConnection: close\r\nContent-Length: 0\r\nX-Mq-Error: {xmq}\r\n\r\n"
+    )
+    .into_bytes()
 }

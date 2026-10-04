@@ -7,7 +7,8 @@ use crate::slots::ConnSlot;
 use crate::{Inner, Transport, clock};
 use core::ptr;
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnStats, ConnectError, Error, PathError, PathId, PathStats, SlotId, Time,
+    ConnConfig, ConnId, ConnProto, ConnStats, ConnectError, Error, PathError, PathId, PathStats,
+    SlotId, Time,
 };
 use std::ffi::CString;
 use std::net::SocketAddr;
@@ -126,19 +127,36 @@ pub(crate) fn connect(
         // boxed Inner) outlive the call and are copied by xquic.
         unsafe {
             let ssl: xqc_conn_ssl_config_t = core::mem::zeroed();
-            let cid = xqc_connect(
-                engine,
-                &settings,
-                ptr::null(),
-                0,
-                sni.as_ptr(),
-                0,
-                &ssl,
-                (&peer as *const libc::sockaddr_storage).cast(),
-                peerlen,
-                alpn,
-                ud_of(s),
-            );
+            let peer = (&peer as *const libc::sockaddr_storage).cast();
+            // spec §3.2: same settings and user data (the conn slot) for both protocols; the
+            // create notification fires synchronously inside either call and binds the slot.
+            let cid = match cfg.proto {
+                ConnProto::Raw => xqc_connect(
+                    engine,
+                    &settings,
+                    ptr::null(),
+                    0,
+                    sni.as_ptr(),
+                    0,
+                    &ssl,
+                    peer,
+                    peerlen,
+                    alpn,
+                    ud_of(s),
+                ),
+                ConnProto::H3 => xqc_h3_connect(
+                    engine,
+                    &settings,
+                    ptr::null(),
+                    0,
+                    sni.as_ptr(),
+                    0,
+                    &ssl,
+                    peer,
+                    peerlen,
+                    ud_of(s),
+                ),
+            };
             // Copied before any other xquic call (spec §4.8 "Borrowed data").
             (!cid.is_null()).then(|| cid.read_unaligned())
         }

@@ -609,6 +609,13 @@ impl Io for MioIo {
         }
     }
 
+    fn set_nodelay(&mut self, s: TcpSock) -> io::Result<()> {
+        match self.tcp(s) {
+            Some(t) => t.set_nodelay(true),
+            None => Err(ErrorKind::NotConnected.into()),
+        }
+    }
+
     fn close_tcp(&mut self, s: TcpSock, abort: bool) {
         if let Some(Sock::Tcp(t) | Sock::Connecting(_, t)) = self.remove(s.0) {
             if abort {
@@ -887,6 +894,31 @@ mod tests {
         );
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::WouldBlock);
         assert!(gso);
+    }
+
+    #[test]
+    fn set_nodelay_sets_tcp_nodelay_on_a_connected_socket() {
+        let mut io = MioIo::new(Arc::new(super::super::io::StdResolver), false).unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let op = DialOpId::from_slot(mq_transport_api::SlotId::new(1, 1)).unwrap();
+        io.start_connect(op, l.local_addr().unwrap());
+        let deadline = io.now() + std::time::Duration::from_secs(10);
+        let s = loop {
+            assert!(io.now() < deadline, "no Connected within 10 s");
+            let ev = io.wait(Wait::Until(deadline));
+            if let Some(s) = ev.into_iter().find_map(|e| match e {
+                IoEvent::Connected { r, .. } => Some(r.unwrap()),
+                _ => None,
+            }) {
+                break s;
+            }
+        };
+        assert!(
+            !io.tcp(s).unwrap().nodelay().unwrap(),
+            "Nagle on by default"
+        );
+        io.set_nodelay(s).unwrap();
+        assert!(io.tcp(s).unwrap().nodelay().unwrap());
     }
 
     #[test]

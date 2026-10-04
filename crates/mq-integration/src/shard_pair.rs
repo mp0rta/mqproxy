@@ -31,8 +31,8 @@ use mq_runtime::{
 use mq_transport::Transport;
 use mq_transport_api::fabric::{Fabric, Packet};
 use mq_transport_api::{
-    CongestionControl, ConnConfig, ConnId, Event, Role, Scheduler, StreamError, StreamId, Time,
-    TransportConfig,
+    CongestionControl, ConnConfig, ConnId, ConnProto, Event, Role, Scheduler, StreamError,
+    StreamId, Time, TransportConfig,
 };
 use mq_wire::frames::{AddrType, AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp};
 use std::collections::HashMap;
@@ -74,6 +74,7 @@ pub fn transport_cfg(role: Role, max_conns: u32) -> TransportConfig {
         scheduler: Scheduler::MinRtt,
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
+        h3: false,
     }
 }
 
@@ -132,7 +133,7 @@ impl<A> Tap<A> {
         let mut v: Vec<ConnId> = Vec::new();
         for (_, e) in &self.events {
             match e {
-                Event::ConnEstablished(c) | Event::NewConn(c) if !v.contains(c) => v.push(*c),
+                Event::ConnEstablished(c) | Event::NewConn(c, _) if !v.contains(c) => v.push(*c),
                 Event::ConnClosed(c, _) => v.retain(|x| x != c),
                 _ => {}
             }
@@ -939,6 +940,7 @@ impl RawClient {
             peer: self.server,
             sni: "mqproxy",
             idle_timeout: Some(Duration::from_secs(30)),
+            proto: ConnProto::Raw,
         };
         let c = cx.connect(&cfg).expect("connect");
         let conn = RawConn {
@@ -1057,8 +1059,12 @@ impl App for RawClient {
                     st.closed = true;
                 }
             }
-            Event::NewConn(_) | Event::MpReady(_) | Event::PathRemoved(..) => {}
+            Event::NewConn(..) | Event::MpReady(_) | Event::PathRemoved(..) => {}
             Event::DatagramReadable(_) => {} // wired with the UDP lane
+            Event::H3Request(..)
+            | Event::H3Readable(_)
+            | Event::H3Writable(_)
+            | Event::H3Closed(..) => {}
         }
     }
 

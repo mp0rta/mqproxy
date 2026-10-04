@@ -12,7 +12,14 @@ publish = false
 # (and xquic's test hooks) into the `mqproxy` binary; the tests enable it
 # through the self dev-dependency below.
 harness = [
+    "dep:log",
     "dep:mq-wire",
+    "dep:mq-http",
+    "dep:tokio",
+    "dep:hyper",
+    "dep:h2",
+    "dep:rustls",
+    "dep:tokio-rustls",
     "mq-proxy/test-support",
     "mq-runtime/test-support",
     "mq-transport/test-support",
@@ -26,6 +33,17 @@ mq-transport = { path = "../mq-transport" }
 mq-transport-api = { path = "../mq-transport-api" }
 mq-linux = { path = "../mq-linux" }
 mq-wire = { path = "../mq-wire", optional = true }
+log = { workspace = true, optional = true }
+mq-http = { path = "../mq-http", optional = true }
+# The real-origin harness (origin_server.rs): a hyper server on a tokio
+# current_thread runtime. h2 resolves to the locked 0.4.19.
+tokio = { workspace = true, optional = true, features = ["io-util", "time"] }
+hyper = { workspace = true, optional = true }
+h2 = { version = "0.4", optional = true }
+rustls = { workspace = true, optional = true }
+# Without default features: they enable aws-lc-rs next to ring, and rustls's
+# default-provider selection then panics.
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
 
 [dev-dependencies]
 mq-integration = { path = ".", features = ["harness"] }

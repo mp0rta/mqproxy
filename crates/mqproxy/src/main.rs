@@ -11,7 +11,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     match mqproxy::cli::parse(&argv) {
-        Ok(resolved) => {
+        Ok(mut resolved) => {
+            // spec §8: the test-only connect timeout knob, read once here.
+            if let mqproxy::cli::Mode::Server(s) = &mut resolved.mode {
+                if let Some(g) = &mut s.config.gateway {
+                    let env = std::env::var("MQ_GW_ORIGIN_CONNECT_TIMEOUT_S").ok();
+                    g.origin_connect_timeout = mqproxy::cli::origin_connect_timeout(env.as_deref());
+                }
+            }
             for w in &resolved.warnings {
                 log::warn!("{w}");
             }

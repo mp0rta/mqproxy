@@ -260,6 +260,72 @@ fn tcp_write_queues_and_close_waits_for_drain() {
 }
 
 #[test]
+fn tcp_writable_fires_once_after_sendbuffull() {
+    let mut h = setup();
+    let tcp = h.accept();
+    h.sh.with_app(T0, |_, cx| {
+        cx.tcp_write(tcp, &[0; TCP_BUF]).unwrap();
+        assert!(cx.tcp_write(tcp, b"x").is_err());
+    });
+    h.app.take();
+    h.sh.tcp_tx_commit(T0, tcp, IoResult::Bytes(TCP_BUF / 2));
+    assert!(h.app.take().is_empty(), "not drained yet");
+    h.sh.tcp_tx_commit(T0, tcp, IoResult::Bytes(TCP_BUF / 2));
+    assert_eq!(h.app.take(), [Recorded::TcpWritable(tcp)]);
+    // Disarmed: a later drain without a new SendBufFull is silent.
+    h.sh.with_app(T0, |_, cx| cx.tcp_write(tcp, b"y").unwrap());
+    h.sh.tcp_tx_commit(T0, tcp, IoResult::Bytes(1));
+    assert!(h.app.take().is_empty());
+}
+
+#[test]
+fn tcp_writable_not_armed_by_fitting_writes() {
+    let mut h = setup();
+    let tcp = h.accept();
+    h.sh.with_app(T0, |_, cx| cx.tcp_write(tcp, &[0; 1000]).unwrap());
+    h.app.take();
+    h.sh.tcp_tx_commit(T0, tcp, IoResult::Bytes(1000));
+    assert!(h.app.take().is_empty());
+    // A write too large for an empty buffer cannot be helped by waiting.
+    h.sh.with_app(T0, |_, cx| {
+        assert!(cx.tcp_write(tcp, &vec![0; TCP_BUF + 1]).is_err())
+    });
+    h.sh.with_app(T0, |_, cx| cx.tcp_write(tcp, b"z").unwrap());
+    h.sh.tcp_tx_commit(T0, tcp, IoResult::Bytes(1));
+    assert!(h.app.take().is_empty());
+}
+
+#[test]
+fn tcp_writable_never_for_relay_or_closed() {
+    // Armed by a SendBufFull, then handed to a relay: draining it is silent.
+    let mut h = setup();
+    let tcp = h.accept();
+    h.sh.with_app(T0, |_, cx| {
+        cx.tcp_write(tcp, &[0; TCP_BUF]).unwrap();
+        cx.tcp_write(tcp, b"x").unwrap_err();
+    });
+    let c = h.conn();
+    let s = h.stream(c);
+    h.sh.with_app(T0, |_, cx| cx.start_relay(tcp, s, NO_PREREAD))
+        .unwrap();
+    h.app.take();
+    h.sh.tcp_tx_commit(T0, tcp, IoResult::Bytes(TCP_BUF));
+    assert!(!h.app.take().contains(&Recorded::TcpWritable(tcp)));
+    // Closed after the arm.
+    let tcp = h.accept();
+    h.sh.with_app(T0, |_, cx| {
+        cx.tcp_write(tcp, &[0; 100]).unwrap();
+        cx.tcp_write(tcp, &[0; TCP_BUF]).unwrap_err();
+    });
+    h.sh.with_app(T0, |_, cx| cx.tcp_close(tcp));
+    h.app.take();
+    h.sh.tcp_tx_commit(T0, tcp, IoResult::Bytes(100));
+    assert!(h.app.take().is_empty(), "closing socket: no callback");
+    h.sh.tcp_tx_commit(T0, tcp, IoResult::Bytes(1));
+    assert!(h.app.take().is_empty(), "closed socket: no callback");
+}
+
+#[test]
 fn tcp_abort_closes_now() {
     let mut h = setup();
     let tcp = h.accept();
@@ -270,6 +336,23 @@ fn tcp_abort_closes_now() {
     assert_eq!(h.reqs(), [IoRequest::TcpClose { tcp, abort: true }]);
     assert_eq!(h.sh.tcp_interest(tcp), Interest::default());
     assert!(h.sh.tcp_tx_buf(tcp).is_empty());
+}
+
+#[test]
+fn tcp_set_nodelay_requested_for_app_socket_only() {
+    let mut h = setup();
+    let tcp = h.accept();
+    h.sh.with_app(T0, |_, cx| cx.tcp_set_nodelay(tcp));
+    assert_eq!(h.reqs(), [IoRequest::TcpSetNodelay { tcp }]);
+    h.sh.with_app(T0, |_, cx| {
+        cx.tcp_abort(tcp);
+        cx.tcp_set_nodelay(tcp);
+    });
+    assert_eq!(
+        h.reqs(),
+        [IoRequest::TcpClose { tcp, abort: true }],
+        "a stale id is ignored"
+    );
 }
 
 #[test]

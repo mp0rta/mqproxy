@@ -1,9 +1,10 @@
 //! spec §5.3 "Setup", §6.4, §6.6: `run_server` / `run_client` build the
 //! transport, the driver and the shard in C `cmd_server` / `cmd_client` order,
-//! run the loop and return the exit status (1 for cert/bind/qlog failures).
+//! run the loop and return the exit status (1 for cert/bind/qlog/origin-TLS failures).
 
-use crate::cli::{Client as ClientArgs, Mode, Resolved, Server as ServerArgs};
+use crate::cli::{self, Client as ClientArgs, Mode, Resolved, Server as ServerArgs};
 use crate::setup_redirect;
+use mq_proxy::server::origin::{build_client_config, native_roots};
 use mq_proxy::{client, client::Client, server::Server};
 use mq_runtime::driver::{Driver, DriverConfig, StdResolver};
 use mq_runtime::{App, ListenKind, Shard};
@@ -65,7 +66,7 @@ fn seed() -> u64 {
     u64::from(std::process::id()) ^ secs
 }
 
-/// The transport (cert/key loaded here), then `--qlog`.
+/// The transport (cert/key loaded here, H3 per `cli::wants_h3`), then `--qlog`.
 fn transport(r: &Resolved, role: Role, max_conns: u32, err: String) -> Result<Transport, String> {
     let name = if matches!(role, Role::Client) {
         "client"
@@ -79,6 +80,7 @@ fn transport(r: &Resolved, role: Role, max_conns: u32, err: String) -> Result<Tr
         scheduler: r.scheduler,
         cc: r.cc,
         realtime_offset_us: realtime_offset_us(),
+        h3: cli::wants_h3(r),
     })
     .map_err(|e| format!("{err} ({e:?})"))?;
     if let Some(dir) = &r.qlog {
@@ -155,16 +157,36 @@ fn run_server(r: &Resolved, s: &ServerArgs) -> Result<i32, String> {
     let udp = d
         .bind_udp(s.listen)
         .map_err(|e| format!("failed to bind listen path {} ({e})", s.listen))?;
-    let shard = Shard::new(t, Server::new(s.config.clone()), udp.local_addr(), seed());
+    // spec §7.8: the origin TLS config; no usable roots is a startup error.
+    let app = match &s.config.gateway {
+        Some(g) => {
+            let tls = build_client_config(g.origin_ca.as_deref(), &native_roots).map_err(|e| {
+                // C's line, plus the cause (as the transport's).
+                let ca = g.origin_ca.as_deref().map_or("(system)".into(), |p| p.display().to_string());
+                format!(
+                    "failed to create HTTP gateway server (origin_ca={ca}, connect_timeout={}s) ({e})",
+                    g.origin_connect_timeout.as_secs()
+                )
+            })?;
+            Server::with_gateway(s.config.clone(), tls)
+        }
+        None => Server::new(s.config.clone()),
+    };
+    let shard = Shard::new(t, app, udp.local_addr(), seed());
     d.attach_primary_udp(udp, shard.primary_udp())
         .expect("first attach");
     ready(
         r,
         format!(
-            "mqproxy server listening on {} (cc={}, sched={}, gateway=off, udp={}, udp-idle={}s)",
+            "mqproxy server listening on {} (cc={}, sched={}, gateway={}, udp={}, udp-idle={}s)",
             s.listen,
             cc_name(r.cc),
             sched_name(r.scheduler),
+            if s.config.gateway.is_some() {
+                "on"
+            } else {
+                "off"
+            },
             if s.config.udp_enabled { "on" } else { "off" },
             s.config.udp_idle_timeout.as_secs()
         ),
@@ -216,6 +238,9 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
         d.attach_listener(l, shard.add_listener(tag));
         ingress += &format!(" {key}={addr}");
     }
+    // C binds tproxy (and installs its rules) before the fetch listener, but
+    // logs the ingress list as socks5, http-connect, gateway, tproxy.
+    let mut tproxy = String::new();
     if let Some(addr) = c.tproxy {
         let l = d
             .listen(addr, c.tproxy_mode)
@@ -227,7 +252,7 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
         } else {
             "redirect"
         };
-        ingress += &format!(" tproxy={}:{port}({mode})", addr.ip());
+        tproxy = format!(" tproxy={}:{port}({mode})", addr.ip());
         if c.setup_redirect {
             let o = setup_redirect::Opts {
                 mode: c.tproxy_mode,
@@ -246,6 +271,14 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
             d.on_shutdown(move || Rules::remove(&hook, f));
         }
     }
+    if let Some(addr) = c.config.gateway {
+        let l = d
+            .listen(addr, ListenKind::Plain)
+            .map_err(|e| format!("failed to bind gateway fetch listener on {addr} ({e})"))?;
+        d.attach_listener(l, shard.add_listener(client::FETCH));
+        ingress += &format!(" gateway={addr}");
+    }
+    ingress += &tproxy;
     ready(
         r,
         format!(

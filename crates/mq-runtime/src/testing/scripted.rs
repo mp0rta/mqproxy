@@ -3,8 +3,8 @@
 
 use mq_transport_api::{
     CloseReason, ConnConfig, ConnId, ConnStats, ConnectError, DatagramError, ErrType, Error, Event,
-    PathError, PathId, SlotId, StreamError, StreamId, StreamInfo, Time, Transmit, TransportOps,
-    TxKey,
+    H3Close, H3Header, H3ReqId, H3ReqInfo, PathError, PathId, SlotId, StreamError, StreamId,
+    StreamInfo, Time, Transmit, TransportOps, TxKey,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 /// One recorded `TransportOps` call, in call order (spec §8.1 "call log").
 /// Pure queries (`pending_transmit`, `resume_pending`, `poll_event`,
-/// `next_timeout`, `conn_stats`, `stream_info`, `datagram_mss`) are not logged.
+/// `next_timeout`, `conn_stats`, `stream_info`, `datagram_mss`, `h3_req_info`) are not logged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Call {
     RecvDatagram {
@@ -28,7 +28,7 @@ pub enum Call {
         key: TxKey,
         n: usize,
     },
-    Connect,
+    Connect(ConnConfig),
     OpenStream(ConnId),
     /// `bytes` is everything offered, not just the accepted prefix.
     StreamSend {
@@ -50,6 +50,25 @@ pub enum Call {
     DatagramSend {
         conn: ConnId,
         bytes: Vec<u8>,
+    },
+    OpenH3Request(ConnId),
+    H3SendHeaders {
+        r: H3ReqId,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        fin: bool,
+    },
+    /// `bytes` is everything offered, not just the accepted prefix.
+    H3SendBody {
+        r: H3ReqId,
+        bytes: Vec<u8>,
+        fin: bool,
+    },
+    H3Finish(H3ReqId),
+    H3Reset(H3ReqId),
+    H3RecvHeaders(H3ReqId),
+    H3RecvBody {
+        r: H3ReqId,
+        cap: usize,
     },
 }
 
@@ -85,6 +104,29 @@ impl Default for DgramRx {
     }
 }
 
+/// Header pairs as scripted and recorded by the H3 helpers.
+pub type Headers = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// One scripted H3 request. Created by `new_h3_request`, a successful
+/// `open_h3_request`, or the first `inject_*` / `expect_*` naming its id.
+#[derive(Default)]
+struct H3Req {
+    info: Option<H3ReqInfo>,
+    /// Pending header sections with their fin flag.
+    headers: VecDeque<(Headers, bool)>,
+    body: VecDeque<u8>,
+    body_fin: bool,
+    /// Returned once by the next `h3_recv_*` (spec §6.2 step 1, §6.3).
+    err: Option<StreamError>,
+    closed: bool,
+    send_headers: VecDeque<Result<(), StreamError>>,
+    send_body: VecDeque<Result<usize, StreamError>>,
+    sent_headers: Vec<(Headers, bool)>,
+    sent_body: Vec<Vec<u8>>,
+    /// An `H3Readable` is queued and not yet popped.
+    readable_queued: bool,
+}
+
 #[derive(Default)]
 struct ScriptState {
     next_id: u32,
@@ -118,12 +160,42 @@ struct ScriptState {
     dgram_rx: HashMap<ConnId, DgramRx>,
     dgram_mss: HashMap<ConnId, usize>,
     dgram_mss_calls: HashMap<ConnId, usize>,
+    h3: HashMap<H3ReqId, H3Req>,
+    open_h3: HashMap<ConnId, VecDeque<Result<H3ReqId, Error>>>,
+    /// Next QUIC stream id per connection: 0, 4, 8, …
+    h3_quic: HashMap<ConnId, u64>,
 }
 
 impl ScriptState {
     fn fresh_slot(&mut self) -> SlotId {
         self.next_id += 1;
         SlotId::new(self.next_id, 1)
+    }
+    fn fresh_h3(&mut self) -> H3ReqId {
+        H3ReqId::from_slot(self.fresh_slot()).expect("generation 1")
+    }
+    /// Registers `r` as a request of `conn` with the next QUIC stream id.
+    fn bind_h3(&mut self, r: H3ReqId, conn: ConnId) {
+        let q = self.h3_quic.entry(conn).or_insert(0);
+        let quic_id = *q;
+        *q += 4;
+        self.h3.entry(r).or_default().info = Some(H3ReqInfo { conn, quic_id });
+    }
+    /// The live request `r`, created empty if unknown; `Stale` once closed.
+    fn h3_live(&mut self, r: H3ReqId) -> Result<&mut H3Req, StreamError> {
+        let q = self.h3.entry(r).or_default();
+        if q.closed {
+            Err(StreamError::Stale)
+        } else {
+            Ok(q)
+        }
+    }
+    /// Queues one `H3Readable` for `r`, coalesced until popped.
+    fn h3_readable(&mut self, r: H3ReqId) {
+        let q = self.h3.entry(r).or_default();
+        if !std::mem::replace(&mut q.readable_queued, true) {
+            self.injected.push_back(Event::H3Readable(r));
+        }
     }
 }
 
@@ -283,6 +355,72 @@ impl ScriptedHandle {
     pub fn new_stream_id(&self) -> StreamId {
         StreamId::from_slot(self.st().fresh_slot()).expect("generation 1")
     }
+    pub fn new_h3_req_id(&self) -> H3ReqId {
+        self.st().fresh_h3()
+    }
+    /// Queued results for `open_h3_request` on `conn`; `Ok(id)` registers `id` as a request of `conn`.
+    pub fn expect_open_h3_request(&self, conn: ConnId, r: Result<H3ReqId, Error>) {
+        self.st().open_h3.entry(conn).or_default().push_back(r);
+    }
+    /// Queued results for `h3_send_body` on `r`; `Ok(n)` below the offered length accepts only that prefix.
+    pub fn expect_h3_send_body(&self, r: H3ReqId, v: Result<usize, StreamError>) {
+        self.st().h3.entry(r).or_default().send_body.push_back(v);
+    }
+    pub fn expect_h3_send_headers(&self, r: H3ReqId, v: Result<(), StreamError>) {
+        self.st().h3.entry(r).or_default().send_headers.push_back(v);
+    }
+    /// One header section for `r` (with its fin flag); pushes a coalesced `H3Readable`.
+    pub fn inject_h3_headers(&self, r: H3ReqId, hs: Vec<(Vec<u8>, Vec<u8>)>, fin: bool) {
+        let mut st = self.st();
+        st.h3.entry(r).or_default().headers.push_back((hs, fin));
+        st.h3_readable(r);
+    }
+    /// Body bytes for `r`; `fin` is reported with the last byte; pushes a coalesced `H3Readable`.
+    pub fn inject_h3_body(&self, r: H3ReqId, bytes: Vec<u8>, fin: bool) {
+        let mut st = self.st();
+        let q = st.h3.entry(r).or_default();
+        q.body.extend(bytes);
+        q.body_fin |= fin;
+        st.h3_readable(r);
+    }
+    /// Pushes one `H3Readable`; the next `h3_recv_headers` / `h3_recv_body` on `r` returns `Err(e)` once.
+    pub fn inject_h3_error(&self, r: H3ReqId, e: StreamError) {
+        let mut st = self.st();
+        st.h3.entry(r).or_default().err = Some(e);
+        st.h3_readable(r);
+    }
+    /// Queues `H3Closed`; every op on `r` is `Stale` from now on.
+    pub fn close_h3(&self, r: H3ReqId, close: H3Close) {
+        let mut st = self.st();
+        st.h3.entry(r).or_default().closed = true;
+        st.injected.push_back(Event::H3Closed(r, Box::new(close)));
+    }
+    /// Server side: a peer-opened request on `conn` (QUIC id 0, 4, 8, … per connection); pushes `H3Request`.
+    pub fn new_h3_request(&self, conn: ConnId) -> H3ReqId {
+        let mut st = self.st();
+        let r = st.fresh_h3();
+        st.bind_h3(r, conn);
+        st.injected.push_back(Event::H3Request(conn, r));
+        r
+    }
+    /// Injected body bytes of `r` that no `h3_recv_body` has taken yet.
+    pub fn h3_body_unread(&self, r: H3ReqId) -> usize {
+        self.st().h3.get(&r).map_or(0, |q| q.body.len())
+    }
+    /// Bytes accepted by each successful `h3_send_body` on `r`, in order.
+    pub fn h3_sends(&self, r: H3ReqId) -> Vec<Vec<u8>> {
+        self.st()
+            .h3
+            .get(&r)
+            .map_or_else(Vec::new, |q| q.sent_body.clone())
+    }
+    /// Header sections accepted by `h3_send_headers` on `r`, in order, with their fin flag.
+    pub fn h3_headers_sent(&self, r: H3ReqId) -> Vec<(Headers, bool)> {
+        self.st()
+            .h3
+            .get(&r)
+            .map_or_else(Vec::new, |q| q.sent_headers.clone())
+    }
     pub fn log(&self) -> Vec<Call> {
         self.st().log.clone()
     }
@@ -377,10 +515,18 @@ impl TransportOps for ScriptedTransport {
     fn poll_event(&mut self) -> Option<Event> {
         let mut st = self.st();
         let e = st.events.pop_front().or_else(|| st.injected.pop_front())?;
-        if let Event::DatagramReadable(c) = e {
-            if let Some(rx) = st.dgram_rx.get_mut(&c) {
-                rx.readable_queued = false;
+        match &e {
+            Event::DatagramReadable(c) => {
+                if let Some(rx) = st.dgram_rx.get_mut(c) {
+                    rx.readable_queued = false;
+                }
             }
+            Event::H3Readable(r) => {
+                if let Some(q) = st.h3.get_mut(r) {
+                    q.readable_queued = false;
+                }
+            }
+            _ => {}
         }
         Some(e)
     }
@@ -394,11 +540,11 @@ impl TransportOps for ScriptedTransport {
         }
     }
 
-    fn connect(&mut self, now: Time, _cfg: &ConnConfig) -> Result<ConnId, ConnectError> {
+    fn connect(&mut self, now: Time, cfg: &ConnConfig) -> Result<ConnId, ConnectError> {
         self.last_now = now;
         let scripted = {
             let mut st = self.st();
-            st.log.push(Call::Connect);
+            st.log.push(Call::Connect(cfg.clone()));
             st.connect.pop_front()
         };
         if let Some(r) = scripted {
@@ -564,5 +710,131 @@ impl TransportOps for ScriptedTransport {
         }
         buf[..d.len()].copy_from_slice(&d);
         Some(d.len())
+    }
+
+    fn open_h3_request(&mut self, now: Time, conn: ConnId) -> Result<H3ReqId, Error> {
+        self.last_now = now;
+        let mut st = self.st();
+        st.log.push(Call::OpenH3Request(conn));
+        let r = match st.open_h3.get_mut(&conn).and_then(VecDeque::pop_front) {
+            Some(r) => r?,
+            None => st.fresh_h3(),
+        };
+        st.bind_h3(r, conn);
+        Ok(r)
+    }
+
+    fn h3_send_headers(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        hs: &[H3Header<'_>],
+        fin: bool,
+    ) -> Result<(), StreamError> {
+        self.last_now = now;
+        let headers: Headers = hs
+            .iter()
+            .map(|h| (h.name.to_vec(), h.value.to_vec()))
+            .collect();
+        let mut st = self.st();
+        st.log.push(Call::H3SendHeaders {
+            r,
+            headers: headers.clone(),
+            fin,
+        });
+        let q = st.h3_live(r)?;
+        let v = q.send_headers.pop_front().unwrap_or(Ok(()));
+        if v.is_ok() {
+            q.sent_headers.push((headers, fin));
+        }
+        v
+    }
+
+    fn h3_send_body(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<usize, StreamError> {
+        self.last_now = now;
+        let mut st = self.st();
+        st.log.push(Call::H3SendBody {
+            r,
+            bytes: data.to_vec(),
+            fin,
+        });
+        let q = st.h3_live(r)?;
+        let n = q
+            .send_body
+            .pop_front()
+            .unwrap_or(Ok(data.len()))?
+            .min(data.len());
+        q.sent_body.push(data[..n].to_vec());
+        Ok(n)
+    }
+
+    fn h3_finish(&mut self, now: Time, r: H3ReqId) -> Result<(), StreamError> {
+        self.last_now = now;
+        let mut st = self.st();
+        st.log.push(Call::H3Finish(r));
+        st.h3_live(r).map(|_| ())
+    }
+
+    fn h3_recv_headers(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        each: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<bool, StreamError> {
+        self.last_now = now;
+        let mut st = self.st();
+        st.log.push(Call::H3RecvHeaders(r));
+        let q = st.h3_live(r)?;
+        if let Some(e) = q.err.take() {
+            return Err(e);
+        }
+        let (hs, fin) = q.headers.pop_front().ok_or(StreamError::Blocked)?;
+        drop(st); // `each` may call back into the handle
+        for (n, v) in &hs {
+            each(n, v);
+        }
+        Ok(fin)
+    }
+
+    fn h3_recv_body(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        buf: &mut [u8],
+    ) -> Result<(usize, bool), StreamError> {
+        self.last_now = now;
+        let mut st = self.st();
+        st.log.push(Call::H3RecvBody { r, cap: buf.len() });
+        let q = st.h3_live(r)?;
+        if let Some(e) = q.err.take() {
+            return Err(e);
+        }
+        let n = buf.len().min(q.body.len());
+        for (d, b) in buf.iter_mut().zip(q.body.drain(..n)) {
+            *d = b;
+        }
+        let fin = q.body.is_empty() && std::mem::take(&mut q.body_fin);
+        if n == 0 && !fin {
+            return Err(StreamError::Blocked);
+        }
+        Ok((n, fin))
+    }
+
+    fn h3_reset(&mut self, now: Time, r: H3ReqId) {
+        self.last_now = now;
+        self.st().log.push(Call::H3Reset(r));
+    }
+
+    fn h3_req_info(&self, r: H3ReqId) -> Result<H3ReqInfo, Error> {
+        match self.st().h3.get(&r) {
+            Some(q) if !q.closed => q.info.ok_or(Error::Stale),
+            _ => Err(Error::Stale),
+        }
     }
 }

@@ -11,7 +11,7 @@ use mq_proxy::server::Server;
 use mq_runtime::driver::DriverConfig;
 use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
 use mq_runtime::{ListenKind, Shard};
-use mq_transport_api::{ConnId, Event, StreamId, StreamInfo, StreamKind};
+use mq_transport_api::{ConnId, ConnProto, Event, StreamId, StreamInfo, StreamKind};
 use mq_wire::frames::{AuthReq, AuthResp, ConnectTcpResp, FEAT_UDP_RELAY};
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
@@ -282,7 +282,7 @@ impl ServerRig {
     /// `NewConn` + the control stream with a good `AUTH_REQUEST`; waits for the OK.
     pub fn authed(&self) -> ConnId {
         let c = self.t.new_conn_id();
-        self.t.push_event(Event::NewConn(c));
+        self.t.push_event(Event::NewConn(c, ConnProto::Raw));
         let ctrl = self.push_stream(c, 0);
         feed(&self.t, ctrl, &auth_req(b"secret"), false);
         let ok = auth_resp_features(0, 0, FEAT_UDP_RELAY); // the default server config

@@ -15,6 +15,8 @@
 //! Each held stream (control included) takes one of the connection's 4096
 //! budget entries until it is released; relaying streams take none.
 
+pub mod gateway;
+pub mod origin;
 mod udp_session;
 
 use crate::app_stream::{self, CHUNK, Recv};
@@ -23,11 +25,12 @@ use crate::metrics::format_metrics;
 use crate::udp::preopen::PreOpen;
 use crate::udp::send::MssCache;
 use crate::udp::{Counters, host_of};
+use gateway::Gateway;
 use mq_runtime::{
     AcceptMeta, App, Cx, DialError, DialOpId, ListenerTag, RELAY_BUF, SocketOpId, StreamPreread,
     Target, TcpEnd, TcpId, TimerId, UdpSocketId,
 };
-use mq_transport_api::{ConnId, Event, StreamId, StreamInfo, StreamKind};
+use mq_transport_api::{ConnId, ConnProto, Event, StreamId, StreamInfo, StreamKind};
 use mq_wire::frames::{
     AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp, DecodeError, FEAT_UDP_RELAY, MAX_FRAME,
     STATUS_ERROR, STATUS_OK, STREAM_TYPE_CONNECT_TCP, STREAM_TYPE_UDP_SESSION, TcpErr,
@@ -37,6 +40,7 @@ use mq_wire::varint;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use udp_session::SrvSession;
@@ -82,6 +86,8 @@ struct Ctrl {
 }
 
 struct Conn {
+    /// SP3 spec §6: an H3 conn has no auth timer, control stream or UDP state.
+    proto: ConnProto,
     ctrl: Option<Ctrl>,
     /// Auth deadline, then (after a refusal) the delayed close.
     timer: Option<TimerId>,
@@ -160,6 +166,8 @@ pub struct Server {
     active: Option<ConnId>,
     auth_attempts: u64,
     shutting_down: bool,
+    /// SP3 spec §6: `None` = `--no-gateway`.
+    gw: Option<Gateway>,
 }
 
 /// spec §6.3: `CONNECT_TCP_RESPONSE`, no message.
@@ -251,8 +259,24 @@ impl Server {
             active: None,
             auth_attempts: 0,
             shutting_down: false,
+            gw: None,
             cfg,
         }
+    }
+
+    /// SP3 spec §6: `new` with the gateway and its origin bridge composed in;
+    /// `cfg.gateway` must be `Some`.
+    pub fn with_gateway(cfg: ServerConfig, tls: Arc<rustls::ClientConfig>) -> Server {
+        let g = cfg.gateway.clone().expect("with_gateway needs cfg.gateway");
+        let mut s = Server::new(cfg);
+        s.gw = Some(Gateway::new(g, s.token.clone(), tls));
+        s
+    }
+
+    /// SP3 spec §6.3–§6.6: drive `BridgeEvents` directly.
+    #[cfg(feature = "test-support")]
+    pub fn gw_core_mut(&mut self) -> Option<&mut gateway::GwCore> {
+        self.gw.as_mut().map(Gateway::core_mut)
     }
 
     /// Complete `AUTH_REQUEST`s seen (C `auth_attempts`), malformed ones included.
@@ -304,14 +328,16 @@ impl Server {
             .map(|(c, _)| *c)
     }
 
-    fn on_new_conn(&mut self, cx: &mut Cx<'_>, c: ConnId) {
-        // spec §6.3 auth deadline: from NewConn.
-        let timer = self.timer(cx, self.cfg.auth_deadline, Tm::Conn(c));
+    fn on_new_conn(&mut self, cx: &mut Cx<'_>, c: ConnId, proto: ConnProto) {
+        let raw = proto == ConnProto::Raw;
+        // spec §6.3 auth deadline: from NewConn; SP3 spec §6: none for H3.
+        let timer = raw.then(|| self.timer(cx, self.cfg.auth_deadline, Tm::Conn(c)));
         self.conns.insert(
             c,
             Conn {
+                proto,
                 ctrl: None,
-                timer: Some(timer),
+                timer,
                 held: 0,
                 closing: false,
                 udp: HashMap::new(),
@@ -320,8 +346,12 @@ impl Server {
                 counters: Counters::default(),
             },
         );
-        // spec §6.5: C sets `last_conn` at acceptance, before auth.
-        self.active = Some(c);
+        if raw {
+            // spec §6.5: C sets `last_conn` at acceptance, before auth.
+            self.active = Some(c);
+        } else if let Some(g) = self.gw.as_mut() {
+            g.on_new_conn(cx, c);
+        }
         if self.shutting_down {
             self.close(cx, c);
         }
@@ -343,8 +373,12 @@ impl Server {
             self.drop_data(cx, s, false);
         }
         let conn = self.conns.remove(&c).expect("present");
-        // SP2 spec §7.3: once per connection, after its sessions were reaped.
-        udp_session::log_stats(&conn.counters);
+        if conn.proto == ConnProto::Raw {
+            // SP2 spec §7.3: once per connection, after its sessions were reaped.
+            udp_session::log_stats(&conn.counters);
+        } else if let Some(g) = self.gw.as_mut() {
+            g.on_conn_closed(cx, c);
+        }
         if let Some(t) = conn.timer {
             self.cancel(cx, t);
         }
@@ -358,7 +392,12 @@ impl Server {
 
     /// spec §6.3: control stream, data stream, or reset.
     fn on_new_stream(&mut self, cx: &mut Cx<'_>, c: ConnId, s: StreamId, info: StreamInfo) {
-        let Some(conn) = self.conns.get_mut(&c).filter(|k| !k.closing) else {
+        // SP3 spec §6: xquic's H3 layer owns an H3 conn's streams.
+        let Some(conn) = self
+            .conns
+            .get_mut(&c)
+            .filter(|k| !k.closing && k.proto == ConnProto::Raw)
+        else {
             return cx.stream_reset(s);
         };
         if info.kind == StreamKind::Uni {
@@ -645,11 +684,15 @@ impl Server {
         }
     }
 
-    /// spec §6.5: the lines of the most recently accepted connection, if open.
+    /// spec §6.5: the lines of the most recently accepted connection, if
+    /// open, then (SP3 spec §6) those of the most recent H3 conn, as C.
     fn dump_metrics(&self, cx: &Cx<'_>) {
-        if let Some(st) = self.active.and_then(|c| cx.conn_stats(c).ok()) {
-            for l in format_metrics(Some(&st)) {
-                log::info!("{l}");
+        let last_h3 = self.gw.as_ref().and_then(Gateway::last_h3);
+        for c in [self.active, last_h3].into_iter().flatten() {
+            if let Ok(st) = cx.conn_stats(c) {
+                for l in format_metrics(Some(&st)) {
+                    log::info!("{l}");
+                }
             }
         }
     }
@@ -664,7 +707,7 @@ impl App for Server {
 
     fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
         match ev {
-            Event::NewConn(c) => self.on_new_conn(cx, c),
+            Event::NewConn(c, proto) => self.on_new_conn(cx, c, proto),
             Event::ConnClosed(c, _) => self.on_conn_closed(cx, c),
             Event::NewStream(c, s, info) => self.on_new_stream(cx, c, s, info),
             Event::StreamReadable(s) if self.data.contains_key(&s) => self.data_readable(cx, s),
@@ -684,6 +727,15 @@ impl App for Server {
             // Client-only events.
             Event::ConnEstablished(_) | Event::MpReady(_) | Event::PathRemoved(..) => {}
             Event::DatagramReadable(c) => self.udp_inbound(cx, c),
+            // SP3 spec §6.7: always the gateway's.
+            Event::H3Request(..)
+            | Event::H3Readable(_)
+            | Event::H3Writable(_)
+            | Event::H3Closed(..) => {
+                if let Some(g) = self.gw.as_mut() {
+                    g.on_h3_event(cx, ev);
+                }
+            }
         }
     }
 
@@ -691,16 +743,39 @@ impl App for Server {
         cx.tcp_close(tcp); // the server has no TCP listeners in SP1
     }
 
-    fn on_tcp_data(&mut self, _cx: &mut Cx<'_>, _tcp: TcpId) {
-        // A dialled socket is relayed (or aborted) as soon as its result arrives.
+    /// Only the origin bridge's sockets (SP3 spec §6.7): a dialled socket
+    /// of the TCP core is relayed (or aborted) as soon as its result arrives.
+    fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        if let Some(g) = self.gw.as_mut() {
+            g.on_tcp_data(cx, tcp);
+        }
     }
 
-    fn on_tcp_end(&mut self, _cx: &mut Cx<'_>, _tcp: TcpId, _end: TcpEnd) {
-        // spec §5.4: ReadEof is kept across start_relay; an Error while the OK
-        // response is still being written leaves a dead id that start_relay rejects.
+    /// Only the origin bridge's sockets (SP3 spec §6.7). spec §5.4: ReadEof
+    /// is kept across start_relay; an Error while the OK response is still
+    /// being written leaves a dead id that start_relay rejects.
+    fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
+        if let Some(g) = self.gw.as_mut() {
+            g.on_tcp_end(cx, tcp, end);
+        }
+    }
+
+    /// SP3 spec §4/§6.7: only the origin bridge's sockets ask for it.
+    fn on_tcp_writable(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        if let Some(g) = self.gw.as_mut() {
+            g.on_tcp_writable(cx, tcp);
+        }
     }
 
     fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>) {
+        // SP3 spec §6.7: the bridge's dials first.
+        if self
+            .gw
+            .as_mut()
+            .is_some_and(|g| g.on_dial_result(cx, op, r))
+        {
+            return;
+        }
         let Some(s) = self.dials.remove(&op) else {
             // Not wanted any more: dispose of a late socket.
             if let Ok(tcp) = r {
@@ -747,6 +822,10 @@ impl App for Server {
 
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         let Some(tm) = self.timers.remove(&id) else {
+            // SP3 spec §6.7: the bridge's timers.
+            if let Some(g) = self.gw.as_mut() {
+                g.on_timer(cx, id);
+            }
             return;
         };
         match tm {
@@ -780,6 +859,10 @@ impl App for Server {
     /// connection's UDP sessions and logs its stats line, once.
     fn on_shutdown(&mut self, cx: &mut Cx<'_>) {
         self.shutting_down = true;
+        // SP3 spec §6.6: origin sockets aborted, H3 requests reset.
+        if let Some(g) = self.gw.as_mut() {
+            g.on_shutdown(cx);
+        }
         if self.conns.is_empty() {
             return cx.request_exit(0);
         }

@@ -1,7 +1,10 @@
 //! spec §5.1, §8.1: `ScriptedTransport` scripts every `TransportOps` result.
 
 use mq_runtime::testing::{Call, ScriptedTransport};
-use mq_transport_api::{ConnConfig, DatagramError, Event, PathId, StreamError, Time, TransportOps};
+use mq_transport_api::{
+    ConnConfig, ConnProto, DatagramError, Error, Event, H3Close, H3Header, H3ReqStats, PathId,
+    StreamError, Time, TransportOps, Unread,
+};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -10,6 +13,7 @@ fn cfg() -> ConnConfig {
         peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 4433)),
         sni: "mqproxy",
         idle_timeout: None,
+        proto: ConnProto::Raw,
     }
 }
 
@@ -126,7 +130,7 @@ fn log_records_order_and_bytes() {
     assert_eq!(
         h.log(),
         vec![
-            Call::Connect,
+            Call::Connect(cfg()),
             Call::OpenStream(c),
             Call::StreamSend {
                 s,
@@ -261,4 +265,214 @@ fn scripted_datagram_mss_calls_counted() {
     assert_eq!(t.datagram_mss(other), 1200);
     assert_eq!(h.datagram_mss_calls(c), 2);
     assert_eq!(h.datagram_mss_calls(other), 1);
+}
+
+// --- H3 (spec §3.1, §3.6) ---
+
+type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn pairs(v: &[(&str, &str)]) -> Pairs {
+    v.iter()
+        .map(|(a, b)| (a.as_bytes().to_vec(), b.as_bytes().to_vec()))
+        .collect()
+}
+
+fn stats() -> H3ReqStats {
+    H3ReqStats {
+        send_body: 1,
+        recv_body: 2,
+        begin_us: 3,
+        header_send_us: 4,
+        fin_send_us: 5,
+        fin_ack_us: 6,
+        mp_state: 7,
+        stream_err: 0,
+        close_msg: Some("done".into()),
+    }
+}
+
+#[test]
+fn scripted_connect_records_config() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = ConnConfig {
+        proto: ConnProto::H3,
+        sni: "gw",
+        ..cfg()
+    };
+    t.connect(T, &c).unwrap();
+    match &h.log()[..] {
+        [Call::Connect(got)] => {
+            assert_eq!(got.proto, ConnProto::H3);
+            assert_eq!(got.sni, "gw");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn scripted_h3_roundtrip() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    let r = h.new_h3_request(c);
+    let r2 = h.new_h3_request(c);
+    assert_eq!(t.poll_event(), Some(Event::H3Request(c, r)));
+    assert_eq!(t.poll_event(), Some(Event::H3Request(c, r2)));
+    assert_eq!(t.poll_event(), None);
+    assert_eq!(t.h3_req_info(r).unwrap().conn, c);
+    assert_eq!(t.h3_req_info(r).unwrap().quic_id, 0);
+    assert_eq!(t.h3_req_info(r2).unwrap().quic_id, 4);
+
+    let hs = pairs(&[(":method", "GET"), ("host", "x")]);
+    h.inject_h3_headers(r, hs.clone(), false);
+    h.inject_h3_body(r, b"abc".to_vec(), true);
+    // coalesced: one H3Readable for both
+    assert_eq!(t.poll_event(), Some(Event::H3Readable(r)));
+    assert_eq!(t.poll_event(), None);
+
+    let mut got = Vec::new();
+    let fin = t
+        .h3_recv_headers(T, r, &mut |n, v| got.push((n.to_vec(), v.to_vec())))
+        .unwrap();
+    assert!(!fin);
+    assert_eq!(got, hs);
+    assert_eq!(
+        t.h3_recv_headers(T, r, &mut |_, _| panic!("no section")),
+        Err(StreamError::Blocked)
+    );
+    let mut buf = [0u8; 16];
+    assert_eq!(t.h3_recv_body(T, r, &mut buf), Ok((3, true)));
+    assert_eq!(&buf[..3], b"abc");
+    assert_eq!(t.h3_recv_body(T, r, &mut buf), Err(StreamError::Blocked));
+}
+
+#[test]
+fn scripted_h3_send_scripted_blocked() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    let r = h.new_h3_request(c);
+    h.expect_h3_send_body(r, Err(StreamError::Blocked));
+    assert_eq!(
+        t.h3_send_body(T, r, b"xy", false),
+        Err(StreamError::Blocked)
+    );
+    assert!(h.h3_sends(r).is_empty());
+    // default accepts everything; a short scripted Ok(n) records only the prefix
+    h.expect_h3_send_body(r, Ok(1));
+    assert_eq!(t.h3_send_body(T, r, b"xy", false), Ok(1));
+    assert_eq!(t.h3_send_body(T, r, b"z", true), Ok(1));
+    assert_eq!(h.h3_sends(r), vec![b"x".to_vec(), b"z".to_vec()]);
+
+    h.expect_h3_send_headers(r, Err(StreamError::Reset));
+    let hs = [H3Header {
+        name: b":status",
+        value: b"200",
+    }];
+    assert_eq!(t.h3_send_headers(T, r, &hs, false), Err(StreamError::Reset));
+    assert!(h.h3_headers_sent(r).is_empty());
+    assert_eq!(t.h3_send_headers(T, r, &hs, true), Ok(()));
+    assert_eq!(
+        h.h3_headers_sent(r),
+        vec![(pairs(&[(":status", "200")]), true)]
+    );
+    assert_eq!(t.h3_finish(T, r), Ok(()));
+}
+
+#[test]
+fn scripted_open_h3_request_scripted_failure() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    h.expect_open_h3_request(c, Err(Error::Ceiling));
+    assert_eq!(t.open_h3_request(T, c), Err(Error::Ceiling));
+    let r = h.new_h3_req_id();
+    h.expect_open_h3_request(c, Ok(r));
+    assert_eq!(t.open_h3_request(T, c), Ok(r));
+    // the request is usable at once, inside the same callback
+    assert_eq!(t.h3_send_headers(T, r, &[], false), Ok(()));
+    assert_eq!(t.h3_req_info(r).unwrap().conn, c);
+    // unscripted: a fresh id
+    let r2 = t.open_h3_request(T, c).unwrap();
+    assert_ne!(r, r2);
+}
+
+#[test]
+fn scripted_h3_recv_calls_logged() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    let r = h.new_h3_request(c);
+    let mut buf = [0u8; 8];
+    let _ = t.h3_recv_headers(T, r, &mut |_, _| {});
+    let _ = t.h3_recv_body(T, r, &mut buf);
+    t.h3_reset(T, r);
+    assert_eq!(
+        h.log(),
+        vec![
+            Call::H3RecvHeaders(r),
+            Call::H3RecvBody { r, cap: 8 },
+            Call::H3Reset(r),
+        ]
+    );
+}
+
+#[test]
+fn scripted_h3_recv_error_injected() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    let r = h.new_h3_request(c);
+    let _ = t.poll_event();
+    h.inject_h3_error(r, StreamError::Reset);
+    assert_eq!(t.poll_event(), Some(Event::H3Readable(r)));
+    let mut buf = [0u8; 8];
+    assert_eq!(t.h3_recv_body(T, r, &mut buf), Err(StreamError::Reset));
+    // once: reads are normal afterwards
+    assert_eq!(t.h3_recv_body(T, r, &mut buf), Err(StreamError::Blocked));
+    h.inject_h3_error(r, StreamError::Conn);
+    assert_eq!(
+        t.h3_recv_headers(T, r, &mut |_, _| {}),
+        Err(StreamError::Conn)
+    );
+    h.inject_h3_headers(r, pairs(&[("a", "b")]), true);
+    assert_eq!(t.h3_recv_headers(T, r, &mut |_, _| {}), Ok(true));
+}
+
+#[test]
+fn scripted_h3_close_carries_unread() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    let r = h.new_h3_request(c);
+    let close = H3Close {
+        stats: stats(),
+        unread: Some(Unread {
+            headers: Some(pairs(&[("k", "v")])),
+            body: b"tail".to_vec(),
+        }),
+    };
+    h.close_h3(r, close.clone());
+    let _ = t.poll_event(); // H3Request
+    assert_eq!(t.poll_event(), Some(Event::H3Closed(r, Box::new(close))));
+}
+
+#[test]
+fn scripted_h3_stale_after_close() {
+    let (mut t, h) = ScriptedTransport::new();
+    let c = h.new_conn_id();
+    let r = h.new_h3_request(c);
+    h.close_h3(
+        r,
+        H3Close {
+            stats: stats(),
+            unread: None,
+        },
+    );
+    let mut buf = [0u8; 8];
+    assert_eq!(t.h3_send_headers(T, r, &[], false), Err(StreamError::Stale));
+    assert_eq!(t.h3_send_body(T, r, b"x", false), Err(StreamError::Stale));
+    assert_eq!(t.h3_finish(T, r), Err(StreamError::Stale));
+    assert_eq!(
+        t.h3_recv_headers(T, r, &mut |_, _| {}),
+        Err(StreamError::Stale)
+    );
+    assert_eq!(t.h3_recv_body(T, r, &mut buf), Err(StreamError::Stale));
+    assert_eq!(t.h3_req_info(r), Err(Error::Stale));
+    t.h3_reset(T, r); // a no-op
+    assert!(h.h3_sends(r).is_empty());
 }

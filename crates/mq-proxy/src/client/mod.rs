@@ -11,6 +11,7 @@
 //! control stream is Connecting, with one but not `authed` is Authing.
 
 pub mod backoff;
+pub mod gateway;
 mod ingress_glue;
 mod paths;
 pub mod pending;
@@ -23,12 +24,13 @@ use crate::ingress::{INGRESS_CAP, socks5_assoc_reply, target_from_original_dst};
 use crate::metrics::format_metrics;
 use crate::udp::SessionEnd;
 use backoff::Backoff;
+use gateway::Gateway;
 use ingress_glue::{Fed, Ingress, kind_of};
 use mq_runtime::{
     AcceptMeta, App, Cx, DialError, DialOpId, Host, ListenerTag, SocketOpId, StreamPreread, Target,
     TcpEnd, TcpId, TimerId, UdpSocketId,
 };
-use mq_transport_api::{ConnConfig, ConnId, Event, StreamId};
+use mq_transport_api::{ConnConfig, ConnId, ConnProto, Event, StreamId};
 use mq_wire::frames::{
     AddrType, AuthReq, AuthResp, ConnectTcpReq, ConnectTcpResp, DecodeError, FEAT_UDP_RELAY,
     MAX_FRAME, STREAM_TYPE_CONNECT_TCP, TcpErr,
@@ -45,6 +47,8 @@ use udp_session::Sessions;
 pub const SOCKS5: ListenerTag = ListenerTag(1);
 pub const HTTP_CONNECT: ListenerTag = ListenerTag(2);
 pub const TRANSPARENT: ListenerTag = ListenerTag(3);
+/// SP3 spec §5.1: the fetch listener.
+pub const FETCH: ListenerTag = ListenerTag(4);
 
 /// spec §6.2: the TLS server name, as C.
 const SNI: &str = "mqproxy";
@@ -125,6 +129,8 @@ pub struct Client {
     assocs: HashMap<TcpId, Assoc>,
     /// SP2 spec §6.3: the UDP sessions.
     sess: Sessions,
+    /// SP3 spec §5: the fetch gateway, with its own H3 tunnel.
+    gw: Option<Gateway>,
 }
 
 /// spec §6.2: truncate to the wire limit with a warning (C truncates silently).
@@ -134,6 +140,15 @@ fn truncated(s: &str, max: usize, flag: &str) -> Vec<u8> {
         log::warn!("mq_client: {flag} is longer than {max} bytes; truncated");
     }
     b[..b.len().min(max)].to_vec()
+}
+
+/// spec §6.5: the `mq.conn` / `mq.path` lines of `conn`; nothing without one.
+fn log_conn_metrics(cx: &Cx<'_>, conn: Option<ConnId>) {
+    if let Some(st) = conn.and_then(|c| cx.conn_stats(c).ok()) {
+        for l in format_metrics(Some(&st)) {
+            log::info!("{l}");
+        }
+    }
 }
 
 /// spec §6.1: the ingress error reply (if any), then close.
@@ -187,13 +202,20 @@ impl Client {
             reconnect: None,
             ingress: HashMap::new(),
             opens: HashMap::new(),
-            paths: Paths::new(&cfg),
+            paths: Paths::new(&cfg, "mq_client"),
             timers: HashMap::new(),
             udp: UdpAvail::Unknown,
             assocs: HashMap::new(),
             sess: Sessions::new(),
+            gw: cfg.gateway.map(|_| Gateway::new(&cfg)),
             cfg,
         }
+    }
+
+    /// SP3 spec §5: the fetch gateway, when `--gateway` is set.
+    #[cfg(feature = "test-support")]
+    pub fn gateway(&self) -> Option<&Gateway> {
+        self.gw.as_ref()
     }
 
     /// SP2 spec §6.3: the source an association locked.
@@ -245,6 +267,7 @@ impl Client {
             peer: self.cfg.server,
             sni: SNI,
             idle_timeout: self.cfg.keepalive_idle,
+            proto: ConnProto::Raw,
         };
         match cx.connect(&cfg) {
             Ok(id) => {
@@ -528,7 +551,7 @@ impl Client {
         self.paths.on_conn_closed(cx);
         if self.shutting_down {
             self.set_udp(cx, UdpAvail::Unavailable);
-            return cx.request_exit(0);
+            return self.maybe_exit(cx);
         }
         if self.cfg.reconnect {
             self.set_udp(cx, UdpAvail::Unknown);
@@ -551,10 +574,16 @@ impl Client {
 
     /// spec §6.5: the `mq.conn` / `mq.path` lines of the held connection.
     fn dump_metrics(&self, cx: &Cx<'_>) {
-        if let Some(st) = self.conn.as_ref().and_then(|c| cx.conn_stats(c.id).ok()) {
-            for l in format_metrics(Some(&st)) {
-                log::info!("{l}");
-            }
+        log_conn_metrics(cx, self.conn.as_ref().map(|c| c.id));
+    }
+
+    /// SP3 spec §5.9: shutting down, exit once both tunnels are gone (or never existed).
+    fn maybe_exit(&self, cx: &mut Cx<'_>) {
+        if self.shutting_down
+            && self.conn.is_none()
+            && self.gw.as_ref().is_none_or(Gateway::tunnel_gone)
+        {
+            cx.request_exit(0);
         }
     }
 
@@ -571,10 +600,25 @@ impl App for Client {
         if let Some(every) = self.cfg.metrics_interval {
             self.timer(cx, every, Tm::Metrics);
         }
-        self.connect(cx);
+        // SP3 spec §5.7: the raw tunnel only with a TCP ingress; it connects
+        // before the gateway's tunnel.
+        if self.cfg.has_tcp_ingress {
+            self.connect(cx);
+        }
+        if let Some(g) = self.gw.as_mut() {
+            g.on_start(cx);
+        }
     }
 
     fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
+        // SP3 spec §5.8: the gateway's tunnel and every H3 event go to the gateway.
+        let ev = match self.gw.as_mut() {
+            Some(g) => match g.on_transport_event(cx, ev) {
+                Some(ev) => ev,
+                None => return self.maybe_exit(cx),
+            },
+            None => ev,
+        };
         match ev {
             Event::ConnEstablished(c) if self.current(c) => self.on_established(cx),
             // spec §6.5: the stats line is per ConnClosed; a synchronous
@@ -633,6 +677,11 @@ impl App for Client {
     }
 
     fn on_accepted(&mut self, cx: &mut Cx<'_>, l: ListenerTag, tcp: TcpId, meta: AcceptMeta) {
+        if l == FETCH
+            && let Some(g) = self.gw.as_mut()
+        {
+            return g.on_accepted(cx, tcp, meta);
+        }
         let Some(kind) = kind_of(l) else {
             return cx.tcp_close(tcp);
         };
@@ -658,6 +707,9 @@ impl App for Client {
     }
 
     fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
+            return g.on_tcp_data(cx, tcp);
+        }
         if self.assocs.contains_key(&tcp) {
             return discard(cx, tcp);
         }
@@ -679,6 +731,9 @@ impl App for Client {
     }
 
     fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
+        if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
+            return g.on_tcp_end(cx, tcp, end);
+        }
         if let Some(ing) = self.ingress.remove(&tcp) {
             self.cancel(cx, ing.timer);
             if end == TcpEnd::ReadEof {
@@ -713,6 +768,12 @@ impl App for Client {
         }
     }
 
+    fn on_tcp_writable(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
+            g.on_tcp_writable(cx, tcp);
+        }
+    }
+
     fn on_dial_result(&mut self, _cx: &mut Cx<'_>, _op: DialOpId, _r: Result<TcpId, DialError>) {
         // The client never dials.
     }
@@ -735,6 +796,14 @@ impl App for Client {
     ) {
         let assoc = self.assocs.iter_mut().find(|(_, a)| a.open_op == Some(op));
         let Some((&tcp, a)) = assoc else {
+            // SP3 spec §5.7: the raw tunnel's paths first, then the gateway's;
+            // an op owned by neither is closed by the raw `Paths`.
+            if !self.paths.owns(op)
+                && let Some(g) = self.gw.as_mut()
+                && g.on_udp_socket(cx, op, r)
+            {
+                return;
+            }
             let conn = self.conn.as_ref().filter(|c| !c.closing).map(|c| c.id);
             return self.paths.on_udp_socket(cx, conn, op, r);
         };
@@ -766,8 +835,14 @@ impl App for Client {
 
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         let Some(tm) = self.timers.remove(&id) else {
+            // A path retry of the raw tunnel, else the gateway's (SP3 spec §5.8).
             let conn = self.conn.as_ref().filter(|c| !c.closing).map(|c| c.id);
-            return self.paths.on_timer(cx, conn, id);
+            if !self.paths.on_timer(cx, conn, id) {
+                if let Some(g) = self.gw.as_mut() {
+                    g.on_timer(cx, id);
+                }
+            }
+            return;
         };
         match tm {
             Tm::Auth => {
@@ -785,8 +860,12 @@ impl App for Client {
                 if let Some(every) = self.cfg.metrics_interval {
                     self.timer(cx, every, Tm::Metrics);
                 }
-                // spec §6.5: nothing without a connection, as C `cli_metrics_tick`.
+                // spec §6.5: nothing without a connection, as C `cli_metrics_tick`;
+                // SP3 spec §5.7: then the gateway tunnel's block.
                 self.dump_metrics(cx);
+                if let Some(g) = self.gw.as_ref() {
+                    g.dump_metrics(cx);
+                }
             }
             Tm::Ingress(tcp) => {
                 if self.ingress.remove(&tcp).is_some() {
@@ -815,10 +894,12 @@ impl App for Client {
         if let Some(t) = self.reconnect.take() {
             self.cancel(cx, t);
         }
-        if self.conn.is_none() {
-            return cx.request_exit(0);
-        }
         self.dump_metrics(cx);
         self.close(cx);
+        if let Some(g) = self.gw.as_mut() {
+            g.on_shutdown(cx);
+        }
+        // SP3 spec §5.9: replaces the early exit for "no raw conn".
+        self.maybe_exit(cx);
     }
 }

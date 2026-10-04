@@ -76,6 +76,21 @@ pub(crate) fn app_proto_callbacks() -> xqc_app_proto_callbacks_t {
     }
 }
 
+/// H3 callbacks (spec §3.3): connection and request notifications only; the h3-ext datagram
+/// and bytestream tables stay empty (xquic null-checks them).
+pub(crate) fn h3_callbacks() -> xqc_h3_callbacks_t {
+    // SAFETY: a C struct of `Option<fn>` fields; all-zero is all `None`.
+    let mut cbs: xqc_h3_callbacks_t = unsafe { core::mem::zeroed() };
+    cbs.h3c_cbs.h3_conn_create_notify = Some(h3_conn_create_notify);
+    cbs.h3c_cbs.h3_conn_close_notify = Some(h3_conn_close_notify);
+    cbs.h3c_cbs.h3_conn_handshake_finished = Some(h3_conn_handshake_finished);
+    cbs.h3r_cbs.h3_request_create_notify = Some(h3_request_create_notify);
+    cbs.h3r_cbs.h3_request_close_notify = Some(h3_request_close_notify);
+    cbs.h3r_cbs.h3_request_read_notify = Some(h3_request_read_notify);
+    cbs.h3r_cbs.h3_request_write_notify = Some(h3_request_write_notify);
+    cbs
+}
+
 // ── callbacks with no state ─────────────────────────────────────────────
 
 /// spec §4.7: accept any certificate (as the C client does).

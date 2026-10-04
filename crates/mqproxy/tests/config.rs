@@ -2,6 +2,7 @@
 //! with `--config <tempfile>`. Ports C `tests/test_config.c` and gives every
 //! row of the SP1 flag table its INI equivalent.
 
+use mq_proxy::config::GatewayConfig;
 use mq_runtime::ListenKind;
 use mq_transport_api::{CongestionControl, Scheduler};
 use mqproxy::cli::{self, Client, Exit, Mode, Resolved, Server};
@@ -172,13 +173,13 @@ fn c_client_roundtrip() {
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 }
 
-/// C test_bool_variants: `yes`/`0` on the bool keys (`[UDP] Enabled` takes
-/// effect; `[Gateway] Enabled` is accepted, no effect; SP1: `Masquerade = true`
-/// is exit 2). C `parse_bool` is exact `true`/`yes`/`1`; anything else is false.
+/// C test_bool_variants: `yes`/`0` on the bool keys. C `parse_bool` is exact
+/// `true`/`yes`/`1`; anything else is false.
 #[test]
 fn c_bool_variants() {
     let r = srv("[Gateway]\nEnabled = yes\n[UDP]\nEnabled = 0\n").unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(server(&r).config.gateway.is_some());
     assert!(!server(&r).config.udp_enabled);
     for (v, on) in [
         ("true", true),
@@ -190,8 +191,12 @@ fn c_bool_variants() {
     ] {
         let r = srv(&format!("[UDP]\nEnabled = {v}\n")).unwrap();
         assert_eq!(server(&r).config.udp_enabled, on, "Enabled = {v}");
+        let r = srv(&format!("[Gateway]\nEnabled = {v}\nMasquerade = {v}\n")).unwrap();
+        assert_eq!(server(&r).config.gateway.is_some(), on, "Enabled = {v}");
+        let r = srv(&format!("[Gateway]\nMasquerade = {v}\n")).unwrap();
+        let g = server(&r).config.gateway.clone().unwrap();
+        assert_eq!(g.masquerade, on, "Masquerade = {v}");
     }
-    assert_eq!(exit(srv("[Gateway]\nMasquerade = true\n")).code, 2);
 }
 
 /// C test_path_cap: 10 file paths → 8 kept, with a warning.
@@ -383,6 +388,7 @@ fn empty_value_not_set() {
     assert_eq!(exit(run("server", &ini, &[])).code, 2);
     let r = srv("[Gateway]\nOriginCA =\nMasquerade =\n").unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(server(&r).config.gateway, Some(GatewayConfig::default()));
 }
 
 #[test]
@@ -447,10 +453,63 @@ fn client_implemented_keys_resolve() {
     assert_eq!(client(&r).tproxy, Some(addr("127.0.0.1:2")));
 }
 
+/// spec §8: `[Gateway] Enabled = false` is `--no-gateway`; the CLI can only
+/// turn the gateway off (C has no `--gateway` on the server).
 #[test]
-fn server_accepted_no_effect_keys() {
+fn ini_gateway_enabled_false_disables() {
     let r = srv("[Gateway]\nEnabled = false\n").unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(server(&r).config.gateway, None);
+    assert!(!cli::wants_h3(&r));
+    assert!(r.startup_lines.is_empty(), "{:?}", r.startup_lines);
+    // CLI over INI: `--no-gateway` beats `Enabled = true`.
+    let ini = Ini::new(&format!("{SRV}[Gateway]\nEnabled = true\n"));
+    assert!(
+        server(&run("server", &ini, &[]).unwrap())
+            .config
+            .gateway
+            .is_some()
+    );
+    let r = run("server", &ini, &["--no-gateway"]).unwrap();
+    assert_eq!(server(&r).config.gateway, None);
+    // The gateway-only keys with the gateway off: warned, ignored (C text).
+    let r = srv("[Gateway]\nEnabled = no\nMasquerade = true\n[Metrics]\nPerRequest = 1\n").unwrap();
+    assert_eq!(server(&r).config.gateway, None);
+    assert!(
+        warned(&r, "--masquerade has no effect with --no-gateway"),
+        "{:?}",
+        r.warnings
+    );
+    assert!(
+        warned(&r, "--request-metrics has no effect with --no-gateway"),
+        "{:?}",
+        r.warnings
+    );
+}
+
+/// spec §8: `OriginCA`, `Masquerade`, `[Metrics] PerRequest` reach
+/// `ServerConfig.gateway`; the CLI overrides `OriginCA`.
+#[test]
+fn ini_gateway_keys_take_effect() {
+    let r = srv("[Gateway]\nOriginCA = /ca.pem\nMasquerade = true\n[Metrics]\nPerRequest = yes\n")
+        .unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(
+        server(&r).config.gateway,
+        Some(GatewayConfig {
+            origin_ca: Some(PathBuf::from("/ca.pem")),
+            masquerade: true,
+            request_metrics: true,
+            ..GatewayConfig::default()
+        })
+    );
+    let r = srv("[Gateway]\nMasquerade = false\n[Metrics]\nPerRequest = 0\n").unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(server(&r).config.gateway, Some(GatewayConfig::default()));
+    let ini = Ini::new(&format!("{SRV}[Gateway]\nOriginCA = /file.pem\n"));
+    let r = run("server", &ini, &["--origin-ca", "/cli.pem"]).unwrap();
+    let g = server(&r).config.gateway.clone().unwrap();
+    assert_eq!(g.origin_ca, Some(PathBuf::from("/cli.pem")));
 }
 
 /// spec §8: `[UDP] Enabled` / `IdleTimeout` reach `ServerConfig`, and the CLI
@@ -504,22 +563,28 @@ fn client_accepted_no_effect_keys() {
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 }
 
+/// spec §8: `[Ingress] Gateway` alone satisfies the ingress rule; the CLI
+/// overrides it.
 #[test]
-fn server_unavailable_keys_exit_2_only_when_true_or_set() {
-    for k in [
-        "[Gateway]\nOriginCA = /ca.pem\n",
-        "[Gateway]\nMasquerade = true\n",
-        "[Metrics]\nPerRequest = yes\n",
-    ] {
-        assert_eq!(exit(srv(k)).code, 2, "{k}");
-    }
-    let r = srv("[Gateway]\nMasquerade = false\n[Metrics]\nPerRequest = 0\n").unwrap();
+fn ini_ingress_gateway_counts_as_ingress() {
+    let ini = Ini::new(
+        "[Server]\nAddress = 127.0.0.1:1\n[Auth]\nKey = t\n[Ingress]\nGateway = 127.0.0.1:8081\n",
+    );
+    let r = run("client", &ini, &[]).unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(client(&r).config.gateway, Some(addr("127.0.0.1:8081")));
+    assert!(!client(&r).config.has_tcp_ingress);
+    assert!(cli::wants_h3(&r));
+    let r = run("client", &ini, &["--gateway", "127.0.0.1:9"]).unwrap();
+    assert_eq!(client(&r).config.gateway, Some(addr("127.0.0.1:9")));
+    let r = cli_("[Ingress]\nGateway = 127.0.0.1:8081\n").unwrap();
+    assert!(client(&r).config.has_tcp_ingress);
+    assert_eq!(exit(cli_("[Ingress]\nGateway = nope\n")).code, 2);
 }
 
+/// spec §8: `[Mitm] Enabled` stays a startup error (SP4), only when true.
 #[test]
-fn client_unavailable_keys_exit_2_only_when_true_or_set() {
-    assert_eq!(exit(cli_("[Ingress]\nGateway = 127.0.0.1:8081\n")).code, 2);
+fn client_mitm_key_exit_2_only_when_true() {
     assert_eq!(exit(cli_("[Mitm]\nEnabled = 1\n")).code, 2);
     assert!(cli_("[Mitm]\nEnabled = no\n").is_ok());
 }

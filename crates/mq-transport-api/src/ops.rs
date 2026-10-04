@@ -3,8 +3,8 @@
 
 use crate::config::{ConnConfig, ConnStats};
 use crate::error::{ConnectError, DatagramError, Error, PathError, StreamError};
-use crate::event::{Event, StreamInfo, Transmit};
-use crate::ids::{ConnId, PathId, StreamId, TxKey};
+use crate::event::{Event, H3Header, H3ReqInfo, StreamInfo, Transmit};
+use crate::ids::{ConnId, H3ReqId, PathId, StreamId, TxKey};
 use crate::time::Time;
 use std::net::SocketAddr;
 
@@ -62,4 +62,43 @@ pub trait TransportOps {
     fn datagram_mss(&self, conn: ConnId) -> usize;
     /// Oldest received datagram into `buf` (`buf.len() >= 65535`); `None` = ring empty / stale.
     fn datagram_recv(&mut self, conn: ConnId, buf: &mut [u8]) -> Option<usize>;
+
+    // H3 requests (spec §3.1)
+    /// Client only: a server-role transport returns `Error::Role`.
+    fn open_h3_request(&mut self, now: Time, conn: ConnId) -> Result<H3ReqId, Error>;
+    /// All-or-error; `Blocked` cannot occur with the vendored xquic (spec §3.1).
+    fn h3_send_headers(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        hs: &[H3Header<'_>],
+        fin: bool,
+    ) -> Result<(), StreamError>;
+    /// The `stream_send` contract: `Ok(n)` accepted, FIN only when `n == data.len()`.
+    fn h3_send_body(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<usize, StreamError>;
+    /// A bare FIN (spec §3.1).
+    fn h3_finish(&mut self, now: Time, r: H3ReqId) -> Result<(), StreamError>;
+    /// Drains one header section; `Ok(fin)`. `Blocked` when none is pending.
+    fn h3_recv_headers(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        each: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<bool, StreamError>;
+    /// `(bytes, fin)`; `(0, false)` is `Blocked`.
+    fn h3_recv_body(
+        &mut self,
+        now: Time,
+        r: H3ReqId,
+        buf: &mut [u8],
+    ) -> Result<(usize, bool), StreamError>;
+    /// A no-op on a stale id.
+    fn h3_reset(&mut self, now: Time, r: H3ReqId);
+    fn h3_req_info(&self, r: H3ReqId) -> Result<H3ReqInfo, Error>;
 }
