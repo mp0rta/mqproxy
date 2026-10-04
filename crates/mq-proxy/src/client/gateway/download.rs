@@ -1,20 +1,14 @@
 //! SP3 spec §5.4: the fetch download's response head — collected from the H3
-//! header section under C's caps (`dl_each_header`), rendered as the local
+//! header section under the shared limits (SP4 spec §5), rendered as the local
 //! HTTP/1.1 head (`adp_resp_head`).
 
 use mq_http::h1;
 use mq_http::headers::is_hop_by_hop;
+use mq_http::limits::{SECTION_MAX, SectionBudget};
 
-/// C `MQ_GW_RESP_NAME_CAP` / `MQ_GW_RESP_VAL_CAP`: a name ≥ 128 or a value
-/// ≥ 2048 bytes is malformed.
-const RESP_NAME_CAP: usize = 128;
-const RESP_VAL_CAP: usize = 2048;
-/// C `MQ_GW_RESP_MAX_HDRS` / `MQ_GW_RESP_ARENA` (`name\0value\0` per header):
-/// sized so that the 8192-byte render cap is what binds.
-const RESP_MAX_HDRS: usize = 2048;
-const RESP_ARENA: usize = 16 * 1024;
-/// C `adp_resp_head`'s `char head[8192]`.
-const RESP_RENDER_MAX: usize = 8192;
+/// SP4 spec §5: the render buffer, `SECTION_MAX` plus room for the status line
+/// and the `Transfer-Encoding` / `Connection` lines.
+const RESP_RENDER_MAX: usize = SECTION_MAX + 1024;
 
 /// The response head cannot be relayed: 502 `upstream-protocol` (spec §5.4).
 #[derive(Debug, PartialEq, Eq)]
@@ -40,7 +34,8 @@ pub struct RespHead {
 pub struct HeadCollector {
     status: Option<u16>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
-    arena: usize,
+    /// Over the whole section, `:status` included (SP4 spec §5).
+    budget: SectionBudget,
     cl_count: usize,
     cl: Option<u64>,
     bad: bool,
@@ -55,6 +50,7 @@ impl HeadCollector {
         if name == b":status" {
             match value {
                 [a, b, c] if value.iter().all(u8::is_ascii_digit) => {
+                    self.bad = self.budget.add(name, value).is_err();
                     let code = [a, b, c]
                         .iter()
                         .fold(0u16, |n, &&d| n * 10 + u16::from(d - b'0'));
@@ -73,14 +69,7 @@ impl HeadCollector {
             return;
         }
         let ctl = |s: &[u8]| s.iter().any(|&c| matches!(c, b'\r' | b'\n' | 0));
-        self.arena += name.len() + value.len() + 2;
-        if name.len() >= RESP_NAME_CAP
-            || value.len() >= RESP_VAL_CAP
-            || ctl(name)
-            || ctl(value)
-            || self.headers.len() >= RESP_MAX_HDRS
-            || self.arena > RESP_ARENA
-        {
+        if self.budget.add(name, value).is_err() || ctl(name) || ctl(value) {
             self.bad = true;
             return;
         }
@@ -108,7 +97,7 @@ impl HeadCollector {
 
 /// Status line (empty reason), the headers as received (`content-length`
 /// rewritten to `0` for a `HEAD` fetch, §12), `Transfer-Encoding: chunked`
-/// without a `content-length`, `Connection: close`, blank line; > 8192 bytes
+/// without a `content-length`, `Connection: close`, blank line; over `RESP_RENDER_MAX` bytes
 /// is malformed.
 pub fn render_head(h: &RespHead, fetch_method_is_head: bool) -> Result<Vec<u8>, Malformed> {
     let mut o = Vec::with_capacity(512);
@@ -135,6 +124,7 @@ pub fn render_head(h: &RespHead, fetch_method_is_head: bool) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mq_http::limits::{COUNT_MAX, FIELD_MAX};
 
     fn collect(hs: &[(&str, &str)], fin: bool) -> Result<RespHead, Malformed> {
         let mut c = HeadCollector::default();
@@ -237,61 +227,108 @@ mod tests {
     }
 
     #[test]
-    fn head_name_128_value_2048_malformed() {
+    fn head_field_over_field_max_malformed() {
         let st = (":status", "200");
-        let n127 = "n".repeat(127);
-        let v2047 = "v".repeat(2047);
-        assert!(collect(&[st, (&n127, &v2047)], false).is_ok());
+        // name + value = FIELD_MAX fits, one byte more does not.
+        let v_fits = "v".repeat(FIELD_MAX - 1);
+        assert!(collect(&[st, ("n", &v_fits)], false).is_ok());
         assert_eq!(
-            collect(&[st, (&"n".repeat(128), "v")], false),
+            collect(&[st, ("n", &format!("{v_fits}v"))], false),
             Err(Malformed)
         );
+        let n_fits = "n".repeat(FIELD_MAX);
+        assert!(collect(&[st, (&n_fits, "")], false).is_ok());
         assert_eq!(
-            collect(&[st, ("n", &"v".repeat(2048))], false),
+            collect(&[st, (&format!("{n_fits}n"), "")], false),
             Err(Malformed)
         );
-        // 2048 headers is the count cap (the render cap binds long before).
-        let mut c = HeadCollector::default();
-        c.push(b":status", b"200");
-        for _ in 0..2048 {
-            c.push(b"a", b"");
-        }
-        assert!(c.finish(false).is_ok());
-        let mut c = HeadCollector::default();
-        c.push(b":status", b"200");
-        for _ in 0..2049 {
-            c.push(b"a", b"");
-        }
-        assert_eq!(c.finish(false), Err(Malformed));
-        // The 16 KiB arena (`name\0value\0`).
-        let mut c = HeadCollector::default();
-        c.push(b":status", b"200");
-        for _ in 0..8 {
-            c.push(b"n", &[b'v'; 2045]); // 2048 arena bytes each
-        }
-        assert!(c.finish(false).is_ok());
-        let mut c = HeadCollector::default();
-        c.push(b":status", b"200");
-        for _ in 0..8 {
-            c.push(b"n", &[b'v'; 2045]);
-        }
-        c.push(b"n", b"");
-        assert_eq!(c.finish(false), Err(Malformed));
     }
 
     #[test]
-    fn head_render_over_8192_malformed() {
-        // Fixed part: "HTTP/1.1 200 \r\n" (15) + "content-length: 0\r\n" (19)
-        // + "Connection: close\r\n" (19) + "\r\n" (2) = 55; "x: <v>\r\n" = 5 + len.
-        let fits = "v".repeat(8192 - 55 - 5 - 4 * 2005);
-        let mut hs = vec![(":status", "200"), ("content-length", "0")];
+    fn collector_6k_value_ok() {
+        let six_k = "v".repeat(6 * 1024);
+        let h = collect(&[(":status", "200"), ("x-big", &six_k)], false).unwrap();
+        assert_eq!(h.headers, [(b"x-big".to_vec(), six_k.into_bytes())]);
+    }
+
+    #[test]
+    fn collector_257_headers_malformed() {
+        // `:status` counts: 255 more headers make 256 fields, 256 more make 257.
+        let fill = |n: usize| {
+            let mut c = HeadCollector::default();
+            c.push(b":status", b"200");
+            for _ in 0..n {
+                c.push(b"a", b"");
+            }
+            c.finish(false)
+        };
+        assert!(fill(COUNT_MAX - 1).is_ok());
+        assert_eq!(fill(COUNT_MAX), Err(Malformed));
+    }
+
+    /// `:status: 200` costs 7 + 3 + 32 = 42; seven 4032-byte fields and one of 4502
+    /// fill SECTION_MAX exactly.
+    fn full_section<'a>(v: &'a str, last: &'a str) -> Vec<(&'a str, &'a str)> {
+        let mut hs = vec![(":status", "200")];
+        hs.extend([("n", v); 7]);
+        hs.push(("n", last));
+        hs
+    }
+
+    #[test]
+    fn collector_section_budget_counts_status_and_32k_binds() {
+        let (v, last) = ("v".repeat(3999), "v".repeat(4469));
+        let mut hs = full_section(&v, &last);
+        assert!(collect(&hs, false).is_ok());
+        hs.push(("a", ""));
+        assert_eq!(collect(&hs, false), Err(Malformed));
+        let over = format!("{last}v");
+        assert_eq!(
+            collect(&full_section(&v, &over), false),
+            Err(Malformed),
+            "one byte over"
+        );
+    }
+
+    #[test]
+    fn render_head_near_section_max_fits() {
+        // A section filling SECTION_MAX renders (about 32.5 KiB) within the cap.
+        let (v, last) = ("v".repeat(3999), "v".repeat(4469));
+        let got = render(&full_section(&v, &last), false).unwrap();
+        assert!(
+            got.len() > 32_000 && got.len() <= RESP_RENDER_MAX,
+            "{}",
+            got.len()
+        );
+    }
+
+    #[test]
+    fn head_render_over_8192_ok() {
+        // SP3's 8 KiB render cap is gone: the old at-the-cap fixture plus one byte.
+        let fits = "v".repeat(8192 - 55 - 5 - 4 * 2005 + 1);
         let big = "v".repeat(2000);
+        let mut hs = vec![(":status", "200"), ("content-length", "0")];
         hs.extend([("x", big.as_str()); 4]);
         hs.push(("x", &fits));
-        assert_eq!(render(&hs, false).unwrap().len(), 8192);
-        let over = format!("{fits}v");
-        *hs.last_mut().unwrap() = ("x", &over);
-        assert_eq!(render(&hs, false), Err(Malformed));
+        assert_eq!(render(&hs, false).unwrap().len(), 8193);
+    }
+
+    #[test]
+    fn head_render_over_render_max_malformed() {
+        // The collector cannot produce this (a rendered field is 4 bytes over its
+        // content, the budget's is 32), so build the head directly.
+        let mk = |n: usize| RespHead {
+            status: 200,
+            headers: vec![(b"x".to_vec(), vec![b'v'; n])],
+            cl: None,
+            has_cl: true,
+            fin: false,
+        };
+        // "HTTP/1.1 200 \r\n" (15) + "x: <v>\r\n" (5 + n) + "Connection: close\r\n" (19) + "\r\n" (2).
+        let fits = RESP_RENDER_MAX - 15 - 5 - 19 - 2;
+        let at_cap = render_head(&mk(fits), false).unwrap();
+        assert_eq!(at_cap.len(), RESP_RENDER_MAX);
+        assert_eq!(render_head(&mk(fits + 1), false), Err(Malformed));
     }
 
     #[test]

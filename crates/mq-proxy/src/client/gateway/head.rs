@@ -3,12 +3,16 @@
 
 use mq_http::h1;
 use mq_http::headers::{
-    HttpVer, Method, NAME_CAP, Reject, Target, VAL_CAP, forward_cookie_requested, has_dup_xmq,
-    parse_cache_ttl, parse_http_ver, parse_method, parse_method_upper, parse_target, strip_client,
+    HttpVer, Method, Reject, Target, forward_cookie_requested, has_dup_xmq, parse_cache_ttl,
+    parse_http_ver, parse_method, parse_method_upper, parse_target, strip_client,
 };
+use mq_http::limits::SectionBudget;
 
 /// C `MQ_GW_MAX_SEND_HDRS` (spec §5.2: at most 64 + 8 headers).
 const MAX_FWD: usize = h1::MAX_HEADERS + 8;
+/// A control value (auth, class, accept-encoding) of this many bytes is too long
+/// (SP4 spec §5: unchanged; the forwarded headers use `mq_http::limits`).
+const CTL_VAL_MAX: usize = 1024;
 
 /// The request head, owned (spec §5.2: the parser's borrows end at
 /// `tcp_consume`). The control values are raw; `None` = header absent, so the
@@ -109,20 +113,26 @@ pub fn check(head: &Head) -> Result<Checked, Reject> {
         _ => 0,
     };
     // An empty value is never too long, so presence is all that matters here.
-    let long = |v: &Option<Vec<u8>>| v.as_ref().is_some_and(|v| v.len() >= VAL_CAP);
-    let long_fwd = head.headers.iter().any(|(n, v)| {
-        !strip_client(n, head.forward_cookie) && (n.len() >= NAME_CAP || v.len() >= VAL_CAP)
-    });
-    if long(&head.auth) || long(&head.class) || long(&head.accept_encoding) || long_fwd {
+    let long = |v: &Option<Vec<u8>>| v.as_ref().is_some_and(|v| v.len() >= CTL_VAL_MAX);
+    if long(&head.auth) || long(&head.class) || long(&head.accept_encoding) {
         return Err(Reject::HeaderTooLong);
     }
-    Ok(Checked {
+    let checked = Checked {
         method,
         target,
         http_ver,
         cache_ttl,
         auth: auth.clone(),
-    })
+    };
+    // SP4 spec §5: the budget covers exactly what is forwarded, pseudo-headers included.
+    let mut budget = SectionBudget::default();
+    if forwarded_headers(head, &checked)
+        .iter()
+        .any(|(n, v)| budget.add(n, v).is_err())
+    {
+        return Err(Reject::HeaderTooLong);
+    }
+    Ok(checked)
 }
 
 /// Spec §5.2: the forwarded H3 header list, in order.
@@ -188,6 +198,7 @@ pub fn synth_error(code: u16, xmq: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use mq_http::h1::{Progress, parse_head};
+    use mq_http::limits::FIELD_MAX;
 
     type Hs = Vec<(Vec<u8>, Vec<u8>)>;
 
@@ -226,7 +237,7 @@ mod tests {
 
     #[test]
     fn reject_order_1_to_8() {
-        let long = "x".repeat(1024);
+        let long = "x".repeat(FIELD_MAX);
         let cases: [(&[(&str, &str)], Reject); 8] = [
             (
                 &[AUTH, ("x-mq-auth", "Bearer u"), ("X-Mq-Target", "bad")],
@@ -268,7 +279,7 @@ mod tests {
                     AUTH,
                     TARGET,
                     ("X-Mq-Accept-Encoding", "gzip"),
-                    ("Accept-Encoding", &long),
+                    ("X-Long", &long),
                 ],
                 Reject::HeaderTooLong,
             ),
@@ -284,30 +295,32 @@ mod tests {
     fn header_too_long_caps() {
         let v = |n: usize| "v".repeat(n);
         let auth = format!("Bearer {}", v(1024 - 7));
-        let name = "n".repeat(128);
+        // A forwarded field is `name + value`, at most FIELD_MAX bytes.
+        let other = v(FIELD_MAX - "x-other".len());
+        let over_other = v(FIELD_MAX - "x-other".len() + 1);
+        let name = "n".repeat(FIELD_MAX + 1);
         let too_long: [&[(&str, &str)]; 5] = [
             &[("X-Mq-Auth", &auth), TARGET],
             &[AUTH, TARGET, ("X-Mq-Class", &v(1024))],
             &[AUTH, TARGET, ("X-Mq-Accept-Encoding", &v(1024))],
-            &[AUTH, TARGET, (&name, "v")],
-            &[AUTH, TARGET, ("X-Other", &v(1024))],
+            &[AUTH, TARGET, (&name, "")],
+            &[AUTH, TARGET, ("X-Other", &over_other)],
         ];
         for hs in too_long {
             assert_eq!(rej(hs), Reject::HeaderTooLong);
         }
         let auth = format!("Bearer {}", v(1023 - 7));
-        let name = "n".repeat(127);
+        let name = "n".repeat(FIELD_MAX);
         let fits: [&[(&str, &str)]; 5] = [
             &[("X-Mq-Auth", &auth), TARGET],
             &[AUTH, TARGET, ("X-Mq-Class", &v(1023))],
-            &[AUTH, TARGET, (&name, &v(1023))],
-            // stripped headers are not forwarded, so their size does not matter
-            &[AUTH, TARGET, ("Cookie", &v(2000)), ("Host", &v(2000))],
+            &[AUTH, TARGET, (&name, "")],
+            &[AUTH, TARGET, ("X-Other", &other)],
             &[
                 AUTH,
                 TARGET,
                 ("X-Mq-Forward-Cookie", "true"),
-                ("Cookie", &v(1023)),
+                ("Cookie", &v(FIELD_MAX - "cookie".len())),
             ],
         ];
         for hs in fits {
@@ -317,13 +330,59 @@ mod tests {
             AUTH,
             TARGET,
             ("X-Mq-Forward-Cookie", "true"),
-            ("Cookie", &v(1024)),
+            ("Cookie", &v(FIELD_MAX - "cookie".len() + 1)),
         ];
         assert_eq!(
             rej(&cookie),
             Reject::HeaderTooLong,
             "a forwarded cookie counts"
         );
+        // Stripped headers are not forwarded, so their size does not matter.
+        let mut h = head(&[AUTH, TARGET]);
+        for n in ["cookie", "host"] {
+            h.headers.push((n.into(), vec![b'v'; FIELD_MAX + 1]));
+        }
+        assert!(check(&h).is_ok());
+    }
+
+    #[test]
+    fn fetch_head_6k_header_forwarded() {
+        let six_k = "v".repeat(6 * 1024);
+        let got = fwd(&[AUTH, TARGET, ("X-Big", &six_k)]);
+        assert_eq!(
+            got.last().unwrap(),
+            &(b"x-big".to_vec(), six_k.into_bytes())
+        );
+    }
+
+    #[test]
+    fn fetch_head_section_over_32k_header_too_long() {
+        // Five fields of 8000 bytes: each under FIELD_MAX, together over SECTION_MAX.
+        let mut h = head(&[AUTH, TARGET]);
+        h.headers
+            .extend((0..5).map(|i| (format!("x-h{i}").into_bytes(), vec![b'v'; 8000])));
+        assert_eq!(check(&h).unwrap_err(), Reject::HeaderTooLong);
+        // The same section minus one field fits.
+        h.headers.pop();
+        assert!(check(&h).is_ok());
+    }
+
+    #[test]
+    fn overridden_oversized_accept_encoding_accepted() {
+        // `X-Mq-Accept-Encoding` replaces the caller's header, which is dropped
+        // before the budget, so its size does not count.
+        let big = "x".repeat(FIELD_MAX);
+        let got = fwd(&[
+            AUTH,
+            TARGET,
+            ("X-Mq-Accept-Encoding", "gzip"),
+            ("Accept-Encoding", &big),
+        ]);
+        let ae: Vec<_> = got
+            .iter()
+            .filter(|(n, _)| n == b"accept-encoding")
+            .collect();
+        assert_eq!(ae, [&(b"accept-encoding".to_vec(), b"gzip".to_vec())]);
     }
 
     #[test]
