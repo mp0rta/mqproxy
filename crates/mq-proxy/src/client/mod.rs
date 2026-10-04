@@ -146,6 +146,8 @@ pub struct Client {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Owner {
     Fetch(TcpId),
+    #[allow(dead_code)] // constructed by `MStream::open` (Task 7.3)
+    Mitm(mitm::MStreamKey),
 }
 
 /// spec §6.2: truncate to the wire limit with a warning (C truncates silently).
@@ -654,6 +656,7 @@ impl App for Client {
                         g.on_ready(cx, &mut self.ex, tcp, ready);
                     }
                 }
+                Owner::Mitm(_) => {} // the MITM front is wired in Task 8.2
             }
             return self.maybe_exit(cx);
         }

@@ -66,7 +66,9 @@ where
     /// TLS in: drain `reader()` first, then `read_tls` from `rx` (never an empty
     /// reader unless `eof`), `process_new_packets`. `eof = true` = TCP read EOF:
     /// one empty `read_tls` after `rx` is exhausted, pipe EOF published once the
-    /// buffered plaintext drained (spec §2.1, SP3 §7.3).
+    /// buffered plaintext drained (spec §2.1, SP3 §7.3). On `Err`, `consumed`
+    /// is not reported: the caller must abandon the socket, or call `output`
+    /// itself to flush the alert before closing.
     pub fn input(&mut self, mut rx: &[u8], eof: bool) -> Result<In, rustls::Error> {
         let total = rx.len();
         let mut r = In::default();
