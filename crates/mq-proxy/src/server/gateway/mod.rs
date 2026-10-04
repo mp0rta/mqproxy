@@ -222,6 +222,12 @@ impl Gateway {
             Err(_) => return self.core.send_error(cx, id, 400, "bad-request"),
         }
         let d = decide(&c, &self.core.token);
+        // spec §4.7: a conn that has sent the token is not evicted at the conn cap.
+        if d.authed
+            && let Ok(info) = cx.h3_req_info(id)
+        {
+            cx.mark_conn_authed(info.conn);
+        }
         let r = self.core.reqs.get_mut(&id).expect("an Intake request");
         r.authed = d.authed;
         r.meta = d.meta;

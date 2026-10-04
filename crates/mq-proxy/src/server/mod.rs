@@ -494,6 +494,7 @@ impl Server {
             self.cancel(cx, t);
         }
         if ok {
+            cx.mark_conn_authed(c); // spec §4.7: not evicted at the conn cap
             log::info!("mq_server: auth OK");
         } else {
             // spec §6.3 "Auth refused": FIN, then close 1 s later.

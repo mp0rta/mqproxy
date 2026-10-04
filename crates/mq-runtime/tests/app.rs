@@ -60,6 +60,7 @@ impl TransportOps for Null {
         Ok(PathId(7))
     }
     fn close_conn(&mut self, _: Time, _: ConnId) {}
+    fn mark_conn_authed(&mut self, _: ConnId) {}
     fn conn_stats(&self, _: ConnId) -> Result<ConnStats, Error> {
         Err(Error::Stale)
     }

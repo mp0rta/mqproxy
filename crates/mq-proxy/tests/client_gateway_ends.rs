@@ -9,7 +9,8 @@ use mq_proxy::config::ClientConfig;
 use mq_runtime::testing::{Call, log_capture};
 use mq_runtime::{IoRequest, IoResult, TcpId};
 use mq_transport_api::{
-    CloseReason, ConnId, ConnStats, ErrType, Event, H3Close, H3ReqId, H3ReqStats, PathStats, Unread,
+    CloseReason, ConnId, ConnStats, ErrType, Event, H3Close, H3ReqId, H3ReqStats, PathStats,
+    StreamError, Unread,
 };
 use std::io;
 use std::time::Duration;
@@ -153,6 +154,35 @@ fn finish_from_unread_src() {
     assert_eq!(close_of(&mut h, tcp), Some(false));
     assert!(!owned(&h, tcp));
     assert_eq!(resets(&h, r), 0);
+}
+
+/// A stale `H3Readable` (xquic signalled readability, then destroyed the
+/// request: QPACK-blocked HEADERS decoded after the close timer) queued
+/// ahead of `H3Closed`: the read is `Stale`, the rescue still finishes.
+#[test]
+fn stale_readable_before_rescue_headers() {
+    let (mut h, tcp, r) = open();
+    h.t.inject_h3_error(r, StreamError::Stale);
+    closed(&mut h, r, unread(Some(&[(":status", "200")]), b"hello"));
+    let mut want = HEAD_CHUNKED.to_vec();
+    want.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+    assert_eq!(h.tx_all(tcp), want);
+    assert_eq!(close_of(&mut h, tcp), Some(false));
+    assert!(!owned(&h, tcp));
+}
+
+#[test]
+fn stale_readable_before_rescue_body() {
+    let (mut h, tcp, r) = open();
+    respond(&mut h, r, &[(":status", "200")], false);
+    body(&mut h, r, b"abc", false);
+    h.t.inject_h3_error(r, StreamError::Stale);
+    closed(&mut h, r, unread(None, b"de"));
+    let mut want = HEAD_CHUNKED.to_vec();
+    want.extend_from_slice(b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n");
+    assert_eq!(h.tx_all(tcp), want);
+    assert_eq!(close_of(&mut h, tcp), Some(false));
+    assert!(!owned(&h, tcp));
 }
 
 #[test]

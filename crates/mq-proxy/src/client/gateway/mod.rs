@@ -425,7 +425,9 @@ impl Gateway {
             let mut col = HeadCollector::default();
             let fin = match cx.h3_recv_headers(h3, &mut |n, v| col.push(n, v)) {
                 Ok(fin) => fin,
-                Err(StreamError::Blocked) => return,
+                // Stale: a readiness queued before xquic destroyed the request;
+                // its `H3Closed` follows with the rescue (§3.7 (2)).
+                Err(StreamError::Blocked | StreamError::Stale) => return,
                 Err(_) => return self.abort(cx, tcp),
             };
             match d.start(cx, tcp, method, col, fin) {
@@ -438,7 +440,7 @@ impl Gateway {
         while d.pending.is_empty() {
             let (n, fin) = match cx.h3_recv_body(h3, &mut buf) {
                 Ok(x) => x,
-                Err(StreamError::Blocked) => return,
+                Err(StreamError::Blocked | StreamError::Stale) => return, // as above
                 Err(_) => return self.abort(cx, tcp),
             };
             // A zero-length read is never framed (it would end the body).

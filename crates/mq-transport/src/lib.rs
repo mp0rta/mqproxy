@@ -40,6 +40,8 @@ pub(crate) struct Inner {
     n_counted: u32,
     /// Accepted, not yet admitted or released (spec §4.7).
     n_provisional: u32,
+    /// Admissions so far: the next `ConnSlot::admitted` (spec §4.7).
+    n_admitted: u64,
     conns: Slots<ConnSlot>,
     streams: Slots<StreamSlot>,
     h3reqs: Slots<H3ReqSlot>,
@@ -61,6 +63,7 @@ impl Inner {
             alpn,
             n_counted: 0,
             n_provisional: 0,
+            n_admitted: 0,
             conns: Default::default(),
             streams: Default::default(),
             h3reqs: Default::default(),
@@ -204,6 +207,12 @@ impl TransportOps for Transport {
 
     fn close_conn(&mut self, now: Time, c: ConnId) {
         conn::close_conn(self, now, c)
+    }
+
+    fn mark_conn_authed(&mut self, c: ConnId) {
+        if let Some(s) = self.inner.conns.get_mut(c.slot()) {
+            s.authed = true;
+        }
     }
 
     fn conn_stats(&self, c: ConnId) -> Result<ConnStats, mq_transport_api::Error> {

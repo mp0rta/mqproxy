@@ -13,7 +13,7 @@
 | `--listen <ip:port>` | **(必須)** MPQUIC コネクションを受け付ける UDP アドレス |
 | `--token <token>` | **(必須)** クライアントが提示すべき共有認証トークン |
 | `--cert <path>` / `--key <path>` | **（必須）** TLS 証明書／鍵 (PEM)。リポジトリには `tests/certs` にローカル用の自己署名テスト証明書が同梱されています。 |
-| `--max-conns <N>` | 同時 QUIC コネクション数の上限 (デフォルト 16、`0` = 無制限)。超過した受信コネクションは拒否されます (`CONNECTION_REFUSED`) — 認証前 DoS ガード。 |
+| `--max-conns <N>` | 同時 QUIC コネクション数の上限 (デフォルト 16、`0` = 無制限)。上限到達時は、まだ認証していない (`AUTH` も有効なトークン付きゲートウェイリクエストもない) 最も古いコネクションを切断して新しいコネクションを受け入れます。全コネクションが認証済みなら新規は拒否されます (`CONNECTION_REFUSED`) — 認証前 DoS ガード。 |
 | `--cc <algo>` | 輻輳制御: `bbr` (デフォルト) \| `bbr2` \| `cubic` |
 | `--scheduler <s>` | マルチパススケジューラ: `minrtt` (デフォルト) \| `backup` \| `wlb` |
 | `--qlog <dir>` | xquic qlog を `<dir>/server.qlog` に書き出す |

@@ -4,7 +4,7 @@
 mod server_harness;
 
 use mq_proxy::config::ServerConfig;
-use mq_runtime::testing::log_capture;
+use mq_runtime::testing::{Call, log_capture};
 use mq_transport_api::{Event, StreamError, StreamKind};
 use mq_wire::frames::{AuthResp, FEAT_UDP_RELAY};
 use server_harness::*;
@@ -27,6 +27,8 @@ fn auth_ok_advertises_udp_relay() {
     );
     assert_eq!(h.send_fins(ctrl), [false], "control stream stays open");
     assert_eq!(h.sh.app().auth_attempts(), 1);
+    // spec §4.7: exempt from eviction at the conn cap.
+    assert_eq!(h.count(|x| *x == Call::MarkConnAuthed(c)), 1);
     // Authenticated: no close, not even after the auth deadline.
     h.advance(Duration::from_secs(20));
     assert_eq!(h.close_conn_count(c), 0);
@@ -84,6 +86,7 @@ fn auth_wrong_token_error_fin_then_close_after_1s() {
         "never reset: that would discard the response"
     );
     assert_eq!(h.sh.app().auth_attempts(), 1);
+    assert_eq!(h.count(|x| matches!(x, Call::MarkConnAuthed(_))), 0);
     h.advance(Duration::from_millis(999));
     assert_eq!(h.close_conn_count(c), 0, "time to deliver the response");
     h.advance(Duration::from_millis(1));
