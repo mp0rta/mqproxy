@@ -426,7 +426,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | `--listen <ip:port>` | **(required)** UDP address to accept MPQUIC connections on |
 | `--token <token>` | **(required)** Shared auth token clients must present |
 | `--cert <path>` / `--key <path>` | **(required)** TLS cert/key (PEM). The repo ships a self-signed test cert under `tests/certs` for local use. |
-| `--max-conns <N>` | Cap on simultaneous QUIC connections (default 16; `0` = unlimited). Excess inbound connections are refused (`CONNECTION_REFUSED`) — a pre-auth DoS guard. |
+| `--max-conns <N>` | Cap on simultaneous QUIC connections (default 16; `0` = unlimited). At the cap, a new connection evicts the oldest one that has not authenticated yet (`AUTH`, or a gateway request with a valid token); when every connection is authenticated, new ones are refused (`CONNECTION_REFUSED`) — a pre-auth DoS guard. |
 | `--cc <algo>` | Congestion control: `bbr` (default) \| `bbr2` \| `cubic` |
 | `--scheduler <s>` | Multipath scheduler: `minrtt` (default) \| `backup` \| `wlb` |
 | `--qlog <dir>` | Write xquic qlog to `<dir>/server.qlog` |
