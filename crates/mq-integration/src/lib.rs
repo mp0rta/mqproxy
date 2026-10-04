@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "harness")]
+pub mod browser;
+#[cfg(feature = "harness")]
 pub mod driver_harness;
 #[cfg(feature = "harness")]
 pub mod h3_apps;

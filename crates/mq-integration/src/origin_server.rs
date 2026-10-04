@@ -142,6 +142,18 @@ pub enum Handler {
     HangNoResponse,
     /// Closes the connection without a response.
     CloseWithoutResponse,
+    /// The inner handler's response with these headers appended.
+    WithHeaders(Vec<(&'static str, String)>, Box<Handler>),
+}
+
+/// One request as the origin saw it (`OriginServer::requests`).
+#[derive(Clone, Debug)]
+pub struct RecordedRequest {
+    pub method: String,
+    /// Path and query.
+    pub path: String,
+    /// In order, as received (lowercase names).
+    pub headers: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +190,8 @@ struct Shared {
     closed: AtomicU32,
     /// `EarlyOkKeepBodyUnread` / `GatedKeepBodyUnread` request bodies, by path.
     stash: Mutex<Vec<(String, Incoming)>>,
+    /// Every request the hyper modes served.
+    requests: Mutex<Vec<RecordedRequest>>,
 }
 
 impl Shared {
@@ -209,6 +223,7 @@ impl OriginServer {
             accepted: AtomicU32::new(0),
             closed: AtomicU32::new(0),
             stash: Mutex::default(),
+            requests: Mutex::default(),
         });
         let sh = shared.clone();
         let thread = thread::spawn(move || match mode.proto {
@@ -270,6 +285,11 @@ impl OriginServer {
     /// `RawH2Tls`: the frames written so far, as (type, flags).
     pub fn sent(&self) -> Vec<(u8, u8)> {
         self.shared.sent.lock().unwrap().clone()
+    }
+
+    /// Every request the hyper modes (h1 and h2) received so far.
+    pub fn requests(&self) -> Vec<RecordedRequest> {
+        self.shared.requests.lock().unwrap().clone()
     }
 }
 
@@ -425,6 +445,7 @@ where
     let svc = {
         let (ctl, sh, handler) = (ctl.clone(), sh.clone(), mode.handler.clone());
         service_fn(move |req: Request<Incoming>| {
+            sh.requests.lock().unwrap().push(record(&req));
             let h = pick(&handler, req.uri().path());
             respond(req, h, ctl.clone(), sh.clone())
         })
@@ -471,6 +492,18 @@ async fn run_conn<C: Future>(
     tokio::time::sleep(LINGER).await;
 }
 
+fn record(req: &Request<Incoming>) -> RecordedRequest {
+    let headers = (req.headers().iter())
+        .map(|(n, v)| (n.as_str().to_owned(), v.as_bytes().to_vec()))
+        .collect();
+    let path = req.uri().path_and_query().map_or("", |p| p.as_str());
+    RecordedRequest {
+        method: req.method().as_str().to_owned(),
+        path: path.to_owned(),
+        headers,
+    }
+}
+
 fn pick(h: &Handler, path: &str) -> Handler {
     match h {
         Handler::PerPath(routes) => routes
@@ -489,6 +522,11 @@ async fn respond(
 ) -> Result<Response<OBody>, Infallible> {
     let mut resp = Response::new(OBody::Gen(Gen::new(0, Some(0))));
     let mut h = HeaderMap::new();
+    let (mut handler, mut extra) = (handler, Vec::new());
+    while let Handler::WithHeaders(hs, inner) = handler {
+        extra.extend(hs);
+        handler = *inner;
+    }
     let body = match handler {
         Handler::Echo => OBody::Echo(req.into_body()),
         Handler::FileBytes(n) => OBody::Gen(Gen::new(n, Some(n))),
@@ -505,6 +543,7 @@ async fn respond(
             OBody::Gen(g)
         }
         Handler::PerPath(_) => unreachable!("resolved by pick"),
+        Handler::WithHeaders(..) => unreachable!("unwrapped above"),
         Handler::Trailers(n) => {
             let mut g = Gen::new(n, None);
             g.tail = Tail::Trailers;
@@ -570,6 +609,12 @@ async fn respond(
             return pending().await;
         }
     };
+    for (n, v) in extra {
+        h.append(
+            header_name(n),
+            HeaderValue::from_str(&v).expect("header value"),
+        );
+    }
     *resp.headers_mut() = h;
     *resp.body_mut() = body;
     Ok(resp)

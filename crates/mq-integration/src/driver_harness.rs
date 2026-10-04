@@ -135,12 +135,28 @@ impl<H: Send + 'static> DriverThread<H> {
         A: App + 'static,
         F: FnOnce(SocketAddr) -> (Shard<T, A>, H) + Send + 'static,
     {
+        Self::spawn_on_addr(SocketAddr::new(udp_ip, 0), cfg, listeners, factory)
+    }
+
+    /// `spawn_with` with the primary UDP socket bound to exactly `udp` (a
+    /// restarted server keeps its address).
+    pub fn spawn_on_addr<T, A, F>(
+        udp: SocketAddr,
+        cfg: DriverConfig,
+        listeners: Vec<(ListenKind, ListenerTag)>,
+        factory: F,
+    ) -> DriverThread<H>
+    where
+        T: TransportOps + 'static,
+        A: App + 'static,
+        F: FnOnce(SocketAddr) -> (Shard<T, A>, H) + Send + 'static,
+    {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel::<()>();
         let (done_tx, done) = mpsc::channel();
         let thread = thread::spawn(move || {
             let mut d = Driver::new(cfg).expect("driver");
-            let udp = d.bind_udp(SocketAddr::new(udp_ip, 0)).expect("bind_udp");
+            let udp = d.bind_udp(udp).expect("bind_udp");
             let udp_addr = udp.local_addr();
             let (mut shard, handle) = factory(udp_addr);
             d.attach_primary_udp(udp, shard.primary_udp())
