@@ -251,6 +251,7 @@ impl Gateway {
                 }
             }
             Event::MpReady(c) if mine == Some(c) => self.tunnel.paths.on_mp_ready(cx, c),
+            Event::PathRemoved(c, p) if mine == Some(c) => self.tunnel.paths.on_path_removed(cx, p),
             // Ignored once EOF was read (out of `by_h3`, §5.5).
             Event::H3Closed(r, close) => {
                 if let Some(tcp) = self.by_h3.remove(&r) {
@@ -644,7 +645,9 @@ impl Gateway {
     /// SP3 spec §5.8: `false` = not the gateway's timer.
     pub fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) -> bool {
         let Some(tm) = self.timers.remove(&id) else {
-            return false;
+            // A path retry of the tunnel (§5.7: own backoff and paths).
+            let conn = self.tunnel.conn.filter(|_| !self.shutting_down);
+            return self.tunnel.paths.on_timer(cx, conn, id);
         };
         match tm {
             GwTm::Reconnect => {

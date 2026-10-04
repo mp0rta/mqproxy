@@ -147,7 +147,8 @@ impl TransportOps for Transport {
                 Event::ConnEstablished(c)
                 | Event::NewConn(c, _)
                 | Event::MpReady(c)
-                | Event::DatagramReadable(c) => conns.is_live(c.slot()),
+                | Event::DatagramReadable(c)
+                | Event::PathRemoved(c, _) => conns.is_live(c.slot()),
                 Event::NewStream(_, s, _) | Event::StreamReadable(s) | Event::StreamWritable(s) => {
                     streams.is_live(s.slot())
                 }

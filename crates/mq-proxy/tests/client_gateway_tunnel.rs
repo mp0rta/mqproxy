@@ -290,7 +290,7 @@ fn mp_ready_and_udp_socket_route_to_gateway_paths() {
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("INFO mq_gw_client: extra path up: bind 10.0.0.2 -> path_id ")),
+            .any(|l| l.starts_with("INFO mq_gw_client: path up: bind 10.0.0.2 -> path_id ")),
         "{lines:?}"
     );
     assert!(h.log().contains(&Call::AddPath {
@@ -303,6 +303,31 @@ fn mp_ready_and_udp_socket_route_to_gateway_paths() {
             .any(|r| matches!(r, IoRequest::CloseUdpSocket { .. })),
         "the gateway kept the socket"
     );
+}
+
+/// Path recovery (#35) on the gateway tunnel: a path xquic removed is re-added
+/// after the per-candidate backoff; the retry timer reaches the gateway's `Paths`.
+#[test]
+fn gateway_removed_path_reopens_after_backoff() {
+    let a: IpAddr = "10.0.0.2".parse().unwrap();
+    let (mut h, op) = gw_with_extra_path(a);
+    let gw = h.gw_conn.unwrap();
+    h.t.expect_add_path(Ok(mq_transport_api::PathId(1)));
+    h.sh.on_udp_socket(h.now, op, Ok(SocketAddr::new(a, 40000)))
+        .unwrap();
+    h.reqs();
+    h.event(Event::PathRemoved(gw, mq_transport_api::PathId(1)));
+    let opens = |reqs: Vec<IoRequest>| -> Vec<IpAddr> {
+        reqs.iter()
+            .filter_map(|r| match r {
+                IoRequest::OpenUdpSocket { local_ip, .. } => Some(*local_ip),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(opens(h.reqs()).is_empty(), "not at once");
+    h.advance(Duration::from_millis(500));
+    assert_eq!(opens(h.reqs()), [a], "re-opened by the gateway's retry");
 }
 
 #[test]

@@ -127,6 +127,7 @@ impl Events {
             | Event::NewConn(..)
             | Event::NewStream(..)
             | Event::StreamClosed(_)
+            | Event::PathRemoved(..)
             | Event::H3Request(..)
             | Event::H3Closed(..) => {}
         }

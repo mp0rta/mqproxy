@@ -6,7 +6,7 @@
 use mq_transport::Transport;
 use mq_transport_api::{CongestionControl, Event, Role, Scheduler, Time, TransportConfig};
 use mq_transport_api::{TransportOps, TxKey};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -52,6 +52,9 @@ pub struct Peer {
     pub local_addrs: Vec<SocketAddr>,
     /// Keys whose "socket" is unwritable: `pump_out` leaves their queues untouched.
     pub blocked: HashSet<TxKey>,
+    /// Path id -> index into `local_addrs`, overriding the default "path k sends from
+    /// `local_addrs[k]`" (a re-added path takes a fresh id but reuses an address).
+    pub path_addr: HashMap<u64, usize>,
 }
 
 impl Peer {
@@ -73,6 +76,7 @@ impl Peer {
             thread: Some(thread),
             local_addrs,
             blocked: HashSet::new(),
+            path_addr: HashMap::new(),
         }
     }
 
@@ -95,13 +99,15 @@ impl Peer {
     pub fn pump_out(&self, now: Time) -> Vec<Datagram> {
         let blocked = self.blocked.clone();
         let addrs = self.local_addrs.clone();
+        let path_addr = self.path_addr.clone();
         self.call(now, move |t, _| {
             let mut keys = Vec::new();
             t.pending_transmit(&mut keys);
             let mut out = Vec::new();
             for key in keys.into_iter().filter(|k| !blocked.contains(k)) {
                 // A server has one socket for every path.
-                let from = addrs[(key.1.0 as usize).min(addrs.len() - 1)];
+                let k = path_addr.get(&key.1.0).copied().unwrap_or(key.1.0 as usize);
+                let from = addrs[k.min(addrs.len() - 1)];
                 while let Some(tx) = t.peek_transmit(key) {
                     let before = out.len();
                     out.extend(tx.payload.chunks(tx.segment_size).map(|d| Datagram {

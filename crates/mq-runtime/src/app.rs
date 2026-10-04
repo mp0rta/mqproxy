@@ -347,6 +347,10 @@ impl<'a> Cx<'a> {
     pub fn primary_local(&self) -> SocketAddr {
         self.st.primary_local()
     }
+    /// The primary UDP socket, for re-adding a removed primary path.
+    pub fn primary_udp(&self) -> UdpSocketId {
+        self.st.primary_udp()
+    }
     /// spec §5.4: request a UDP socket on an ephemeral port; completes in `on_udp_socket`.
     pub fn open_udp_socket(&mut self, local_ip: IpAddr) -> SocketOpId {
         self.st.open_udp_socket(local_ip)

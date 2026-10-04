@@ -563,6 +563,19 @@ pub(super) unsafe extern "C" fn ready_to_create_path_notify(
     })
 }
 
+pub(super) unsafe extern "C" fn path_removed_notify(
+    _scid: *const xqc_cid_t,
+    path_id: u64,
+    ud: *mut c_void,
+) {
+    with_inner((), |i| {
+        if i.conns.is_live(slot_of(ud)) {
+            i.events
+                .push(Event::PathRemoved(conn_id(slot_of(ud)), PathId(path_id)));
+        }
+    })
+}
+
 /// `ud` is the connection's transport user data (the slot from `server_accept` or `connect`).
 pub(super) unsafe extern "C" fn conn_create_notify(
     conn: *mut xqc_connection_t,

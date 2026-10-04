@@ -575,6 +575,8 @@ pub struct Pair<S: App, C: App> {
     pub now: Time,
     /// Datagrams are dropped in both directions.
     pub blackhole: bool,
+    /// Datagrams from or to this address are dropped (one path black-holed).
+    pub blackhole_ip: Option<IpAddr>,
     /// When `Some`, every datagram sent is appended with its time.
     pub wire: Option<Vec<(Time, Packet)>>,
     /// Datagrams to an address neither side owns (e.g. a closed socket), dropped.
@@ -589,6 +591,7 @@ impl<S: App + 'static, C: App + 'static> Pair<S, C> {
             fabric: Fabric::new(),
             now: T0,
             blackhole: false,
+            blackhole_ip: None,
             wire: None,
             unrouted: 0,
         }
@@ -629,6 +632,10 @@ impl<S: App + 'static, C: App + 'static> Pair<S, C> {
         }
         if !self.blackhole {
             for p in out {
+                let ip = self.blackhole_ip;
+                if ip.is_some_and(|ip| p.from.ip() == ip || p.to.ip() == ip) {
+                    continue;
+                }
                 self.fabric.push(self.now, p);
             }
         }
@@ -1052,7 +1059,7 @@ impl App for RawClient {
                     st.closed = true;
                 }
             }
-            Event::NewConn(..) | Event::MpReady(_) => {}
+            Event::NewConn(..) | Event::MpReady(_) | Event::PathRemoved(..) => {}
             Event::DatagramReadable(_) => {} // wired with the UDP lane
             Event::H3Request(..)
             | Event::H3Readable(_)

@@ -636,6 +636,47 @@ fn conn_closed_sweeps_relays_by_conn_id_and_mapped_sockets() {
 }
 
 #[test]
+fn path_removed_closes_only_that_paths_socket() {
+    let mut h = setup();
+    let a = h.conn();
+    let open = |h: &mut H, port| {
+        let op = h.sh.with_app(T0, |_, cx| {
+            cx.open_udp_socket(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        });
+        h.sh.on_udp_socket(T0, op, Ok(addr(port))).unwrap()
+    };
+    let (s1, s2) = (open(&mut h, 7001), open(&mut h, 7002));
+    let primary = h.sh.primary_udp();
+    let (p1, p2, p0) = h.sh.with_app(T0, |_, cx| {
+        (
+            cx.add_path(a, s1, false).unwrap(),
+            cx.add_path(a, s2, false).unwrap(),
+            cx.add_path(a, primary, false).unwrap(),
+        )
+    });
+    h.sh.drive(T0);
+    h.reqs();
+    h.app.take();
+    h.t.push_event(Event::PathRemoved(a, p1));
+    h.t.push_event(Event::PathRemoved(a, p0));
+    h.sh.drive(T0);
+    assert_eq!(h.reqs(), [IoRequest::CloseUdpSocket { sock: s1 }]);
+    assert_eq!(
+        h.app.take(),
+        [
+            Recorded::TransportEvent(Event::PathRemoved(a, p1)),
+            Recorded::TransportEvent(Event::PathRemoved(a, p0))
+        ]
+    );
+    // p1's queue falls back to the primary; p2 keeps its socket.
+    h.t.set_transmit((Some(a), p1), addr(9), vec![vec![1]]);
+    h.t.set_transmit((Some(a), p2), addr(9), vec![vec![2]]);
+    let mut socks: Vec<_> = h.sh.pending_transmit().collect();
+    socks.sort();
+    assert_eq!(socks, [primary, s2]);
+}
+
+#[test]
 fn late_event_for_closed_relay_dropped() {
     let mut h = setup();
     let (tcp, s) = h.relay();

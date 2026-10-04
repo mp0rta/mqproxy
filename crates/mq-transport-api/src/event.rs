@@ -1,7 +1,7 @@
 //! Events and transmit view (spec §4.2).
 
 use crate::config::ConnProto;
-use crate::ids::{ConnId, H3ReqId, StreamId};
+use crate::ids::{ConnId, H3ReqId, PathId, StreamId};
 use std::net::SocketAddr;
 
 /// Transport output event (spec §4.2). `StreamReadable`, `StreamWritable`,
@@ -24,6 +24,9 @@ pub enum Event {
     /// A datagram is in the connection's receive ring; drain with
     /// `datagram_recv` until `None` (spec §3.1).
     DatagramReadable(ConnId),
+    /// xquic closed a path (peer abandon, path idle timeout, failed validation); the
+    /// connection lives on. Re-adding a path is up to the app: no `MpReady` follows.
+    PathRemoved(ConnId, PathId),
     /// Server: the peer opened a request (spec §3.1).
     H3Request(ConnId, H3ReqId),
     /// Level flags, coalesced.
