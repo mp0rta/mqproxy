@@ -14,6 +14,7 @@ pub mod backoff;
 pub mod exchange;
 pub mod gateway;
 mod ingress_glue;
+pub mod mitm;
 mod paths;
 pub mod pending;
 pub mod tunnel_h3;
