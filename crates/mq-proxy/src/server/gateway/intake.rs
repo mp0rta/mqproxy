@@ -11,7 +11,7 @@ use mq_http::headers::{
     AUTHORITY_MAX, HttpVer, Method, name_ok, parse_http_ver, parse_method, strip_server,
     uri_field_ok, value_ok,
 };
-use mq_http::limits::{COUNT_MAX, SectionBudget, TARGET_PATH_MAX};
+use mq_http::limits::{SectionBudget, TARGET_PATH_MAX};
 use subtle::ConstantTimeEq;
 
 /// C's fixed buffers `char auth[512]` / `char cls[128]`: the only two
@@ -40,8 +40,6 @@ pub(super) struct Capture {
     /// The forwarded set, in order.
     headers: Vec<(Vec<u8>, Vec<u8>)>,
     bad_header: bool,
-    /// More than `COUNT_MAX` fields.
-    bad: bool,
     /// The pseudo-headers and every forwarded field (SP4 spec §5).
     budget: SectionBudget,
 }
@@ -81,9 +79,8 @@ impl Capture {
             // (the response cache is gone) and hop-by-hop go with `strip_server`.
         } else if !name_ok(n) || !value_ok(v) || http::HeaderName::from_bytes(n).is_err() {
             self.bad_header = true;
-        } else if self.budget.count() == COUNT_MAX {
-            self.bad = true;
         } else if self.budget.add(n, v).is_err() {
+            // Field, section or count (`COUNT_MAX`) overflow.
             self.bad_header = true;
         } else {
             self.headers.push((n.to_vec(), v.to_vec()));
@@ -120,7 +117,7 @@ pub(super) fn decide(c: &Capture, token: &[u8]) -> Decision {
     if c.bad_header {
         return reject(false, 400, "bad-header");
     }
-    if c.bad || c.bad_cl {
+    if c.bad_cl {
         return reject(false, 400, "bad-request");
     }
     let tok = c.auth.as_deref().and_then(|a| a.strip_prefix(b"Bearer "));
@@ -260,10 +257,11 @@ mod tests {
         let d = decide(&c, TOK);
         assert_eq!(d.outcome.map(|_| ()), Err((400, "bad-header")));
         assert!(!d.authed && d.meta.is_none());
-        // 3 before 4: count overflow, then a bad content-length.
+        // Count overflow (SP4 spec §5) is a step-2 `bad-header`, before auth.
         let mut c = many(257);
         c.each(b"x-mq-auth", b"Bearer nope");
-        assert_eq!(outcome(&c), Err((400, "bad-request")));
+        assert_eq!(outcome(&c), Err((400, "bad-header")));
+        // 3 before 4: a bad content-length.
         let mut c = req(&[bad_auth], false);
         c.each(b"content-length", b"");
         assert_eq!(outcome(&c), Err((400, "bad-request")));
@@ -590,10 +588,10 @@ mod tests {
     }
 
     #[test]
-    fn intake_count_256_incl_pseudo_then_bad_request() {
+    fn intake_count_256_incl_pseudo_then_bad_header() {
         // 4 pseudo-headers + accept already count: 251 more reach COUNT_MAX.
         assert_eq!(outcome(&many(251)), Ok(()));
-        assert_eq!(outcome(&many(252)), Err((400, "bad-request")));
+        assert_eq!(outcome(&many(252)), Err((400, "bad-header")));
     }
 
     #[test]
