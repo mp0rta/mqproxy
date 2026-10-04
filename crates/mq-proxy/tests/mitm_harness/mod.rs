@@ -7,8 +7,8 @@
 
 use crate::common::{addr, meta};
 use bytes::Bytes;
-use h2::RecvStream;
 use h2::client::{ResponseFuture, SendRequest};
+use h2::{Reason, RecvStream, SendStream};
 use mq_proxy::client::TRANSPARENT;
 use mq_proxy::client::mitm::Handoff;
 use mq_proxy::client::mitm::MitmTuning;
@@ -220,6 +220,40 @@ impl MH {
         self.sh.app().conn_count()
     }
 
+    /// One round of `flow`: pending events, the proxy's output to the
+    /// browser, the browser's into whatever receive room there is (the rest
+    /// stays in `pending`), then a due continuation. `true` when anything
+    /// moved.
+    pub fn flow_step(&mut self, b: &mut Browser, tcp: TcpId, pending: &mut Vec<u8>) -> bool {
+        self.drive();
+        let from = self.tcp_out_all(tcp);
+        pending.extend(b.exchange(&from));
+        let fed = if self.close_of(tcp).is_none() {
+            self.tcp_in_some(tcp, pending)
+        } else {
+            pending.len()
+        };
+        pending.drain(..fed);
+        let cont = self.sh.next_timeout() == Some(self.now);
+        if cont {
+            self.drive();
+        }
+        !from.is_empty() || fed > 0 || cont
+    }
+
+    /// `relay` for bulk transfers: the receive buffer may fill, and
+    /// continuations (0-delay timers) fire, until nothing moves.
+    pub fn flow(&mut self, b: &mut Browser, tcp: TcpId) {
+        let mut pending = Vec::new();
+        for _ in 0..100_000 {
+            if !self.flow_step(b, tcp, &mut pending) {
+                assert!(pending.is_empty(), "browser bytes stuck");
+                return;
+            }
+        }
+        panic!("flow did not settle");
+    }
+
     /// Bytes both ways until neither side has anything to send.
     pub fn relay(&mut self, b: &mut Browser, tcp: TcpId) {
         for _ in 0..100 {
@@ -301,10 +335,21 @@ struct BStream {
     data: Vec<u8>,
     done: bool,
     err: Option<String>,
+    reason: Option<Reason>,
+    /// The request side, kept for more body or a reset.
+    up: Option<SendStream<Bytes>>,
+    /// Received bytes whose capacity is held back (`Browser::hold_capacity`).
+    unreleased: usize,
 }
 
 impl BStream {
-    fn poll(&mut self, cx: &mut Context<'_>) {
+    fn fail(&mut self, e: h2::Error) {
+        self.reason = e.reason();
+        self.err = Some(e.to_string());
+        self.done = true;
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>, hold: bool) {
         if let Some(f) = &mut self.resp {
             match Pin::new(f).poll(cx) {
                 Poll::Pending => return,
@@ -314,10 +359,7 @@ impl BStream {
                     self.head = Some(p);
                     self.body = Some(b);
                 }
-                Poll::Ready(Err(e)) => {
-                    self.err = Some(e.to_string());
-                    self.done = true;
-                }
+                Poll::Ready(Err(e)) => self.fail(e),
             }
             self.resp = None;
         }
@@ -326,13 +368,14 @@ impl BStream {
             match b.poll_data(cx) {
                 Poll::Pending => return,
                 Poll::Ready(Some(Ok(d))) => {
-                    let _ = b.flow_control().release_capacity(d.len());
+                    if hold {
+                        self.unreleased += d.len();
+                    } else {
+                        let _ = b.flow_control().release_capacity(d.len());
+                    }
                     self.data.extend_from_slice(&d);
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    self.err = Some(e.to_string());
-                    self.done = true;
-                }
+                Poll::Ready(Some(Err(e))) => return self.fail(e),
                 Poll::Ready(None) => self.done = true,
             }
         }
@@ -366,6 +409,39 @@ pub struct Browser {
     pub close_notify: bool,
     eof_to_h2: bool,
     pub tls_error: Option<rustls::Error>,
+    /// Received DATA capacity is not released (`hold_capacity`).
+    hold: bool,
+    /// Ciphertext toward the proxy, not yet returned by `exchange`.
+    ct_out: Vec<u8>,
+    /// Every plaintext byte toward the proxy, in order.
+    pub plain_tx: Vec<u8>,
+}
+
+/// One h2 frame: type, flags, stream id, payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub ty: u8,
+    pub flags: u8,
+    pub sid: u32,
+    pub payload: Vec<u8>,
+}
+
+/// The h2 frames in `b`, in order.
+pub fn parse_frames(mut b: &[u8]) -> Vec<Frame> {
+    let mut out = Vec::new();
+    while b.len() >= 9 {
+        let len = u32::from_be_bytes([0, b[0], b[1], b[2]]) as usize;
+        let sid = u32::from_be_bytes([b[5], b[6], b[7], b[8]]) & 0x7fff_ffff;
+        let end = (9 + len).min(b.len());
+        out.push(Frame {
+            ty: b[3],
+            flags: b[4],
+            sid,
+            payload: b[9..end].to_vec(),
+        });
+        b = &b[end..];
+    }
+    out
 }
 
 impl Browser {
@@ -391,7 +467,37 @@ impl Browser {
             close_notify: false,
             eof_to_h2: false,
             tls_error: None,
+            hold: false,
+            ct_out: Vec::new(),
+            plain_tx: Vec::new(),
         }
+    }
+
+    /// The h2 client's receive windows (before the first `exchange`).
+    pub fn windows(mut self, stream: u32, conn: u32) -> Browser {
+        let (h2_end, io) = pipe_pair();
+        let mut b = h2::client::Builder::new();
+        b.initial_window_size(stream)
+            .initial_connection_window_size(conn);
+        self.hs = Some(Box::pin(b.handshake(h2_end)));
+        self.io = io;
+        self
+    }
+
+    /// While on, received DATA is kept but its capacity is not released,
+    /// so the proxy's send window shrinks.
+    pub fn hold_capacity(&mut self, on: bool) {
+        self.hold = on;
+    }
+
+    /// Releases the capacity `hold_capacity` held back on `h`.
+    pub fn release(&mut self, h: &StreamHandle) {
+        let s = &mut self.streams[h.0];
+        if let Some(b) = &mut s.body {
+            let _ = b.flow_control().release_capacity(s.unreleased);
+            s.unreleased = 0;
+        }
+        self.poll_h2();
     }
 
     fn client(
@@ -461,11 +567,14 @@ impl Browser {
             self.read_plain();
         }
         self.poll_h2();
-        let mut out = Vec::new();
+        self.drain_tls();
+        std::mem::take(&mut self.ct_out)
+    }
+
+    fn drain_tls(&mut self) {
         while self.tls.wants_write() {
-            self.tls.write_tls(&mut out).unwrap();
+            self.tls.write_tls(&mut self.ct_out).unwrap();
         }
-        out
     }
 
     /// Plaintext straight into TLS, around the h2 client.
@@ -482,6 +591,44 @@ impl Browser {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> StreamHandle {
+        let h = self.open(method, path, headers, body.is_empty());
+        if !body.is_empty() {
+            self.send(&h, body, true);
+        }
+        h
+    }
+
+    /// A request whose body follows through `send`.
+    pub fn request_streaming(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> StreamHandle {
+        self.open(method, path, headers, false)
+    }
+
+    /// More request body for `h` (h2 buffers it past the window).
+    pub fn send(&mut self, h: &StreamHandle, data: &[u8], fin: bool) {
+        let up = self.streams[h.0].up.as_mut().expect("request side");
+        up.send_data(Bytes::copy_from_slice(data), fin).unwrap();
+        self.poll_h2();
+    }
+
+    /// RST_STREAM(CANCEL) on `h`.
+    pub fn cancel(&mut self, h: &StreamHandle) {
+        let up = self.streams[h.0].up.as_mut().expect("request side");
+        up.send_reset(Reason::CANCEL);
+        self.poll_h2();
+    }
+
+    fn open(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        end: bool,
+    ) -> StreamHandle {
         self.poll_h2();
         let send = self.send.as_mut().expect("h2 client ready");
         let waker = Waker::from(self.dirty.clone());
@@ -493,12 +640,9 @@ impl Browser {
         for (n, v) in headers {
             r = r.header(*n, *v);
         }
-        let (resp, mut up) = send
-            .send_request(r.body(()).unwrap(), body.is_empty())
+        let (resp, up) = send
+            .send_request(r.body(()).unwrap(), end)
             .expect("send_request");
-        if !body.is_empty() {
-            up.send_data(Bytes::copy_from_slice(body), true).unwrap();
-        }
         self.streams.push(BStream {
             resp: Some(resp),
             head: None,
@@ -506,6 +650,9 @@ impl Browser {
             data: Vec::new(),
             done: false,
             err: None,
+            reason: None,
+            up: Some(up),
+            unreleased: 0,
         });
         self.poll_h2();
         StreamHandle(self.streams.len() - 1)
@@ -524,6 +671,33 @@ impl Browser {
     /// The stream's error (a reset, or the conn's end), if any.
     pub fn stream_error(&self, h: &StreamHandle) -> Option<String> {
         self.streams[h.0].err.clone()
+    }
+
+    /// The reset reason of the stream's error, if any.
+    pub fn stream_reason(&self, h: &StreamHandle) -> Option<Reason> {
+        self.streams[h.0].reason
+    }
+
+    /// The response head, once it arrived.
+    pub fn head(&mut self, h: &StreamHandle) -> Option<http::response::Parts> {
+        self.poll_h2();
+        self.streams[h.0].head.clone()
+    }
+
+    /// Response body bytes received so far.
+    pub fn received(&mut self, h: &StreamHandle) -> Vec<u8> {
+        self.poll_h2();
+        self.streams[h.0].data.clone()
+    }
+
+    /// The h2 frames the proxy sent, in order.
+    pub fn frames(&self) -> Vec<Frame> {
+        parse_frames(&self.plain_rx)
+    }
+
+    /// The h2 frames the browser sent, in order (after its 24-byte preface).
+    pub fn sent_frames(&self) -> Vec<Frame> {
+        parse_frames(self.plain_tx.get(24..).unwrap_or_default())
     }
 
     /// The types of the h2 frames the proxy sent, in order.
@@ -571,7 +745,7 @@ impl Browser {
                 self.conn = None;
             }
             for s in &mut self.streams {
-                s.poll(&mut cx);
+                s.poll(&mut cx, self.hold);
             }
             self.pull_from_h2(&mut cx);
             if !self.dirty.take() {
@@ -601,7 +775,10 @@ impl Browser {
             let mut rb = ReadBuf::new(&mut buf);
             match Pin::new(&mut self.io).poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) if !rb.filled().is_empty() => {
+                    self.plain_tx.extend_from_slice(rb.filled());
                     self.tls.writer().write_all(rb.filled()).unwrap();
+                    // rustls buffers at most 64 KiB of unsent ciphertext.
+                    self.drain_tls();
                 }
                 _ => return,
             }

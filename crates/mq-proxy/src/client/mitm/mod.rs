@@ -7,6 +7,7 @@ pub mod head;
 pub mod host;
 pub mod leaf;
 pub mod policy;
+mod stream;
 
 use super::Owner;
 use super::exchange::{Exchanges, Ready};
@@ -95,11 +96,12 @@ pub struct Mitm {
     leaf: LeafStore,
     tuning: MitmTuning,
     /// `"Bearer " + token` for `map_request` (SP4 spec §7.5 step 5).
-    #[allow(dead_code)] // read by `MStream::open` (Task 7.3)
     auth: Vec<u8>,
     h2: h2::server::Builder,
     stats: Stats,
     timers: Timers,
+    /// The pump's pass budget: `PUMP_CAP` (R2); a test hook lowers it.
+    pump_cap: usize,
 }
 
 #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
@@ -126,6 +128,7 @@ impl Mitm {
             h2,
             stats: Stats::default(),
             timers: Timers::default(),
+            pump_cap: crate::server::origin::PUMP_CAP,
         }
     }
 
@@ -160,13 +163,13 @@ impl Mitm {
         &mut self,
         cx: &mut Cx<'_>,
         ex: &mut Exchanges<Owner>,
-        _tunnel: Option<ConnId>,
+        tunnel: Option<ConnId>,
         tcp: TcpId,
     ) -> Option<Handoff> {
         if let Phase::Peek { .. } = self.conns.get(&tcp)?.phase {
-            return self.peek(cx, ex, tcp);
+            return self.peek(cx, ex, tunnel, tcp);
         }
-        self.pump(cx, ex, tcp);
+        self.pump(cx, ex, tunnel, tcp);
         None
     }
 
@@ -174,10 +177,10 @@ impl Mitm {
         &mut self,
         cx: &mut Cx<'_>,
         ex: &mut Exchanges<Owner>,
-        _tunnel: Option<ConnId>,
+        tunnel: Option<ConnId>,
         tcp: TcpId,
     ) {
-        self.pump(cx, ex, tcp);
+        self.pump(cx, ex, tunnel, tcp);
     }
 
     /// SP4 spec §7.3 "EOF and errors while peeking"; §7.4 "Ends" item 5.
@@ -185,6 +188,7 @@ impl Mitm {
         &mut self,
         cx: &mut Cx<'_>,
         ex: &mut Exchanges<Owner>,
+        tunnel: Option<ConnId>,
         tcp: TcpId,
         end: TcpEnd,
     ) -> Option<Handoff> {
@@ -206,7 +210,7 @@ impl Mitm {
             }
             return self.opaque(cx, tcp, Why::Eof, None);
         }
-        self.pump(cx, ex, tcp);
+        self.pump(cx, ex, tunnel, tcp);
         None
     }
 
@@ -215,11 +219,14 @@ impl Mitm {
         &mut self,
         cx: &mut Cx<'_>,
         ex: &mut Exchanges<Owner>,
-        _tunnel: Option<ConnId>,
+        tunnel: Option<ConnId>,
         key: MStreamKey,
-        _r: Ready,
+        r: Ready,
     ) {
-        self.pump(cx, ex, key.conn.0);
+        if let Some(c) = self.conns.get_mut(&key.conn.0) {
+            c.on_ready(key.stream, r);
+        }
+        self.pump(cx, ex, tunnel, key.conn.0);
     }
 
     /// `(true, ..)` when `id` was one of ours (SP4 spec §7.8).
@@ -227,7 +234,7 @@ impl Mitm {
         &mut self,
         cx: &mut Cx<'_>,
         ex: &mut Exchanges<Owner>,
-        _tunnel: Option<ConnId>,
+        tunnel: Option<ConnId>,
         id: TimerId,
     ) -> (bool, Option<Handoff>) {
         let Some(tcp) = self.timers.0.remove(&id) else {
@@ -238,20 +245,28 @@ impl Mitm {
         };
         if c.cont == Some(id) {
             c.cont = None;
-            self.pump(cx, ex, tcp);
+            self.pump(cx, ex, tunnel, tcp);
             return (true, None);
         }
-        match &c.phase {
+        let t = self.tuning;
+        match &mut c.phase {
             Phase::Peek { .. } => return (true, self.opaque(cx, tcp, Why::Timeout, None)),
             Phase::Live(l) if !l.h2_ready() => self.end_conn(cx, ex, tcp, End::Handshake),
+            // §7.8: idle with no open stream, else the watchdog; either is
+            // counted from `last_rx` and re-armed for the remainder.
             Phase::Live(l) => {
-                // Idle: `idle` since `last_rx`, re-armed for the remainder.
                 let quiet = cx.now() - l.last_rx;
-                if quiet < self.tuning.idle {
-                    c.timer = self.timers.arm(cx, tcp, self.tuning.idle - quiet);
-                    return (true, None);
+                let open = !l.streams.is_empty();
+                if !open && quiet >= t.idle {
+                    self.end_conn(cx, ex, tcp, End::Idle);
+                } else if open && quiet >= t.dead_after {
+                    self.end_conn(cx, ex, tcp, End::Dead);
+                } else {
+                    if open && quiet >= t.ping_after {
+                        l.ping();
+                    }
+                    c.arm_liveness(cx, &mut self.timers, &t);
                 }
-                self.end_conn(cx, ex, tcp, End::Idle);
             }
             // §7.4 "Deadline": whatever the stage, even after a `tcp_close`.
             Phase::Closing(_) => {
@@ -260,7 +275,7 @@ impl Mitm {
                 return (true, None);
             }
         }
-        self.pump(cx, ex, tcp);
+        self.pump(cx, ex, tunnel, tcp);
         (true, None)
     }
 
@@ -275,7 +290,7 @@ impl Mitm {
                 }
                 Phase::Live(_) => {
                     self.end_conn(cx, ex, tcp, End::Shutdown);
-                    self.pump(cx, ex, tcp);
+                    self.pump(cx, ex, None, tcp);
                 }
                 Phase::Closing(_) => {}
             }
@@ -285,11 +300,15 @@ impl Mitm {
     /// SP4 spec §7.10; `None` while every counter is zero.
     pub(crate) fn metrics_line(&self) -> Option<String> {
         let s = &self.stats;
-        let live = (self.conns.values())
-            .filter(|c| matches!(c.phase, Phase::Live(_)))
-            .count() as u64;
+        let (mut live, mut streams) = (0u64, 0);
+        for c in self.conns.values() {
+            if let Phase::Live(l) = &c.phase {
+                live += 1;
+                streams += l.streams.len();
+            }
+        }
         let leaf = self.leaf.stats();
-        let mut line = format!("mq.mitm conns={live} streams=0 mitm={}", s.mitm);
+        let mut line = format!("mq.mitm conns={live} streams={streams} mitm={}", s.mitm);
         for (k, n) in WHY_KEYS.iter().zip(s.opaque) {
             line += &format!(" opaque_{k}={n}");
         }

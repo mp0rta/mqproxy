@@ -1,21 +1,21 @@
 //! SP4 spec §7.3 / §7.4 / §7.8: one browser conn — the ClientHello peek,
-//! the TLS + h2 pump, idle, and the `Closing` drain.
+//! the TLS + h2 pump with its streams, idle and the open-stream watchdog,
+//! and the `Closing` drain.
 #![cfg_attr(not(feature = "test-support"), allow(dead_code))]
 
-use super::head::reject_response;
 use super::policy::{Route, Sni, Why};
-use super::{Handoff, MConnId, Mitm, MitmTuning, Stats, Timers};
+use super::stream::MStream;
+use super::{Handoff, MConnId, MStreamKey, Mitm, MitmTuning, Stats, Timers};
 use crate::client::Owner;
-use crate::client::exchange::Exchanges;
+use crate::client::exchange::{Exchanges, Ready};
 use crate::ingress::INGRESS_CAP;
-use crate::server::origin::PUMP_CAP;
 use crate::tls_pipe::{Dirty, PipeIo, TlsIo, pipe};
 use bytes::Bytes;
-use mq_http::headers::Reject;
 use mq_runtime::{Cx, TCP_BUF, Target, TcpId, TimerId};
-use mq_transport_api::Time;
+use mq_transport_api::{ConnId, Time};
 use rustls::ServerConnection;
 use rustls::server::{Accepted, Acceptor};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use std::time::Duration;
 
 pub(super) struct MitmConn {
     tcp: TcpId,
-    /// The phase's deadline: peek, handshake, idle, or `Closing`.
+    /// The phase's deadline: peek, handshake, idle or watchdog, or `Closing`.
     pub(super) timer: TimerId,
     /// The 0-delay continuation of a pump that ran out of passes.
     pub(super) cont: Option<TimerId>,
@@ -48,9 +48,27 @@ pub(super) struct Live {
     sni: Sni,
     tls: TlsIo<ServerConnection>,
     h2: H2,
+    /// In round-robin order: each pass starts at the front and rotates it
+    /// (fairness under the budget, §7.4 step 3).
+    pub(super) streams: VecDeque<MStream>,
     /// Last inbound TLS bytes.
     pub(super) last_rx: Time,
+    /// Taken once at h2 `Ready`; one outstanding PING at most (§7.8).
+    ping: Option<h2::PingPong>,
+    /// The liveness timer is the watchdog (streams open), not idle.
+    watchdog: bool,
     dirty: Arc<Dirty>,
+}
+
+/// The parts of `Mitm` a conn borrows next to its own table entry.
+pub(super) struct Env<'a> {
+    pub(super) ex: &'a mut Exchanges<Owner>,
+    /// `H3Tunnel::pick_conn()` (R6).
+    pub(super) tunnel: Option<ConnId>,
+    pub(super) timers: &'a mut Timers,
+    pub(super) tuning: &'a MitmTuning,
+    pub(super) stats: &'a mut Stats,
+    pub(super) auth: &'a [u8],
 }
 
 enum H2 {
@@ -86,6 +104,8 @@ pub(super) enum End {
     H2Fail,
     Handshake,
     Idle,
+    /// The watchdog: `dead_after` of inbound silence with open streams.
+    Dead,
     Shutdown,
     SocketError,
 }
@@ -101,6 +121,17 @@ impl Live {
     pub(super) fn h2_ready(&self) -> bool {
         matches!(self.h2, H2::Ready(_))
     }
+
+    /// §7.8 watchdog: one PING unless one is outstanding. `poll_pong` first
+    /// clears a PONG already seen; while one is pending `send_ping` refuses.
+    pub(super) fn ping(&mut self) {
+        let waker = Waker::from(self.dirty.clone());
+        let mut tcx = Context::from_waker(&waker);
+        if let Some(p) = &mut self.ping {
+            let _ = p.poll_pong(&mut tcx);
+            let _ = p.send_ping(h2::Ping::opaque());
+        }
+    }
 }
 
 impl MitmConn {
@@ -114,15 +145,35 @@ impl MitmConn {
         }
     }
 
-    /// One pump pass (§7.4): TLS in → h2 → TLS out; `Closing` drains.
-    /// `Ok(true)` when something moved or a waker fired.
-    fn pass(
-        &mut self,
-        cx: &mut Cx<'_>,
-        timers: &mut Timers,
-        tuning: &MitmTuning,
-        stats: &mut Stats,
-    ) -> Result<bool, End> {
+    /// An `Exchanges` readiness for stream `stream`.
+    pub(super) fn on_ready(&mut self, stream: u32, r: Ready) {
+        if let Phase::Live(l) = &mut self.phase
+            && let Some(s) = l.streams.iter_mut().find(|s| s.id == stream)
+        {
+            s.on_ready(r);
+        }
+    }
+
+    /// SP4 spec §7.8: the liveness timer from `last_rx` — idle with no
+    /// open stream; the watchdog's PING, then dead deadline, otherwise.
+    pub(super) fn arm_liveness(&mut self, cx: &mut Cx<'_>, timers: &mut Timers, t: &MitmTuning) {
+        let Phase::Live(l) = &mut self.phase else {
+            return;
+        };
+        l.watchdog = !l.streams.is_empty();
+        let quiet = cx.now() - l.last_rx;
+        let at = match l.watchdog {
+            false => t.idle,
+            true if quiet < t.ping_after => t.ping_after,
+            true => t.dead_after,
+        };
+        timers.disarm(cx, self.timer);
+        self.timer = timers.arm(cx, self.tcp, at.saturating_sub(quiet));
+    }
+
+    /// One pump pass (§7.4): TLS in → h2 → streams → TLS out; `Closing`
+    /// drains. `Ok(true)` when something moved or a waker fired.
+    fn pass(&mut self, cx: &mut Cx<'_>, env: &mut Env<'_>) -> Result<bool, End> {
         let tcp = self.tcp;
         let l = match &mut self.phase {
             Phase::Peek { .. } => return Ok(false),
@@ -144,11 +195,12 @@ impl MitmConn {
         match &mut l.h2 {
             H2::Handshaking(hs) => match Pin::new(hs).poll(&mut tcx) {
                 Poll::Pending => {}
-                Poll::Ready(Ok(conn)) => {
+                Poll::Ready(Ok(mut conn)) => {
+                    l.ping = conn.ping_pong();
                     l.h2 = H2::Ready(conn);
                     // §7.8: the handshake deadline gives way to the idle timer.
-                    timers.disarm(cx, self.timer);
-                    self.timer = timers.arm(cx, tcp, tuning.idle);
+                    env.timers.disarm(cx, self.timer);
+                    self.timer = env.timers.arm(cx, tcp, env.tuning.idle);
                     moved = true;
                 }
                 Poll::Ready(Err(_)) => return Err(or_eof(End::H2Fail)),
@@ -156,19 +208,39 @@ impl MitmConn {
             H2::Ready(conn) => loop {
                 match conn.poll_accept(&mut tcx) {
                     Poll::Pending => break,
-                    Poll::Ready(Some(Ok((_req, mut respond)))) => {
-                        // Task 7.2 stub: no tunnel streams yet, so every
-                        // request is answered 502 and nothing is retained.
-                        stats.reqs += 1;
-                        stats.rejects += 1;
-                        let resp = reject_response(Reject::TunnelUnavailable);
-                        let _ = respond.send_response(resp, true);
+                    Poll::Ready(Some(Ok((req, mut respond)))) => {
+                        env.stats.reqs += 1;
                         moved = true;
+                        // §7.6 "Admission": h2 stops counting a stream that
+                        // is closed toward the browser but still draining.
+                        if l.streams.len() >= env.tuning.mstream_max {
+                            respond.send_reset(h2::Reason::REFUSED_STREAM);
+                            env.stats.rejects += 1;
+                            continue;
+                        }
+                        let key = MStreamKey {
+                            conn: MConnId(tcp),
+                            stream: respond.stream_id().as_u32(),
+                        };
+                        let (ex, tunnel, auth) = (&mut *env.ex, env.tunnel, env.auth);
+                        match MStream::open(cx, ex, tunnel, key, (req, respond), &l.sni, auth) {
+                            Some(s) => l.streams.push_back(s),
+                            None => env.stats.rejects += 1,
+                        }
                     }
                     Poll::Ready(Some(Err(_))) => return Err(or_eof(End::H2Fail)),
                     Poll::Ready(None) => return Err(or_eof(End::H2Closed)),
                 }
             },
+        }
+        // 3. Streams, from the front; the front rotates each pass.
+        let room = l.tls.out_has_room();
+        for s in &mut l.streams {
+            moved |= s.step(cx, env.ex, &mut tcx, room);
+        }
+        l.streams.retain(|s| !s.done());
+        if !l.streams.is_empty() {
+            l.streams.rotate_left(1);
         }
         // 4. TLS out; what TCP refuses waits in `out` for `on_tcp_writable`.
         moved |= l.tls.output(cx, tcp);
@@ -177,35 +249,33 @@ impl MitmConn {
 
     /// SP4 spec §7.4 "Ends": the conn's exchanges are reset, then `Closing`
     /// under the 1 s deadline; a socket error only settles (the caller removes).
-    fn end(
-        &mut self,
-        cx: &mut Cx<'_>,
-        ex: &mut Exchanges<Owner>,
-        timers: &mut Timers,
-        tuning: &MitmTuning,
-        stats: &mut Stats,
-        end: End,
-    ) {
+    fn end(&mut self, cx: &mut Cx<'_>, env: &mut Env<'_>, end: End) {
         if !matches!(self.phase, Phase::Live(_)) {
             return;
         }
         let id = MConnId(self.tcp);
-        ex.drain_owner(cx, |o| matches!(o, Owner::Mitm(k) if k.conn == id));
+        (env.ex).drain_owner(cx, |o| matches!(o, Owner::Mitm(k) if k.conn == id));
         match end {
-            End::TlsFatal => stats.tls_fail += 1,
-            End::H2Fail => stats.h2_fail += 1,
+            End::TlsFatal => env.stats.tls_fail += 1,
+            End::H2Fail => env.stats.h2_fail += 1,
+            End::Dead => env.stats.dead += 1,
             _ => {}
         }
-        let Phase::Live(l) = std::mem::replace(&mut self.phase, Phase::Closing(Box::default()))
+        let Phase::Live(mut l) = std::mem::replace(&mut self.phase, Phase::Closing(Box::default()))
         else {
             unreachable!("checked above")
         };
-        log::info!("mq_mitm: {} closed ({end:?}, streams=0)", l.sni.as_str());
+        // §7.4 "Ends" item 1: the streams go with their exchanges.
+        let streams = std::mem::take(&mut l.streams).len();
+        log::info!(
+            "mq_mitm: {} closed ({end:?}, streams={streams})",
+            l.sni.as_str()
+        );
         if end == End::SocketError {
             return;
         }
-        timers.disarm(cx, self.timer);
-        self.timer = timers.arm(cx, self.tcp, tuning.closing);
+        env.timers.disarm(cx, self.timer);
+        self.timer = env.timers.arm(cx, self.tcp, env.tuning.closing);
         let Live {
             mut tls, h2, dirty, ..
         } = *l;
@@ -264,12 +334,19 @@ fn closing_pass(cx: &mut Cx<'_>, tcp: TcpId, cl: &mut Closing) -> bool {
 }
 
 impl Mitm {
+    /// A live conn's `Dirty` flag (test-support).
+    pub(super) fn dirty(&self, tcp: TcpId) -> bool {
+        let c = self.conns.get(&tcp).map(|c| &c.phase);
+        matches!(c, Some(Phase::Live(l)) if l.dirty.is_set())
+    }
+
     /// SP4 spec §7.3 "Peek": feed the unfed `rx` until it is exhausted or a
     /// decision is made (rustls reads ≤ 4 KiB per `read_tls`).
     pub(super) fn peek(
         &mut self,
         cx: &mut Cx<'_>,
         ex: &mut Exchanges<Owner>,
+        tunnel: Option<ConnId>,
         tcp: TcpId,
     ) -> Option<Handoff> {
         let Phase::Peek { acceptor, fed, .. } = &mut self.conns.get_mut(&tcp)?.phase else {
@@ -296,7 +373,7 @@ impl Mitm {
         match got {
             Peeked::Wait => None,
             Peeked::Opaque(w) => self.opaque(cx, tcp, w, None),
-            Peeked::Hello(a) => self.decide(cx, ex, tcp, a, fed),
+            Peeked::Hello(a) => self.decide(cx, ex, tunnel, tcp, a, fed),
         }
     }
 
@@ -306,6 +383,7 @@ impl Mitm {
         &mut self,
         cx: &mut Cx<'_>,
         ex: &mut Exchanges<Owner>,
+        tunnel: Option<ConnId>,
         tcp: TcpId,
         a: Accepted,
         fed: usize,
@@ -330,7 +408,7 @@ impl Mitm {
         };
         cx.tcp_consume(tcp, fed); // the commit point: rustls holds the bytes
         self.go_live(cx, tcp, sni, tls);
-        self.pump(cx, ex, tcp);
+        self.pump(cx, ex, tunnel, tcp);
         None
     }
 
@@ -348,34 +426,49 @@ impl Mitm {
             sni,
             tls: TlsIo::new(tls, handle),
             h2: H2::Handshaking(self.h2.handshake(io)),
+            streams: VecDeque::new(),
             last_rx: cx.now(),
+            ping: None,
+            watchdog: false,
             dirty: Arc::default(),
         }));
         self.stats.mitm += 1;
     }
 
-    /// SP4 spec §7.4 "Pump": at most `PUMP_CAP` passes (R2); work left over
-    /// arms the 0-delay continuation instead of looping on.
-    pub(super) fn pump(&mut self, cx: &mut Cx<'_>, ex: &mut Exchanges<Owner>, tcp: TcpId) {
-        let Mitm {
-            conns,
-            timers,
-            tuning,
-            stats,
-            ..
-        } = self;
-        let Some(c) = conns.get_mut(&tcp) else {
-            return;
-        };
-        for _ in 0..PUMP_CAP {
-            match c.pass(cx, timers, tuning, stats) {
-                Ok(false) => return,
+    /// SP4 spec §7.4 "Pump": at most `PUMP_CAP` passes (R2). A last pass
+    /// that still moved arms the 0-delay continuation instead of looping on:
+    /// moving is the only signal of leftover work (e.g. TLS input held back
+    /// by a full pipe, which no waker reports). Then §7.8: the liveness
+    /// timer switches when the open-stream count crosses zero.
+    pub(super) fn pump(
+        &mut self,
+        cx: &mut Cx<'_>,
+        ex: &mut Exchanges<Owner>,
+        tunnel: Option<ConnId>,
+        tcp: TcpId,
+    ) {
+        let budget = self.pump_cap;
+        let (c, mut env) = self.split(ex, tunnel, tcp);
+        let Some(c) = c else { return };
+        let mut more = true;
+        for _ in 0..budget {
+            match c.pass(cx, &mut env) {
+                Ok(false) => {
+                    more = false;
+                    break;
+                }
                 Ok(true) => {}
-                Err(end) => c.end(cx, ex, timers, tuning, stats, end),
+                Err(end) => c.end(cx, &mut env, end),
             }
         }
-        if c.cont.is_none() {
-            c.cont = Some(timers.arm(cx, tcp, Duration::ZERO));
+        if more && c.cont.is_none() {
+            c.cont = Some(env.timers.arm(cx, tcp, Duration::ZERO));
+        }
+        if let Phase::Live(l) = &c.phase
+            && l.h2_ready()
+            && l.watchdog == l.streams.is_empty()
+        {
+            c.arm_liveness(cx, env.timers, env.tuning);
         }
     }
 
@@ -387,15 +480,26 @@ impl Mitm {
         tcp: TcpId,
         end: End,
     ) {
-        let Mitm {
-            conns,
-            timers,
-            tuning,
-            stats,
-            ..
-        } = self;
-        if let Some(c) = conns.get_mut(&tcp) {
-            c.end(cx, ex, timers, tuning, stats, end);
+        if let (Some(c), mut env) = self.split(ex, None, tcp) {
+            c.end(cx, &mut env, end);
         }
+    }
+
+    /// Conn `tcp` and the rest of `Mitm`, borrowed side by side.
+    fn split<'a>(
+        &'a mut self,
+        ex: &'a mut Exchanges<Owner>,
+        tunnel: Option<ConnId>,
+        tcp: TcpId,
+    ) -> (Option<&'a mut MitmConn>, Env<'a>) {
+        let env = Env {
+            ex,
+            tunnel,
+            timers: &mut self.timers,
+            tuning: &self.tuning,
+            stats: &mut self.stats,
+            auth: &self.auth,
+        };
+        (self.conns.get_mut(&tcp), env)
     }
 }

@@ -48,6 +48,17 @@ impl MitmHost {
         self.mitm.conns.len()
     }
 
+    /// Lowers the pump's pass budget (`PUMP_CAP`): the in-memory TCP fills
+    /// long before a download spends 16 passes.
+    pub fn set_pump_budget(&mut self, passes: usize) {
+        self.mitm.pump_cap = passes;
+    }
+
+    /// A live conn's `Dirty` flag is set: a waker fired since its last pass.
+    pub fn dirty(&self, tcp: TcpId) -> bool {
+        self.mitm.dirty(tcp)
+    }
+
     /// The caller's half of `Handoff` (SP4 spec §7.3 "Opaque" step 2).
     fn handoff(&mut self, cx: &mut Cx<'_>, h: Option<Handoff>) {
         if let Some(h) = h {
@@ -85,7 +96,9 @@ impl App for MitmHost {
 
     fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
         if self.mitm.owns_tcp(tcp) {
-            let h = self.mitm.on_tcp_end(cx, &mut self.ex, tcp, end);
+            let h = self
+                .mitm
+                .on_tcp_end(cx, &mut self.ex, self.tunnel, tcp, end);
             self.handoff(cx, h);
         }
     }

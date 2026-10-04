@@ -23,6 +23,11 @@ impl Dirty {
     pub fn take(&self) -> bool {
         self.0.swap(false, Ordering::Relaxed)
     }
+
+    /// Reads the flag, leaving it as it is.
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 impl Wake for Dirty {

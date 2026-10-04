@@ -146,7 +146,6 @@ pub struct Client {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Owner {
     Fetch(TcpId),
-    #[allow(dead_code)] // constructed by `MStream::open` (Task 7.3)
     Mitm(mitm::MStreamKey),
 }
 
