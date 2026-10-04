@@ -72,6 +72,14 @@ fn now() -> Time {
 
 // ── bookkeeping (spec §4.7, §4.8 slot lifetime tables) ──────────────────
 
+/// spec §4.7: floor of the provisional cap and of the evicting backlog.
+const BACKLOG_MIN: u32 = 64;
+
+/// spec §4.7: provisional conns, and separately conns being evicted, are each capped here.
+fn backlog_cap(max_conns: u32) -> u32 {
+    BACKLOG_MIN.max(max_conns.saturating_mul(4))
+}
+
 /// The `max_conns` cap (spec §4.7; 0 = unlimited). `Ok(None)`: room. `Ok(Some(v))`: full, but
 /// admitting is allowed by evicting `v`, the oldest counted connection that is neither
 /// authenticated nor already evicting. `Err(())`: full. Evicting connections stay counted
@@ -87,6 +95,11 @@ fn cap_check(inner: &Inner) -> Result<Option<SlotId>, ()> {
     if inner.n_counted - evicting < max {
         return Ok(None);
     }
+    // Victims linger ~3 PTO in xquic, and a conn is created at ALPN selection (before the
+    // handshake completes): without this bound a ClientHello burst grows them unboundedly.
+    if evicting >= backlog_cap(max) {
+        return Err(());
+    }
     let victim = inner
         .conns
         .iter_live()
@@ -96,7 +109,7 @@ fn cap_check(inner: &Inner) -> Result<Option<SlotId>, ()> {
 }
 
 /// `server_accept`: both caps, then a provisional slot. `None` → refuse. The eviction itself
-/// waits for the create notification (a completed handshake).
+/// waits for the create notification (ALPN selected from the ClientHello).
 pub(crate) fn on_server_accept(
     inner: &mut Inner,
     conn: *mut xqc_connection_t,
@@ -105,7 +118,7 @@ pub(crate) fn on_server_accept(
 ) -> Option<SlotId> {
     let max = inner.cfg.max_conns;
     cap_check(inner).ok()?;
-    if inner.n_provisional >= 64.max(max.saturating_mul(4)) {
+    if inner.n_provisional >= backlog_cap(max) {
         return None;
     }
     let mut slot = ConnSlot::new(true, conn, cid);
@@ -1123,6 +1136,31 @@ mod tests {
         admitted(&mut i, ConnProto::H3);
         on_server_refuse(&mut i, a);
         assert_eq!(i.n_counted, 1);
+    }
+
+    /// Victims linger ~3 PTO in xquic after the close: a burst of newcomers must not grow
+    /// that backlog without bound (Codex SP3-1 P1).
+    #[test]
+    fn evicting_backlog_is_bounded() {
+        let mut i = inner(1);
+        let mut first = admitted(&mut i, ConnProto::H3);
+        let late = accept(&mut i); // passed accept before the backlog filled
+        for _ in 0..BACKLOG_MIN {
+            admitted(&mut i, ConnProto::H3);
+        }
+        let n = i.conns.iter_live().filter(|(_, c)| c.evicting).count();
+        assert_eq!(n, BACKLOG_MIN as usize);
+        assert_eq!(i.n_counted, BACKLOG_MIN + 1);
+        // Full backlog: refused at accept and at create, nothing more is evicted.
+        assert!(on_server_accept(&mut i, core::ptr::null_mut(), cid(), Time(0)).is_none());
+        assert!(!create(&mut i, late, ConnProto::H3));
+        assert_eq!(i.n_counted, BACKLOG_MIN + 1);
+        // A victim's close frees one backlog place.
+        assert!(evicting(&i, first));
+        close(&mut i, first);
+        first = admitted(&mut i, ConnProto::H3);
+        assert!(!evicting(&i, first));
+        assert!(on_server_accept(&mut i, core::ptr::null_mut(), cid(), Time(0)).is_none());
     }
 
     #[test]
