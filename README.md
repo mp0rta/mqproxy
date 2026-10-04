@@ -350,7 +350,7 @@ nft add rule  inet mqproxy_block forward udp dport 443 reject
 mq.mitm conns=<live> streams=<open> mitm=<n> opaque_not_tls=<n> opaque_no_sni=<n> opaque_bad_sni=<n> opaque_no_h2=<n> opaque_ignored=<n> opaque_ca_scope=<n> opaque_tls_incompat=<n> opaque_timeout=<n> opaque_too_large=<n> opaque_eof=<n> opaque_capacity=<n> tls_fail=<n> h2_fail=<n> dead=<n> leaf_hit=<n> leaf_miss=<n> reqs=<n> rejects=<n>
 ```
 
-`conns` and `streams` are what is open now; the rest are cumulative. Each `opaque_*` counter counts connections relayed opaquely for one reason above; `leaf_hit`/`leaf_miss` are forged-certificate cache hits and misses; `reqs`/`rejects` are requests mapped onto the tunnel and requests answered locally with an error.
+`conns` and `streams` are what is open now; the rest are cumulative. Each `opaque_*` counter counts connections relayed opaquely for one reason above; `leaf_hit`/`leaf_miss` are forged-certificate cache hits and misses; `reqs` counts every h2 request received, and `rejects` counts those refused before a tunnel request was opened: an `x-mq-error` or 421 answer from the request mapping, an unavailable or refused tunnel, an `RST_STREAM` for a malformed request, or a `REFUSED_STREAM` past the per-connection stream limit.
 
 **Security posture:**
 
