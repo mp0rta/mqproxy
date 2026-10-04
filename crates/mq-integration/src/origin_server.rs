@@ -163,6 +163,10 @@ pub struct OriginServerMode {
     pub max_concurrent_streams: Option<u32>,
     /// Accept one connection at a time (the e2e python origin's behaviour).
     pub single_conn: bool,
+    /// Accept on `[::]` with IPV6_V6ONLY off, so `localhost` works whichever loopback the
+    /// resolver lists first (musl + an `::1 localhost` /etc/hosts line). Falls back to
+    /// `127.0.0.1` without IPv6. `OriginServer::addr` stays `127.0.0.1:<port>` either way.
+    pub dual_stack: bool,
     pub handler: Handler,
 }
 
@@ -173,6 +177,7 @@ impl OriginServerMode {
             proto,
             max_concurrent_streams: None,
             single_conn: false,
+            dual_stack: false,
             handler,
         }
     }
@@ -209,12 +214,30 @@ pub struct OriginServer {
     thread: Option<JoinHandle<()>>,
 }
 
+/// The listener and the IPv4 address clients are told to use.
+fn bind(dual_stack: bool) -> (TcpListener, SocketAddr) {
+    if dual_stack && let Ok(l) = bind_dual_stack() {
+        let port = l.local_addr().expect("origin addr").port();
+        return (l, SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+    let addr = l.local_addr().expect("origin addr");
+    (l, addr)
+}
+
+fn bind_dual_stack() -> io::Result<TcpListener> {
+    let s = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?;
+    s.set_only_v6(false)?;
+    s.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    s.listen(1024)?;
+    Ok(s.into())
+}
+
 impl OriginServer {
     pub fn spawn(mode: OriginServerMode) -> OriginServer {
         install_ring();
-        let l = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+        let (l, addr) = bind(mode.dual_stack);
         l.set_nonblocking(true).expect("nonblocking listener");
-        let addr = l.local_addr().expect("origin addr");
         let shared = Arc::new(Shared {
             stop: watch::Sender::new(false),
             release: watch::Sender::new(false),

@@ -546,6 +546,7 @@ dependencies = [
  "mq-transport-api",
  "mq-wire",
  "rustls",
+ "socket2",
  "tokio",
  "tokio-rustls",
 ]

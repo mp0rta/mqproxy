@@ -87,7 +87,11 @@ fn proxy(origin: SocketAddr, mitm: MitmConfig) -> LoopbackProxy {
 }
 
 fn origin(proto: Proto, handler: Handler) -> OriginServer {
-    OriginServer::spawn(OriginServerMode::new(proto, handler))
+    // `localhost:<port>` may resolve to ::1 first; the gateway dials one address only.
+    OriginServer::spawn(OriginServerMode {
+        dual_stack: true,
+        ..OriginServerMode::new(proto, handler)
+    })
 }
 
 /// A browser trusting `roots_pem` (the MITM CA, or the origin CA for opaque routes).
