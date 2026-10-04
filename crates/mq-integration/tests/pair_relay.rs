@@ -103,7 +103,7 @@ fn pair_blocked_path_quota_and_resume() {
         k.0 += 1;
         let moved = k.1 != now;
         k.1 = now;
-        moved || k.0 % 64 == 0
+        moved || k.0.is_multiple_of(64)
     };
 
     // Warm-up over both paths.

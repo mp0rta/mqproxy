@@ -10,7 +10,7 @@ exclude = ["crates/mq-wire/fuzz", "crates/mq-proxy/fuzz", "crates/mq-http/fuzz"]
 [workspace.package]
 version = "0.0.4"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 
 [workspace.dependencies]

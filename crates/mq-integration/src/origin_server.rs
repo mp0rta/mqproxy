@@ -225,10 +225,11 @@ impl OriginServer {
     /// Stops accepting and closes every connection.
     pub fn stop(&mut self) {
         self.shared.stop.send_replace(true);
-        if let Some(t) = self.thread.take() {
-            if t.join().is_err() && !thread::panicking() {
-                panic!("origin server thread panicked");
-            }
+        if let Some(t) = self.thread.take()
+            && t.join().is_err()
+            && !thread::panicking()
+        {
+            panic!("origin server thread panicked");
         }
     }
 
@@ -634,11 +635,11 @@ impl Gen {
             let end = self.len.min(self.off + CHUNK);
             let data: Vec<u8> = (self.off..end).map(upload_byte).collect();
             self.off = end;
-            if let Some((at, ctl)) = &self.goaway {
-                if self.off >= *at {
-                    ctl.goaway.notify_one();
-                    self.goaway = None;
-                }
+            if let Some((at, ctl)) = &self.goaway
+                && self.off >= *at
+            {
+                ctl.goaway.notify_one();
+                self.goaway = None;
             }
             return Poll::Ready(Some(Ok(Frame::data(data.into()))));
         }

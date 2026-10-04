@@ -361,11 +361,11 @@ impl<T: TransportOps, A: App> Shard<T, A> {
         ids.rotate_left(start);
         self.rr = self.rr.wrapping_add(1);
         for tcp in ids {
-            if let Some(TcpEntry::Relay(r)) = self.st.tcp.get_mut(&tcp) {
-                if r.is_runnable() {
-                    r.pump(&mut self.transport, now, RELAY_BUDGET);
-                    self.st.touched = true;
-                }
+            if let Some(TcpEntry::Relay(r)) = self.st.tcp.get_mut(&tcp)
+                && r.is_runnable()
+            {
+                r.pump(&mut self.transport, now, RELAY_BUDGET);
+                self.st.touched = true;
             }
             self.settle_relay(now, tcp);
         }

@@ -126,10 +126,10 @@ impl PipeHandle {
         let n = sink(&st.tx[..len]);
         assert!(n <= len, "sink accepted more than offered");
         st.tx.drain(..n);
-        if n > 0 {
-            if let Some(w) = st.tx_waker.take() {
-                w.wake();
-            }
+        if n > 0
+            && let Some(w) = st.tx_waker.take()
+        {
+            w.wake();
         }
         n
     }

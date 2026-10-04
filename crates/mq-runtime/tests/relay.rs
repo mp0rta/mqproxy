@@ -85,7 +85,7 @@ impl FakeTcp {
             let buf = r.tcp_rx_space();
             assert!(!buf.is_empty(), "read interest with an empty rx slice");
             let avail = self.limit - self.pos;
-            let res = if self.wb_every > 0 && self.reads % self.wb_every == 0 {
+            let res = if self.wb_every > 0 && self.reads.is_multiple_of(self.wb_every) {
                 IoResult::WouldBlock
             } else if avail == 0 {
                 match self.end {

@@ -381,10 +381,10 @@ impl<A: App> Node<A> {
                 self.core.io_mut().inject_udp(s, p.from, &p.data);
             }
         }
-        if self.exit.is_none() {
-            if let Next::Exit(c) = self.core.iteration() {
-                self.exit = Some(c);
-            }
+        if self.exit.is_none()
+            && let Next::Exit(c) = self.core.iteration()
+        {
+            self.exit = Some(c);
         }
         let mut acted = self.origin.step(self.core.io_mut());
         let opened = self.tap().udp[self.udp_seen..].to_vec();

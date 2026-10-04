@@ -255,10 +255,10 @@ impl App for H3EchoServer {
                 }
             }
             Event::H3Writable(r) => {
-                if let Some(q) = self.reqs.get_mut(&r).filter(|q| q.responding) {
-                    if q.sent < q.resp.len() {
-                        push(cx, r, &q.resp, &mut q.sent, q.fin);
-                    }
+                if let Some(q) = self.reqs.get_mut(&r).filter(|q| q.responding)
+                    && q.sent < q.resp.len()
+                {
+                    push(cx, r, &q.resp, &mut q.sent, q.fin);
                 }
             }
             Event::H3Closed(r, close) => {

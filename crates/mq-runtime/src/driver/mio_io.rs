@@ -628,12 +628,11 @@ impl Io for MioIo {
     }
 
     fn close_tcp(&mut self, s: TcpSock, abort: bool) {
-        if let Some(Sock::Tcp(t) | Sock::Connecting(_, t)) = self.remove(s.0) {
-            if abort {
-                if let Err(e) = mq_linux::set_linger_zero(&t) {
-                    log::debug!("SO_LINGER: {e}");
-                }
-            }
+        if let Some(Sock::Tcp(t) | Sock::Connecting(_, t)) = self.remove(s.0)
+            && abort
+            && let Err(e) = mq_linux::set_linger_zero(&t)
+        {
+            log::debug!("SO_LINGER: {e}");
         }
     }
 

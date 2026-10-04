@@ -72,11 +72,16 @@ fn hundred_resets_each_side_release_all_slots() {
                 continue;
             }
             if k < N && !st.sent {
-                let fin = k % 2 == 0;
+                let fin = k.is_multiple_of(2);
                 assert_eq!(send(&p.server, p.now, *s, payload.clone(), fin), Ok(1024));
                 st.sent = true;
             }
-            let reset_now = k >= N && if k % 2 == 0 { st.fin_rx } else { st.got > 0 };
+            let reset_now = k >= N
+                && if k.is_multiple_of(2) {
+                    st.fin_rx
+                } else {
+                    st.got > 0
+                };
             if reset_now {
                 reset(p, true, *s, st);
             }
