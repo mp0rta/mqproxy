@@ -1,5 +1,5 @@
 //! SP3 spec §7.1: the pipe between an origin socket and hyper. hyper's
-//! `Connection` owns its IO object, so the state is shared: `HyperIo` is
+//! `Connection` owns its IO object, so the state is shared: `PipeIo` is
 //! hyper's end, `PipeHandle` (kept in `OriginConn`) the pump's.
 
 use super::PIPE_CAP;
@@ -41,18 +41,39 @@ fn dead_err() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "origin conn removed")
 }
 
-/// hyper's end of the pipe.
+/// The IO end handed to hyper, h2 or rustls. With `peer` set (`pipe_pair`)
+/// its writes land in the peer's `rx` instead of its own `tx`.
 #[derive(Debug)]
-pub struct HyperIo(Rc<RefCell<PipeState>>);
+pub struct PipeIo {
+    st: Rc<RefCell<PipeState>>,
+    peer: Option<Rc<RefCell<PipeState>>>,
+}
 
 /// The pump's end of the pipe.
 #[derive(Debug)]
 pub struct PipeHandle(Rc<RefCell<PipeState>>);
 
-/// A fresh pipe: hyper's end and the pump's.
-pub fn pipe() -> (HyperIo, PipeHandle) {
+/// A fresh pipe: the IO end and the pump's.
+pub fn pipe() -> (PipeIo, PipeHandle) {
     let st = Rc::new(RefCell::new(PipeState::default()));
-    (HyperIo(st.clone()), PipeHandle(st))
+    let io = PipeIo {
+        st: st.clone(),
+        peer: None,
+    };
+    (io, PipeHandle(st))
+}
+
+/// Two cross-wired ends for in-memory peers: what one writes the other reads
+/// (≤ `PIPE_CAP` in flight), and `poll_shutdown` is the peer's EOF.
+#[cfg(any(test, feature = "test-support"))]
+pub fn pipe_pair() -> (PipeIo, PipeIo) {
+    let a = Rc::new(RefCell::new(PipeState::default()));
+    let b = Rc::new(RefCell::new(PipeState::default()));
+    let end = |st: &Rc<_>, peer: &Rc<_>| PipeIo {
+        st: Rc::clone(st),
+        peer: Some(Rc::clone(peer)),
+    };
+    (end(&a, &b), end(&b, &a))
 }
 
 impl PipeHandle {
@@ -128,13 +149,16 @@ impl PipeHandle {
     }
 }
 
-impl hyper::rt::Read for HyperIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
+impl PipeIo {
+    /// The one read op behind both trait families: offers the next <= `room`
+    /// bytes as the deque's two slices to `put`.
+    fn poll_read_with(
+        &self,
         cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
+        room: usize,
+        put: impl FnOnce(&[u8], &[u8]),
     ) -> Poll<io::Result<()>> {
-        let mut st = self.0.borrow_mut();
+        let mut st = self.st.borrow_mut();
         if st.dead {
             return Poll::Ready(Err(dead_err()));
         }
@@ -145,34 +169,80 @@ impl hyper::rt::Read for HyperIo {
             st.rx_waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        let n = buf.remaining().min(st.rx.len());
+        let n = room.min(st.rx.len());
         let (a, b) = st.rx.as_slices();
         let na = n.min(a.len());
-        buf.put_slice(&a[..na]);
-        buf.put_slice(&b[..n - na]);
+        put(&a[..na], &b[..n - na]);
         st.rx.drain(..n);
         st.rx_since_send += n as u64;
+        if n > 0 && self.peer.is_some() {
+            // a pair's writer parks on the room in *our* rx
+            if let Some(w) = st.tx_waker.take() {
+                w.wake();
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_write_inner(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if self.st.borrow().dead {
+            return Poll::Ready(Err(dead_err()));
+        }
+        let Some(peer) = &self.peer else {
+            let mut st = self.st.borrow_mut();
+            let n = buf.len().min(PIPE_CAP - st.tx.len());
+            if n == 0 && !buf.is_empty() {
+                st.tx_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            st.tx.extend_from_slice(&buf[..n]);
+            return Poll::Ready(Ok(n));
+        };
+        let mut p = peer.borrow_mut();
+        let n = buf.len().min(PIPE_CAP - p.rx.len());
+        if n == 0 && !buf.is_empty() {
+            p.tx_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        p.rx.extend(&buf[..n]);
+        if n > 0 {
+            p.wake_reader();
+        }
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_shutdown_inner(&self) -> Poll<io::Result<()>> {
+        self.st.borrow_mut().tx_shutdown = true;
+        if let Some(peer) = &self.peer {
+            let mut p = peer.borrow_mut();
+            p.rx_eof = true;
+            p.wake_reader();
+        }
         Poll::Ready(Ok(()))
     }
 }
 
-impl hyper::rt::Write for HyperIo {
+impl hyper::rt::Read for PipeIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        let room = buf.remaining();
+        self.poll_read_with(cx, room, |a, b| {
+            buf.put_slice(a);
+            buf.put_slice(b);
+        })
+    }
+}
+
+impl hyper::rt::Write for PipeIo {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut st = self.0.borrow_mut();
-        if st.dead {
-            return Poll::Ready(Err(dead_err()));
-        }
-        let n = buf.len().min(PIPE_CAP - st.tx.len());
-        if n == 0 && !buf.is_empty() {
-            st.tx_waker = Some(cx.waker().clone());
-            return Poll::Pending;
-        }
-        st.tx.extend_from_slice(&buf[..n]);
-        Poll::Ready(Ok(n))
+        self.poll_write_inner(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -180,8 +250,39 @@ impl hyper::rt::Write for HyperIo {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0.borrow_mut().tx_shutdown = true;
+        self.poll_shutdown_inner()
+    }
+}
+
+impl tokio::io::AsyncRead for PipeIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let room = buf.remaining();
+        self.poll_read_with(cx, room, |a, b| {
+            buf.put_slice(a);
+            buf.put_slice(b);
+        })
+    }
+}
+
+impl tokio::io::AsyncWrite for PipeIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_inner(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_shutdown_inner()
     }
 }
 
@@ -209,7 +310,7 @@ mod tests {
     }
 
     /// One `poll_read` into a `cap`-byte buffer: `None` = Pending.
-    fn read(io: &mut HyperIo, cx: &mut Context<'_>, cap: usize) -> Option<io::Result<Vec<u8>>> {
+    fn read(io: &mut PipeIo, cx: &mut Context<'_>, cap: usize) -> Option<io::Result<Vec<u8>>> {
         let mut store = vec![0; cap];
         let mut rb = hyper::rt::ReadBuf::new(&mut store);
         match Pin::new(io).poll_read(cx, rb.unfilled()) {
@@ -218,7 +319,7 @@ mod tests {
         }
     }
 
-    fn write(io: &mut HyperIo, cx: &mut Context<'_>, b: &[u8]) -> Poll<io::Result<usize>> {
+    fn write(io: &mut PipeIo, cx: &mut Context<'_>, b: &[u8]) -> Poll<io::Result<usize>> {
         Pin::new(io).poll_write(cx, b)
     }
 
@@ -382,6 +483,77 @@ mod tests {
             read(&mut io, &mut cx, 16).unwrap().unwrap(),
             b"",
             "then the 0-byte read"
+        );
+    }
+
+    /// spec §2.1: the MITM front polls h2 over a `PipeIo` by hand with the
+    /// `Dirty` waker; here both ends are h2 peers over `pipe_pair`.
+    #[test]
+    fn h2_handshake_over_pipe_pair() {
+        use super::super::Dirty;
+        use std::future::Future;
+
+        let (a, b) = pipe_pair();
+        let server = async move {
+            let mut conn = h2::server::handshake(a).await.unwrap();
+            let (req, mut respond) = conn.accept().await.unwrap().unwrap();
+            assert_eq!(req.uri().path(), "/ping");
+            let rsp = http::Response::builder().status(200).body(()).unwrap();
+            let mut body = respond.send_response(rsp, false).unwrap();
+            body.send_data(bytes::Bytes::from_static(b"pong"), true)
+                .unwrap();
+            while conn.accept().await.is_some() {}
+        };
+        let client = async move {
+            let (send, conn) = h2::client::handshake(b).await.unwrap();
+            let req = async move {
+                let req = http::Request::get("http://mq.test/ping").body(()).unwrap();
+                let (rsp, _) = send.ready().await.unwrap().send_request(req, true).unwrap();
+                let rsp = rsp.await.unwrap();
+                assert_eq!(rsp.status(), 200);
+                let mut body = rsp.into_body();
+                let mut got = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    got.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(got, b"pong");
+            };
+            let (_, r) = tokio::join!(req, conn);
+            r.unwrap();
+        };
+        let mut both = std::pin::pin!(async { tokio::join!(server, client) });
+        let dirty = Arc::new(Dirty::default());
+        let waker = Waker::from(dirty.clone());
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..1000 {
+            if both.as_mut().poll(&mut cx).is_ready() {
+                return;
+            }
+            assert!(dirty.take(), "pending without a wake would hang");
+        }
+        panic!("h2 over pipe_pair did not finish");
+    }
+
+    #[test]
+    fn pipe_pair_backpressure_and_shutdown_eof() {
+        let (mut a, mut b) = pipe_pair();
+        let (f, w) = flag();
+        let mut cx = Context::from_waker(&w);
+        assert!(
+            matches!(write(&mut a, &mut cx, &vec![1; PIPE_CAP + 9]), Poll::Ready(Ok(n)) if n == PIPE_CAP)
+        );
+        assert!(write(&mut a, &mut cx, b"x").is_pending(), "peer's rx full");
+        assert_eq!(read(&mut b, &mut cx, 10).unwrap().unwrap().len(), 10);
+        assert!(woke(&f), "the peer's read wakes the parked writer");
+        assert!(Pin::new(&mut a).poll_shutdown(&mut cx).is_ready());
+        assert_eq!(
+            read(&mut b, &mut cx, PIPE_CAP).unwrap().unwrap().len(),
+            PIPE_CAP - 10
+        );
+        assert_eq!(
+            read(&mut b, &mut cx, 1).unwrap().unwrap(),
+            b"",
+            "shutdown is EOF"
         );
     }
 }

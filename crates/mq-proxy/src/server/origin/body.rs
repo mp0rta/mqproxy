@@ -1,8 +1,8 @@
 //! SP3 spec §7.4: the request body hyper polls. The gateway fills the shared
 //! `UploadBuf` from `h3_recv_body` (§6.3); hyper owns the `UploadBody`.
 
+use super::Dirty;
 use super::SLICE;
-use super::exec::Dirty;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;

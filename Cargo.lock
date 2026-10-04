@@ -468,6 +468,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pki-types",
  "subtle",
+ "tokio",
 ]
 
 [[package]]

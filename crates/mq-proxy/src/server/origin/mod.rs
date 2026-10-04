@@ -6,24 +6,21 @@ mod accounting;
 mod body;
 mod errors;
 mod events;
-mod exec;
 #[cfg(feature = "test-support")]
 pub mod host;
 mod key;
-mod pipe;
 mod pump;
 mod request;
 mod response;
 pub mod tls;
 
+pub use crate::tls_pipe::{Dirty, PIPE_CAP, SLICE};
+use crate::tls_pipe::{PipeHandle, PipeIo, ShardExec, pipe};
 use accounting::{ConnAccounting, SweepClass};
 pub use body::{UploadBody, UploadBuf};
 #[cfg(feature = "test-support")]
 pub use errors::ErrClass;
 pub use events::{Accepted, BridgeEvents};
-pub use exec::Dirty;
-use exec::ShardExec;
-use pipe::{HyperIo, PipeHandle};
 pub use tls::{TlsSetupError, build_client_config, install_ring, native_roots};
 
 use http::{Request, Response};
@@ -46,8 +43,6 @@ use std::time::Duration;
 
 /// spec §8: the pinned hyper line (`hyper = "~1.10"`), for the startup log.
 pub const HYPER_VERSION: &str = "1.10";
-/// spec §7.1/§9.3: each direction of the pipe.
-pub const PIPE_CAP: usize = 64 * 1024;
 /// spec §6.3/§9.3: one request's `UploadBuf`.
 pub const UPLOAD_CAP: usize = 256 * 1024;
 /// spec §7.7: idle expiry (curl's default `MAXAGE_CONN`).
@@ -56,8 +51,6 @@ pub const IDLE_MAX: Duration = Duration::from_secs(118);
 pub const SWEEP: Duration = Duration::from_secs(10);
 /// spec §7.3 step 4: pump iterations per callback.
 pub const PUMP_CAP: usize = 16;
-/// spec §7.3/§7.4: one `tcp_write` slice, one upload frame.
-pub const SLICE: usize = 16 * 1024;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Scheme {
     Http,
@@ -275,8 +268,8 @@ enum Where {
     Conn(OriginConnId),
 }
 
-type H1Conn = http1::Connection<HyperIo, UploadBody>;
-type H2Conn = http2::Connection<HyperIo, UploadBody, ShardExec>;
+type H1Conn = http1::Connection<PipeIo, UploadBody>;
+type H2Conn = http2::Connection<PipeIo, UploadBody, ShardExec>;
 
 /// The hyper handshake's result, either protocol.
 enum Handshaked {
@@ -287,7 +280,7 @@ enum Handshaked {
 enum Driver {
     /// The TLS handshake runs through the socket; hyper's end of the pipe
     /// waits here for the hyper handshake (§7.2 step 4).
-    Tls(HyperIo),
+    Tls(PipeIo),
     Handshaking(Pin<Box<dyn Future<Output = hyper::Result<Handshaked>>>>),
     H1(Pin<Box<H1Conn>>),
     H2(Pin<Box<H2Conn>>),
@@ -735,7 +728,7 @@ impl Origin {
         self.timers.insert(t, OriginTimer::Connect(h3));
         *timer = Some(t);
         let plain = tls.is_none();
-        let (hyper_io, io) = pipe::pipe();
+        let (hyper_io, io) = pipe();
         let id = self.conns.insert(OriginConn {
             key: key.clone(),
             tcp,
@@ -1210,7 +1203,7 @@ mod tests {
     }
 
     pub(super) fn bare_conn() -> OriginConn {
-        let (hyper_io, io) = pipe::pipe();
+        let (hyper_io, io) = pipe();
         OriginConn {
             key: (Scheme::Http, "o.test".into(), 80),
             tcp: some_tcp(),

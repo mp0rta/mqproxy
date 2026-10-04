@@ -13,6 +13,7 @@ mq-wire = { path = "../mq-wire" }
 log = { workspace = true }
 subtle = { workspace = true }
 hyper = { workspace = true }
+tokio = { workspace = true }
 h2 = { workspace = true }   # floor only (RUSTSEC-2026-0258), see the workspace manifest
 http = { workspace = true }
 http-body = { workspace = true }

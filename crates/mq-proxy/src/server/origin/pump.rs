@@ -830,7 +830,7 @@ mod tests {
     fn rx_movable_after_step1_stopped_for_room() {
         let (mut sh, tcp) = socket_with_rx(b"abc");
         let mut origin = test_origin();
-        let free_room = |o: &mut Origin, id| o.conns.get_mut(id).unwrap().io = pipe::pipe().1;
+        let free_room = |o: &mut Origin, id| o.conns.get_mut(id).unwrap().io = pipe().1;
         sh.with_app(NOW, |_, cx| {
             // Plain: the rest waits in `tcp_rx`.
             let id = origin.conns.insert(OriginConn {
