@@ -135,6 +135,8 @@ mkdir -p "${CI_BENCH_RESULTS}"
 
 ORIGIN_CERT="${WORK}/origin.crt"
 ORIGIN_KEY="${WORK}/origin.key"
+ORIGIN_CA="${WORK}/origin-ca.crt"
+ORIGIN_CA_KEY="${WORK}/origin-ca.key"
 MITM_CA_CRT_RUN="${WORK}/ca.crt"
 MITM_CA_KEY_RUN="${WORK}/ca.key"
 BLOB_FILE="${WORK}/blob.bin"
@@ -211,12 +213,25 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── Mint origin cert ──
-openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "${ORIGIN_KEY}" -out "${ORIGIN_CERT}" -days 2 \
-    -subj "/CN=${MITM_HOST}" \
-    -addext "subjectAltName=DNS:${MITM_HOST},DNS:localhost,IP:127.0.0.1" \
-    >/dev/null 2>&1
+# ── Mint origin CA + leaf ──
+# A CA:FALSE leaf under a separate CA: the Rust server verifies with webpki,
+# which rejects a self-signed cert used as its own end entity.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout "${ORIGIN_CA_KEY}" -out "${ORIGIN_CA}" -days 2 \
+    -subj "/CN=mqproxy-bench-origin-ca" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign" >/dev/null 2>&1
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout "${ORIGIN_KEY}" -out "${WORK}/origin.csr" \
+    -subj "/CN=${MITM_HOST}" >/dev/null 2>&1
+printf '%s\n' \
+    "subjectAltName=DNS:${MITM_HOST},DNS:localhost,IP:127.0.0.1" \
+    "basicConstraints=critical,CA:FALSE" \
+    "keyUsage=critical,digitalSignature" \
+    "extendedKeyUsage=serverAuth" >"${WORK}/origin-ext.cnf"
+openssl x509 -req -in "${WORK}/origin.csr" -CA "${ORIGIN_CA}" \
+    -CAkey "${ORIGIN_CA_KEY}" -CAcreateserial -days 2 \
+    -extfile "${WORK}/origin-ext.cnf" -out "${ORIGIN_CERT}" >/dev/null 2>&1
 
 # Stage root-owned CA copies (mq_mitm_core requires ca.key owned by euid)
 cp "${MITM_CA_CRT}" "${MITM_CA_CRT_RUN}" && chmod 644 "${MITM_CA_CRT_RUN}"
@@ -247,7 +262,7 @@ for _ in $(seq 1 50); do
     if ! kill -0 "${ORIGIN_PID}" 2>/dev/null; then
         note "error: TLS origin died on startup" >&2; exit 1
     fi
-    if curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CERT}" \
+    if curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CA}" \
         "https://localhost:${ORIGIN_PORT}/" 2>/dev/null; then
         break
     fi
@@ -265,7 +280,7 @@ printf '%s\n' "${HOSTS_LINE}" >> /etc/hosts
     --token "ci-mitm-bench" \
     --cert "${MQPROXY_CERT}" \
     --key "${MQPROXY_KEY}" \
-    --origin-ca "${ORIGIN_CERT}" \
+    --origin-ca "${ORIGIN_CA}" \
     > "${WORK}/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 1

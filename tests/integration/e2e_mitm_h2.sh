@@ -38,7 +38,7 @@
 #       handshake that FAILS against the MITM CA) proves the ignore-hosts splice
 #       is opaque (the origin's real ClientHello/cert reach the wire untouched).
 #
-# ASSERTIONS (Task 16 Step 2):
+# ASSERTIONS (cases a-f run by default; g and h are Rust-only):
 #   (a) curl --http2 to the MITM host gets the origin object over h2
 #       (http_version == 2, body byte-exact)        → transparent MITM works.
 #   (b) a second same-origin fetch REUSES the warm origin connection
@@ -57,6 +57,15 @@
 #       presented for the excluded host).
 #   (e) concurrent multi-stream fetch (curl --http2 --parallel N URLs) succeeds
 #       (the orchestrator's single h2 conn multiplexes N streams onto the tunnel).
+#   (f) a POST upload body reaches the origin byte-exact over h2 (no FIN-before-body
+#       regression: the H2 adapter must report a streaming body).
+#   (g) [Rust] curl --http1.1 --cacert <origin CA> succeeds: a client that does not
+#       offer h2 takes the OPAQUE path (origin cert verifies; the MITM CA is rejected).
+#   (h) [Rust] a 6 KiB Cookie and a 3 KiB URL succeed (the C server stores forwarded
+#       values in 1024 bytes, so this case is not C-compatible).
+#
+# CASE SELECTION: MITM_CASES (default "a b c d e f", which CTest and the C interop
+# runs use). Rust<->Rust runs set MITM_CASES="a b c d e f g h".
 #
 # HOW HOSTNAMES RESOLVE (both client AND server sides):
 #   The H2 adapter forwards the browser's :authority verbatim; the gateway server
@@ -64,11 +73,13 @@
 #   against --origin-ca. So BOTH the SNI host (browser→client) and the libcurl
 #   target host (server→origin) are the SAME hostname, and BOTH must resolve to
 #   127.0.0.1 and be covered by the origin cert's SAN. We therefore:
-#     * generate a DEDICATED origin cert at runtime (in WORK) whose SAN covers
-#       mitm.test + pinned.example + localhost + IP:127.0.0.1 (the tracked
-#       tests/certs/origin.crt only carries localhost/127.0.0.1, so we mint our
-#       own self-signed origin cert here and point --origin-ca at it — the e2e
-#       is self-contained, like e2e_gateway already generates its own files).
+#     * generate a DEDICATED origin CA + leaf at runtime (in WORK); the leaf's SAN
+#       covers mitm.test + pinned.example + localhost + IP:127.0.0.1 (the tracked
+#       tests/certs/origin.crt only carries localhost/127.0.0.1) and --origin-ca
+#       points at the CA. A CA + CA:FALSE leaf pair is required: the Rust server
+#       verifies with webpki, which rejects a self-signed cert used as its own
+#       end-entity (CaUsedAsEndEntity). The e2e is self-contained, like
+#       e2e_gateway, which also generates its own files.
 #     * add /etc/hosts entries mitm.test/pinned.example → 127.0.0.1 (we are root
 #       in the NET_ADMIN container) so BOTH curl's SNI and the server's libcurl
 #       resolve the hostnames. The entries are removed on cleanup.
@@ -105,10 +116,14 @@
 #     (NOTE the curl-CLI gotcha: libcurl-dev != the curl binary — install `curl`.)
 #
 # ENV (passed by CMake; overridable):
-#   MQPROXY_BIN              the `mqproxy` binary (MUST be MITM-capable).
+#   MQPROXY_BIN              the `mqproxy` binary (MUST be MITM-capable; the Rust
+#                            binary or, for interop, tests/integration/
+#                            mqproxy-interop-wrapper.sh).
 #   MQPROXY_CERT/KEY         tunnel TLS cert/key (CN=mqproxy-test).
 #   MQ_MITM_CA_CRT/KEY       the MITM signing CA (configure-time fixtures) —
 #                            consumed by --ca-cert/--ca-key; curl trusts the crt.
+#                            The key must be PKCS#8 (the Rust loader's only format).
+#   MITM_CASES               cases to run (default "a b c d e f").
 #
 set -u
 
@@ -122,6 +137,9 @@ MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 MITM_CA_CRT="${MQ_MITM_CA_CRT:-${REPO_ROOT}/tests/certs/mitm-ca.crt}"
 MITM_CA_KEY="${MQ_MITM_CA_KEY:-${REPO_ROOT}/tests/certs/mitm-ca.key}"
+
+MITM_CASES="${MITM_CASES:-a b c d e f}"
+want() { case " ${MITM_CASES} " in *" $1 "*) return 0 ;; esac; return 1; }
 
 TOKEN="mitm-h2-e2e-token"
 SERVER_IP="127.0.0.1"
@@ -235,8 +253,10 @@ WORK="$(mktemp -d /tmp/mqproxy_e2e_mitm_h2.XXXXXX)"
 # nobody must traverse WORK to write its -o output (mktemp -d is 0700/root).
 chmod 755 "${WORK}"
 
-ORIGIN_CERT="${WORK}/origin.crt"   # runtime origin cert (SAN covers both hosts)
+ORIGIN_CERT="${WORK}/origin.crt"   # runtime origin leaf (SAN covers both hosts)
 ORIGIN_KEY="${WORK}/origin.key"
+ORIGIN_CA="${WORK}/origin-ca.crt"  # its CA (--origin-ca, curl --cacert)
+ORIGIN_CA_KEY="${WORK}/origin-ca.key"
 # Public copies under /tmp so the unprivileged `nobody` curl can --cacert them
 # (the repo path is usually under a 0700 home dir nobody cannot traverse — see
 # the e2e_tproxy.sh note on the HTTP-000 path-permission trap).
@@ -293,17 +313,29 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── mint a dedicated origin cert (SAN covers both hostnames) ─────────────────
-# Self-signed; the server trusts it via --origin-ca (origin cert == its own CA,
-# exactly as e2e_gateway uses the self-signed origin.crt as --origin-ca). SAN
-# carries the two test hostnames + localhost + IP so the server's libcurl host
-# verification passes for both the MITM and the ignore-host targets.
+# ── mint a dedicated origin CA + leaf (SAN covers both hostnames) ─────────────
+# The server trusts the CA via --origin-ca. SAN carries the two test hostnames +
+# localhost + IP so the server's host verification passes for both the MITM and
+# the ignore-host targets. The leaf is CA:FALSE (webpki rejects a CA used as an
+# end entity).
 mint_origin_cert() {
-    openssl req -x509 -newkey rsa:2048 -nodes \
-        -keyout "${ORIGIN_KEY}" -out "${ORIGIN_CERT}" -days 2 \
-        -subj "/CN=${MITM_HOST}" \
-        -addext "subjectAltName=DNS:${MITM_HOST},DNS:${IGNORE_HOST},DNS:localhost,IP:127.0.0.1" \
-        >/dev/null 2>&1 || return 1
+    local ext="${WORK}/origin-ext.cnf"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -keyout "${ORIGIN_CA_KEY}" -out "${ORIGIN_CA}" -days 2 \
+        -subj "/CN=mqproxy-e2e-origin-ca" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign" >/dev/null 2>&1 || return 1
+    openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -keyout "${ORIGIN_KEY}" -out "${WORK}/origin.csr" \
+        -subj "/CN=${MITM_HOST}" >/dev/null 2>&1 || return 1
+    printf '%s\n' \
+        "subjectAltName=DNS:${MITM_HOST},DNS:${IGNORE_HOST},DNS:localhost,IP:127.0.0.1" \
+        "basicConstraints=critical,CA:FALSE" \
+        "keyUsage=critical,digitalSignature" \
+        "extendedKeyUsage=serverAuth" >"${ext}"
+    openssl x509 -req -in "${WORK}/origin.csr" -CA "${ORIGIN_CA}" \
+        -CAkey "${ORIGIN_CA_KEY}" -CAcreateserial -days 2 -extfile "${ext}" \
+        -out "${ORIGIN_CERT}" >/dev/null 2>&1 || return 1
     return 0
 }
 
@@ -383,6 +415,15 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path.split("?", 1)[0] == "/echo-sizes":
+            # Case h: report how many bytes of target and Cookie arrived.
+            body = ("%d %d" % (len(self.path), len(self.headers.get("Cookie") or ""))).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.split("?", 1)[0] == "/__count":
             qs = urllib.parse.urlparse(self.path).query
             p = urllib.parse.parse_qs(qs).get("p", [""])[0]
@@ -441,7 +482,7 @@ start_origin() {
             sed 's/^/  origin| /' "${WORK}/origin.log" >&2 2>/dev/null
             return 1
         fi
-        if curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CERT}" \
+        if curl -s -o /dev/null --max-time 2 --cacert "${ORIGIN_CA}" \
             "https://localhost:${ORIGIN_PORT}/" 2>/dev/null; then
             return 0
         fi
@@ -457,7 +498,7 @@ start_server() {
         --listen "${SERVER_IP}:${QUIC_PORT}" \
         --token "${TOKEN}" \
         --cert "${MQPROXY_CERT}" --key "${MQPROXY_KEY}" \
-        --origin-ca "${ORIGIN_CERT}" \
+        --origin-ca "${ORIGIN_CA}" \
         --request-metrics \
         --cache-max-bytes 67108864 \
         >"${WORK}/server.log" 2>&1 &
@@ -538,13 +579,13 @@ ncurl() {
 }
 
 # ── run ───────────────────────────────────────────────────────────────────────
-note "minting runtime origin cert (SAN=${MITM_HOST},${IGNORE_HOST},localhost,127.0.0.1) ..."
+note "minting runtime origin CA + leaf (SAN=${MITM_HOST},${IGNORE_HOST},localhost,127.0.0.1) ..."
 mint_origin_cert || { note "ERROR: could not mint origin cert."; exit 1; }
 
 # Stage world-readable CA copies for the unprivileged curl.
 cp "${MITM_CA_CRT}" "${MITM_CA_PUB}" && chmod 644 "${MITM_CA_PUB}" || \
     { note "ERROR: could not stage MITM CA copy."; exit 1; }
-cp "${ORIGIN_CERT}" "${ORIGIN_CA_PUB}" && chmod 644 "${ORIGIN_CA_PUB}" || \
+cp "${ORIGIN_CA}" "${ORIGIN_CA_PUB}" && chmod 644 "${ORIGIN_CA_PUB}" || \
     { note "ERROR: could not stage origin CA copy."; exit 1; }
 
 # Stage euid-owned 0600 CA cert+key copies for --ca-cert/--ca-key (the core's
@@ -579,184 +620,227 @@ printf '%s\n' "opaque-${ORIGIN_MAGIC}" >"${WORK}/opq.bin"  # ignore-host object 
 MITM_URL="https://${MITM_HOST}:${ORIGIN_PORT}"
 IGNORE_URL="https://${IGNORE_HOST}:${ORIGIN_PORT}"
 
-# ── case (a): transparent MITM works — h2 200 against the FORGED leaf ─────────
-# curl --http2 --cacert <MITM CA>. A clean h2 200 + byte-exact body proves the
-# client forged a leaf for ${MITM_HOST} signed by the MITM CA, terminated TLS,
-# spoke h2 over the tunnel, and the server fetched the origin. We RETRY (the QUIC
-# handshake / first MITM forge can lag) like e2e_tproxy.
-note "case a: curl --http2 (MITM, --cacert MITM-CA) to ${MITM_URL}/obj.bin ..."
-res_a="000 0"
-for attempt in $(seq 1 10); do
-    res_a="$(ncurl "${WORK}/a_body.txt" --http2 --cacert "${MITM_CA_PUB}" "${MITM_URL}/obj.bin")"
+if want a; then
+    # ── case (a): transparent MITM works — h2 200 against the FORGED leaf ─────────
+    # curl --http2 --cacert <MITM CA>. A clean h2 200 + byte-exact body proves the
+    # client forged a leaf for ${MITM_HOST} signed by the MITM CA, terminated TLS,
+    # spoke h2 over the tunnel, and the server fetched the origin. We RETRY (the QUIC
+    # handshake / first MITM forge can lag) like e2e_tproxy.
+    note "case a: curl --http2 (MITM, --cacert MITM-CA) to ${MITM_URL}/obj.bin ..."
+    res_a="000 0"
+    for attempt in $(seq 1 10); do
+        res_a="$(ncurl "${WORK}/a_body.txt" --http2 --cacert "${MITM_CA_PUB}" "${MITM_URL}/obj.bin")"
+        read -r code_a ver_a <<< "${res_a:-000 0}"; ver_a="${ver_a:-0}"
+        [ "${code_a}" = "200" ] && break
+        note "case a: attempt ${attempt}/10 got HTTP ${code_a} (h${ver_a}); retrying ..."
+        sleep 1
+    done
     read -r code_a ver_a <<< "${res_a:-000 0}"; ver_a="${ver_a:-0}"
-    [ "${code_a}" = "200" ] && break
-    note "case a: attempt ${attempt}/10 got HTTP ${code_a} (h${ver_a}); retrying ..."
-    sleep 1
-done
-read -r code_a ver_a <<< "${res_a:-000 0}"; ver_a="${ver_a:-0}"
-[ "${code_a}" = "200" ] || fail "case a: HTTP code = ${code_a} (want 200) — MITM termination/forge failed; \
-check ${WORK}/client.log + ${WORK}/server.log"
-# http_version must be 2 (curl prints '2' for HTTP/2).
-[ "${ver_a}" = "2" ] || fail "case a: http_version = ${ver_a} (want 2) — h2 was not negotiated"
-body_a="$(cat "${WORK}/a_body.txt" 2>/dev/null)"
-[ "${body_a}" = "${ORIGIN_MAGIC}" ] || fail "case a: body mismatch: got '${body_a}' want '${ORIGIN_MAGIC}'"
-ok "case a: transparent MITM works — h2 200 + body byte-exact (forged leaf trusted via MITM CA)"
+    [ "${code_a}" = "200" ] || fail "case a: HTTP code = ${code_a} (want 200) — MITM termination/forge failed; \
+    check ${WORK}/client.log + ${WORK}/server.log"
+    # http_version must be 2 (curl prints '2' for HTTP/2).
+    [ "${ver_a}" = "2" ] || fail "case a: http_version = ${ver_a} (want 2) — h2 was not negotiated"
+    body_a="$(cat "${WORK}/a_body.txt" 2>/dev/null)"
+    [ "${body_a}" = "${ORIGIN_MAGIC}" ] || fail "case a: body mismatch: got '${body_a}' want '${ORIGIN_MAGIC}'"
+    ok "case a: transparent MITM works — h2 200 + body byte-exact (forged leaf trusted via MITM CA)"
+fi
 
-# ── case (b): cache HIT — second fetch served origin-once ────────────────────
-# MITM-MODEL NOTE — why this is origin-CONNECTION-REUSE, not a server cache HIT:
-#   The Task-16 plan text says "origin-once (cache hit)". But §4.5 step 1 (the
-#   S3-D11 untrusted-browser-header policy, enforced in mq_gw_h2_adapter on_header)
-#   STRIPS every browser-supplied x-mq-* header UNCONDITIONALLY, and the MITM path
-#   injects EXACTLY two controls (x-mq-auth, x-mq-forward-cookie) — NOT X-Mq-Cache.
-#   The server-side response cache is therefore NOT reachable from a transparently
-#   MITM'd browser (a browser must never be able to drive the gateway cache). So an
-#   origin-served-ONCE assertion is impossible in this model — the origin is hit on
-#   every fetch. The valid, falsifiable "served efficiently the second time" proof
-#   in the MITM model is ORIGIN-CONNECTION REUSE: the server keeps the origin TLS
-#   connection warm and the 2nd same-origin fetch reuses it (mq.req origin_reuse=1,
-#   origin_connect_ms=0). That is what we assert here (e2e_gateway case 9 proves the
-#   same flip for the fetch-API path). The cache HIT itself is unit/e2e-covered on
-#   the gateway fetch path (e2e_gateway case 14), which is the only ingress that can
-#   set X-Mq-Cache.
-note "case b: two same-origin MITM fetches → assert 2nd reuses the origin connection ..."
-res_b1="$(ncurl "${WORK}/b1_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
-    "${MITM_URL}/cache-obj.bin")"
-read -r code_b1 _ <<< "${res_b1:-000 0}"
-[ "${code_b1}" = "200" ] || fail "case b: first fetch HTTP code = ${code_b1} (want 200)"
-res_b2="$(ncurl "${WORK}/b2_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
-    "${MITM_URL}/cache-obj.bin")"
-read -r code_b2 _ <<< "${res_b2:-000 0}"
-[ "${code_b2}" = "200" ] || fail "case b: second fetch HTTP code = ${code_b2} (want 200)"
-# Both bodies byte-identical (same origin object).
-cmp -s "${WORK}/b1_body.txt" "${WORK}/b2_body.txt" || fail "case b: 2nd body differs from 1st"
-# FALSIFIABLE reuse proof: the server must log at least one mq.req for this path
-# with origin_reuse=1 (the warm origin connection was reused on the 2nd fetch).
-# server.log is in WORK; mq.req fires slightly after curl returns, so poll briefly.
-b_reuse=0
-for _ in $(seq 1 25); do
-    if grep -Eq 'mq\.req .* path="/cache-obj.bin" .* origin_reuse=1' "${WORK}/server.log" 2>/dev/null; then
-        b_reuse=1; break
-    fi
-    sleep 0.2
-done
-[ "${b_reuse}" -eq 1 ] || fail "case b: no mq.req for /cache-obj.bin with origin_reuse=1 \
-(2nd same-origin fetch did not reuse the origin connection); mq.req lines: \
-$(grep -E 'mq\.req .* path=\"/cache-obj.bin\"' "${WORK}/server.log" 2>/dev/null | tr '\n' '|')"
-ok "case b: second same-origin fetch reuses the warm origin connection (origin_reuse=1)"
+if want b; then
+    # ── case (b): cache HIT — second fetch served origin-once ────────────────────
+    # MITM-MODEL NOTE — why this is origin-CONNECTION-REUSE, not a server cache HIT:
+    #   The Task-16 plan text says "origin-once (cache hit)". But §4.5 step 1 (the
+    #   S3-D11 untrusted-browser-header policy, enforced in mq_gw_h2_adapter on_header)
+    #   STRIPS every browser-supplied x-mq-* header UNCONDITIONALLY, and the MITM path
+    #   injects EXACTLY two controls (x-mq-auth, x-mq-forward-cookie) — NOT X-Mq-Cache.
+    #   The server-side response cache is therefore NOT reachable from a transparently
+    #   MITM'd browser (a browser must never be able to drive the gateway cache). So an
+    #   origin-served-ONCE assertion is impossible in this model — the origin is hit on
+    #   every fetch. The valid, falsifiable "served efficiently the second time" proof
+    #   in the MITM model is ORIGIN-CONNECTION REUSE: the server keeps the origin TLS
+    #   connection warm and the 2nd same-origin fetch reuses it (mq.req origin_reuse=1,
+    #   origin_connect_ms=0). That is what we assert here (e2e_gateway case 9 proves the
+    #   same flip for the fetch-API path). The cache HIT itself is unit/e2e-covered on
+    #   the gateway fetch path (e2e_gateway case 14), which is the only ingress that can
+    #   set X-Mq-Cache.
+    note "case b: two same-origin MITM fetches → assert 2nd reuses the origin connection ..."
+    res_b1="$(ncurl "${WORK}/b1_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
+        "${MITM_URL}/cache-obj.bin")"
+    read -r code_b1 _ <<< "${res_b1:-000 0}"
+    [ "${code_b1}" = "200" ] || fail "case b: first fetch HTTP code = ${code_b1} (want 200)"
+    res_b2="$(ncurl "${WORK}/b2_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
+        "${MITM_URL}/cache-obj.bin")"
+    read -r code_b2 _ <<< "${res_b2:-000 0}"
+    [ "${code_b2}" = "200" ] || fail "case b: second fetch HTTP code = ${code_b2} (want 200)"
+    # Both bodies byte-identical (same origin object).
+    cmp -s "${WORK}/b1_body.txt" "${WORK}/b2_body.txt" || fail "case b: 2nd body differs from 1st"
+    # FALSIFIABLE reuse proof: the server must log at least one mq.req for this path
+    # with origin_reuse=1 (the warm origin connection was reused on the 2nd fetch).
+    # server.log is in WORK; mq.req fires slightly after curl returns, so poll briefly.
+    b_reuse=0
+    for _ in $(seq 1 25); do
+        if grep -Eq 'mq\.req .* path="/cache-obj.bin" .* origin_reuse=1' "${WORK}/server.log" 2>/dev/null; then
+            b_reuse=1; break
+        fi
+        sleep 0.2
+    done
+    [ "${b_reuse}" -eq 1 ] || fail "case b: no mq.req for /cache-obj.bin with origin_reuse=1 \
+    (2nd same-origin fetch did not reuse the origin connection); mq.req lines: \
+    $(grep -E 'mq\.req .* path=\"/cache-obj.bin\"' "${WORK}/server.log" 2>/dev/null | tr '\n' '|')"
+    ok "case b: second same-origin fetch reuses the warm origin connection (origin_reuse=1)"
+fi
 
-# ── case (c): cookie-authenticated request reaches origin WITH its Cookie ─────
-# §4.5 forward: the H2 adapter forwards browser headers verbatim + injects
-# x-mq-forward-cookie:true, so the origin must see Cookie: k=v echoed back.
-note "case c: MITM fetch of /echo-cookie with Cookie: k=v ..."
-res_c="$(ncurl "${WORK}/c_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
-    -H "Cookie: k=v" "${MITM_URL}/echo-cookie")"
-read -r code_c _ <<< "${res_c:-000 0}"
-[ "${code_c}" = "200" ] || fail "case c: HTTP code = ${code_c} (want 200)"
-body_c="$(cat "${WORK}/c_body.txt" 2>/dev/null)"
-[ "${body_c}" = "k=v" ] || fail "case c: origin saw Cookie='${body_c}' (want k=v) — §4.5 forward failed"
-ok "case c: cookie-authenticated request reached origin WITH its Cookie (k=v)"
+if want c; then
+    # ── case (c): cookie-authenticated request reaches origin WITH its Cookie ─────
+    # §4.5 forward: the H2 adapter forwards browser headers verbatim + injects
+    # x-mq-forward-cookie:true, so the origin must see Cookie: k=v echoed back.
+    note "case c: MITM fetch of /echo-cookie with Cookie: k=v ..."
+    res_c="$(ncurl "${WORK}/c_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
+        -H "Cookie: k=v" "${MITM_URL}/echo-cookie")"
+    read -r code_c _ <<< "${res_c:-000 0}"
+    [ "${code_c}" = "200" ] || fail "case c: HTTP code = ${code_c} (want 200)"
+    body_c="$(cat "${WORK}/c_body.txt" 2>/dev/null)"
+    [ "${body_c}" = "k=v" ] || fail "case c: origin saw Cookie='${body_c}' (want k=v) — §4.5 forward failed"
+    ok "case c: cookie-authenticated request reached origin WITH its Cookie (k=v)"
+fi
 
-# ── case (d): --ignore-host SNI spliced opaquely (no MITM cert presented) ─────
-# Positive (opacity): curl --http2 verifying the ORIGIN cert MUST succeed — the
-# connection passed through untouched, so the origin's real cert reaches curl.
-# Negative (no MITM): curl verifying the MITM CA MUST FAIL — no forged leaf is
-# presented for an ignore-host (if one were, this would WRONGLY succeed).
-note "case d: ignore-host ${IGNORE_HOST} — opaque splice proof (origin CA ok, MITM CA fails) ..."
-# (d.1) origin-CA verify succeeds (opaque pass-through). The opaque relay is a
-# byte-pipe; curl will negotiate whatever the origin offers (h2 only if the
-# python origin advertised it — it does NOT, so the http_version may be 1.1 here.
-# Opacity, not h2, is the axis for the ignore-host, so we assert code+cert only).
-res_d="000 0"
-for attempt in $(seq 1 10); do
-    res_d="$(ncurl "${WORK}/d_body.txt" --cacert "${ORIGIN_CA_PUB}" "${IGNORE_URL}/opq.bin")"
+if want d; then
+    # ── case (d): --ignore-host SNI spliced opaquely (no MITM cert presented) ─────
+    # Positive (opacity): curl --http2 verifying the ORIGIN cert MUST succeed — the
+    # connection passed through untouched, so the origin's real cert reaches curl.
+    # Negative (no MITM): curl verifying the MITM CA MUST FAIL — no forged leaf is
+    # presented for an ignore-host (if one were, this would WRONGLY succeed).
+    note "case d: ignore-host ${IGNORE_HOST} — opaque splice proof (origin CA ok, MITM CA fails) ..."
+    # (d.1) origin-CA verify succeeds (opaque pass-through). The opaque relay is a
+    # byte-pipe; curl will negotiate whatever the origin offers (h2 only if the
+    # python origin advertised it — it does NOT, so the http_version may be 1.1 here.
+    # Opacity, not h2, is the axis for the ignore-host, so we assert code+cert only).
+    res_d="000 0"
+    for attempt in $(seq 1 10); do
+        res_d="$(ncurl "${WORK}/d_body.txt" --cacert "${ORIGIN_CA_PUB}" "${IGNORE_URL}/opq.bin")"
+        read -r code_d _ <<< "${res_d:-000 0}"
+        [ "${code_d}" = "200" ] && break
+        note "case d: attempt ${attempt}/10 origin-CA fetch got HTTP ${code_d}; retrying ..."
+        sleep 1
+    done
     read -r code_d _ <<< "${res_d:-000 0}"
-    [ "${code_d}" = "200" ] && break
-    note "case d: attempt ${attempt}/10 origin-CA fetch got HTTP ${code_d}; retrying ..."
-    sleep 1
-done
-read -r code_d _ <<< "${res_d:-000 0}"
-[ "${code_d}" = "200" ] || fail "case d: origin-CA verify HTTP code = ${code_d} (want 200) — opaque splice failed"
-body_d="$(cat "${WORK}/d_body.txt" 2>/dev/null)"
-[ "${body_d}" = "opaque-${ORIGIN_MAGIC}" ] || \
-    fail "case d: opaque body mismatch: got '${body_d}' want 'opaque-${ORIGIN_MAGIC}'"
-# (d.2) MITM-CA verify MUST FAIL — no forged leaf for an ignore-host. A non-200
-# (curl cert-verify error → HTTP 000) is the required outcome; a 200 here would
-# mean the host was WRONGLY MITM'd (forged leaf presented).
-res_d2="$(ncurl "${WORK}/d2_body.txt" --cacert "${MITM_CA_PUB}" "${IGNORE_URL}/opq.bin")"
-read -r code_d2 _ <<< "${res_d2:-000 0}"
-[ "${code_d2}" != "200" ] || \
-    fail "case d: MITM-CA verify UNEXPECTEDLY succeeded (HTTP 200) — the ignore-host was MITM'd (forged leaf presented)"
-ok "case d: ignore-host spliced opaquely (origin cert verifies; MITM CA rejected — no forged leaf, HTTP ${code_d2})"
+    [ "${code_d}" = "200" ] || fail "case d: origin-CA verify HTTP code = ${code_d} (want 200) — opaque splice failed"
+    body_d="$(cat "${WORK}/d_body.txt" 2>/dev/null)"
+    [ "${body_d}" = "opaque-${ORIGIN_MAGIC}" ] || \
+        fail "case d: opaque body mismatch: got '${body_d}' want 'opaque-${ORIGIN_MAGIC}'"
+    # (d.2) MITM-CA verify MUST FAIL — no forged leaf for an ignore-host. A non-200
+    # (curl cert-verify error → HTTP 000) is the required outcome; a 200 here would
+    # mean the host was WRONGLY MITM'd (forged leaf presented).
+    res_d2="$(ncurl "${WORK}/d2_body.txt" --cacert "${MITM_CA_PUB}" "${IGNORE_URL}/opq.bin")"
+    read -r code_d2 _ <<< "${res_d2:-000 0}"
+    [ "${code_d2}" != "200" ] || \
+        fail "case d: MITM-CA verify UNEXPECTEDLY succeeded (HTTP 200) — the ignore-host was MITM'd (forged leaf presented)"
+    ok "case d: ignore-host spliced opaquely (origin cert verifies; MITM CA rejected — no forged leaf, HTTP ${code_d2})"
+fi
 
-# ── case (e): concurrent multi-stream fetch succeeds ─────────────────────────
-# curl --http2 --parallel over multiple URLs runs them concurrently on ONE h2
-# connection (the MITM orchestrator multiplexes N streams onto the single
-# terminated h2 conn → tunnel). All must return 200. We use curl's -Z (parallel)
-# with multiple --next blocks; write each body to a distinct file and check all
-# returned 200. (Each URL is /obj.bin; the origin serves it N times.)
-note "case e: concurrent multi-stream MITM fetch (curl --http2 --parallel x4) ..."
-: >"${WORK}/e_codes.txt"; chmod 666 "${WORK}/e_codes.txt"
-for i in 1 2 3 4; do
-    : >"${WORK}/e_${i}.txt"; chmod 666 "${WORK}/e_${i}.txt"
-done
-# -Z enables parallel transfers; -w '%{http_code}\n' prints one code per URL.
-# SC2024: the >e_codes.txt redirect is INTENTIONALLY performed by the (root)
-# parent shell, not by `nobody` — root owns WORK so writing e_codes.txt is fine.
-# The per-stream BODY files are written by `nobody` via curl -o into the
-# pre-created world-writable e_*.txt above (that is the capture that matters).
-# shellcheck disable=SC2024
-sudo -u nobody curl -s --http2 -Z --max-time 25 --cacert "${MITM_CA_PUB}" \
-    -o "${WORK}/e_1.txt" "${MITM_URL}/obj.bin" \
-    -o "${WORK}/e_2.txt" "${MITM_URL}/obj.bin" \
-    -o "${WORK}/e_3.txt" "${MITM_URL}/obj.bin" \
-    -o "${WORK}/e_4.txt" "${MITM_URL}/obj.bin" \
-    -w '%{http_code}\n' >"${WORK}/e_codes.txt" 2>/dev/null || true
-e_ok=0
-for i in 1 2 3 4; do
-    if [ "$(cat "${WORK}/e_${i}.txt" 2>/dev/null)" = "${ORIGIN_MAGIC}" ]; then
-        e_ok=$((e_ok + 1))
-    fi
-done
-e_200="$(grep -c '^200$' "${WORK}/e_codes.txt" 2>/dev/null || echo 0)"
-[ "${e_ok}" -eq 4 ] || fail "case e: only ${e_ok}/4 concurrent fetches returned the correct body; \
-codes: $(tr '\n' ' ' <"${WORK}/e_codes.txt")"
-[ "${e_200}" -ge 4 ] || fail "case e: only ${e_200}/4 concurrent fetches returned HTTP 200; \
-codes: $(tr '\n' ' ' <"${WORK}/e_codes.txt")"
-ok "case e: concurrent multi-stream fetch — 4/4 streams returned 200 + byte-exact body"
+if want e; then
+    # ── case (e): concurrent multi-stream fetch succeeds ─────────────────────────
+    # curl --http2 --parallel over multiple URLs runs them concurrently on ONE h2
+    # connection (the MITM orchestrator multiplexes N streams onto the single
+    # terminated h2 conn → tunnel). All must return 200. We use curl's -Z (parallel)
+    # with multiple --next blocks; write each body to a distinct file and check all
+    # returned 200. (Each URL is /obj.bin; the origin serves it N times.)
+    note "case e: concurrent multi-stream MITM fetch (curl --http2 --parallel x4) ..."
+    : >"${WORK}/e_codes.txt"; chmod 666 "${WORK}/e_codes.txt"
+    for i in 1 2 3 4; do
+        : >"${WORK}/e_${i}.txt"; chmod 666 "${WORK}/e_${i}.txt"
+    done
+    # -Z enables parallel transfers; -w '%{http_code}\n' prints one code per URL.
+    # SC2024: the >e_codes.txt redirect is INTENTIONALLY performed by the (root)
+    # parent shell, not by `nobody` — root owns WORK so writing e_codes.txt is fine.
+    # The per-stream BODY files are written by `nobody` via curl -o into the
+    # pre-created world-writable e_*.txt above (that is the capture that matters).
+    # shellcheck disable=SC2024
+    sudo -u nobody curl -s --http2 -Z --max-time 25 --cacert "${MITM_CA_PUB}" \
+        -o "${WORK}/e_1.txt" "${MITM_URL}/obj.bin" \
+        -o "${WORK}/e_2.txt" "${MITM_URL}/obj.bin" \
+        -o "${WORK}/e_3.txt" "${MITM_URL}/obj.bin" \
+        -o "${WORK}/e_4.txt" "${MITM_URL}/obj.bin" \
+        -w '%{http_code}\n' >"${WORK}/e_codes.txt" 2>/dev/null || true
+    e_ok=0
+    for i in 1 2 3 4; do
+        if [ "$(cat "${WORK}/e_${i}.txt" 2>/dev/null)" = "${ORIGIN_MAGIC}" ]; then
+            e_ok=$((e_ok + 1))
+        fi
+    done
+    e_200="$(grep -c '^200$' "${WORK}/e_codes.txt" 2>/dev/null || echo 0)"
+    [ "${e_ok}" -eq 4 ] || fail "case e: only ${e_ok}/4 concurrent fetches returned the correct body; \
+    codes: $(tr '\n' ' ' <"${WORK}/e_codes.txt")"
+    [ "${e_200}" -ge 4 ] || fail "case e: only ${e_200}/4 concurrent fetches returned HTTP 200; \
+    codes: $(tr '\n' ' ' <"${WORK}/e_codes.txt")"
+    ok "case e: concurrent multi-stream fetch — 4/4 streams returned 200 + byte-exact body"
+fi
 
-# ── case (f): POST with a body reaches the origin (codex-1 High regression) ────
-# THE production proof for this fix. A POST upload through the transparent MITM:
-# curl --http2 --data-binary @<file> POSTs a body. The H2 adapter must report
-# content_length == -1 (streaming, has body) so the core does NOT FIN the upstream
-# H3 request before the body — the bug (content_length placeholder -1 + core's old
-# `<= 0` no_body test) FIN'd it on headers, so the body was lost. We assert the
-# ORIGIN echoed the EXACT body back (do_POST echoes the request body), which is
-# only possible if the body traversed the full MITM→tunnel→origin path intact.
-note "case f: POST upload (curl --http2 --data-binary) → origin must echo the body ..."
-# A multi-KiB body so it spans more than one DATA frame (exercises the streaming
-# body path, not just a single tiny chunk that could ride the headers).
-POST_BODY="${WORK}/post_body.bin"
-python3 - "$POST_BODY" <<'PY'
-import sys
-# 9000 deterministic bytes (> one 16 KiB frame is not required; multi-chunk is).
-data = bytes((i * 37 + 11) & 0xff for i in range(9000))
-with open(sys.argv[1], "wb") as f:
-    f.write(data)
-PY
-chmod 644 "${POST_BODY}"
-res_f="$(ncurl "${WORK}/f_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
-    --data-binary "@${POST_BODY}" -H 'Content-Type: application/octet-stream' \
-    "${MITM_URL}/upload")"
-read -r code_f ver_f <<< "${res_f:-000 0}"; ver_f="${ver_f:-0}"
-[ "${code_f}" = "200" ] || fail "case f: POST HTTP code = ${code_f} (want 200) — \
-upstream request was likely FIN'd before the body (codex-1 High); check ${WORK}/client.log + ${WORK}/server.log"
-[ "${ver_f}" = "2" ] || fail "case f: http_version = ${ver_f} (want 2) — h2 was not negotiated for the POST"
-# The origin echoes the request body verbatim → byte-exact match proves the full
-# upload body reached the origin (the FIN-before-body bug would truncate/lose it).
-cmp -s "${POST_BODY}" "${WORK}/f_body.txt" || fail "case f: origin echo differs from the POST body — \
-the request body did not reach the origin intact (FIN-before-body regression)"
-ok "case f: POST upload body reached the origin byte-exact over h2 (no FIN-before-body)"
+if want f; then
+    # ── case (f): POST with a body reaches the origin (codex-1 High regression) ────
+    # THE production proof for this fix. A POST upload through the transparent MITM:
+    # curl --http2 --data-binary @<file> POSTs a body. The H2 adapter must report
+    # content_length == -1 (streaming, has body) so the core does NOT FIN the upstream
+    # H3 request before the body — the bug (content_length placeholder -1 + core's old
+    # `<= 0` no_body test) FIN'd it on headers, so the body was lost. We assert the
+    # ORIGIN echoed the EXACT body back (do_POST echoes the request body), which is
+    # only possible if the body traversed the full MITM→tunnel→origin path intact.
+    note "case f: POST upload (curl --http2 --data-binary) → origin must echo the body ..."
+    # A multi-KiB body so it spans more than one DATA frame (exercises the streaming
+    # body path, not just a single tiny chunk that could ride the headers).
+    POST_BODY="${WORK}/post_body.bin"
+    # 9000 deterministic bytes (> one 16 KiB frame is not required; multi-chunk is).
+    python3 -c 'import sys; open(sys.argv[1], "wb").write(bytes((i * 37 + 11) & 0xff for i in range(9000)))' "$POST_BODY"
+    chmod 644 "${POST_BODY}"
+    res_f="$(ncurl "${WORK}/f_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
+        --data-binary "@${POST_BODY}" -H 'Content-Type: application/octet-stream' \
+        "${MITM_URL}/upload")"
+    read -r code_f ver_f <<< "${res_f:-000 0}"; ver_f="${ver_f:-0}"
+    [ "${code_f}" = "200" ] || fail "case f: POST HTTP code = ${code_f} (want 200) — \
+    upstream request was likely FIN'd before the body (codex-1 High); check ${WORK}/client.log + ${WORK}/server.log"
+    [ "${ver_f}" = "2" ] || fail "case f: http_version = ${ver_f} (want 2) — h2 was not negotiated for the POST"
+    # The origin echoes the request body verbatim → byte-exact match proves the full
+    # upload body reached the origin (the FIN-before-body bug would truncate/lose it).
+    cmp -s "${POST_BODY}" "${WORK}/f_body.txt" || fail "case f: origin echo differs from the POST body — \
+    the request body did not reach the origin intact (FIN-before-body regression)"
+    ok "case f: POST upload body reached the origin byte-exact over h2 (no FIN-before-body)"
+fi
+
+if want g; then
+    # ── case (g): an HTTP/1.1-only client takes the OPAQUE path (spec §11.4) ──────
+    # curl --http1.1 offers no h2 in ALPN, so the client splices the flow untouched
+    # (opaque: no-h2). The origin's real cert reaches curl: verifying the ORIGIN CA
+    # succeeds and the MITM CA must be rejected (no forged leaf was presented).
+    note "case g: curl --http1.1 (--cacert origin CA) to ${MITM_URL}/obj.bin → opaque ..."
+    res_g="$(ncurl "${WORK}/g_body.txt" --http1.1 --cacert "${ORIGIN_CA_PUB}" "${MITM_URL}/obj.bin")"
+    read -r code_g ver_g <<< "${res_g:-000 0}"; ver_g="${ver_g:-0}"
+    [ "${code_g}" = "200" ] || fail "case g: HTTP code = ${code_g} (want 200) — opaque path failed for an h1-only client"
+    [ "${ver_g}" = "1.1" ] || fail "case g: http_version = ${ver_g} (want 1.1)"
+    body_g="$(cat "${WORK}/g_body.txt" 2>/dev/null)"
+    [ "${body_g}" = "${ORIGIN_MAGIC}" ] || fail "case g: body mismatch: got '${body_g}' want '${ORIGIN_MAGIC}'"
+    res_g2="$(ncurl "${WORK}/g2_body.txt" --http1.1 --cacert "${MITM_CA_PUB}" "${MITM_URL}/obj.bin")"
+    read -r code_g2 _ <<< "${res_g2:-000 0}"
+    [ "${code_g2}" != "200" ] || fail "case g: MITM-CA verify UNEXPECTEDLY succeeded — an h1-only client was MITM'd"
+    ok "case g: curl --http1.1 spliced opaquely (origin CA verifies; MITM CA rejected, HTTP ${code_g2})"
+fi
+
+if want h; then
+    # ── case (h): a 6 KiB Cookie and a 3 KiB URL succeed (spec §11.4) ─────────────
+    # Both exceed 1 KiB; the origin reports the byte counts it received, so a value
+    # truncated or dropped anywhere on the MITM → tunnel → server → origin path shows.
+    note "case h: 6 KiB Cookie + 3 KiB URL through the MITM ..."
+    COOKIE_VAL="$(head -c 6144 /dev/zero | tr '\0' 'c')"
+    LONG_Q="$(head -c 3072 /dev/zero | tr '\0' 'q')"
+    res_h="$(ncurl "${WORK}/h_body.txt" --http2 --cacert "${MITM_CA_PUB}" \
+        -H "Cookie: k=${COOKIE_VAL}" "${MITM_URL}/echo-sizes?q=${LONG_Q}")"
+    read -r code_h _ <<< "${res_h:-000 0}"
+    [ "${code_h}" = "200" ] || fail "case h: HTTP code = ${code_h} (want 200)"
+    want_h="$(( ${#LONG_Q} + 14 )) $(( ${#COOKIE_VAL} + 2 ))" # "/echo-sizes?q=" is 14 bytes; "k=" is 2
+    body_h="$(cat "${WORK}/h_body.txt" 2>/dev/null)"
+    [ "${body_h}" = "${want_h}" ] || fail "case h: origin saw '${body_h}' (target-len cookie-len), want '${want_h}'"
+    ok "case h: 6 KiB Cookie + 3 KiB URL reached the origin intact (${body_h})"
+fi
 
 # ── summary ───────────────────────────────────────────────────────────────────
-note "RESULT = PASS (${PASS_COUNT} checks: MITM-works + cache-once + cookie-forward + ignore-host-splice + multi-stream + post-upload)."
+[ "${PASS_COUNT}" -gt 0 ] || fail "no case ran (MITM_CASES='${MITM_CASES}')"
+note "RESULT = PASS (cases: ${MITM_CASES}; ${PASS_COUNT} checks)."
 exit 0
