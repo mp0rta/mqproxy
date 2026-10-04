@@ -15,6 +15,7 @@ pub mod gateway;
 mod ingress_glue;
 mod paths;
 pub mod pending;
+pub mod tunnel_h3;
 mod udp_assoc;
 mod udp_session;
 
@@ -40,6 +41,7 @@ use pending::{IngressKind, Pending, PendingOpen};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use tunnel_h3::H3Tunnel;
 use udp_assoc::Assoc;
 use udp_session::Sessions;
 
@@ -129,7 +131,9 @@ pub struct Client {
     assocs: HashMap<TcpId, Assoc>,
     /// SP2 spec §6.3: the UDP sessions.
     sess: Sessions,
-    /// SP3 spec §5: the fetch gateway, with its own H3 tunnel.
+    /// SP4 spec §3: the shared H3 tunnel (layer ③), created with the gateway.
+    h3: Option<H3Tunnel>,
+    /// SP3 spec §5: the fetch gateway, over the H3 tunnel.
     gw: Option<Gateway>,
 }
 
@@ -207,6 +211,7 @@ impl Client {
             udp: UdpAvail::Unknown,
             assocs: HashMap::new(),
             sess: Sessions::new(),
+            h3: cfg.gateway.map(|_| H3Tunnel::new(&cfg)),
             gw: cfg.gateway.map(|_| Gateway::new(&cfg)),
             cfg,
         }
@@ -216,6 +221,18 @@ impl Client {
     #[cfg(feature = "test-support")]
     pub fn gateway(&self) -> Option<&Gateway> {
         self.gw.as_ref()
+    }
+
+    /// SP4 spec §3: the H3 tunnel's usable connection (`H3Tunnel::pick_conn`).
+    #[cfg(feature = "test-support")]
+    pub fn h3_tunnel_conn(&self) -> Option<ConnId> {
+        self.h3.as_ref().and_then(H3Tunnel::pick_conn)
+    }
+
+    /// SP4 spec §3: `H3Tunnel::gone`; `false` without a tunnel.
+    #[cfg(feature = "test-support")]
+    pub fn h3_tunnel_gone(&self) -> bool {
+        self.h3.as_ref().is_some_and(H3Tunnel::gone)
     }
 
     /// SP2 spec §6.3: the source an association locked.
@@ -579,9 +596,7 @@ impl Client {
 
     /// SP3 spec §5.9: shutting down, exit once both tunnels are gone (or never existed).
     fn maybe_exit(&self, cx: &mut Cx<'_>) {
-        if self.shutting_down
-            && self.conn.is_none()
-            && self.gw.as_ref().is_none_or(Gateway::tunnel_gone)
+        if self.shutting_down && self.conn.is_none() && self.h3.as_ref().is_none_or(H3Tunnel::gone)
         {
             cx.request_exit(0);
         }
@@ -605,13 +620,21 @@ impl App for Client {
         if self.cfg.has_tcp_ingress {
             self.connect(cx);
         }
-        if let Some(g) = self.gw.as_mut() {
-            g.on_start(cx);
+        if let Some(t) = self.h3.as_mut() {
+            t.on_start(cx);
         }
     }
 
     fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
-        // SP3 spec §5.8: the gateway's tunnel and every H3 event go to the gateway.
+        // SP3 spec §5.8: the H3 tunnel's events, then the H3 request events
+        // (the gateway's).
+        let ev = match self.h3.as_mut() {
+            Some(t) => match t.on_transport_event(cx, ev) {
+                Some(ev) => ev,
+                None => return self.maybe_exit(cx),
+            },
+            None => ev,
+        };
         let ev = match self.gw.as_mut() {
             Some(g) => match g.on_transport_event(cx, ev) {
                 Some(ev) => ev,
@@ -707,8 +730,9 @@ impl App for Client {
     }
 
     fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
-            return g.on_tcp_data(cx, tcp);
+            return g.on_tcp_data(cx, tunnel, tcp);
         }
         if self.assocs.contains_key(&tcp) {
             return discard(cx, tcp);
@@ -796,11 +820,11 @@ impl App for Client {
     ) {
         let assoc = self.assocs.iter_mut().find(|(_, a)| a.open_op == Some(op));
         let Some((&tcp, a)) = assoc else {
-            // SP3 spec §5.7: the raw tunnel's paths first, then the gateway's;
+            // SP3 spec §5.7: the raw tunnel's paths first, then the H3 tunnel's;
             // an op owned by neither is closed by the raw `Paths`.
             if !self.paths.owns(op)
-                && let Some(g) = self.gw.as_mut()
-                && g.on_udp_socket(cx, op, r)
+                && let Some(t) = self.h3.as_mut()
+                && t.on_udp_socket(cx, op, r)
             {
                 return;
             }
@@ -835,12 +859,14 @@ impl App for Client {
 
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         let Some(tm) = self.timers.remove(&id) else {
-            // A path retry of the raw tunnel, else the gateway's (SP3 spec §5.8).
+            // A path retry of the raw tunnel, else the H3 tunnel's, else the
+            // gateway's (SP3 spec §5.8).
             let conn = self.conn.as_ref().filter(|c| !c.closing).map(|c| c.id);
-            if !self.paths.on_timer(cx, conn, id) {
-                if let Some(g) = self.gw.as_mut() {
-                    g.on_timer(cx, id);
-                }
+            if !self.paths.on_timer(cx, conn, id)
+                && !self.h3.as_mut().is_some_and(|t| t.on_timer(cx, id))
+                && let Some(g) = self.gw.as_mut()
+            {
+                g.on_timer(cx, id);
             }
             return;
         };
@@ -861,10 +887,10 @@ impl App for Client {
                     self.timer(cx, every, Tm::Metrics);
                 }
                 // spec §6.5: nothing without a connection, as C `cli_metrics_tick`;
-                // SP3 spec §5.7: then the gateway tunnel's block.
+                // SP3 spec §5.7: then the H3 tunnel's block.
                 self.dump_metrics(cx);
-                if let Some(g) = self.gw.as_ref() {
-                    g.dump_metrics(cx);
+                if let Some(t) = self.h3.as_ref() {
+                    t.dump_metrics(cx);
                 }
             }
             Tm::Ingress(tcp) => {
@@ -896,6 +922,9 @@ impl App for Client {
         }
         self.dump_metrics(cx);
         self.close(cx);
+        if let Some(t) = self.h3.as_mut() {
+            t.on_shutdown(cx);
+        }
         if let Some(g) = self.gw.as_mut() {
             g.on_shutdown(cx);
         }

@@ -41,10 +41,7 @@ fn connect_cfgs(h: &H) -> Vec<ConnConfig> {
 }
 
 fn tunnel_conn(h: &H) -> Option<ConnId> {
-    h.sh.app()
-        .gateway()
-        .expect("gateway configured")
-        .tunnel_conn()
+    h.sh.app().h3_tunnel_conn()
 }
 
 fn has_line(lines: &[String], want: &str) -> bool {
@@ -145,10 +142,10 @@ fn no_reconnect_is_terminal_and_502() {
     });
     let gw = h.gw_conn.unwrap();
     h.event(Event::ConnEstablished(gw));
-    assert!(!h.sh.app().gateway().unwrap().tunnel_gone());
+    assert!(!h.sh.app().h3_tunnel_gone());
     h.event(closed_ev(gw));
     assert_eq!(h.sh.next_timeout(), None, "no reconnect timer");
-    assert!(h.sh.app().gateway().unwrap().tunnel_gone());
+    assert!(h.sh.app().h3_tunnel_gone());
     assert_eq!(tunnel_conn(&h), None);
     h.advance(Duration::from_secs(60));
     assert_eq!(h.connects(), 2, "no reconnect");
