@@ -1,7 +1,6 @@
 //! SP4 spec §7.3 / §7.4 / §7.8: one browser conn — the ClientHello peek,
 //! the TLS + h2 pump with its streams, idle and the open-stream watchdog,
 //! and the `Closing` drain.
-#![cfg_attr(not(feature = "test-support"), allow(dead_code))]
 
 use super::policy::{Route, Sni, Why};
 use super::stream::MStream;
@@ -335,6 +334,7 @@ fn closing_pass(cx: &mut Cx<'_>, tcp: TcpId, cl: &mut Closing) -> bool {
 
 impl Mitm {
     /// A live conn's `Dirty` flag (test-support).
+    #[cfg(feature = "test-support")]
     pub(super) fn dirty(&self, tcp: TcpId) -> bool {
         let c = self.conns.get(&tcp).map(|c| &c.phase);
         matches!(c, Some(Phase::Live(l)) if l.dirty.is_set())

@@ -1,6 +1,6 @@
 //! `MitmHost` (test-support): an `App` holding `Exchanges<Owner>` and a
 //! `Mitm`, routing its sockets' TCP events, its timers and the H3 events of
-//! its exchanges to the front, as `Client` will (Task 8.2). Every `Handoff`
+//! its exchanges to the front, as `Client` does. Every `Handoff`
 //! is recorded instead of reaching the SP1 relay.
 
 use super::{Handoff, Mitm};

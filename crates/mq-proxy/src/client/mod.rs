@@ -30,6 +30,7 @@ use backoff::Backoff;
 use exchange::Exchanges;
 use gateway::Gateway;
 use ingress_glue::{Fed, Ingress, kind_of};
+use mitm::{Handoff, Mitm};
 use mq_runtime::{
     AcceptMeta, App, Cx, DialError, DialOpId, Host, ListenerTag, SocketOpId, StreamPreread, Target,
     TcpEnd, TcpId, TimerId, UdpSocketId,
@@ -134,12 +135,15 @@ pub struct Client {
     assocs: HashMap<TcpId, Assoc>,
     /// SP2 spec §6.3: the UDP sessions.
     sess: Sessions,
-    /// SP4 spec §3: the shared H3 tunnel (layer ③), created with the gateway.
+    /// SP4 spec §3: the shared H3 tunnel (layer ③), created iff `--gateway`
+    /// or `--mitm`.
     h3: Option<H3Tunnel>,
     /// SP4 spec §2.2: the H3 requests of every front (layer ②).
     ex: Exchanges<Owner>,
     /// SP3 spec §5: the fetch gateway, over the H3 tunnel.
     gw: Option<Gateway>,
+    /// SP4 spec §7: the MITM front, over the H3 tunnel.
+    mitm: Option<Mitm>,
 }
 
 /// SP4 spec §2.2: the front an exchange belongs to.
@@ -223,9 +227,10 @@ impl Client {
             udp: UdpAvail::Unknown,
             assocs: HashMap::new(),
             sess: Sessions::new(),
-            h3: cfg.gateway.map(|_| H3Tunnel::new(&cfg)),
+            h3: (cfg.gateway.is_some() || cfg.mitm.is_some()).then(|| H3Tunnel::new(&cfg)),
             ex: Exchanges::new(),
             gw: cfg.gateway.map(|_| Gateway::new(&cfg)),
+            mitm: cfg.mitm.as_ref().map(|m| Mitm::new(m, &cfg.token)),
             cfg,
         }
     }
@@ -469,6 +474,22 @@ impl Client {
         }
     }
 
+    /// SP4 spec §7.3 "Opaque" steps 2–3: the socket leaves the MITM front
+    /// for the raw tunnel; the peeked bytes in `rx` are relayed first.
+    fn handoff(&mut self, cx: &mut Cx<'_>, h: Option<Handoff>) {
+        if let Some(h) = h {
+            cx.tcp_set_read(h.tcp, false);
+            self.request(cx, h.tcp, IngressKind::Transparent, h.target);
+        }
+    }
+
+    /// SP4 spec §7.10: the `mq.mitm` line, after the tunnel's block.
+    fn log_mitm_metrics(&self) {
+        if let Some(l) = self.mitm.as_ref().and_then(Mitm::metrics_line) {
+            log::info!("{l}");
+        }
+    }
+
     /// spec §6.2 "Open": a data stream with the type byte and `CONNECT_TCP_REQUEST`.
     fn open(&mut self, cx: &mut Cx<'_>, conn: ConnId, tcp: TcpId, kind: IngressKind, t: &Target) {
         let s = match cx.open_stream(conn) {
@@ -655,7 +676,12 @@ impl App for Client {
                         g.on_ready(cx, &mut self.ex, tcp, ready);
                     }
                 }
-                Owner::Mitm(_) => {} // the MITM front is wired in Task 8.2
+                Owner::Mitm(key) => {
+                    let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
+                    if let Some(m) = self.mitm.as_mut() {
+                        m.on_ready(cx, &mut self.ex, tunnel, key, ready);
+                    }
+                }
             }
             return self.maybe_exit(cx);
         }
@@ -731,6 +757,11 @@ impl App for Client {
         if kind == IngressKind::Transparent {
             // spec §6.1: the target is the original destination, IPv4 only.
             return match target_from_original_dst(&meta) {
+                // SP4 spec §7.3: with `--mitm`, the front peeks first.
+                Some(t) if self.mitm.is_some() => {
+                    let h = self.mitm.as_mut().expect("checked").on_accepted(cx, tcp, t);
+                    self.handoff(cx, h);
+                }
                 Some(t) => {
                     cx.tcp_set_read(tcp, false);
                     self.request(cx, tcp, kind, t);
@@ -750,6 +781,10 @@ impl App for Client {
         let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
             return g.on_tcp_data(cx, &mut self.ex, tunnel, tcp);
+        }
+        if let Some(m) = self.mitm.as_mut().filter(|m| m.owns_tcp(tcp)) {
+            let h = m.on_tcp_data(cx, &mut self.ex, tunnel, tcp);
+            return self.handoff(cx, h);
         }
         if self.assocs.contains_key(&tcp) {
             return discard(cx, tcp);
@@ -774,6 +809,11 @@ impl App for Client {
     fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
             return g.on_tcp_end(cx, &mut self.ex, tcp, end);
+        }
+        if let Some(m) = self.mitm.as_mut().filter(|m| m.owns_tcp(tcp)) {
+            let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
+            let h = m.on_tcp_end(cx, &mut self.ex, tunnel, tcp, end);
+            return self.handoff(cx, h);
         }
         if let Some(ing) = self.ingress.remove(&tcp) {
             self.cancel(cx, ing.timer);
@@ -811,7 +851,11 @@ impl App for Client {
 
     fn on_tcp_writable(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
-            g.on_tcp_writable(cx, &mut self.ex, tcp);
+            return g.on_tcp_writable(cx, &mut self.ex, tcp);
+        }
+        if let Some(m) = self.mitm.as_mut().filter(|m| m.owns_tcp(tcp)) {
+            let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
+            m.on_tcp_writable(cx, &mut self.ex, tunnel, tcp);
         }
     }
 
@@ -877,13 +921,16 @@ impl App for Client {
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         let Some(tm) = self.timers.remove(&id) else {
             // A path retry of the raw tunnel, else the H3 tunnel's, else the
-            // gateway's (SP3 spec §5.8).
+            // gateway's (SP3 spec §5.8), else the MITM front's (SP4 spec §2.2).
             let conn = self.conn.as_ref().filter(|c| !c.closing).map(|c| c.id);
             if !self.paths.on_timer(cx, conn, id)
                 && !self.h3.as_mut().is_some_and(|t| t.on_timer(cx, id))
-                && let Some(g) = self.gw.as_mut()
+                && !self.gw.as_mut().is_some_and(|g| g.on_timer(cx, id))
+                && let Some(m) = self.mitm.as_mut()
             {
-                g.on_timer(cx, id);
+                let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
+                let (_, h) = m.on_timer(cx, &mut self.ex, tunnel, id);
+                self.handoff(cx, h);
             }
             return;
         };
@@ -909,6 +956,7 @@ impl App for Client {
                 if let Some(t) = self.h3.as_ref() {
                     t.dump_metrics(cx);
                 }
+                self.log_mitm_metrics();
             }
             Tm::Ingress(tcp) => {
                 if self.ingress.remove(&tcp).is_some() {
@@ -942,8 +990,13 @@ impl App for Client {
         if let Some(t) = self.h3.as_mut() {
             t.on_shutdown(cx);
         }
+        self.log_mitm_metrics();
         if let Some(g) = self.gw.as_mut() {
             g.on_shutdown(cx, &mut self.ex);
+        }
+        // SP4 spec §7.9: exit does not wait for `Closing` conns.
+        if let Some(m) = self.mitm.as_mut() {
+            m.on_shutdown(cx, &mut self.ex);
         }
         // SP3 spec §5.9: replaces the early exit for "no raw conn".
         self.maybe_exit(cx);

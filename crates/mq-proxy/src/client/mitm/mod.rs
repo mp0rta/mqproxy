@@ -87,9 +87,7 @@ impl Timers {
 }
 
 /// SP4 spec §7: the MITM front of one shard — its conn table, routing glue
-/// and metrics. `Client` wires it in Task 8.2; until then only the
-/// test-support `MitmHost` drives it.
-#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+/// and metrics, driven by `Client`.
 pub struct Mitm {
     conns: HashMap<TcpId, MitmConn>,
     policy: MitmPolicy,
@@ -104,7 +102,6 @@ pub struct Mitm {
     pump_cap: usize,
 }
 
-#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 impl Mitm {
     /// `LeafStore::new` generates the shard's leaf key here, never per conn.
     pub(crate) fn new(cfg: &MitmConfig, token: &str) -> Self {

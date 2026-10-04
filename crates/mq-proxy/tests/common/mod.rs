@@ -100,7 +100,8 @@ pub struct H {
     /// The connection the raw tunnel's first `connect` returns (scripted at
     /// setup when `cfg.has_tcp_ingress`).
     pub conn: ConnId,
-    /// The gateway tunnel's first connection (scripted when `cfg.gateway` is set).
+    /// The H3 tunnel's first connection (scripted when `cfg.gateway` or
+    /// `cfg.mitm` is set).
     pub gw_conn: Option<ConnId>,
 }
 
@@ -119,7 +120,8 @@ impl H {
         if cfg.has_tcp_ingress {
             t.expect_connect(fail.take().map_or(Ok(conn), Err));
         }
-        let gw_conn = cfg.gateway.map(|_| {
+        let h3 = cfg.gateway.is_some() || cfg.mitm.is_some();
+        let gw_conn = h3.then(|| {
             let c = t.new_conn_id();
             t.expect_connect(fail.take().map_or(Ok(c), Err));
             c
