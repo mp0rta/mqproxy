@@ -5,10 +5,10 @@
 pub mod resp;
 pub(crate) mod wire;
 
-use mq_http::headers::{HttpVer, Method, Reject, Target};
+use mq_http::headers::{HttpVer, Method, Reject, Target, body_check_applies};
 use mq_runtime::Cx;
 use mq_transport_api::{ConnId, Event, H3Header, H3ReqId, StreamError, Unread};
-use resp::RespHead;
+use resp::{HeadCollector, RespHead};
 use std::collections::HashMap;
 
 /// What the request body is.
@@ -95,10 +95,6 @@ enum Up {
 }
 
 /// SP4 spec §4.2: the response side.
-#[expect(
-    dead_code,
-    reason = "built and read by read_head / read_body, Task 4.3"
-)]
 enum Down {
     AwaitHead,
     /// `H3Closed` arrived first: rescue or none.
@@ -124,7 +120,6 @@ enum Down {
 struct Exch<O> {
     owner: O,
     /// Body-check exemptions.
-    #[expect(dead_code, reason = "the end rule, Task 4.3")]
     method: Method,
     /// Neither `H3Closed` seen nor reset by the core: `fail()` resets it.
     live: bool,
@@ -309,14 +304,148 @@ impl<O: Copy> Exchanges<O> {
         }
     }
 
-    /// SP4 spec §4.3 `read_head`; implemented in Task 4.3.
-    pub fn read_head(&mut self, _cx: &mut Cx<'_>, _id: H3ReqId) -> HeadOut {
-        HeadOut::Wait
+    /// SP4 spec §4.3 `read_head`: collect the head under the §5 limits, from
+    /// the transport or from a rescue. `Blocked` / `Stale` wait (a stale
+    /// readiness waits for `H3Closed`, SP3-1). A `Fail` removes the exchange.
+    /// After `Head` it is a no-op `Wait`.
+    pub fn read_head(&mut self, cx: &mut Cx<'_>, id: H3ReqId) -> HeadOut {
+        let Some(x) = self.by_id.get_mut(&id) else {
+            return HeadOut::Fail(Reject::UpstreamReset);
+        };
+        let mut col = HeadCollector::default();
+        let (head, rescue) = match &mut x.down {
+            Down::AwaitHead => match cx.h3_recv_headers(id, &mut |n, v| col.push(n, v)) {
+                Ok(fin) => (col.finish(fin), None),
+                Err(StreamError::Blocked | StreamError::Stale) => return HeadOut::Wait,
+                Err(StreamError::Reset | StreamError::Conn) => {
+                    self.fail(cx, id);
+                    return HeadOut::Fail(Reject::UpstreamReset);
+                }
+            },
+            Down::ClosedBeforeHead(Some(u)) if u.headers.is_some() => {
+                for (n, v) in u.headers.iter().flatten() {
+                    col.push(n, v);
+                }
+                // The end comes from the rescue, through `read_body`.
+                (col.finish(false), Some(std::mem::take(&mut u.body)))
+            }
+            Down::ClosedBeforeHead(_) | Down::Failed => {
+                self.fail(cx, id);
+                return HeadOut::Fail(Reject::UpstreamReset);
+            }
+            Down::Body { .. } | Down::Rescued { .. } => return HeadOut::Wait,
+        };
+        let Ok(head) = head else {
+            self.fail(cx, id);
+            return HeadOut::Fail(Reject::UpstreamProtocol);
+        };
+        let (status, cl) = (head.status, head.cl);
+        x.down = match rescue {
+            None => Down::Body {
+                status,
+                cl,
+                delivered: 0,
+                fin: head.fin,
+            },
+            Some(body) => Down::Rescued {
+                status,
+                cl,
+                delivered: 0,
+                body,
+                off: 0,
+            },
+        };
+        HeadOut::Head(head)
     }
 
-    /// SP4 spec §4.3 `read_body`; implemented in Task 4.3.
-    pub fn read_body(&mut self, _cx: &mut Cx<'_>, _id: H3ReqId, _buf: &mut [u8]) -> BodyOut {
-        BodyOut::Wait
+    /// SP4 spec §4.3 `read_body`: the transport's bytes, or the rescue in
+    /// `buf`-sized slices; the read that ends the body goes through the end
+    /// rule. An empty `buf` consumes nothing; on a live body it is `Wait`
+    /// without a transport call (xquic answers it with EAGAIN, R1). Before
+    /// `Head` it is a no-op `Wait`.
+    pub fn read_body(&mut self, cx: &mut Cx<'_>, id: H3ReqId, buf: &mut [u8]) -> BodyOut {
+        let Some(x) = self.by_id.get_mut(&id) else {
+            return BodyOut::Fail;
+        };
+        let method = x.method;
+        let short = |status, cl: Option<u64>, delivered| {
+            body_check_applies(&method, status) && cl.is_some_and(|c| delivered < c)
+        };
+        // `(n, Some(short))` when this read ends the body.
+        let (n, end) = match &mut x.down {
+            Down::AwaitHead | Down::ClosedBeforeHead(_) => return BodyOut::Wait,
+            Down::Failed => {
+                self.fail(cx, id);
+                return BodyOut::Fail;
+            }
+            Down::Body {
+                status,
+                cl,
+                delivered,
+                fin: true,
+            } => (0, Some(short(*status, *cl, *delivered))),
+            Down::Body {
+                status,
+                cl,
+                delivered,
+                fin: false,
+            } => {
+                if buf.is_empty() {
+                    return BodyOut::Wait;
+                }
+                match cx.h3_recv_body(id, buf) {
+                    Ok((0, false)) | Err(StreamError::Blocked | StreamError::Stale) => {
+                        return BodyOut::Wait;
+                    }
+                    Ok((n, fin)) => {
+                        *delivered += n as u64;
+                        (n, fin.then(|| short(*status, *cl, *delivered)))
+                    }
+                    Err(StreamError::Reset | StreamError::Conn) => {
+                        self.fail(cx, id);
+                        return BodyOut::Fail;
+                    }
+                }
+            }
+            Down::Rescued {
+                status,
+                cl,
+                delivered,
+                body,
+                off,
+            } => {
+                let n = buf.len().min(body.len() - *off);
+                if n == 0 && *off < body.len() {
+                    return BodyOut::Wait;
+                }
+                buf[..n].copy_from_slice(&body[*off..*off + n]);
+                *off += n;
+                *delivered += n as u64;
+                let end = *off == body.len();
+                (n, end.then(|| short(*status, *cl, *delivered)))
+            }
+        };
+        match end {
+            None => BodyOut::Data(n),
+            // End rule 1: xquic's fin does not prove the frame complete
+            // (SP3 §3.7); the bytes in `buf` are abandoned.
+            Some(true) => {
+                self.fail(cx, id);
+                BodyOut::Fail
+            }
+            // End rules 2 and 3: an early response (SP4 spec §4.5) resets the upload;
+            // `up != Done` implies live.
+            Some(false) => {
+                if self
+                    .by_id
+                    .remove(&id)
+                    .is_some_and(|x| !matches!(x.up, Up::Done))
+                {
+                    cx.h3_reset(id);
+                }
+                BodyOut::Last(n)
+            }
+        }
     }
 
     pub fn contains(&self, id: H3ReqId) -> bool {
@@ -337,6 +466,332 @@ impl<O: Copy> Exchanges<O> {
     fn fail(&mut self, cx: &mut Cx<'_>, id: H3ReqId) {
         if self.by_id.remove(&id).is_some_and(|x| x.live) {
             cx.h3_reset(id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mq_http::headers::{parse_method, parse_target};
+    use mq_runtime::Shard;
+    use mq_runtime::testing::{Call, RecordingApp, ScriptedHandle, ScriptedTransport};
+    use mq_transport_api::{H3Close, H3ReqStats, Time};
+    use proptest::prelude::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    const IDS: usize = 4;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// The head (with a `content-length` of `len` when `cl`) the first
+        /// time, `len` body bytes after; `err` injects a receive `Reset`.
+        Readable {
+            id: usize,
+            len: usize,
+            cl: bool,
+            fin: bool,
+            err: bool,
+        },
+        Writable(usize),
+        Closed {
+            id: usize,
+            unread: bool,
+            headers: bool,
+        },
+        Send {
+            id: usize,
+            len: usize,
+            fin: bool,
+            err: bool,
+        },
+        Eof {
+            id: usize,
+            buffered: u64,
+        },
+        ReadHead(usize),
+        ReadBody {
+            id: usize,
+            cap: usize,
+        },
+        Reset(usize),
+        Drain(u32),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        let id = 0..IDS;
+        prop_oneof![
+            (
+                id.clone(),
+                0..6usize,
+                any::<bool>(),
+                any::<bool>(),
+                prop::bool::weighted(0.1)
+            )
+                .prop_map(|(id, len, cl, fin, err)| Op::Readable {
+                    id,
+                    len,
+                    cl,
+                    fin,
+                    err
+                }),
+            id.clone().prop_map(Op::Writable),
+            (id.clone(), any::<bool>(), any::<bool>()).prop_map(|(id, unread, headers)| {
+                Op::Closed {
+                    id,
+                    unread,
+                    headers,
+                }
+            }),
+            (
+                id.clone(),
+                0..4usize,
+                any::<bool>(),
+                prop::bool::weighted(0.1)
+            )
+                .prop_map(|(id, len, fin, err)| Op::Send { id, len, fin, err }),
+            (id.clone(), 0..6u64).prop_map(|(id, buffered)| Op::Eof { id, buffered }),
+            id.clone().prop_map(Op::ReadHead),
+            (id.clone(), 0..5usize).prop_map(|(id, cap)| Op::ReadBody { id, cap }),
+            id.prop_map(Op::Reset),
+            (0..3u32).prop_map(Op::Drain),
+        ]
+    }
+
+    fn req_head() -> impl Strategy<Value = (&'static str, BodyLen)> {
+        let body = prop_oneof![
+            Just(BodyLen::Empty),
+            (0..6u64).prop_map(BodyLen::Known),
+            Just(BodyLen::Unknown),
+        ];
+        (prop::sample::select(vec!["GET", "HEAD", "POST"]), body)
+    }
+
+    /// The reference model of one id (SP4 spec §4.2/§4.3 settlement).
+    #[derive(Default)]
+    struct M {
+        removed: bool,
+        closed: bool,
+        head: bool,
+        head_injected: bool,
+        fin_injected: bool,
+        /// `h3_reset`s logged when it was removed / closed: none may follow.
+        resets_frozen: Option<usize>,
+    }
+
+    fn close(unread: Option<Unread>) -> H3Close {
+        let stats = H3ReqStats {
+            send_body: 0,
+            recv_body: 0,
+            begin_us: 0,
+            header_send_us: 0,
+            fin_send_us: 0,
+            fin_ack_us: 0,
+            mp_state: 0,
+            stream_err: 0,
+            close_msg: None,
+        };
+        H3Close { stats, unread }
+    }
+
+    fn resets(t: &ScriptedHandle, r: H3ReqId) -> usize {
+        t.log().iter().filter(|c| **c == Call::H3Reset(r)).count()
+    }
+
+    fn hs(pairs: &[(&str, String)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        pairs
+            .iter()
+            .map(|(n, v)| (n.as_bytes().to_vec(), v.clone().into_bytes()))
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn settlement_matches_model(
+            heads in prop::collection::vec(req_head(), IDS),
+            ops in prop::collection::vec(op(), 0..48),
+        ) {
+            let (transport, t) = ScriptedTransport::new();
+            let conn = t.new_conn_id();
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+            let mut sh = Shard::new(transport, RecordingApp::new().0, addr, 7);
+            let now = Time::from_micros(1_000_000);
+            sh.start(now);
+            let mut ex = Exchanges::<u32>::new();
+            let owner = |i: usize| (i % 2) as u32;
+            let mut ids = Vec::new();
+            for (i, (method, body)) in heads.iter().enumerate() {
+                let head = ReqHead {
+                    method: parse_method(method.as_bytes()).unwrap(),
+                    target: parse_target(b"https://example.com/p").unwrap(),
+                    auth: b"Bearer t".to_vec(),
+                    class: None,
+                    origin_proto: None,
+                    cache: None,
+                    accept_encoding: None,
+                    headers: vec![],
+                    body: *body,
+                };
+                let r = sh.with_app(now, |_, cx| ex.open(cx, conn, &head, owner(i)));
+                ids.push(r.unwrap());
+            }
+            let mut m: Vec<M> = (0..IDS).map(|_| M::default()).collect();
+
+            for op in ops {
+                let calls = t.log().len();
+                // The ids this op removes, by the model.
+                let mut gone: Vec<usize> = Vec::new();
+                match op {
+                    Op::Readable { id, len, cl, fin, err } => {
+                        let (r, s) = (ids[id], &mut m[id]);
+                        if err {
+                            t.inject_h3_error(r, StreamError::Reset);
+                        } else if !s.head_injected {
+                            let mut h = vec![(":status", "200".to_owned())];
+                            if cl {
+                                h.push(("content-length", len.to_string()));
+                            }
+                            t.inject_h3_headers(r, hs(&h), fin);
+                            s.head_injected = true;
+                            s.fin_injected = fin;
+                        } else if !s.fin_injected {
+                            t.inject_h3_body(r, vec![b'x'; len], fin);
+                            s.fin_injected = fin;
+                        }
+                        let got = ex.on_event(&Event::H3Readable(r));
+                        let want = (!s.removed).then_some((owner(id), r, Ready::Readable));
+                        prop_assert_eq!(got, want);
+                    }
+                    Op::Writable(id) => {
+                        let r = ids[id];
+                        let got = ex.on_event(&Event::H3Writable(r));
+                        let want = (!m[id].removed).then_some((owner(id), r, Ready::Writable));
+                        prop_assert_eq!(got, want);
+                    }
+                    Op::Closed { id, unread, headers } => {
+                        let (r, s) = (ids[id], &mut m[id]);
+                        if !s.closed {
+                            s.closed = true;
+                            let u = unread.then(|| Unread {
+                                headers: headers.then(|| hs(&[(":status", "200".to_owned())])),
+                                body: b"xyz".to_vec(),
+                            });
+                            t.close_h3(r, close(u.clone()));
+                            let got = ex.on_event(&Event::H3Closed(r, Box::new(close(u))));
+                            let want = (!s.removed).then_some((owner(id), r, Ready::Readable));
+                            prop_assert_eq!(got, want);
+                        }
+                    }
+                    Op::Send { id, len, fin, err } => {
+                        let r = ids[id];
+                        if err {
+                            t.expect_h3_send_body(r, Err(StreamError::Reset));
+                        }
+                        let data = vec![b'u'; len];
+                        let got = sh.with_app(now, |_, cx| ex.send_body(cx, r, &data, fin));
+                        if m[id].removed {
+                            prop_assert_eq!(got, SendOut::Done);
+                        }
+                    }
+                    Op::Eof { id, buffered } => {
+                        let r = ids[id];
+                        let got = sh.with_app(now, |_, cx| ex.upload_eof(cx, r, buffered));
+                        if got == EofOut::Truncated {
+                            prop_assert!(!m[id].removed);
+                            gone.push(id);
+                        }
+                    }
+                    Op::ReadHead(id) => {
+                        let r = ids[id];
+                        let got = sh.with_app(now, |_, cx| ex.read_head(cx, r));
+                        let s = &mut m[id];
+                        let quiet = s.head || s.removed;
+                        match got {
+                            HeadOut::Head(_) => {
+                                prop_assert!(!s.removed && !s.head);
+                                s.head = true;
+                            }
+                            HeadOut::Wait => prop_assert!(!s.removed),
+                            HeadOut::Fail(e) => {
+                                // After the head only `Failed` (or a stale id) fails it.
+                                let want = if quiet {
+                                    e == Reject::UpstreamReset
+                                } else {
+                                    matches!(e, Reject::UpstreamReset | Reject::UpstreamProtocol)
+                                };
+                                prop_assert!(want, "{:?}", e);
+                                if !s.removed {
+                                    gone.push(id);
+                                }
+                            }
+                        }
+                        if quiet {
+                            // A no-op after the head; a stale id makes no transport call.
+                            prop_assert_eq!(t.log().len(), calls);
+                        }
+                    }
+                    Op::ReadBody { id, cap } => {
+                        let r = ids[id];
+                        let mut buf = vec![0u8; cap];
+                        let got = sh.with_app(now, |_, cx| ex.read_body(cx, r, &mut buf));
+                        let s = &m[id];
+                        match got {
+                            BodyOut::Data(n) => prop_assert!(s.head && n > 0 && n <= cap),
+                            BodyOut::Last(n) => {
+                                prop_assert!(s.head && !s.removed && n <= cap);
+                                gone.push(id);
+                            }
+                            BodyOut::Wait => prop_assert!(!s.removed),
+                            // `Failed` fails either read, before the head too.
+                            BodyOut::Fail => {
+                                if !s.removed {
+                                    gone.push(id);
+                                }
+                            }
+                        }
+                        if s.removed || !s.head || cap == 0 {
+                            // Stale, before the head, or an empty probe: no h3_recv_body.
+                            let recv = t.log()[calls..]
+                                .iter()
+                                .any(|c| matches!(c, Call::H3RecvBody { .. }));
+                            prop_assert!(!recv);
+                        }
+                    }
+                    Op::Reset(id) => {
+                        let r = ids[id];
+                        sh.with_app(now, |_, cx| ex.reset(cx, r));
+                        if !m[id].removed {
+                            gone.push(id);
+                        }
+                    }
+                    Op::Drain(o) => {
+                        sh.with_app(now, |_, cx| ex.drain_owner(cx, |x| *x == o));
+                        gone.extend((0..IDS).filter(|&i| owner(i) == o && !m[i].removed));
+                    }
+                }
+                for i in gone {
+                    m[i].removed = true;
+                }
+                for (i, s) in m.iter_mut().enumerate() {
+                    let n = resets(&t, ids[i]);
+                    prop_assert!(n <= 1, "id {} reset {} times", i, n);
+                    prop_assert_eq!(ex.contains(ids[i]), !s.removed, "id {}", i);
+                    if let Some(frozen) = s.resets_frozen {
+                        prop_assert_eq!(n, frozen, "a reset after removal or H3Closed, id {}", i);
+                    } else if s.removed || s.closed {
+                        s.resets_frozen = Some(n);
+                    }
+                }
+            }
+            sh.with_app(now, |_, cx| ex.drain_owner(cx, |_| true));
+            prop_assert_eq!(ex.len(), 0);
+            for (i, s) in m.iter().enumerate() {
+                let n = resets(&t, ids[i]);
+                prop_assert!(n <= 1);
+                if let Some(frozen) = s.resets_frozen {
+                    prop_assert_eq!(n, frozen);
+                }
+            }
         }
     }
 }
