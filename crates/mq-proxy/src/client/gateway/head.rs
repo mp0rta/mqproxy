@@ -4,7 +4,7 @@
 use mq_http::h1;
 use mq_http::headers::{
     HttpVer, Method, NAME_CAP, Reject, Target, VAL_CAP, forward_cookie_requested, has_dup_xmq,
-    parse_cache_ttl, parse_http_ver, parse_method, parse_target, strip_client,
+    parse_cache_ttl, parse_http_ver, parse_method, parse_method_upper, parse_target, strip_client,
 };
 
 /// C `MQ_GW_MAX_SEND_HDRS` (spec §5.2: at most 64 + 8 headers).
@@ -90,7 +90,7 @@ pub fn check(head: &Head) -> Result<Checked, Reject> {
     let method = match &head.method {
         None => parse_method(b"GET").expect("a token"),
         // CONNECT: an upgrade the bridge does not implement (§12).
-        Some(m) => parse_method(m)
+        Some(m) => parse_method_upper(m)
             .filter(|m| m.as_bytes() != b"CONNECT")
             .ok_or(Reject::BadMethod)?,
     };

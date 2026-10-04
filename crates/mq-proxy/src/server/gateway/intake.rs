@@ -153,7 +153,7 @@ pub(super) fn decide(c: &Capture, token: &[u8]) -> Decision {
         b"https" => Scheme::Https,
         _ => return reject(true, 400, "bad-request"),
     };
-    // Canonicalised (uppercased); CONNECT is refused (§12.34).
+    // Case preserved (SP4 spec §5); only the exact token CONNECT is refused (§12.34).
     let method = match parse_method(&m) {
         Some(m) if m.as_bytes() != b"CONNECT" && path[0] == b'/' => m,
         _ => return reject(true, 400, "bad-request"),
@@ -289,7 +289,7 @@ mod tests {
             (":method", None),
             (":method", Some(&b""[..])),
             (":method", Some(b"G T")),
-            (":method", Some(b"ABCDEFGHIJKLMNOP")), // 16
+            (":method", Some(&[b'A'; 33])), // 33
             (":scheme", None),
             (":scheme", Some(b"HTTP")),
             (":scheme", Some(b"ftp")),
@@ -304,7 +304,9 @@ mod tests {
             let c = req(&[(n, v)], false);
             assert_eq!(outcome(&c), Err((400, "bad-request")), "{n} {v:?}");
         }
-        let c = req(&[(":method", Some(b"ABCDEFGHIJKLMNO"))], false); // 15
+        let c = req(&[(":method", Some(b"ABCDEFGHIJKLMNOP"))], false); // 16
+        assert_eq!(outcome(&c), Ok(()));
+        let c = req(&[(":method", Some(&[b'A'; 32]))], false); // 32
         assert_eq!(outcome(&c), Ok(()));
     }
 
@@ -395,18 +397,21 @@ mod tests {
     }
 
     #[test]
-    fn method_canonicalised_uppercase() {
+    fn method_case_preserved() {
         let c = req(&[(":method", Some(b"pAtCh"))], false);
         let d = decide(&c, TOK);
-        assert_eq!(d.meta.expect("meta").method.as_bytes(), b"PATCH");
-        assert_eq!(d.outcome.expect("admitted").method.as_bytes(), b"PATCH");
+        assert_eq!(d.meta.expect("meta").method.as_bytes(), b"pAtCh");
+        assert_eq!(d.outcome.expect("admitted").method.as_bytes(), b"pAtCh");
     }
 
     #[test]
     fn connect_rejected_400_bad_request() {
-        for m in [&b"CONNECT"[..], b"connect", b"Connect"] {
+        // Only the exact token; `connect` is an ordinary method here.
+        let c = req(&[(":method", Some(b"CONNECT"))], false);
+        assert_eq!(outcome(&c), Err((400, "bad-request")));
+        for m in [&b"connect"[..], b"Connect"] {
             let c = req(&[(":method", Some(m))], false);
-            assert_eq!(outcome(&c), Err((400, "bad-request")), "{m:?}");
+            assert_eq!(outcome(&c), Ok(()), "{m:?}");
         }
     }
 
@@ -584,7 +589,7 @@ mod tests {
         let d = decide(&c, TOK);
         assert!(d.authed);
         let m = d.meta.expect("meta");
-        assert_eq!(m.method.as_bytes(), b"POST");
+        assert_eq!(m.method.as_bytes(), b"post");
         assert_eq!(m.authority, b"o.test");
         assert_eq!(
             m.path, b"/p?q=1",

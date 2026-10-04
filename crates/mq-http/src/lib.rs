@@ -2,4 +2,5 @@
 #![forbid(unsafe_code)]
 pub mod h1;
 pub mod headers;
+pub mod limits;
 pub mod metrics;

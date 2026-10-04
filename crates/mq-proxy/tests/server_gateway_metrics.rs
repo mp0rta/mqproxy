@@ -239,7 +239,7 @@ fn mq_req_golden_https_ok() {
     };
     assert_eq!(
         line(&mut h, r, stats),
-        "INFO mq.req cid=- sid=4 method=POST status=200 authority=\"o.test\" path=\"/p\" \
+        "INFO mq.req cid=- sid=4 method=post status=200 authority=\"o.test\" path=\"/p\" \
 req_bytes=7 resp_bytes=0 ttfb_ms=0 duration_ms=-1 origin_protocol=h2 origin_tls=ok \
 content_encoding=gzip cache=bypass origin_reuse=1 origin_connect_ms=0 mp_state=0 \
 completion_ms=-1 reset=\"\""

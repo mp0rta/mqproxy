@@ -2,8 +2,11 @@
 
 pub const HEAD_MAX: usize = 16 * 1024;
 pub const MAX_HEADERS: usize = 64;
-/// Longest method (bytes) and longest request-target / canonical target path (C `char[1024]` minus NUL).
+/// Longest method (bytes) of the fetch listener's own request line only
+/// (C `char[16]` minus NUL); the shared method bound is `limits::METHOD_MAX`.
 pub const METHOD_MAX: usize = 15;
+/// Longest request-target of the fetch listener's own request line only
+/// (C `char[1024]` minus NUL); the shared bound is `limits::TARGET_PATH_MAX`.
 pub const PATH_MAX: usize = 1023;
 
 /// One header line; `value` is OWS-trimmed.

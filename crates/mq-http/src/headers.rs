@@ -1,6 +1,7 @@
 //! Gateway header rules (spec §2.3), port of `src/gateway/mq_gw_headers.c`.
 
-use crate::h1::{METHOD_MAX, PATH_MAX, is_tchar};
+use crate::h1::is_tchar;
+use crate::limits::{METHOD_MAX, TARGET_PATH_MAX};
 
 /// Longest `X-Mq-Cache` TTL in seconds (1 year).
 pub const CACHE_TTL_MAX: u32 = 31_536_000;
@@ -104,7 +105,7 @@ pub fn parse_target(s: &[u8]) -> Option<Target> {
         Some(b'?') => [&b"/"[..], rest].concat(),
         Some(_) => rest.to_vec(),
     };
-    if path.len() > PATH_MAX {
+    if path.len() > TARGET_PATH_MAX {
         return None;
     }
     Some(Target {
@@ -114,10 +115,10 @@ pub fn parse_target(s: &[u8]) -> Option<Target> {
     })
 }
 
-/// Uppercased method, 1..=15 tchars.
+/// Method, case preserved, 1..=`METHOD_MAX` tchars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Method {
-    pub bytes: [u8; 16],
+    pub bytes: [u8; METHOD_MAX],
     pub len: usize,
 }
 
@@ -131,13 +132,17 @@ pub fn parse_method(s: &[u8]) -> Option<Method> {
     if s.is_empty() || s.len() > METHOD_MAX || !s.iter().all(|&c| is_tchar(c)) {
         return None;
     }
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; METHOD_MAX];
     bytes[..s.len()].copy_from_slice(s);
-    bytes.make_ascii_uppercase();
     Some(Method {
         bytes,
         len: s.len(),
     })
+}
+
+/// `parse_method` of the ASCII-uppercased input (the fetch front's `X-Mq-Method`).
+pub fn parse_method_upper(s: &[u8]) -> Option<Method> {
+    parse_method(&s.to_ascii_uppercase())
 }
 
 /// The method is `HEAD` (the head render and the body check).
@@ -446,21 +451,17 @@ mod tests {
         assert!(parse_target(&mk(256)).is_none());
     }
     #[test]
-    fn target_path_1023_ok() {
-        // canonical "/?" + 1021 = 1023 bytes
-        let s = [&b"https://h?"[..], &vec![b'a'; 1021]].concat();
-        assert_eq!(parse_target(&s).expect("1023").path.len(), 1023);
-        // slash form: "/" + 1022
-        let s = [&b"https://h/"[..], &vec![b'a'; 1022]].concat();
-        assert_eq!(parse_target(&s).expect("1023").path.len(), 1023);
-    }
-    #[test]
-    fn target_path_1024_after_prefix_bad() {
-        // canonical "/?" + 1022 = 1024 bytes (the rest alone is 1023)
-        let s = [&b"https://h?"[..], &vec![b'a'; 1022]].concat();
+    fn target_path_8187_ok_8188_none() {
+        // canonical "/?" + 8185 = 8187 bytes
+        let s = [&b"https://h?"[..], &vec![b'a'; 8185]].concat();
+        assert_eq!(parse_target(&s).expect("8187").path.len(), 8187);
+        // slash form: "/" + 8186
+        let s = [&b"https://h/"[..], &vec![b'a'; 8186]].concat();
+        assert_eq!(parse_target(&s).expect("8187").path.len(), 8187);
+        // canonical "/?" + 8186 = 8188 bytes (the rest alone is 8187)
+        let s = [&b"https://h?"[..], &vec![b'a'; 8186]].concat();
         assert!(parse_target(&s).is_none());
-        // C test_target_path_too_long: "/" + 1024
-        let s = [&b"https://h/"[..], &vec![b'a'; 1024]].concat();
+        let s = [&b"https://h/"[..], &vec![b'a'; 8187]].concat();
         assert!(parse_target(&s).is_none());
     }
     #[test]
@@ -480,19 +481,39 @@ mod tests {
 
     // ---- parse_method ----
     #[test]
-    fn method_uppercased() {
-        let m = parse_method(b"PuT").expect("PuT");
-        assert_eq!(m.as_bytes(), b"PUT");
-        assert_eq!(parse_method(b"get").expect("get").as_bytes(), b"GET");
+    fn parse_method_preserves_case() {
+        assert_eq!(
+            parse_method(b"propfind").expect("propfind").as_bytes(),
+            b"propfind"
+        );
+        assert_eq!(parse_method(b"PuT").expect("PuT").as_bytes(), b"PuT");
         assert_eq!(
             parse_method(b"M-E.T!").expect("tchars").as_bytes(),
             b"M-E.T!"
         );
     }
     #[test]
-    fn method_15_ok_16_bad() {
-        assert_eq!(parse_method(b"ABCDEFGHIJKLMNO").expect("15").len, 15);
-        assert!(parse_method(b"ABCDEFGHIJKLMNOP").is_none());
+    fn parse_method_upper_uppercases() {
+        assert_eq!(
+            parse_method_upper(b"pAtCh").expect("pAtCh").as_bytes(),
+            b"PATCH"
+        );
+        assert_eq!(
+            parse_method_upper(b"M-e.t!").expect("tchars").as_bytes(),
+            b"M-E.T!"
+        );
+        assert!(parse_method_upper(b"").is_none());
+        assert!(parse_method_upper(&[b'a'; 33]).is_none());
+    }
+    #[test]
+    fn parse_method_32_ok_33_none() {
+        assert!(parse_method(&[b'a'; 32]).is_some());
+        assert!(parse_method(&[b'a'; 33]).is_none());
+    }
+    #[test]
+    fn method_32_ok_33_bad() {
+        assert_eq!(parse_method(&[b'A'; 32]).expect("32").len, 32);
+        assert!(parse_method(&[b'A'; 33]).is_none());
         assert!(parse_method(b"").is_none());
     }
     #[test]

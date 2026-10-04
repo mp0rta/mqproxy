@@ -128,7 +128,8 @@ mod tests {
     fn build_h1_origin_form_and_host_first() {
         let s = bodiless(stored("get", "/x?q=1", &[("user-agent", "t")]));
         let r = build_request(&s, OriginProto::H1).unwrap();
-        assert_eq!(r.method(), http::Method::GET);
+        // Case preserved: "get" is an extension method, not `Method::GET`.
+        assert_eq!(r.method().as_str(), "get");
         assert_eq!(r.uri().to_string(), "/x?q=1");
         assert_eq!(r.uri().scheme(), None);
         assert_eq!(names(&r), ["host", "accept", "user-agent"]);
