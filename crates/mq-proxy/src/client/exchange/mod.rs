@@ -255,8 +255,9 @@ impl<O: Copy> Exchanges<O> {
 
     /// SP4 spec §4.3: readiness goes to the owner; `H3Closed` ends the upload,
     /// moves the response side (rescue or failure) and reads as `Readable`.
-    /// Events for unknown ids give `None`.
-    pub fn on_event(&mut self, ev: &Event) -> Option<(O, H3ReqId, Ready)> {
+    /// Events for unknown ids give `None` and are left as they were; a known
+    /// `H3Closed`'s rescue is taken out of `ev` (no second copy of the body).
+    pub fn on_event(&mut self, ev: &mut Event) -> Option<(O, H3ReqId, Ready)> {
         let (id, ready) = match ev {
             Event::H3Readable(id) => (*id, Ready::Readable),
             Event::H3Writable(id) => (*id, Ready::Writable),
@@ -266,19 +267,19 @@ impl<O: Copy> Exchanges<O> {
                 x.live = false;
                 x.up = Up::Done;
                 x.down = match std::mem::replace(&mut x.down, Down::Failed) {
-                    Down::AwaitHead => Down::ClosedBeforeHead(close.unread.clone()),
+                    Down::AwaitHead => Down::ClosedBeforeHead(close.unread.take()),
                     // `fin: true` keeps `Body`: nothing is rescued after a consumed fin.
                     Down::Body {
                         status,
                         cl,
                         delivered,
                         fin: false,
-                    } => match &close.unread {
+                    } => match close.unread.take() {
                         Some(u) => Down::Rescued {
                             status,
                             cl,
                             delivered,
-                            body: u.body.clone(),
+                            body: u.body,
                             off: 0,
                         },
                         None => Down::Failed,
@@ -313,9 +314,10 @@ impl<O: Copy> Exchanges<O> {
             return HeadOut::Fail(Reject::UpstreamReset);
         };
         let mut col = HeadCollector::default();
+        // `rescue`: `Ok(body)` from a rescue, else `Err(fin)` of the section.
         let (head, rescue) = match &mut x.down {
             Down::AwaitHead => match cx.h3_recv_headers(id, &mut |n, v| col.push(n, v)) {
-                Ok(fin) => (col.finish(fin), None),
+                Ok(fin) => (col.finish(), Err(fin)),
                 Err(StreamError::Blocked | StreamError::Stale) => return HeadOut::Wait,
                 Err(StreamError::Reset | StreamError::Conn) => {
                     self.fail(cx, id);
@@ -327,7 +329,7 @@ impl<O: Copy> Exchanges<O> {
                     col.push(n, v);
                 }
                 // The end comes from the rescue, through `read_body`.
-                (col.finish(false), Some(std::mem::take(&mut u.body)))
+                (col.finish(), Ok(std::mem::take(&mut u.body)))
             }
             Down::ClosedBeforeHead(_) | Down::Failed => {
                 self.fail(cx, id);
@@ -341,13 +343,13 @@ impl<O: Copy> Exchanges<O> {
         };
         let (status, cl) = (head.status, head.cl);
         x.down = match rescue {
-            None => Down::Body {
+            Err(fin) => Down::Body {
                 status,
                 cl,
                 delivered: 0,
-                fin: head.fin,
+                fin,
             },
-            Some(body) => Down::Rescued {
+            Ok(body) => Down::Rescued {
                 status,
                 cl,
                 delivered: 0,
@@ -961,14 +963,14 @@ mod tests {
                             s.t_fin |= fin;
                             s.fin_injected = fin;
                         }
-                        let got = ex.on_event(&Event::H3Readable(r));
+                        let got = ex.on_event(&mut Event::H3Readable(r));
                         let want = (!s.removed).then_some((owner(id), r, Ready::Readable));
                         prop_assert_eq!(got, want);
                         0
                     }
                     Op::Writable(id) => {
                         let r = ids[id];
-                        let got = ex.on_event(&Event::H3Writable(r));
+                        let got = ex.on_event(&mut Event::H3Writable(r));
                         let want = (!m[id].removed).then_some((owner(id), r, Ready::Writable));
                         prop_assert_eq!(got, want);
                         0
@@ -981,7 +983,7 @@ mod tests {
                                 body: RESCUE.to_vec(),
                             });
                             t.close_h3(r, close(u.clone()));
-                            let got = ex.on_event(&Event::H3Closed(r, Box::new(close(u))));
+                            let got = ex.on_event(&mut Event::H3Closed(r, Box::new(close(u))));
                             let want = (!s.removed).then_some((owner(id), r, Ready::Readable));
                             prop_assert_eq!(got, want);
                             s.on_closed(unread.then_some(headers));

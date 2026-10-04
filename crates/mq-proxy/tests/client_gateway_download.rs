@@ -171,6 +171,30 @@ fn download_sendbuffull_on_last_frame_keeps_terminator() {
     assert_eq!(close_of(&mut h, tcp), Some(false));
 }
 
+/// An unparsable or repeated `content-length` (`has_cl`, no `cl`): no body
+/// check, and the body is written raw — the head has no `Transfer-Encoding`.
+#[test]
+fn body_check_unparsable_cl_skipped() {
+    for (cl, line) in [
+        (&[("content-length", "1x0")][..], "content-length: 1x0\r\n"),
+        (
+            &[("content-length", "100"), ("content-length", "100")],
+            "content-length: 100\r\ncontent-length: 100\r\n",
+        ),
+    ] {
+        let (mut h, tcp, r) = open();
+        let mut head = vec![(":status", "200")];
+        head.extend_from_slice(cl);
+        respond(&mut h, r, &head, false);
+        body(&mut h, r, &[b'x'; 50], true);
+        let mut want = format!("HTTP/1.1 200 \r\n{line}Connection: close\r\n\r\n").into_bytes();
+        want.extend_from_slice(&[b'x'; 50]);
+        assert_eq!(h.tx_all(tcp), want, "raw passthrough, no chunk framing");
+        assert_eq!(close_of(&mut h, tcp), Some(false));
+        assert_eq!(resets(&h, r), 0);
+    }
+}
+
 #[test]
 fn malformed_head_502_upstream_protocol_and_reset() {
     for head in [
@@ -205,14 +229,25 @@ fn fin_on_headers_finishes() {
     assert_eq!(h.count(|c| matches!(c, Call::H3RecvBody { .. })), 0);
 }
 
+/// SP4 spec §6.2 / §13.20: a receive error before the head is `HeadOut::Fail`,
+/// answered like `H3Closed` without headers (SP3 aborted the socket).
 #[test]
-fn recv_error_before_head_aborts() {
+fn recv_error_before_head_synthesised_502() {
     let (mut h, tcp, r) = open();
     h.t.inject_h3_error(r, StreamError::Reset);
     h.drive();
-    assert_eq!(h.sh.tcp_tx_buf(tcp).len(), 0, "no 502 on this path");
-    assert_eq!(close_of(&mut h, tcp), Some(true));
+    assert_eq!(
+        h.tx_all(tcp),
+        b"HTTP/1.1 502 \r\nX-Mq-Error: upstream-reset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    assert_eq!(close_of(&mut h, tcp), Some(false));
     assert_eq!(resets(&h, r), 1);
+    // Removed: a later readiness reads nothing.
+    let reads = |h: &H| h.count(|c| matches!(c, Call::H3RecvHeaders(_)));
+    let before = reads(&h);
+    respond(&mut h, r, &[(":status", "200")], true);
+    assert_eq!(reads(&h), before);
+    assert!(!h.sh.app().gateway().unwrap().owns_tcp(tcp));
 }
 
 #[test]

@@ -26,6 +26,7 @@ use crate::ingress::{INGRESS_CAP, socks5_assoc_reply, target_from_original_dst};
 use crate::metrics::format_metrics;
 use crate::udp::SessionEnd;
 use backoff::Backoff;
+use exchange::Exchanges;
 use gateway::Gateway;
 use ingress_glue::{Fed, Ingress, kind_of};
 use mq_runtime::{
@@ -134,8 +135,16 @@ pub struct Client {
     sess: Sessions,
     /// SP4 spec §3: the shared H3 tunnel (layer ③), created with the gateway.
     h3: Option<H3Tunnel>,
+    /// SP4 spec §2.2: the H3 requests of every front (layer ②).
+    ex: Exchanges<Owner>,
     /// SP3 spec §5: the fetch gateway, over the H3 tunnel.
     gw: Option<Gateway>,
+}
+
+/// SP4 spec §2.2: the front an exchange belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Owner {
+    Fetch(TcpId),
 }
 
 /// spec §6.2: truncate to the wire limit with a warning (C truncates silently).
@@ -213,6 +222,7 @@ impl Client {
             assocs: HashMap::new(),
             sess: Sessions::new(),
             h3: cfg.gateway.map(|_| H3Tunnel::new(&cfg)),
+            ex: Exchanges::new(),
             gw: cfg.gateway.map(|_| Gateway::new(&cfg)),
             cfg,
         }
@@ -627,22 +637,25 @@ impl App for Client {
     }
 
     fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
-        // SP3 spec §5.8: the H3 tunnel's events, then the H3 request events
-        // (the gateway's).
-        let ev = match self.h3.as_mut() {
+        // SP4 spec §2.2: the H3 tunnel's events, then the H3 request events,
+        // routed by the exchange's owner.
+        let mut ev = match self.h3.as_mut() {
             Some(t) => match t.on_transport_event(cx, ev) {
                 Some(ev) => ev,
                 None => return self.maybe_exit(cx),
             },
             None => ev,
         };
-        let ev = match self.gw.as_mut() {
-            Some(g) => match g.on_transport_event(cx, ev) {
-                Some(ev) => ev,
-                None => return self.maybe_exit(cx),
-            },
-            None => ev,
-        };
+        if let Some((owner, _, ready)) = self.ex.on_event(&mut ev) {
+            match owner {
+                Owner::Fetch(tcp) => {
+                    if let Some(g) = self.gw.as_mut() {
+                        g.on_ready(cx, &mut self.ex, tcp, ready);
+                    }
+                }
+            }
+            return self.maybe_exit(cx);
+        }
         match ev {
             Event::ConnEstablished(c) if self.current(c) => self.on_established(cx),
             // spec §6.5: the stats line is per ConnClosed; a synchronous
@@ -733,7 +746,7 @@ impl App for Client {
     fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
         let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
-            return g.on_tcp_data(cx, tunnel, tcp);
+            return g.on_tcp_data(cx, &mut self.ex, tunnel, tcp);
         }
         if self.assocs.contains_key(&tcp) {
             return discard(cx, tcp);
@@ -757,7 +770,7 @@ impl App for Client {
 
     fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
-            return g.on_tcp_end(cx, tcp, end);
+            return g.on_tcp_end(cx, &mut self.ex, tcp, end);
         }
         if let Some(ing) = self.ingress.remove(&tcp) {
             self.cancel(cx, ing.timer);
@@ -795,7 +808,7 @@ impl App for Client {
 
     fn on_tcp_writable(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
-            g.on_tcp_writable(cx, tcp);
+            g.on_tcp_writable(cx, &mut self.ex, tcp);
         }
     }
 
@@ -927,7 +940,7 @@ impl App for Client {
             t.on_shutdown(cx);
         }
         if let Some(g) = self.gw.as_mut() {
-            g.on_shutdown(cx);
+            g.on_shutdown(cx, &mut self.ex);
         }
         // SP3 spec §5.9: replaces the early exit for "no raw conn".
         self.maybe_exit(cx);

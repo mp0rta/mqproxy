@@ -24,16 +24,22 @@ fn gw_only() -> ClientConfig {
     }
 }
 
-/// A gateway-only client with an open, bodiless fetch request.
-fn open() -> (H, TcpId, H3ReqId) {
+/// A gateway-only client with an open fetch request (`extra` header lines,
+/// `body` in the head's read).
+fn open_with(extra: &str, body: &[u8]) -> (H, TcpId, H3ReqId) {
     let mut h = H::new(gw_only());
     let gw = h.gw_conn.unwrap();
     h.event(Event::ConnEstablished(gw));
     let r = h.t.new_h3_req_id();
     h.t.expect_open_h3_request(gw, Ok(r));
     let tcp = h.accept(h.fetch, meta(None));
-    h.rx(tcp, &fetch_req("", b""));
+    h.rx(tcp, &fetch_req(extra, body));
     (h, tcp, r)
+}
+
+/// A bodiless one.
+fn open() -> (H, TcpId, H3ReqId) {
+    open_with("", b"")
 }
 
 fn hs(pairs: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -137,6 +143,56 @@ fn finish_write_order_pending_src_terminator_close() {
     assert_eq!(out.len(), want.len());
     assert!(out == want, "pending, then rescued frames, then terminator");
     assert!(!owned(&h, tcp));
+    assert_eq!(resets(&h, r), 0);
+}
+
+/// A rescue that arrives before the head: the core serves head and body,
+/// the front renders head, chunked body and terminator.
+#[test]
+fn finish_from_unread_src() {
+    let (mut h, tcp, r) = open();
+    closed(&mut h, r, unread(Some(&[(":status", "200")]), b"hello"));
+    let mut want = HEAD_CHUNKED.to_vec();
+    want.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+    assert_eq!(h.tx_all(tcp), want);
+    assert_eq!(close_of(&mut h, tcp), Some(false));
+    assert!(!owned(&h, tcp));
+    assert_eq!(resets(&h, r), 0);
+}
+
+/// SP4 spec §4.5: an early response (90 of 100 upload bytes still to come)
+/// — the core resets the request once, the response is rendered, the rest
+/// of the upload is discarded, the socket closes cleanly.
+#[test]
+fn finish_with_upload_remaining_resets() {
+    let (mut h, tcp, r) = open_with("Content-Length: 100\r\n", &[b'x'; 10]);
+    respond(&mut h, r, &[(":status", "403")], true);
+    assert_eq!(resets(&h, r), 1);
+    assert_eq!(
+        h.tx_all(tcp),
+        b"HTTP/1.1 403 \r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n"
+    );
+    assert_eq!(close_of(&mut h, tcp), Some(false));
+    // Still finishing (a frame stuck): more upload is consumed, never sent.
+    let (mut h, tcp, r) = open_with("Content-Length: 100\r\n", &[b'x'; 10]);
+    respond(&mut h, r, &[(":status", "403")], false);
+    body(&mut h, r, &pattern(4 * 16_384, 0), true);
+    assert_eq!(resets(&h, r), 1);
+    assert!(owned(&h, tcp), "finishing");
+    let sends = h.count(|c| matches!(c, Call::H3SendBody { .. }));
+    h.rx(tcp, &[b'y'; 90]);
+    assert_eq!(h.sh.tcp_rx_buf(tcp).len(), 64 * 1024, "discarded");
+    assert_eq!(h.count(|c| matches!(c, Call::H3SendBody { .. })), sends);
+    let mut out = h.tx_all(tcp);
+    out.extend(h.tx_all(tcp));
+    assert!(out.ends_with(b"\r\n0\r\n\r\n"));
+    assert_eq!(close_of(&mut h, tcp), Some(false));
+    assert_eq!(resets(&h, r), 1);
+    // A complete upload is not reset.
+    let (mut h, tcp, r) = open_with("Content-Length: 10\r\n", &[b'x'; 10]);
+    respond(&mut h, r, &[(":status", "200")], true);
+    h.tx_all(tcp);
+    assert_eq!(close_of(&mut h, tcp), Some(false));
     assert_eq!(resets(&h, r), 0);
 }
 

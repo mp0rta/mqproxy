@@ -27,8 +27,8 @@ struct ExApp {
 
 impl App for ExApp {
     fn on_start(&mut self, _: &mut Cx<'_>) {}
-    fn on_transport_event(&mut self, _: &mut Cx<'_>, ev: Event) {
-        if let Some(o) = self.ex.on_event(&ev) {
+    fn on_transport_event(&mut self, _: &mut Cx<'_>, mut ev: Event) {
+        if let Some(o) = self.ex.on_event(&mut ev) {
             self.out.push(o);
         }
     }

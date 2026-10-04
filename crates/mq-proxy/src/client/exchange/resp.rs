@@ -1,5 +1,5 @@
 //! The collected H3 response head (SP4 spec §4.2 / §5; moved from the SP3
-//! fetch download). `fin` goes away in Task 5.1, once the gateway stops using it.
+//! fetch download). No `fin`: the end is always reported by `read_body`.
 
 use mq_http::h1;
 use mq_http::headers::is_hop_by_hop;
@@ -20,8 +20,6 @@ pub struct RespHead {
     pub cl: Option<u64>,
     /// Some `content-length` was received (else the body is framed chunked).
     pub has_cl: bool,
-    /// FIN on the header section.
-    pub fin: bool,
 }
 
 /// Collects one H3 response header section, applying the caps as it goes.
@@ -76,14 +74,13 @@ impl HeadCollector {
     }
 
     /// `Malformed` when a cap was hit or `:status` is missing.
-    pub fn finish(self, fin: bool) -> Result<RespHead, Malformed> {
+    pub fn finish(self) -> Result<RespHead, Malformed> {
         match self.status {
             Some(status) if !self.bad => Ok(RespHead {
                 status,
                 headers: self.headers,
                 cl: self.cl.filter(|_| self.cl_count == 1),
                 has_cl: self.cl_count > 0,
-                fin,
             }),
             _ => Err(Malformed),
         }
@@ -95,12 +92,12 @@ mod tests {
     use super::*;
     use mq_http::limits::{COUNT_MAX, FIELD_MAX};
 
-    fn collect(hs: &[(&str, &str)], fin: bool) -> Result<RespHead, Malformed> {
+    fn collect(hs: &[(&str, &str)]) -> Result<RespHead, Malformed> {
         let mut c = HeadCollector::default();
         for (n, v) in hs {
             c.push(n.as_bytes(), v.as_bytes());
         }
-        c.finish(fin)
+        c.finish()
     }
 
     /// `:status: 200` costs 7 + 3 + 32 = 42; seven 4032-byte fields and one of 4502
@@ -115,46 +112,33 @@ mod tests {
     #[test]
     fn head_status_out_of_range_is_502() {
         for s in ["000", "099", "600", "999"] {
-            assert_eq!(
-                collect(&[(":status", s)], false).unwrap().status,
-                502,
-                "{s}"
-            );
+            assert_eq!(collect(&[(":status", s)]).unwrap().status, 502, "{s}");
         }
         for s in ["100", "599"] {
-            assert_eq!(
-                collect(&[(":status", s)], false)
-                    .unwrap()
-                    .status
-                    .to_string(),
-                s
-            );
+            assert_eq!(collect(&[(":status", s)]).unwrap().status.to_string(), s);
         }
         for s in ["20", "2000", "2x0", "", "+20", "99999999999"] {
-            assert_eq!(collect(&[(":status", s)], false), Err(Malformed), "{s:?}");
+            assert_eq!(collect(&[(":status", s)]), Err(Malformed), "{s:?}");
         }
-        assert_eq!(collect(&[("x", "y")], false), Err(Malformed), "no :status");
+        assert_eq!(collect(&[("x", "y")]), Err(Malformed), "no :status");
         // C: the last `:status` wins.
-        let two = collect(&[(":status", "200"), (":status", "404")], false);
+        let two = collect(&[(":status", "200"), (":status", "404")]);
         assert_eq!(two.unwrap().status, 404);
     }
 
     #[test]
     fn head_drops_pseudo_and_hop_by_hop_keeps_xmq() {
         let long = "v".repeat(4000);
-        let h = collect(
-            &[
-                (":status", "200"),
-                (":path", "/x"),
-                ("connection", "keep-alive"),
-                ("transfer-encoding", "chunked"),
-                ("proxy-connection", &long), // dropped before the caps apply
-                ("keep-alive", "t\r\n"),
-                ("x-mq-origin-protocol", "h2"),
-                ("server", "s"),
-            ],
-            false,
-        )
+        let h = collect(&[
+            (":status", "200"),
+            (":path", "/x"),
+            ("connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("proxy-connection", &long), // dropped before the caps apply
+            ("keep-alive", "t\r\n"),
+            ("x-mq-origin-protocol", "h2"),
+            ("server", "s"),
+        ])
         .unwrap();
         let names: Vec<&[u8]> = h.headers.iter().map(|(n, _)| n.as_slice()).collect();
         assert_eq!(names, [&b"x-mq-origin-protocol"[..], b"server"]);
@@ -165,11 +149,11 @@ mod tests {
     fn head_cr_lf_nul_malformed() {
         for bad in ["a\rb", "a\nb", "a\0b"] {
             let st = (":status", "200");
-            assert_eq!(collect(&[st, ("x", bad)], false), Err(Malformed));
-            assert_eq!(collect(&[st, (bad, "v")], false), Err(Malformed));
+            assert_eq!(collect(&[st, ("x", bad)]), Err(Malformed));
+            assert_eq!(collect(&[st, (bad, "v")]), Err(Malformed));
         }
         // HEAD rewriting the value does not launder it.
-        let h = collect(&[(":status", "200"), ("content-length", "5\r\n")], false);
+        let h = collect(&[(":status", "200"), ("content-length", "5\r\n")]);
         assert_eq!(h, Err(Malformed));
     }
 
@@ -178,23 +162,17 @@ mod tests {
         let st = (":status", "200");
         // name + value = FIELD_MAX fits, one byte more does not.
         let v_fits = "v".repeat(FIELD_MAX - 1);
-        assert!(collect(&[st, ("n", &v_fits)], false).is_ok());
-        assert_eq!(
-            collect(&[st, ("n", &format!("{v_fits}v"))], false),
-            Err(Malformed)
-        );
+        assert!(collect(&[st, ("n", &v_fits)]).is_ok());
+        assert_eq!(collect(&[st, ("n", &format!("{v_fits}v"))]), Err(Malformed));
         let n_fits = "n".repeat(FIELD_MAX);
-        assert!(collect(&[st, (&n_fits, "")], false).is_ok());
-        assert_eq!(
-            collect(&[st, (&format!("{n_fits}n"), "")], false),
-            Err(Malformed)
-        );
+        assert!(collect(&[st, (&n_fits, "")]).is_ok());
+        assert_eq!(collect(&[st, (&format!("{n_fits}n"), "")]), Err(Malformed));
     }
 
     #[test]
     fn collector_6k_value_ok() {
         let six_k = "v".repeat(6 * 1024);
-        let h = collect(&[(":status", "200"), ("x-big", &six_k)], false).unwrap();
+        let h = collect(&[(":status", "200"), ("x-big", &six_k)]).unwrap();
         assert_eq!(h.headers, [(b"x-big".to_vec(), six_k.into_bytes())]);
     }
 
@@ -207,7 +185,7 @@ mod tests {
             for _ in 0..n {
                 c.push(b"a", b"");
             }
-            c.finish(false)
+            c.finish()
         };
         assert!(fill(COUNT_MAX - 1).is_ok());
         assert_eq!(fill(COUNT_MAX), Err(Malformed));
@@ -217,12 +195,12 @@ mod tests {
     fn collector_section_budget_counts_status_and_32k_binds() {
         let (v, last) = ("v".repeat(3999), "v".repeat(4469));
         let mut hs = full_section(&v, &last);
-        assert!(collect(&hs, false).is_ok());
+        assert!(collect(&hs).is_ok());
         hs.push(("a", ""));
-        assert_eq!(collect(&hs, false), Err(Malformed));
+        assert_eq!(collect(&hs), Err(Malformed));
         let over = format!("{last}v");
         assert_eq!(
-            collect(&full_section(&v, &over), false),
+            collect(&full_section(&v, &over)),
             Err(Malformed),
             "one byte over"
         );
@@ -233,7 +211,7 @@ mod tests {
         let cl = |hs: &[(&str, &str)]| {
             let mut v = vec![(":status", "200")];
             v.extend_from_slice(hs);
-            let h = collect(&v, false).unwrap();
+            let h = collect(&v).unwrap();
             (h.cl, h.has_cl)
         };
         assert_eq!(cl(&[("content-length", "100")]), (Some(100), true));

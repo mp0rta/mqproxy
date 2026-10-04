@@ -5,7 +5,7 @@
 use mq_http::h1;
 use mq_http::limits::SECTION_MAX;
 
-pub(super) use crate::client::exchange::resp::{HeadCollector, Malformed, RespHead};
+use crate::client::exchange::resp::{Malformed, RespHead};
 
 /// SP4 spec §5: the render buffer, `SECTION_MAX` plus room for the status line
 /// and the `Transfer-Encoding` / `Connection` lines.
@@ -39,17 +39,18 @@ pub fn render_head(h: &RespHead, fetch_method_is_head: bool) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::exchange::resp::HeadCollector;
 
-    fn collect(hs: &[(&str, &str)], fin: bool) -> Result<RespHead, Malformed> {
+    fn collect(hs: &[(&str, &str)]) -> Result<RespHead, Malformed> {
         let mut c = HeadCollector::default();
         for (n, v) in hs {
             c.push(n.as_bytes(), v.as_bytes());
         }
-        c.finish(fin)
+        c.finish()
     }
 
     fn render(hs: &[(&str, &str)], is_head: bool) -> Result<Vec<u8>, Malformed> {
-        render_head(&collect(hs, false)?, is_head)
+        render_head(&collect(hs)?, is_head)
     }
 
     #[test]
@@ -66,8 +67,8 @@ mod tests {
             got.unwrap(),
             b"HTTP/1.1 200 \r\ncontent-type: text/plain\r\ncontent-length: 5\r\nConnection: close\r\n\r\n"
         );
-        let h = collect(&[(":status", "200"), ("content-length", "5")], true).unwrap();
-        assert_eq!((h.cl, h.has_cl, h.fin), (Some(5), true, true));
+        let h = collect(&[(":status", "200"), ("content-length", "5")]).unwrap();
+        assert_eq!((h.cl, h.has_cl), (Some(5), true));
     }
 
     #[test]
@@ -120,7 +121,6 @@ mod tests {
             headers: vec![(b"x".to_vec(), vec![b'v'; n])],
             cl: None,
             has_cl: true,
-            fin: false,
         };
         // "HTTP/1.1 200 \r\n" (15) + "x: <v>\r\n" (5 + n) + "Connection: close\r\n" (19) + "\r\n" (2).
         let fits = RESP_RENDER_MAX - 15 - 5 - 19 - 2;
