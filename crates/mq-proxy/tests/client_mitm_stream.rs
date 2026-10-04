@@ -7,6 +7,7 @@ mod mitm_harness;
 
 use h2::Reason;
 use mitm_harness::*;
+use mq_proxy::client::mitm::MitmTuning;
 use mq_runtime::TcpId;
 use mq_runtime::testing::Call;
 use mq_transport_api::{ConnId, Event, H3Close, H3ReqId, H3ReqStats, StreamError, Unread};
@@ -58,8 +59,18 @@ impl T {
         T::with(Browser::new("example.com"))
     }
 
-    fn with(mut b: Browser) -> T {
-        let mut mh = MH::p256();
+    fn with(b: Browser) -> T {
+        T::on(MH::p256(), b)
+    }
+
+    /// `ca-p256` with `tuning`.
+    fn tuned(tuning: MitmTuning) -> T {
+        let mut c = cfg("ca-p256");
+        c.tuning = tuning;
+        T::on(MH::new(c), Browser::new("example.com"))
+    }
+
+    fn on(mut mh: MH, mut b: Browser) -> T {
         let conn = mh.t.new_conn_id();
         let now = mh.now;
         mh.sh.with_app(now, |a, _| a.tunnel = Some(conn));
@@ -730,6 +741,49 @@ fn open_stream_cancels_idle() {
     t.relay();
     assert_eq!(t.mh.close_of(t.tcp), Some(false));
     assert_eq!(t.b.frame_types().last(), Some(&GOAWAY));
+}
+
+/// R7: a stream open for `open_for` with no inbound bytes, then ended; the
+/// idle clock (10 s, PING after 60 s) starts when the count reaches zero.
+fn idle_counts_from_the_last_stream_end(open_for: Duration) {
+    let idle = Duration::from_secs(10);
+    let mut t = T::tuned(MitmTuning {
+        idle,
+        ..MitmTuning::default()
+    });
+    let (s, r) = t.req("GET", "/sse", &[], b"");
+    t.mh.advance(open_for);
+    t.relay();
+    assert_eq!(t.mh.close_of(t.tcp), None);
+    assert_eq!(t.pings(), 0);
+    t.head(r, "200", &[], true);
+    assert!(t.b.response(&s).is_some());
+    assert_eq!(t.streams(), 0);
+    assert_eq!(t.mh.close_of(t.tcp), None, "not at the zero-crossing");
+    t.mh.advance(idle - US);
+    t.relay();
+    assert_eq!(
+        t.mh.close_of(t.tcp),
+        None,
+        "idle runs from the stream's end"
+    );
+    assert!(!t.b.frames().iter().any(|f| f.ty == GOAWAY));
+    t.mh.advance(US);
+    t.relay();
+    assert_eq!(t.mh.close_of(t.tcp), Some(false));
+    assert_eq!(t.b.frame_types().last(), Some(&GOAWAY));
+}
+
+#[test]
+fn idle_starts_at_zero_crossing_after_long_quiet_stream() {
+    idle_counts_from_the_last_stream_end(Duration::from_secs(50));
+}
+
+/// idle ≠ ping_after: the count going 1 → 0 re-arms to the idle deadline,
+/// not the watchdog's (60 s), and not idle counted from the request.
+#[test]
+fn zero_crossing_rearms_to_idle_deadline() {
+    idle_counts_from_the_last_stream_end(Duration::from_secs(1));
 }
 
 #[test]

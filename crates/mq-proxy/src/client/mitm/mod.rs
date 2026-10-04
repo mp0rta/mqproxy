@@ -249,12 +249,13 @@ impl Mitm {
         match &mut c.phase {
             Phase::Peek { .. } => return (true, self.opaque(cx, tcp, Why::Timeout, None)),
             Phase::Live(l) if !l.h2_ready() => self.end_conn(cx, ex, tcp, End::Handshake),
-            // §7.8: idle with no open stream, else the watchdog; either is
-            // counted from `last_rx` and re-armed for the remainder.
+            // §7.8: idle with no open stream (R7: from the later of
+            // `last_rx` and the last stream's end), else the watchdog from
+            // `last_rx`; either is re-armed for the remainder.
             Phase::Live(l) => {
                 let quiet = cx.now() - l.last_rx;
                 let open = !l.streams.is_empty();
-                if !open && quiet >= t.idle {
+                if !open && l.idle_quiet(cx.now()) >= t.idle {
                     self.end_conn(cx, ex, tcp, End::Idle);
                 } else if open && quiet >= t.dead_after {
                     self.end_conn(cx, ex, tcp, End::Dead);

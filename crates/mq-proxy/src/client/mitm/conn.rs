@@ -52,6 +52,8 @@ pub(super) struct Live {
     pub(super) streams: VecDeque<MStream>,
     /// Last inbound TLS bytes.
     pub(super) last_rx: Time,
+    /// h2 `Ready`, or the open-stream count's last drop to zero (R7).
+    idle_since: Time,
     /// Taken once at h2 `Ready`; one outstanding PING at most (§7.8).
     ping: Option<h2::PingPong>,
     /// The liveness timer is the watchdog (streams open), not idle.
@@ -121,6 +123,12 @@ impl Live {
         matches!(self.h2, H2::Ready(_))
     }
 
+    /// SP4 spec §7.8, R7: the idle clock runs from the later of the last
+    /// inbound bytes and the moment no stream was left open.
+    pub(super) fn idle_quiet(&self, now: Time) -> Duration {
+        now - self.last_rx.max(self.idle_since)
+    }
+
     /// §7.8 watchdog: one PING unless one is outstanding. `poll_pong` first
     /// clears a PONG already seen; while one is pending `send_ping` refuses.
     pub(super) fn ping(&mut self) {
@@ -153,18 +161,23 @@ impl MitmConn {
         }
     }
 
-    /// SP4 spec §7.8: the liveness timer from `last_rx` — idle with no
-    /// open stream; the watchdog's PING, then dead deadline, otherwise.
+    /// SP4 spec §7.8: idle with no open stream (R7: `idle_quiet`); the
+    /// watchdog's PING, then dead deadline, from `last_rx` otherwise.
     pub(super) fn arm_liveness(&mut self, cx: &mut Cx<'_>, timers: &mut Timers, t: &MitmTuning) {
         let Phase::Live(l) = &mut self.phase else {
             return;
         };
-        l.watchdog = !l.streams.is_empty();
-        let quiet = cx.now() - l.last_rx;
-        let at = match l.watchdog {
-            false => t.idle,
-            true if quiet < t.ping_after => t.ping_after,
-            true => t.dead_after,
+        let now = cx.now();
+        let open = !l.streams.is_empty();
+        if l.watchdog && !open {
+            l.idle_since = now; // the count crossed to zero
+        }
+        l.watchdog = open;
+        let quiet = now - l.last_rx;
+        let (quiet, at) = match open {
+            false => (l.idle_quiet(now), t.idle),
+            true if quiet < t.ping_after => (quiet, t.ping_after),
+            true => (quiet, t.dead_after),
         };
         timers.disarm(cx, self.timer);
         self.timer = timers.arm(cx, self.tcp, at.saturating_sub(quiet));
@@ -197,6 +210,7 @@ impl MitmConn {
                 Poll::Ready(Ok(mut conn)) => {
                     l.ping = conn.ping_pong();
                     l.h2 = H2::Ready(conn);
+                    l.idle_since = cx.now();
                     // §7.8: the handshake deadline gives way to the idle timer.
                     env.timers.disarm(cx, self.timer);
                     self.timer = env.timers.arm(cx, tcp, env.tuning.idle);
@@ -428,6 +442,7 @@ impl Mitm {
             h2: H2::Handshaking(self.h2.handshake(io)),
             streams: VecDeque::new(),
             last_rx: cx.now(),
+            idle_since: cx.now(),
             ping: None,
             watchdog: false,
             dirty: Arc::default(),
@@ -466,9 +481,13 @@ impl Mitm {
         }
         if let Phase::Live(l) = &c.phase
             && l.h2_ready()
-            && l.watchdog == l.streams.is_empty()
         {
-            c.arm_liveness(cx, env.timers, env.tuning);
+            // The timer is still the watchdog with no stream open, or idle
+            // with one: the open-stream count crossed zero.
+            let crossed = l.watchdog == l.streams.is_empty();
+            if crossed {
+                c.arm_liveness(cx, env.timers, env.tuning);
+            }
         }
     }
 
