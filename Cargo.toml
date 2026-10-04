@@ -41,6 +41,8 @@ rustls-native-certs = "0.8"
 # SP4 spec §7.1/§7.2: the MITM CA (load + checks) and leaf forging.
 rcgen = { version = "=0.14.9", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
 x509-parser = "0.18"
+# rcgen's validity type (already in the tree through rcgen); `std` for `From<SystemTime>`.
+time = { version = "0.3", default-features = false, features = ["std"] }
 rustls-webpki = "0.103"
 
 [profile.release]

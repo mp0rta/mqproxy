@@ -41,6 +41,8 @@ pub struct Resolved {
     pub startup_lines: Vec<String>,
 }
 
+// Built once per process; boxing the client side would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Server(Server),

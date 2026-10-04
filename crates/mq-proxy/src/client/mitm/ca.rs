@@ -17,8 +17,6 @@ const FILE_MAX: u64 = 1 << 20;
 const EXPIRY_WARN: Duration = Duration::from_secs(30 * 86400);
 
 /// The loaded CA. Shared by the shards as `Arc<Ca>`.
-// The crate-private fields are read by the leaf store (SP4 spec §7.2).
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Ca {
     pub(crate) issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
     pub(crate) ca_der: CertificateDer<'static>,
@@ -276,7 +274,7 @@ fn unix(t: i64) -> SystemTime {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::client::mitm::policy::{DnsSubtree, Sni};
     use mq_runtime::testing::log_capture;
@@ -293,7 +291,7 @@ mod tests {
     }
 
     /// A fresh dir under the temp dir holding copies of `files`; keys are 0600.
-    fn stage(test: &str, files: &[&str]) -> PathBuf {
+    pub(crate) fn stage(test: &str, files: &[&str]) -> PathBuf {
         let d = std::env::temp_dir().join(format!("mq-ca-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
