@@ -514,10 +514,10 @@ fn dot_segments_normalised_at_origin() {
     assert_eq!(p.join_both(), (0, 0));
 }
 
-/// spec §7.4, §10.3: an empty forwarded `x-test:` is not sent, and an empty `accept:`
-/// suppresses the default `accept: */*`.
+/// SP4 spec §5: an empty forwarded `x-test:` is sent, and an empty `accept:`
+/// is sent and suppresses the default `accept: */*`.
 #[test]
-fn empty_header_not_sent_empty_accept_suppresses_default() {
+fn empty_header_sent_empty_accept_suppresses_default() {
     let o = Capture::spawn();
     let p = gateway();
     wait_up(&p);
@@ -526,8 +526,9 @@ fn empty_header_not_sent_empty_accept_suppresses_default() {
     assert_eq!(r.status, 200);
     let head = o.one().head;
     assert!(head.contains("\r\nx-kept: yes\r\n"), "{head}");
-    assert!(!head.contains("x-test"), "{head}");
-    assert!(!head.contains("\r\naccept:"), "{head}");
+    assert!(head.contains("\r\nx-test:"), "{head}");
+    assert!(head.contains("\r\naccept:"), "{head}");
+    assert!(!head.contains("*/*"), "{head}");
     assert_eq!(p.join_both(), (0, 0));
 }
 

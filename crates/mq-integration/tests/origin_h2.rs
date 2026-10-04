@@ -806,29 +806,35 @@ fn early_200_before_8mib_upload_leaks_nothing() {
     }
 }
 
-/// hyper's h2 `max_header_list_size` is raised to 128 KiB (§7.2): a 120 KiB
-/// head reaches the gateway (whose own caps reject it), a 130 KiB one is an
-/// h2 protocol error → `curl:56`.
+/// hyper's h2 `max_header_list_size` is `SECTION_MAX + 1` (SP4 spec §5): any
+/// head over 32769 bytes is an h2 protocol error → `curl:56`.
 #[test]
-fn h2_head_over_128k_is_56() {
-    let srv = h2(Handler::HeaderListBytes(130 * 1024));
+fn h2_head_over_section_is_56() {
+    let srv = h2(Handler::HeaderListBytes(40 * 1024));
     let mut lp = origin_loop();
     let (_, o) = fetch(&mut lp, get(url(&srv, "/")));
     let f = o.failure();
     assert_eq!(row(f), (56, 502, TlsOutcome::ConnectFail));
     assert!(!f.upstream_protocol);
+}
 
-    let srv = h2(Handler::HeaderListBytes(120 * 1024));
+/// A head under hyper's h2 limit with one 9 KiB field reaches the gateway,
+/// whose own 8192-byte field cap rejects it: 502 `upstream-protocol`.
+#[test]
+fn h2_single_9k_field_upstream_protocol() {
+    let srv = h2(Handler::HeaderListBytes(9 * 1024));
+    let mut lp = origin_loop();
     let (_, o) = fetch(&mut lp, get(url(&srv, "/")));
     let f = o.failure();
     assert!(f.upstream_protocol && f.status == 502, "{f:?}");
 }
 
-/// 65 forwarded headers exceed the gateway's 64 cap, well inside hyper's
-/// 128 KiB: `HeadError::Overflow` keeps the h2 context.
+/// 257 forwarded headers exceed the gateway's 256 count (`:status` and
+/// `x-mq-origin-protocol` included), under the h2 section limit (257 × ~46
+/// bytes < 32769): `HeadError::Overflow` keeps the h2 context.
 #[test]
 fn h2_normalisation_overflow_keeps_h2_context() {
-    let srv = h2(Handler::Headers(65, 8));
+    let srv = h2(Handler::Headers(257, 1));
     let mut lp = origin_loop();
     let (_, o) = fetch(&mut lp, get(url(&srv, "/")));
     let f = o.failure();

@@ -30,6 +30,7 @@ use http::{Request, Response};
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use mq_http::headers::{HttpVer, Method, status_from_curl};
+use mq_http::limits::{COUNT_MAX, SECTION_MAX};
 use mq_runtime::{Cx, DialError, DialOpId, Target, TcpEnd, TcpId, TimerId};
 use mq_transport_api::{H3ReqId, Time};
 use std::cell::RefCell;
@@ -57,11 +58,6 @@ pub const SWEEP: Duration = Duration::from_secs(10);
 pub const PUMP_CAP: usize = 16;
 /// spec §7.3/§7.4: one `tcp_write` slice, one upload frame.
 pub const SLICE: usize = 16 * 1024;
-/// spec §6.2/§6.4: the gateway's cap on a forwarded header set, both
-/// directions (C `MQ_GWS_MAX_HDRS`): more than 64 (names/values are capped by
-/// `mq_http::headers::{NAME_CAP, VAL_CAP}`); dropped headers do not count, as in C.
-pub(crate) const MAX_FWD: usize = 64;
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Scheme {
     Http,
@@ -785,14 +781,14 @@ impl Origin {
             OriginProto::H1 => Box::pin(async move {
                 let (send, conn) = http1::Builder::new()
                     .max_buf_size(64 * 1024)
-                    .max_headers(256)
+                    .max_headers(COUNT_MAX)
                     .handshake(io)
                     .await?;
                 Ok(Handshaked::H1(send, Box::pin(conn)))
             }),
             OriginProto::H2 => Box::pin(async move {
                 let (send, conn) = http2::Builder::new(exec)
-                    .max_header_list_size(128 * 1024)
+                    .max_header_list_size((SECTION_MAX + 1) as u32)
                     .handshake(io)
                     .await?;
                 Ok(Handshaked::H2(send, Box::pin(conn)))

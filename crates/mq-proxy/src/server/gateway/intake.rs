@@ -5,12 +5,13 @@
 //! is just a control byte (§12.41).
 
 use super::ReqMeta;
-use crate::server::origin::{BodyKind, MAX_FWD, Scheme};
-use mq_http::h1::{PATH_MAX, parse_content_length};
+use crate::server::origin::{BodyKind, Scheme};
+use mq_http::h1::parse_content_length;
 use mq_http::headers::{
-    AUTHORITY_MAX, HttpVer, Method, NAME_CAP, VAL_CAP, name_ok, parse_http_ver, parse_method,
-    strip_server, uri_field_ok, value_ok,
+    AUTHORITY_MAX, HttpVer, Method, name_ok, parse_http_ver, parse_method, strip_server,
+    uri_field_ok, value_ok,
 };
+use mq_http::limits::{COUNT_MAX, SectionBudget, TARGET_PATH_MAX};
 use subtle::ConstantTimeEq;
 
 /// C's fixed buffers `char auth[512]` / `char cls[128]`: the only two
@@ -39,8 +40,10 @@ pub(super) struct Capture {
     /// The forwarded set, in order.
     headers: Vec<(Vec<u8>, Vec<u8>)>,
     bad_header: bool,
-    /// More than `MAX_FWD` forwarded headers.
+    /// More than `COUNT_MAX` fields.
     bad: bool,
+    /// The pseudo-headers and every forwarded field (SP4 spec §5).
+    budget: SectionBudget,
 }
 
 impl Capture {
@@ -57,6 +60,8 @@ impl Capture {
                 _ if is(b":path") => &mut self.path,
                 _ => return, // other pseudo-headers: ignored, as C
             };
+            // A pseudo-header is a field too (`:path` at 8188 overflows here).
+            self.bad_header |= self.budget.add(n, v).is_err();
             *slot = Some(v.to_vec());
         } else if is(b"x-mq-auth") {
             self.auth = cut(AUTH_CAP);
@@ -74,15 +79,12 @@ impl Capture {
         } else if is(b"host") || strip_server(n) {
             // `host` is synthesised from `:authority` (§7.4, §12.14); `x-mq-cache`
             // (the response cache is gone) and hop-by-hop go with `strip_server`.
-        } else if !name_ok(n)
-            || !value_ok(v)
-            || http::HeaderName::from_bytes(n).is_err()
-            || n.len() >= NAME_CAP
-            || v.len() >= VAL_CAP
-        {
+        } else if !name_ok(n) || !value_ok(v) || http::HeaderName::from_bytes(n).is_err() {
             self.bad_header = true;
-        } else if self.headers.len() == MAX_FWD {
+        } else if self.budget.count() == COUNT_MAX {
             self.bad = true;
+        } else if self.budget.add(n, v).is_err() {
+            self.bad_header = true;
         } else {
             self.headers.push((n.to_vec(), v.to_vec()));
         }
@@ -160,7 +162,7 @@ pub(super) fn decide(c: &Capture, token: &[u8]) -> Decision {
     };
     // `PathAndQuery` alone would cut at `#` and accept `"{}` (§12.14).
     if authority.len() > AUTHORITY_MAX
-        || path.len() > PATH_MAX
+        || path.len() > TARGET_PATH_MAX
         || !uri_field_ok(&authority)
         || !uri_field_ok(&path)
         || path.iter().any(|b| b"#\"<>{}`".contains(b))
@@ -259,7 +261,7 @@ mod tests {
         assert_eq!(d.outcome.map(|_| ()), Err((400, "bad-header")));
         assert!(!d.authed && d.meta.is_none());
         // 3 before 4: count overflow, then a bad content-length.
-        let mut c = many(65);
+        let mut c = many(257);
         c.each(b"x-mq-auth", b"Bearer nope");
         assert_eq!(outcome(&c), Err((400, "bad-request")));
         let mut c = req(&[bad_auth], false);
@@ -405,6 +407,14 @@ mod tests {
     }
 
     #[test]
+    fn intake_lowercase_custom_method_preserved() {
+        let c = req(&[(":method", Some(b"purge"))], false);
+        let d = decide(&c, TOK);
+        assert_eq!(d.meta.expect("meta").method.as_bytes(), b"purge");
+        assert_eq!(d.outcome.expect("admitted").method.as_bytes(), b"purge");
+    }
+
+    #[test]
     fn connect_rejected_400_bad_request() {
         // Only the exact token; `connect` is an ordinary method here.
         let c = req(&[(":method", Some(b"CONNECT"))], false);
@@ -457,19 +467,32 @@ mod tests {
             outcome(&req(&[(":authority", Some(&a256))], false)),
             Err((400, "bad-target"))
         );
-        let mut p1023 = b"/".to_vec();
-        p1023.resize(1023, b'p');
-        let mut p1024 = p1023.clone();
-        p1024.push(b'p');
-        assert_eq!(outcome(&req(&[(":path", Some(&p1023))], false)), Ok(()));
-        assert_eq!(
-            outcome(&req(&[(":path", Some(&p1024))], false)),
-            Err((400, "bad-target"))
-        );
         assert_eq!(
             outcome(&req(&[(":authority", Some(b"o test"))], false)),
             Err((400, "bad-target"))
         );
+    }
+
+    fn path_of(n: usize) -> Vec<u8> {
+        let mut p = b"/".to_vec();
+        p.resize(n, b'p');
+        p
+    }
+
+    #[test]
+    fn intake_path_8187_ok_8188_bad_header() {
+        // `:path` is a field too: name 5 + value 8187 = FIELD_MAX exactly.
+        let ok = path_of(TARGET_PATH_MAX);
+        assert_eq!(outcome(&req(&[(":path", Some(&ok))], false)), Ok(()));
+        // At 8188 the field budget trips first (step 2), not the target check.
+        let over = path_of(TARGET_PATH_MAX + 1);
+        assert_eq!(
+            outcome(&req(&[(":path", Some(&over))], false)),
+            Err((400, "bad-header"))
+        );
+        // The 1 KiB-era boundary is gone.
+        let p1024 = path_of(1024);
+        assert_eq!(outcome(&req(&[(":path", Some(&p1024))], false)), Ok(()));
     }
 
     #[test]
@@ -514,21 +537,14 @@ mod tests {
         let names: Vec<&[u8]> = a.headers.iter().map(|(n, _)| n.as_slice()).collect();
         assert_eq!(names, [&b"accept"[..], b"authorization", b"x-tab"]);
         assert_eq!(a.ver, HttpVer::H2);
-        // name ≥ 128 / value ≥ 1024 / control bytes / non-tchar names → bad-header.
-        let n127 = vec![b'n'; 127];
-        let n128 = [b'n'; 128];
-        let v1023 = vec![b'v'; 1023];
-        let v1024 = vec![b'v'; 1024];
+        // control bytes / non-tchar names → bad-header.
         let ok = |n: &[u8], v: &[u8]| {
             let mut c = req(&[], true);
             c.each(n, v);
             outcome(&c)
         };
-        assert_eq!(ok(&n127, &v1023), Ok(()));
         for (n, v) in [
-            (&n128[..], &b"v"[..]),
-            (b"x", &v1024[..]),
-            (b"x", b"a\rb"),
+            (&b"x"[..], &b"a\rb"[..]),
             (b"x", b"a\0b"),
             (b"x\tb", b"v"),
             (b"x(y", b"v"),
@@ -536,9 +552,48 @@ mod tests {
         ] {
             assert_eq!(ok(n, v), Err((400, "bad-header")), "{n:?} {v:?}");
         }
-        // 64 forwarded headers in all fit; the 65th is `bad`.
-        assert_eq!(outcome(&many(63)), Ok(()));
-        assert_eq!(outcome(&many(64)), Err((400, "bad-request")));
+    }
+
+    #[test]
+    fn intake_6k_cookie_admitted() {
+        let mut c = req(&[], true);
+        c.each(b"cookie", &vec![b'c'; 6 * 1024]);
+        let a = admitted(&c);
+        assert_eq!(a.headers.last().map(|(_, v)| v.len()), Some(6 * 1024));
+    }
+
+    #[test]
+    fn intake_field_8192_ok_8193_bad_header() {
+        let ok = |v: usize| {
+            let mut c = req(&[], true);
+            c.each(b"x", &vec![b'v'; v]);
+            outcome(&c)
+        };
+        assert_eq!(ok(8191), Ok(()));
+        assert_eq!(ok(8192), Err((400, "bad-header")));
+    }
+
+    #[test]
+    fn intake_section_over_32k_bad_header() {
+        // Each field is under FIELD_MAX; together they pass SECTION_MAX.
+        let mut c = req(&[], true);
+        for i in 0..4 {
+            c.each(format!("x-{i}").as_bytes(), &vec![b'v'; 8000]);
+        }
+        assert_eq!(
+            outcome(&c),
+            Ok(()),
+            "~32.1 KiB with the pseudo-headers fits"
+        );
+        c.each(b"x-4", &vec![b'v'; 8000]);
+        assert_eq!(outcome(&c), Err((400, "bad-header")));
+    }
+
+    #[test]
+    fn intake_count_256_incl_pseudo_then_bad_request() {
+        // 4 pseudo-headers + accept already count: 251 more reach COUNT_MAX.
+        assert_eq!(outcome(&many(251)), Ok(()));
+        assert_eq!(outcome(&many(252)), Err((400, "bad-request")));
     }
 
     #[test]

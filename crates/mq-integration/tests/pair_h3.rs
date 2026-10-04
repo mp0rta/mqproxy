@@ -11,6 +11,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn pair(mode: EchoMode, script: H3Script) -> LoopbackPair<H3Handle, H3Handle> {
+    pair_with(mode, Vec::new(), script)
+}
+
+fn pair_with(
+    mode: EchoMode,
+    resp_headers: Vec<(String, String)>,
+    script: H3Script,
+) -> LoopbackPair<H3Handle, H3Handle> {
     let lo = Ipv4Addr::LOCALHOST.into();
     LoopbackPair::spawn(
         (lo, lo),
@@ -24,6 +32,7 @@ fn pair(mode: EchoMode, script: H3Script) -> LoopbackPair<H3Handle, H3Handle> {
                 true,
             );
             let (app, h) = H3EchoServer::new(mode);
+            let app = app.with_response_headers(resp_headers.clone());
             (Shard::new(t, app, local, 1), h)
         },
         move |local, server| {
@@ -108,6 +117,43 @@ fn h3_reset_with_unread_body_within_margin() {
         let pto = 5 * srtt + Duration::from_millis(25);
         let margin = srtt + 3 * pto + Duration::from_millis(500);
         assert!(*at - cut_at <= margin, "{:?} > {margin:?}", *at - cut_at);
+    }
+    p.join_both();
+}
+
+/// `n` fields of `len` bytes (`x-<i>`).
+fn fields(n: usize, len: usize) -> Vec<(String, String)> {
+    (0..n)
+        .map(|i| (format!("x-{i}"), "a".repeat(len)))
+        .collect()
+}
+
+/// RFC 9114 §4.2.2 size: Σ name + value + 32.
+fn section(hs: &[(Vec<u8>, Vec<u8>)]) -> usize {
+    hs.iter().map(|(n, v)| n.len() + v.len() + 32).sum()
+}
+
+/// SP4 spec §5: both engines accept a 40 KiB field section (xquic's default limit was 32 KiB;
+/// `H3_FIELD_SECTION_MAX` is 64 KiB): a request section reaches the server and a response
+/// section comes back.
+#[test]
+fn h3_40k_section_both_ways() {
+    let mut script = post(Vec::new(), None);
+    script.headers.extend(fields(6, 7000));
+    let p = pair_with(EchoMode::Echo, fields(6, 7000), script);
+    wait(&p.client.handle, |r| r.fin);
+    {
+        let s = p.server.handle.lock();
+        assert!(
+            section(&s.request_headers) >= 40 * 1024,
+            "{}",
+            section(&s.request_headers)
+        );
+    }
+    {
+        let c = p.client.handle.lock();
+        assert_eq!(c.headers[0].0, b":status");
+        assert!(section(&c.headers) >= 40 * 1024, "{}", section(&c.headers));
     }
     p.join_both();
 }
