@@ -56,11 +56,12 @@ pub fn set_keepalive(
 }
 
 /// Opens `path` read-only, failing with `ELOOP` if the final component is a
-/// symlink (`O_NOFOLLOW`). SP4 spec §7.
+/// symlink (`O_NOFOLLOW`). `O_NONBLOCK` keeps a writerless FIFO from
+/// blocking the open (regular-file reads ignore it). SP4 spec §7.
 pub fn open_nofollow(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
 }
 

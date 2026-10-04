@@ -341,6 +341,24 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A writerless FIFO must not block `open` before the `NotRegular` check.
+    #[test]
+    fn fifo_rejected_without_blocking() {
+        let d = stage("fifo", &["ca-p256.crt"]);
+        let fifo = d.join("fifo.key");
+        let ok = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(ok.unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Ca::load(&d.join("ca-p256.crt"), &fifo));
+        });
+        let r = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(matches!(
+            r.expect("Ca::load blocked on the FIFO"),
+            Err(CaError::NotRegular(p)) if p.ends_with("fifo.key")
+        ));
+    }
+
     #[test]
     fn over_1mib_rejected() {
         let d = stage("big", &["ca-p256.crt", "ca-p256.key"]);
