@@ -21,6 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 
 /// The SNI every `TestBrowser` connection sends.
@@ -181,24 +182,36 @@ impl TestBrowser {
 
     /// `n` concurrent GETs of `path` on the one connection.
     pub fn get_parallel(&self, n: usize, path: &str) -> Vec<Resp> {
+        let all: Vec<_> = (0..n).map(|_| self.start_get(path)).collect();
+        (all.into_iter())
+            .map(|t| self.finish(t).expect("parallel GET"))
+            .collect()
+    }
+
+    /// A GET spawned on the browser runtime; it progresses whenever the runtime is driven
+    /// (`drive_until`, `finish`, any other call).
+    pub fn start_get(&self, path: &str) -> JoinHandle<Result<Resp, h2::Error>> {
         let send = self.conn();
-        let uri = format!("https://{}{path}", self.authority);
-        self.block_on(async move {
-            let mut all = Vec::new();
-            for _ in 0..n {
-                let mut s = send.clone().ready().await.expect("ready");
-                let req = Request::get(&uri).body(()).expect("request");
-                let (resp, _) = s.send_request(req, true).expect("send_request");
-                all.push(tokio::spawn(async move {
-                    let (parts, body) = resp.await?.into_parts();
-                    Ok::<_, h2::Error>((parts.status, parts.headers, read_all(body).await?))
-                }));
+        let req = Request::get(format!("https://{}{path}", self.authority)).body(());
+        let req = req.expect("request");
+        self.rt.spawn(async move {
+            let (resp, _) = send.ready().await?.send_request(req, true)?;
+            let (parts, body) = resp.await?.into_parts();
+            Ok((parts.status, parts.headers, read_all(body).await?))
+        })
+    }
+
+    /// The outcome of a `start_get`.
+    pub fn finish(&self, t: JoinHandle<Result<Resp, h2::Error>>) -> Result<Resp, h2::Error> {
+        self.block_on(t).expect("request task")
+    }
+
+    /// Drives the browser runtime until `cond` holds.
+    pub fn drive_until(&self, cond: impl Fn() -> bool) {
+        self.block_on(async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            let mut out = Vec::new();
-            for t in all {
-                out.push(t.await.expect("task").expect("parallel GET"));
-            }
-            out
         })
     }
 

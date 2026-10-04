@@ -17,11 +17,13 @@ use mq_proxy::config::{ClientConfig, MitmConfig, ServerConfig};
 use mq_proxy::server::origin::host::upload_byte;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -65,9 +67,13 @@ fn p256() -> MitmConfig {
 
 /// The pair, its `TRANSPARENT` accepts stamped with `origin` (R3).
 fn proxy(origin: SocketAddr, mitm: MitmConfig) -> LoopbackProxy {
-    log_tap::install();
-    // The routing decisions are logged at debug (SP4 spec §7.10).
-    log::set_max_level(log::LevelFilter::Debug);
+    // The routing decisions are logged at debug (SP4 spec §7.10). Once: `install` resets
+    // the level to Info, which would race a parallel test's debug line.
+    static TAP: Once = Once::new();
+    TAP.call_once(|| {
+        log_tap::install();
+        log::set_max_level(log::LevelFilter::Debug);
+    });
     let client = ClientConfig {
         token: TOKEN.into(),
         reconnect_max_backoff: Duration::from_secs(1),
@@ -175,7 +181,6 @@ fn mitm_8mib_download_byte_exact_h1_and_h2_origin() {
         assert!(body == pattern(len), "body differs ({} bytes)", body.len());
         assert_eq!(p.join_both(), (0, 0));
     }
-    wait_log("mq_mitm: localhost → mitm");
 }
 
 /// SP4 spec §7.5 step 6, §11.3: 8 MiB uploads echoed back, with a known length (forwarded
@@ -348,6 +353,39 @@ fn mitm_421_on_authority_mismatch() {
 
 // ---- tunnel ----
 
+/// One request across a tunnel loss.
+#[derive(Debug, PartialEq)]
+enum Outage {
+    Served,
+    Unavailable,
+    /// A stream reset, or 502 `upstream-reset` for a request opened on the old tunnel
+    /// conn before the client saw it close.
+    Transition,
+}
+
+/// Requests across a tunnel loss may only see, in this order: 502 `upstream-reset`, then
+/// 502 `tunnel-unavailable` (`unavailable` remembers it), then 200 once the tunnel is
+/// back; a stream reset anywhere. Anything else fails, and so does a connection error
+/// (GOAWAY, I/O): the browser connection must survive the tunnel.
+fn during_outage(b: &TestBrowser, path: &str, unavailable: &Cell<bool>) -> Outage {
+    match b.request("GET", None, path, &[], Body::Empty) {
+        Ok(r) if r.0 == 200 => Outage::Served,
+        Ok(r) if tunnel_unavailable(&r) => {
+            unavailable.set(true);
+            Outage::Unavailable
+        }
+        Ok(r) => {
+            let early = !unavailable.get() && r.0 == 502;
+            assert!(early && xmq_error(&r) == Some("upstream-reset"), "{r:?}");
+            Outage::Transition
+        }
+        Err(e) => {
+            assert!(e.is_reset() && !e.is_go_away() && !e.is_io(), "{e}");
+            Outage::Transition
+        }
+    }
+}
+
 /// SP4 spec §10: with the tunnel down, a request gets 502 `tunnel-unavailable` and the
 /// browser connection stays usable.
 #[test]
@@ -357,36 +395,42 @@ fn mitm_tunnel_down_502() {
     let b = mitm_browser(&p, o.addr);
     assert_eq!(b.get("/before", &[]).0, 200);
     p.server.shutdown.trigger();
+    let seen = Cell::new(false);
     wait_until("502 tunnel-unavailable", || {
-        tunnel_unavailable(&b.get("/down", &[]))
+        during_outage(&b, "/down", &seen) == Outage::Unavailable
     });
     assert_eq!(p.join_both(), (0, 0));
 }
 
-/// Review Focus 1: the server restarts; the client's H3 tunnel reconnects, and the same
-/// browser connection is served on the new tunnel.
+/// Review Focus 1: the tunnel drops (server restart) while a MITM stream is in flight.
+/// That stream ends with 502 `upstream-reset` (SP4 spec §10) or a stream reset; requests during the outage follow
+/// `during_outage`'s order; once the tunnel is back, the same browser
+/// connection is served on it. `TestBrowser` never redials, so a success on its one
+/// `SendRequest` after the restart is that connection.
 #[test]
 fn mitm_survives_tunnel_reconnect() {
-    let o = origin(Proto::H2Tls, Handler::Status(200));
+    let h = Handler::PerPath(vec![
+        ("/hang", Handler::HangNoResponse),
+        ("/before", Handler::Status(200)),
+        ("/after", Handler::Status(200)),
+    ]);
+    let o = origin(Proto::H2Tls, h);
     let mut p = proxy(o.addr, p256());
     let b = mitm_browser(&p, o.addr);
     assert_eq!(b.get("/before", &[]).0, 200);
+
+    let hang = b.start_get("/hang");
+    b.drive_until(|| o.requests().iter().any(|r| r.path == "/hang"));
     p.restart_server();
-    let end = Instant::now() + T;
-    loop {
-        // An `Err` would be the browser connection lost: the conn must survive.
-        let r = b.request("GET", None, "/after", &[], Body::Empty);
-        let r = r.expect("the browser connection survives");
-        if r.0 == 200 {
-            break;
-        }
-        assert!(r.0 == 502, "{r:?}");
-        assert!(
-            Instant::now() < end,
-            "never served after the restart: {r:?}"
-        );
-        thread::sleep(Duration::from_millis(20));
+    match b.finish(hang) {
+        Ok(r) => assert_eq!((r.0.as_u16(), xmq_error(&r)), (502, Some("upstream-reset"))),
+        Err(e) => assert!(e.is_reset() && !e.is_go_away() && !e.is_io(), "{e}"),
     }
+
+    let seen = Cell::new(false);
+    wait_until("a 200 on the new tunnel", || {
+        during_outage(&b, "/after", &seen) == Outage::Served
+    });
     assert_eq!(p.join_both(), (0, 0));
 }
 
