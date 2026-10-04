@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# ci_bench_mitm.sh — Per-commit MITM H2 throughput benchmark.
+# ci_bench_mitm.sh — Per-commit MITM H2 throughput benchmark; Rust vs C when
+# MQPROXY_BIN_RUST is set (SP4 spec §11.5).
 #
 # Standalone loopback topology (does NOT source ci_bench_env.sh).
 # Measures MITM proxy throughput with tc-netem shaping on lo.
@@ -16,12 +17,28 @@
 #   1. single_path — path A only (127.0.0.2)
 #   2. multipath   — path A (127.0.0.2) + path B (127.0.0.3)
 #
-# Output: ci_bench_results/mitm_<timestamp>.json
+# Each run starts a fresh server + client pair. CPU seconds of both mqproxy
+# processes over the curl window come from /proc/<pid>/stat (utime+stime).
+#
+# Modes:
+#   single binary (MQPROXY_BIN_RUST unset): one run per variant, positive-
+#     throughput check only. Output: ci_bench_results/mitm_<timestamp>.json
+#   Rust vs C (MQPROXY_BIN_RUST set): REPEAT runs per variant and binary,
+#     interleaved C/Rust, median per cell, ratio table Rust / C. Exits non-zero
+#     when any throughput ratio is below GATE (0.95), when a Rust transfer
+#     failed or a Rust process died, or when a cell lacks REPEAT runs. C
+#     failures and bits/CPU-s are reported, not gated.
+#     Output: ci_bench_results/mitm_rust_vs_c_<timestamp>.json
 #
 # Usage: sudo bash scripts/ci_benchmarks/ci_bench_mitm.sh [path/to/mqproxy]
+#        sudo MQPROXY_BIN_C=build/mqproxy MQPROXY_BIN_RUST=target/release/mqproxy \
+#            bash scripts/ci_benchmarks/ci_bench_mitm.sh
 #
 # Env:
 #   MQPROXY_BIN       path to mqproxy binary (default: build/mqproxy)
+#   MQPROXY_BIN_C     the C binary in Rust-vs-C mode (default: MQPROXY_BIN)
+#   MQPROXY_BIN_RUST  the Rust binary; set to enable Rust-vs-C mode
+#   REPEAT            runs per cell in Rust-vs-C mode (default: 3)
 #   MQPROXY_CERT/KEY  tunnel TLS cert/key (default: tests/certs/test.*)
 #   MQ_MITM_CA_CRT    MITM CA cert (default: tests/certs/mitm-ca.crt)
 #   MQ_MITM_CA_KEY    MITM CA key  (default: tests/certs/mitm-ca.key)
@@ -32,7 +49,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 
-MQPROXY_BIN="${1:-${MQPROXY_BIN:-${REPO_ROOT}/build/mqproxy}}"
+MQPROXY_BIN="${1:-${MQPROXY_BIN_C:-${MQPROXY_BIN:-${REPO_ROOT}/build/mqproxy}}}"
+BIN_RUST="${MQPROXY_BIN_RUST:-}"
 MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 MITM_CA_CRT="${MQ_MITM_CA_CRT:-${REPO_ROOT}/tests/certs/mitm-ca.crt}"
@@ -51,6 +69,20 @@ PARALLEL=4       # H2 streams (matches TCP proxy bench P=4)
 RATE="100mbit"   # per-path bandwidth
 DELAY="25ms"     # per-path one-way delay (RTT ≈ 2×delay)
 BLOB_MB=128      # origin blob size
+GATE=0.95        # Rust/C throughput floor (Rust-vs-C mode)
+REPEAT="${REPEAT:-3}"
+case "${REPEAT}" in
+    ''|*[!0-9]*|0) echo "error: REPEAT must be an integer >= 1 (got '${REPEAT}')" >&2; exit 1 ;;
+esac
+CLK_TCK="$(getconf CLK_TCK)"
+
+# cpu_ticks PID — utime+stime (fields 14+15) of PID, summed over its threads.
+cpu_ticks() {
+    local stat f
+    stat="$(cat "/proc/$1/stat" 2>/dev/null)" || { echo 0; return; }
+    read -r -a f <<< "${stat##*) }"
+    echo $(( f[11] + f[12] ))
+}
 
 SKIP=77
 note() { printf '%s\n' "ci_bench_mitm: $*" >&2; }
@@ -98,10 +130,12 @@ if ! curl --version 2>/dev/null | grep -qi 'HTTP2'; then
     exit "${SKIP}"
 fi
 
-if [ ! -x "${MQPROXY_BIN}" ]; then
-    note "error: mqproxy binary not found: ${MQPROXY_BIN}" >&2
-    exit 1
-fi
+for f in "${MQPROXY_BIN}" ${BIN_RUST:+"${BIN_RUST}"}; do
+    if [ ! -x "${f}" ]; then
+        note "error: mqproxy binary not found: ${f}" >&2
+        exit 1
+    fi
+done
 for f in "${MQPROXY_CERT}" "${MQPROXY_KEY}" "${MITM_CA_CRT}" "${MITM_CA_KEY}"; do
     if [ ! -f "${f}" ]; then
         note "SKIP: cert/key missing: ${f}"
@@ -274,26 +308,31 @@ cp /etc/hosts "${WORK}/hosts.bak"
 HOSTS_BACKED_UP=1
 printf '%s\n' "${HOSTS_LINE}" >> /etc/hosts
 
-# ── Start mqproxy server ──
-"${MQPROXY_BIN}" server \
-    --listen "${SERVER_IP}:${QUIC_PORT}" \
-    --token "ci-mitm-bench" \
-    --cert "${MQPROXY_CERT}" \
-    --key "${MQPROXY_KEY}" \
-    --origin-ca "${ORIGIN_CA}" \
-    > "${WORK}/server.log" 2>&1 &
-SERVER_PID=$!
-sleep 1
+# Small file for the warm-up request (tunnel up + leaf forged before timing).
+printf 'ok\n' > "${WORK}/warm.txt"
+chmod 644 "${WORK}/warm.txt"
 
-# ── measure_variant PATH_MODE — run one MITM bench variant ──
-# Returns throughput in Mbps to stdout.
+# ── measure_variant BIN PATH_MODE LABEL — run one MITM bench variant ──
+# Sets MV_OUT="<mbps> <bytes> <client_ticks> <server_ticks> <failed>". Runs in
+# the main shell (no $(...)), so the EXIT trap sees SERVER_PID/CLIENT_PID.
 measure_variant() {
-    local path_mode="$1"  # single | multi
+    local bin="$1" path_mode="$2" label="$3"  # path_mode: single | multi
     local path_count
     [ "${path_mode}" = "single" ] && path_count=1 || path_count=2
 
     # Apply tc shaping (setup_tc uses replace, no separate clear needed)
     setup_tc "${path_count}"
+
+    # Fresh server per run: no run inherits another's state.
+    "${bin}" server \
+        --listen "${SERVER_IP}:${QUIC_PORT}" \
+        --token "ci-mitm-bench" \
+        --cert "${MQPROXY_CERT}" \
+        --key "${MQPROXY_KEY}" \
+        --origin-ca "${ORIGIN_CA}" \
+        > "${WORK}/server-${label}.log" 2>&1 &
+    SERVER_PID=$!
+    sleep 1
 
     # Build path args for client
     local path_args="--path ${PATH_A_IP}"
@@ -301,7 +340,7 @@ measure_variant() {
 
     # Start client
     # shellcheck disable=SC2086
-    "${MQPROXY_BIN}" client \
+    "${bin}" client \
         --server "${SERVER_IP}:${QUIC_PORT}" \
         --token "ci-mitm-bench" \
         --tproxy "127.0.0.1:${TPROXY_PORT}" \
@@ -313,7 +352,7 @@ measure_variant() {
         --ca-cert "${MITM_CA_CRT_RUN}" \
         --ca-key "${MITM_CA_KEY_RUN}" \
         ${path_args} \
-        > "${WORK}/client-${path_mode}.log" 2>&1 &
+        > "${WORK}/client-${label}.log" 2>&1 &
     CLIENT_PID=$!
 
     # Wait for MITM client ready (nft rules installed + tunnel up)
@@ -322,14 +361,28 @@ measure_variant() {
         if ! kill -0 "${CLIENT_PID}" 2>/dev/null; then
             break
         fi
-        if grep -q "REDIRECT rules installed" "${WORK}/client-${path_mode}.log" 2>/dev/null || \
+        if grep -q "REDIRECT rules installed" "${WORK}/client-${label}.log" 2>/dev/null || \
            nft list table ip mqproxy 2>/dev/null | grep -q REDIRECT; then
             ready=1; break
         fi
         sleep 0.15
     done
 
-    local mbps="0.0"
+    # Warm-up through the MITM: the tunnel is up and the leaf is forged.
+    if [ "${ready}" -eq 1 ]; then
+        ready=0
+        for _ in $(seq 1 50); do
+            if [ "$(sudo -u nobody curl -s -o /dev/null -w '%{http_code}' --http2 --max-time 2 \
+                    --cacert "${MITM_CA_CRT_RUN}" \
+                    "https://${MITM_HOST}:${ORIGIN_PORT}/warm.txt" 2>/dev/null)" = 200 ]; then
+                ready=1; break
+            fi
+            sleep 0.2
+        done
+    fi
+
+    local mbps="0.0" nbytes=0 errs=0 c0 s0 c1 s1
+    c0=$(cpu_ticks "${CLIENT_PID}"); s0=$(cpu_ticks "${SERVER_PID}")
     if [ "${ready}" -eq 1 ]; then
         # P parallel H2 streams over one multiplexed connection
         local curl_outputs="" curl_urls=""
@@ -338,25 +391,36 @@ measure_variant() {
             curl_urls="${curl_urls} https://${MITM_HOST}:${ORIGIN_PORT}/${BLOB_BASENAME}"
         done
 
-        local stat_file="${WORK}/curl-stats-${path_mode}.txt"
+        local stat_file="${WORK}/curl-stats-${label}.txt"
         # shellcheck disable=SC2086,SC2024
         sudo -u nobody \
             curl --http2 --cacert "${MITM_CA_CRT_RUN}" \
             --parallel --parallel-max "${PARALLEL}" \
             ${curl_outputs} \
             --max-time "${DURATION}" \
-            -w '%{size_download} %{time_total}\n' \
+            -w '%{size_download} %{time_total} %{http_code} %{exitcode}\n' \
             ${curl_urls} \
             > "${stat_file}" 2>/dev/null || true
 
         # Aggregate: throughput = sum(bytes) * 8 / max(time) / 1e6
         mbps=$(awk '{b+=$1; if($2>t)t=$2} END{if(t>0) printf "%.2f\n",b*8/t/1e6; else print "0.0"}' \
             "${stat_file}" 2>/dev/null || echo "0.0")
+        # A transfer is good with a 200 and exit 0 or 28 (--max-time ends it).
+        read -r nbytes errs < <(awk -v p="${PARALLEL}" '
+            { b += $1; n++ }
+            $3 != 200 || ($4 != 0 && $4 != 28) || $1 == 0 { e++ }
+            END { if (n < p) e += p - n; printf "%d %d\n", b, e }' "${stat_file}")
     else
-        note "warning: MITM client not ready for variant=${path_mode}" >&2
+        note "warning: MITM client not ready for variant=${label}" >&2
+        errs=1
+    fi
+    c1=$(cpu_ticks "${CLIENT_PID}"); s1=$(cpu_ticks "${SERVER_PID}")
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null || ! kill -0 "${CLIENT_PID}" 2>/dev/null; then
+        note "error: ${label}: an mqproxy process died during the run" >&2
+        errs=$(( errs + 1 ))
     fi
 
-    # Stop client
+    # Stop client, then server
     if [ -n "${CLIENT_PID}" ] && kill -0 "${CLIENT_PID}" 2>/dev/null; then
         kill -TERM "${CLIENT_PID}" 2>/dev/null
         for _ in $(seq 1 30); do
@@ -366,11 +430,131 @@ measure_variant() {
         wait "${CLIENT_PID}" 2>/dev/null || true
     fi
     CLIENT_PID=""
+    kill "${SERVER_PID}" 2>/dev/null && wait "${SERVER_PID}" 2>/dev/null
+    SERVER_PID=""
     nft delete table ip mqproxy 2>/dev/null || true
     clear_tc
 
-    echo "${mbps}"
+    MV_OUT="${mbps} ${nbytes} $(( c1 - c0 )) $(( s1 - s0 )) ${errs}"
 }
+
+# ── Rust vs C mode ──
+if [ -n "${BIN_RUST}" ]; then
+    echo ""
+    echo "================================================================"
+    echo "  CI MITM Benchmark (Rust vs C)"
+    echo "  C:       ${MQPROXY_BIN}"
+    echo "  Rust:    ${BIN_RUST}"
+    echo "  Profile: symmetric ${RATE}/${DELAY} each path"
+    echo "  Params:  ${DURATION}s duration, P=${PARALLEL} H2 streams, DL, REPEAT=${REPEAT}"
+    echo "  Commit:  ${CI_BENCH_COMMIT}"
+    echo "  Date:    $(date '+%Y-%m-%d %H:%M')"
+    echo "================================================================"
+    RAW="${WORK}/raw.tsv"
+    : > "${RAW}"
+    # C and Rust alternate run by run, so host drift hits both alike.
+    for rep_i in $(seq 1 "${REPEAT}"); do
+        for mode in single multi; do
+            for impl in c rust; do
+                bin="${MQPROXY_BIN}"; [ "${impl}" = rust ] && bin="${BIN_RUST}"
+                run="${impl}-${mode}-${rep_i}"
+                measure_variant "${bin}" "${mode}" "${run}"
+                read -r mbps nbytes cticks sticks errs <<< "${MV_OUT}"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${impl}" "${mode}" "${rep_i}" \
+                    "${mbps}" "${nbytes}" "${cticks}" "${sticks}" "${errs}" >> "${RAW}"
+                echo "    ${impl} ${mode} rep=${rep_i}: ${mbps} Mbps, ${errs} failed," \
+                     "client_ticks=${cticks} server_ticks=${sticks}"
+                if [ "${errs}" -ne 0 ] && [ "${impl}" = rust ]; then
+                    tail -n 5 "${WORK}/curl-stats-${run}.txt" "${WORK}/server-${run}.log" \
+                        "${WORK}/client-${run}.log" >&2
+                fi
+            done
+        done
+    done
+
+    OUTPUT_FILE="${CI_BENCH_RESULTS}/mitm_rust_vs_c_$(date -u '+%Y%m%d_%H%M%S').json"
+    python3 - "${RAW}" "${OUTPUT_FILE}" <<PYEOF
+import json, statistics, sys
+
+raw, out = sys.argv[1], sys.argv[2]
+tck, gate, repeat = ${CLK_TCK}, ${GATE}, ${REPEAT}
+names = {"single": "single_path", "multi": "multipath"}
+results = {"c": {}, "rust": {}}
+for line in open(raw):
+    impl, mode, rep, mbps, nbytes, cticks, sticks, errs = line.split()
+    bits, cticks, sticks = int(nbytes) * 8, int(cticks), int(sticks)
+    run = {"rep": int(rep), "throughput_mbps": float(mbps), "bytes": int(nbytes),
+           "failed": int(errs), "client_cpu_s": cticks / tck, "server_cpu_s": sticks / tck,
+           "client_bits_per_cpu_s": bits * tck / cticks if cticks else None,
+           "server_bits_per_cpu_s": bits * tck / sticks if sticks else None,
+           "bits_per_cpu_s": bits * tck / (cticks + sticks) if cticks + sticks else None}
+    results[impl].setdefault(names[mode], {"runs": []})["runs"].append(run)
+
+keys = ("throughput_mbps", "client_bits_per_cpu_s", "server_bits_per_cpu_s", "bits_per_cpu_s")
+for cells in results.values():
+    for cell in cells.values():
+        for k in keys:
+            vals = [r[k] for r in cell["runs"] if r[k] is not None]
+            cell["median_" + k] = statistics.median(vals) if vals else None
+
+def ratio(a, b):
+    return round(a / b, 3) if a and b else None
+
+ratios, ok = {}, True
+print("\n%-12s %9s %9s %6s %10s %10s %10s %10s %6s" % (
+    "cell", "C Mbps", "Rust Mbps", "ratio", "C cli b/c", "R cli b/c", "C srv b/c", "R srv b/c", "ratio"))
+for name in names.values():
+    c, r = results["c"].get(name, {}), results["rust"].get(name, {})
+    # Every cell needs REPEAT runs of both binaries; a short cell fails.
+    short = [i for i, x in (("C", c), ("Rust", r)) if len(x.get("runs", [])) != repeat]
+    tr = ratio(r.get("median_throughput_mbps"), c.get("median_throughput_mbps"))
+    er = ratio(r.get("median_bits_per_cpu_s"), c.get("median_bits_per_cpu_s"))
+    # Rust failures gate. C failures are reported only: the C MITM (WIP, SP4
+    # spec §0) resets its h2 downloads after a few seconds; its throughput is
+    # then the rate up to the reset.
+    failed = sum(x["failed"] for x in r.get("runs", []))
+    c_failed = sum(x["failed"] for x in c.get("runs", []))
+    ratios[name] = {"throughput": tr, "bits_per_cpu_s": er,
+                    "client_bits_per_cpu_s": ratio(r.get("median_client_bits_per_cpu_s"), c.get("median_client_bits_per_cpu_s")),
+                    "server_bits_per_cpu_s": ratio(r.get("median_server_bits_per_cpu_s"), c.get("median_server_bits_per_cpu_s"))}
+    bad = tr is None or tr < gate or failed or short
+    ok = ok and not bad
+    print("%-12s %9.1f %9.1f %6s %10.3g %10.3g %10.3g %10.3g %6s%s%s" % (
+        name, c.get("median_throughput_mbps") or 0, r.get("median_throughput_mbps") or 0, tr,
+        c.get("median_client_bits_per_cpu_s") or 0, r.get("median_client_bits_per_cpu_s") or 0,
+        c.get("median_server_bits_per_cpu_s") or 0, r.get("median_server_bits_per_cpu_s") or 0, er,
+        ("  FAIL" + (" (%d failed Rust transfers)" % failed if failed else "")
+         + (" (missing runs: %s)" % "/".join(short) if short else "")) if bad else "",
+        "  (C: %d failed transfers)" % c_failed if c_failed else ""))
+
+output = {
+    "test": "mitm_rust_vs_c",
+    "commit": "${CI_BENCH_COMMIT}",
+    "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+    "binaries": {"c": "${MQPROXY_BIN}", "rust": "${BIN_RUST}"},
+    "profile": "symmetric",
+    "duration_sec": ${DURATION},
+    "parallel_streams": ${PARALLEL},
+    "repeat": repeat,
+    "clk_tck": tck,
+    "gate": gate,
+    "results": results,
+    "ratios": ratios,
+    "pass": ok,
+}
+with open(out, "w") as f:
+    json.dump(output, f, indent=2)
+print("\nResults written to: %s" % out)
+sys.exit(0 if ok else 1)
+PYEOF
+    rc=$?
+    echo ""
+    echo "================================================================"
+    [ "${rc}" -eq 0 ] && echo "  MITM Benchmark PASS (every throughput ratio >= ${GATE})" \
+                     || echo "  MITM Benchmark FAIL"
+    echo "================================================================"
+    exit "${rc}"
+fi
 
 echo ""
 echo "================================================================"
@@ -384,12 +568,14 @@ echo "================================================================"
 
 echo ""
 echo "==> Variant 1/2: single_path (path A only)"
-mbps_single=$(measure_variant single)
+measure_variant "${MQPROXY_BIN}" single single
+read -r mbps_single _ <<< "${MV_OUT}"
 echo "    single_path: ${mbps_single} Mbps"
 
 echo ""
 echo "==> Variant 2/2: multipath (path A + B)"
-mbps_multi=$(measure_variant multi)
+measure_variant "${MQPROXY_BIN}" multi multi
+read -r mbps_multi _ <<< "${MV_OUT}"
 echo "    multipath: ${mbps_multi} Mbps"
 
 # ── Generate JSON output ──
