@@ -13,6 +13,23 @@ pub fn cert(name: &str) -> String {
     format!("{}/../../tests/certs/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Copy a `tests/certs/rust-mitm/` CA cert + key into a unique 0600 temp dir
+/// (`Ca::load` insists on owner = euid and no group/other bits); returns
+/// `(cert, key)` paths.
+pub fn stage_ca(test: &str, cert_name: &str, key_name: &str) -> (String, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let d = std::env::temp_dir().join(format!("mqproxy-ca-{}-{test}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let stage = |name: &str| {
+        let to = d.join(name);
+        std::fs::copy(cert(&format!("rust-mitm/{name}")), &to).unwrap();
+        std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600)).unwrap();
+        to.to_str().unwrap().to_string()
+    };
+    (stage(cert_name), stage(key_name))
+}
+
 /// A free loopback UDP port (bound, then released).
 pub fn free_udp() -> u16 {
     UdpSocket::bind("127.0.0.1:0")

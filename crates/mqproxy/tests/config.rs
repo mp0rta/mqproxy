@@ -2,6 +2,8 @@
 //! with `--config <tempfile>`. Ports C `tests/test_config.c` and gives every
 //! row of the SP1 flag table its INI equivalent.
 
+mod common;
+
 use mq_proxy::config::GatewayConfig;
 use mq_runtime::ListenKind;
 use mq_transport_api::{CongestionControl, Scheduler};
@@ -226,18 +228,65 @@ fn c_lenient_and_comments() {
     assert!(warned(&r, "Foo"), "{:?}", r.warnings);
 }
 
-/// C test_mitm_section → SP1: `[Mitm] Enabled = true` is exit 2.
+/// C test_mitm_section: `[Mitm] Enabled = true` without `--tproxy` is exit 2
+/// (this INI's only ingress is SOCKS5).
 #[test]
 fn c_mitm_section_enabled_exit_2() {
     let e = exit(cli_(
         "[Mitm]\nEnabled = true\nCACert = /c\nCAKey = /k\nIgnoreHosts = .apple.com\nIgnoreHosts = signal.org\n",
     ));
     assert_eq!(e.code, 2);
+    assert!(
+        e.message.contains("--mitm requires --tproxy"),
+        "{}",
+        e.message
+    );
 }
 
-/// C test_mitm_server_mode_ignored: the server warns and skips every [Mitm] key.
+/// spec §9: the ignore lists are a union — file entries (repeatable key) plus
+/// both CLI forms.
 #[test]
-fn c_mitm_server_mode_ignored() {
+fn ignore_hosts_union_file_cli() {
+    let (c, k) = common::stage_ca("union", "ca-p256.crt", "ca-p256.key");
+    let ini = Ini::new(&format!(
+        "{CLI}[Ingress]\nTProxy = 127.0.0.1:18443\n[Mitm]\nEnabled = true\nCACert = {c}\nCAKey = {k}\n\
+         IgnoreHosts = a.org\nIgnoreHosts = .b.org\n"
+    ));
+    let r = run("client", &ini, &[]).unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(client(&r).config.mitm.as_ref().unwrap().ignore.len(), 2);
+    let r = run(
+        "client",
+        &ini,
+        &["--ignore-host", "c.org", "--ignore-hosts", "d.org,e.org"],
+    )
+    .unwrap();
+    assert_eq!(client(&r).config.mitm.as_ref().unwrap().ignore.len(), 5);
+    // CLI scalars override the file: a bad CA on the CLI beats the good one.
+    let e = exit(run("client", &ini, &["--ca-key", "/nope.key"]));
+    assert!(e.message.contains("/nope.key"), "{}", e.message);
+    // An invalid file entry is exit 2 too.
+    let bad = Ini::new(&format!(
+        "{CLI}[Ingress]\nTProxy = 127.0.0.1:18443\n[Mitm]\nEnabled = true\nCACert = {c}\nCAKey = {k}\nIgnoreHosts = bad host\n"
+    ));
+    let e = exit(run("client", &bad, &[]));
+    assert!(e.message.contains(r#""bad host""#), "{}", e.message);
+}
+
+/// spec §9: CA and ignore keys without `Enabled` are accepted and do nothing
+/// (the paths are not even opened).
+#[test]
+fn ca_flags_without_mitm_no_effect() {
+    let r =
+        cli_("[Mitm]\nCACert = /c\nCAKey = /k\nIgnoreHosts = bad host\nEnabled = false\n").unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(client(&r).config.mitm.is_none());
+}
+
+/// spec §9: a server config with `[Mitm]` warns and is skipped (SP1 wrong-mode
+/// rule), one warning per key.
+#[test]
+fn server_config_mitm_section_warns() {
     let r =
         srv("[Mitm]\nEnabled = true\nCACert = /c\nCAKey = /k\nIgnoreHosts = .apple.com\n").unwrap();
     assert_eq!(
@@ -248,14 +297,15 @@ fn c_mitm_server_mode_ignored() {
     );
 }
 
-/// C test_mitm_enabled_missing_cacert → SP1: `Enabled = true` is exit 2;
-/// `CACert` without `Enabled` is accepted.
+/// C test_mitm_enabled_missing_cacert: `Enabled = true` with `--tproxy` but no
+/// `CACert`/`CAKey` is exit 2 naming the missing key's flag.
 #[test]
-fn c_mitm_cacert_without_enabled_accepted() {
-    assert_eq!(exit(cli_("[Mitm]\nEnabled = true\n")).code, 2);
-    let r =
-        cli_("[Mitm]\nCACert = /c\nCAKey = /k\nIgnoreHosts = x.org\nEnabled = false\n").unwrap();
-    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+fn c_mitm_enabled_missing_cacert_exit_2() {
+    let e = exit(cli_(
+        "[Ingress]\nTProxy = 127.0.0.1:18443\n[Mitm]\nEnabled = true\n",
+    ));
+    assert_eq!(e.code, 2);
+    assert!(e.message.contains("--ca-cert"), "{}", e.message);
 }
 
 /// C test_perms_warning (+ spec §6.4: 0620 warns too).
@@ -582,7 +632,8 @@ fn ini_ingress_gateway_counts_as_ingress() {
     assert_eq!(exit(cli_("[Ingress]\nGateway = nope\n")).code, 2);
 }
 
-/// spec §8: `[Mitm] Enabled` stays a startup error (SP4), only when true.
+/// spec §9: `[Mitm] Enabled` is a startup error without its prerequisites, and
+/// only when true.
 #[test]
 fn client_mitm_key_exit_2_only_when_true() {
     assert_eq!(exit(cli_("[Mitm]\nEnabled = 1\n")).code, 2);

@@ -4,13 +4,15 @@
 use crate::config::{self, FileConfig};
 use clap::error::ErrorKind;
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
-use mq_proxy::config::{ClientConfig, GatewayConfig, ServerConfig};
+use mq_proxy::client::mitm::{MitmTuning, ca::Ca, policy::IgnoreHosts};
+use mq_proxy::config::{ClientConfig, GatewayConfig, MitmConfig, ServerConfig};
 use mq_proxy::server::origin::HYPER_VERSION;
 use mq_proxy::udp::DEFAULT_IDLE;
 use mq_runtime::ListenKind;
 use mq_transport_api::{CongestionControl, Scheduler};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// C `MQ_MAX_EXTRA_PATHS`.
@@ -244,7 +246,7 @@ struct ClientArgs {
     /// UID whose outbound traffic is NOT redirected (default: geteuid() of the process).
     #[arg(long, value_name = "uid", allow_hyphen_values = true, value_parser = clap::value_parser!(u32).range(0..=i32::MAX as i64))]
     tproxy_uid: Option<u32>,
-    /// (not available in this build) Terminate TLS on captured flows (HTTPS MITM) and re-encrypt to the origin. Requires --tproxy and --ca-cert/--ca-key. Off by default.
+    /// Terminate TLS on captured flows (HTTPS MITM) and re-encrypt to the origin. Requires --tproxy and --ca-cert/--ca-key. Off by default.
     #[arg(long)]
     mitm: bool,
     /// (accepted, no effect without --mitm) Signing CA certificate (PEM) used to forge per-host leaf certs (required with --mitm).
@@ -293,10 +295,6 @@ fn usage_error(sub: &str, msg: String) -> Exit {
         code: 2,
         message: e.render().to_string(),
     }
-}
-
-fn unavailable(flag: &str) -> String {
-    format!("{flag} is not available in this build")
 }
 
 // spec §6.4: each value below is `CLI.or(file)`, then the C default.
@@ -380,12 +378,6 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
 }
 
 fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
-    // spec §8: startup error, exit 2 (the INI bool only when true) until SP4.
-    if a.mitm || f.mitm {
-        return Err(unavailable("--mitm ([Mitm] Enabled)"));
-    }
-    // Accepted, no effect (C accepts them without --mitm).
-    let _ = (a.ca_cert, a.ca_key, a.ignore_host, a.ignore_hosts);
     let cc = cc(a.cc.or(f.cc).as_deref())?;
     let scheduler = scheduler(a.scheduler.or(f.scheduler).as_deref())?;
     let tproxy_mode = match a.tproxy_mode.or(f.tproxy_mode).as_deref() {
@@ -438,6 +430,25 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
     let http_connect = opt("--http-connect", http_connect)?;
     let gateway = opt("--gateway", gateway)?;
     let tproxy = opt("--tproxy", tproxy)?;
+    // SP4 spec §9: without --mitm (or `[Mitm] Enabled`) the CA and ignore
+    // settings are accepted and never looked at.
+    let mitm = (a.mitm || f.mitm)
+        .then(|| {
+            // File entries first, then the flags (the comma form skips empty tokens, as in C).
+            let ignore = f.ignore_hosts.into_iter().chain(a.ignore_host).chain(
+                a.ignore_hosts
+                    .into_iter()
+                    .flat_map(|s| s.split(',').map(String::from).collect::<Vec<_>>())
+                    .filter(|s| !s.is_empty()),
+            );
+            mitm_config(
+                tproxy.is_some(),
+                a.ca_cert.or(f.ca_cert),
+                a.ca_key.or(f.ca_key),
+                ignore,
+            )
+        })
+        .transpose()?;
     Ok(Resolved {
         mode: Mode::Client(Client {
             config: ClientConfig {
@@ -460,6 +471,7 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
                 metrics_interval: metrics_interval(a.metrics_interval, f.metrics_interval),
                 gateway,
                 has_tcp_ingress,
+                mitm,
                 ..ClientConfig::default()
             },
             socks5,
@@ -482,6 +494,32 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
         scheduler,
         warnings,
         startup_lines: Vec::new(),
+    })
+}
+
+/// SP4 spec §9: validate `--mitm`'s prerequisites and load the CA, so a broken
+/// setup fails (exit 2) before any socket opens.
+fn mitm_config(
+    has_tproxy: bool,
+    ca_cert: Option<String>,
+    ca_key: Option<String>,
+    ignore: impl Iterator<Item = String>,
+) -> Result<MitmConfig, String> {
+    if !has_tproxy {
+        return Err("--mitm requires --tproxy".into());
+    }
+    let need = |v: Option<String>, flag: &str, key: &str| {
+        v.filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("--mitm requires {flag} ([Mitm] {key})"))
+    };
+    let cert = need(ca_cert, "--ca-cert", "CACert")?;
+    let key = need(ca_key, "--ca-key", "CAKey")?;
+    let ignore = IgnoreHosts::parse(ignore.collect::<Vec<_>>().iter().map(String::as_str))?;
+    let ca = Ca::load(cert.as_ref(), key.as_ref()).map_err(|e| e.to_string())?;
+    Ok(MitmConfig {
+        ca: Arc::new(ca),
+        ignore,
+        tuning: MitmTuning::default(),
     })
 }
 
@@ -525,11 +563,11 @@ pub fn ip_port(flag: &str, s: &str) -> Result<SocketAddr, String> {
 }
 
 /// spec §8: the transport's H3 layer — the server's gateway, or the client's
-/// fetch ingress (its tunnel conn is an `xqc_h3_connect`).
+/// fetch ingress or MITM front (their tunnel conn is an `xqc_h3_connect`).
 pub fn wants_h3(r: &Resolved) -> bool {
     match &r.mode {
         Mode::Server(s) => s.config.gateway.is_some(),
-        Mode::Client(c) => c.config.gateway.is_some(),
+        Mode::Client(c) => c.config.gateway.is_some() || c.config.mitm.is_some(),
     }
 }
 

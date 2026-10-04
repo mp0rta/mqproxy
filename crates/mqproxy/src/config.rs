@@ -23,8 +23,8 @@ const SECTIONS: &[&str] = &[
     "Mitm",
 ];
 
-/// What the file set; `None`/`false`/empty = not set. Accepted-no-effect keys
-/// (`[Mitm] CACert/CAKey/IgnoreHosts`) are recognised and dropped.
+/// What the file set; `None`/`false`/empty = not set. `[Mitm]` is client-only:
+/// in a server config every key warns and is skipped (the wrong-mode rule).
 #[derive(Debug, Default)]
 pub struct FileConfig {
     pub warnings: Vec<String>,
@@ -66,6 +66,9 @@ pub struct FileConfig {
     /// `SkipUid = -1` (C's "use geteuid()") is `None`.
     pub tproxy_uid: Option<u32>,
     pub mitm: bool,
+    pub ca_cert: Option<String>,
+    pub ca_key: Option<String>,
+    pub ignore_hosts: Vec<String>,
 }
 
 /// C `parse_bool`: exact `true`, `yes`, `1`.
@@ -217,8 +220,10 @@ impl FileConfig {
                 }
             }
             ("Mitm", "enabled") if c => self.mitm = bool_(v),
-            // Accepted, no effect without --mitm (as in C).
-            ("Mitm", "cacert" | "cakey" | "ignorehosts") if c => {}
+            ("Mitm", "cacert") if c => self.ca_cert = text(),
+            ("Mitm", "cakey") if c => self.ca_key = text(),
+            // Repeatable (like `[Multipath] Path`); `cli` unions it with the flags.
+            ("Mitm", "ignorehosts") if c => self.ignore_hosts.push(v.into()),
             _ => return false,
         }
         true
