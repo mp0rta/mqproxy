@@ -5,6 +5,7 @@ use super::policy::Sni;
 use crate::client::exchange::resp::{Malformed, RespHead};
 use crate::client::exchange::{BodyLen, ReqHead};
 use http::header::{CONTENT_LENGTH, COOKIE, HOST};
+use http::uri::Authority;
 use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use mq_http::h1::parse_content_length;
 use mq_http::headers::{
@@ -52,7 +53,16 @@ pub fn map_request(
     }
     let authority = match parts.uri.authority() {
         Some(a) => a.as_str().as_bytes(),
-        None => parts.headers.get(HOST).ok_or(bad)?.as_bytes(),
+        // An unvalidated `host` must not reach the URL: `parse_target` would end
+        // the authority at a `/` or `?` and splice the rest into the path.
+        None => {
+            let h = parts.headers.get(HOST).ok_or(bad)?.as_bytes();
+            if h.iter().any(|c| matches!(c, b'/' | b'?' | b'#')) || Authority::try_from(h).is_err()
+            {
+                return Err(MapErr::Reject(Reject::BadTarget));
+            }
+            h
+        }
     };
     // h2 keeps `:scheme` only together with `:authority` (h2 `server.rs`), so a
     // `host`-only request has no scheme to check; the conn is TLS anyway.
@@ -87,6 +97,7 @@ pub fn map_request(
 
 /// Spec §7.5 step 4: drop the hop-by-hop set (`te` included), `host`,
 /// `content-length` and `x-mq-*`; join `cookie` with `"; "` at its first place.
+/// `HeaderMap` groups fields by name, so the cross-name order is not the wire order.
 fn forwarded_headers(map: &HeaderMap) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::with_capacity(map.len());
     for (name, value) in map {
@@ -369,6 +380,14 @@ mod tests {
     }
 
     #[test]
+    fn host_with_path_bad_target() {
+        for h in ["example.com/admin", "example.com?a", "example.com#f"] {
+            let e = map("GET", "/x", &[("host", h)]).unwrap_err();
+            assert_eq!(e, MapErr::Reject(Reject::BadTarget), "{h}");
+        }
+    }
+
+    #[test]
     fn map_response_drops_alt_svc_and_connection_set_keeps_xmq() {
         let r = map_response(&resp(
             200,
@@ -394,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn map_response_head_keeps_content_length() {
+    fn map_response_keeps_content_length() {
         let r = map_response(&resp(200, &[("content-length", "42")])).unwrap();
         assert_eq!(r.headers()["content-length"], "42");
     }
