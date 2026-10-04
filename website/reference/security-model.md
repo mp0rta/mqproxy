@@ -34,4 +34,4 @@ Use of mqproxy is at your own risk. Users are solely responsible for validating 
 
 - [XQUIC](https://github.com/alibaba/xquic) (Alibaba) — the QUIC/MPQUIC transport, via the [mp0rta fork](https://github.com/mp0rta/xquic).
 - [BoringSSL](https://boringssl.googlesource.com/boringssl) — TLS backend.
-- [nghttp2](https://nghttp2.org/) — HTTP/2 framing for the TLS MITM ingress.
+- [nghttp2](https://nghttp2.org/) — HTTP/2 framing for the C build's TLS MITM ingress (the Rust binary uses the `h2` crate and rustls).

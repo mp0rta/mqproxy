@@ -42,7 +42,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -addext "nameConstraints=critical,permitted;DNS:example.com,permitted;DNS:example.org"
 ```
 
-`DNS:example.com` は `example.com` とそのすべてのサブドメインを許可し、`DNS:.example.com` はサブドメインのみを許可します。`excluded;DNS:…` も同様に使えます。サポートされるのは `DNS` と `IP` の制約のみで、それ以外の種類の名前制約を持つ CA は起動エラーになります。
+`DNS:example.com` は `example.com` とそのすべてのサブドメインを許可し、`DNS:.example.com` はサブドメインのみを許可します。`excluded;DNS:…` も同様に使えます。`IP` の制約は無視されます。それ以外の種類の名前制約、またはホスト名ではない `DNS` 制約を持つ CA は起動エラーになります。
 
 ## クイックスタート
 
@@ -97,7 +97,7 @@ MITM は、すべてが肯定的に確認できたときだけ適用されます
 
 サイトとそのサブドメインの両方を除外するには、両方を列挙します。CLI と設定ファイルのエントリは合算されます。
 
-有効なホスト名ではないエントリ（IP アドレス、ワイルドカード、空のエントリ、英数字・`-`・`.` 以外の文字を含むものなど）は **起動エラー**（終了コード 2）となり、問題のエントリが示されます。黙ってスキップされることはありません。
+有効なホスト名ではないエントリ（IP アドレス、ワイルドカード、英数字・`-`・`.` 以外の文字を含むもの、空の `--ignore-host ""` など）は **起動エラー**（終了コード 2）となり、問題のエントリが示されます。黙ってスキップされることはありません。（カンマ区切りの `--ignore-hosts a,,b` の空の項目はスキップされます。）
 
 ## 設定（`[Mitm]`、クライアント専用）
 
@@ -120,8 +120,8 @@ mqproxy が MITM するのは TCP のみです。`Alt-Svc` ヘッダやキャッ
 
 ```bash
 nft add table inet mqproxy_block
-nft add chain inet mqproxy_block fwd '{ type filter hook forward priority 0; }'
-nft add rule  inet mqproxy_block fwd udp dport 443 reject
+nft add chain inet mqproxy_block forward '{ type filter hook forward priority 0; }'
+nft add rule  inet mqproxy_block forward udp dport 443 reject
 ```
 
 そのマシン自身のブラウザには、`forward` の代わりに `output` にフックしてください。
@@ -129,7 +129,7 @@ nft add rule  inet mqproxy_block fwd udp dport 443 reject
 ## リクエスト処理と制限
 
 - **1 コネクション 1 ホスト。** 各 TLS コネクションは、開かれたときの SNI に紐づきます。`:authority` が別のホストを指すリクエストには `421 Misdirected Request` が返り、ブラウザは専用のコネクションで再試行します。
-- **ヘッダ制限**（ゲートウェイトンネルの両端で共通）: ヘッダフィールド（名前 + 値）は 8 KiB、ヘッダセクション全体は 32 KiB、フィールド数は 256、リクエストパス（クエリ込み）は約 8 KiB まで。制限を超えるブラウザのリクエストヘッドには、h2 層が `431` を返します。この範囲内であれば、大きな Cookie、長い URL、大きな CSP ヘッダも通ります。
+- **ヘッダ制限**（ゲートウェイトンネルの両端で共通）: ヘッダフィールド（名前 + 値）は 8 KiB、ヘッダセクション全体は 32 KiB、フィールド数は 256、リクエストパス（クエリ込み）は約 8 KiB まで。制限を超えるブラウザのリクエストヘッドには、h2 層が `431`（またはストリームのリセット）を返します。この範囲内であれば、大きな Cookie、長い URL、大きな CSP ヘッダも通ります。
 - **HTTP/2 の制限:** コネクションあたり同時 128 ストリーム、受信ウィンドウはストリームあたり 256 KiB、コネクション全体で 512 KiB。
 - **コネクション:** クライアントあたり MITM は最大 256 コネクション。開いているストリームのないコネクションはアイドル 60 秒で閉じられます。ストリームが開いている間に 60 秒無通信のピアには PING が送られ、90 秒無通信で閉じられます。Server-Sent Events のような長寿命のレスポンスは問題ありません。
 - **メソッド** は大文字小文字を保持し、32 バイトまで。`CONNECT` とアスタリスク形式（`OPTIONS *`）のリクエストは `400` で拒否されます。

@@ -278,7 +278,7 @@ To limit the CA to your own domains, add a `nameConstraints` extension to the co
   -addext "nameConstraints=critical,permitted;DNS:example.com,permitted;DNS:example.org"
 ```
 
-`DNS:example.com` permits that name and all its subdomains; `DNS:.example.com` permits subdomains only. Only `DNS` and `IP` constraints are supported.
+`DNS:example.com` permits that name and all its subdomains; `DNS:.example.com` permits subdomains only. `IP` constraints are ignored; any other constraint type, or a `DNS` constraint that is not a host name, is a startup error.
 
 ```bash
 # Server — unchanged; the gateway origin bridge does the origin fetch.
@@ -311,7 +311,7 @@ curl https://example.com/
 - the ClientHello takes longer than 5 seconds, is larger than 8 KiB, or the client closes before it is complete;
 - 256 connections are already in MITM (extra connections degrade to opaque relay).
 
-**Ignore-hosts.** `--ignore-host <host>` (repeatable) and `--ignore-hosts <a,b,c>` (comma-separated, no spaces) list hosts to relay opaquely — use this for cert-pinned apps that would reject a forged leaf. Matching is on the lowercased SNI without a trailing dot: `example.com` matches that host **only**; `.example.com` matches **strict subdomains only** (`www.example.com`, `a.b.example.com`, but not `example.com`). To exclude a site and its subdomains, list both. CLI and config entries are combined. An entry that is not a valid host name (an IP address, a wildcard, an empty entry, …) is a **startup error** (exit code 2) naming the entry.
+**Ignore-hosts.** `--ignore-host <host>` (repeatable) and `--ignore-hosts <a,b,c>` (comma-separated, no spaces) list hosts to relay opaquely — use this for cert-pinned apps that would reject a forged leaf. Matching is on the lowercased SNI without a trailing dot: `example.com` matches that host **only**; `.example.com` matches **strict subdomains only** (`www.example.com`, `a.b.example.com`, but not `example.com`). To exclude a site and its subdomains, list both. CLI and config entries are combined. An entry that is not a valid host name (an IP address, a wildcard, characters outside letters, digits, `-` and `.`, an empty `--ignore-host ""`, …) is a **startup error** (exit code 2) naming the entry. (Empty items in a comma-separated `--ignore-hosts a,,b` are skipped.)
 
 **Config** (`[Mitm]`, client-only — see [Configuration file](#configuration-file)):
 
@@ -330,8 +330,8 @@ IgnoreHosts = signal.org
 
 ```bash
 nft add table inet mqproxy_block
-nft add chain inet mqproxy_block fwd '{ type filter hook forward priority 0; }'
-nft add rule  inet mqproxy_block fwd udp dport 443 reject
+nft add chain inet mqproxy_block forward '{ type filter hook forward priority 0; }'
+nft add rule  inet mqproxy_block forward udp dport 443 reject
 ```
 
 (For the local machine's own browsers, hook `output` instead of `forward`.)
@@ -339,7 +339,7 @@ nft add rule  inet mqproxy_block fwd udp dport 443 reject
 **Request handling and limits:**
 
 - **One host per connection.** A request whose `:authority` differs from the connection's SNI gets `421 Misdirected Request`; the browser retries on a connection of its own.
-- **Header limits** (same on both ends of the gateway tunnel): a header field (name + value) up to 8 KiB, a header section up to 32 KiB, up to 256 fields, a request path with query up to about 8 KiB. A browser request head over the limits gets `431` from the h2 layer. Large cookies, long URLs and big CSP headers within these limits pass.
+- **Header limits** (same on both ends of the gateway tunnel): a header field (name + value) up to 8 KiB, a header section up to 32 KiB, up to 256 fields, a request path with query up to about 8 KiB. A browser request head over the limits gets `431` (or a stream reset) from the h2 layer. Large cookies, long URLs and big CSP headers within these limits pass.
 - **HTTP/2:** up to 128 concurrent streams per connection; 256 KiB receive window per stream, 512 KiB per connection.
 - **Connections:** at most 256 in MITM; a connection with no open streams is closed after 60 seconds idle, and a peer silent for 60 seconds while streams are open is pinged and closed after 90 seconds of silence (long-lived responses such as server-sent events are fine).
 - Methods keep their case (up to 32 bytes); `CONNECT` and asterisk-form requests get `400`. A browser's split `cookie` fields are joined; `Cookie` and `Authorization` are forwarded; `alt-svc` is removed from responses.
@@ -628,4 +628,4 @@ Use of mqproxy is at your own risk. Users are solely responsible for validating 
 
 - [XQUIC](https://github.com/alibaba/xquic) (Alibaba) — the QUIC/MPQUIC transport, via the [mp0rta fork](https://github.com/mp0rta/xquic).
 - [BoringSSL](https://boringssl.googlesource.com/boringssl) — TLS backend.
-- [nghttp2](https://nghttp2.org/) — HTTP/2 framing for the TLS MITM ingress.
+- [nghttp2](https://nghttp2.org/) — HTTP/2 framing for the C build's TLS MITM ingress (the Rust binary uses the `h2` crate and rustls).

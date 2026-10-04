@@ -42,7 +42,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -addext "nameConstraints=critical,permitted;DNS:example.com,permitted;DNS:example.org"
 ```
 
-`DNS:example.com` permits `example.com` and all of its subdomains; `DNS:.example.com` permits subdomains only. `excluded;DNS:…` entries work the same way. Only `DNS` and `IP` constraints are supported; a CA with any other kind of name constraint is a startup error.
+`DNS:example.com` permits `example.com` and all of its subdomains; `DNS:.example.com` permits subdomains only. `excluded;DNS:…` entries work the same way. `IP` constraints are ignored; any other constraint type, or a `DNS` constraint that is not a host name, is a startup error.
 
 ## Quick start
 
@@ -97,7 +97,7 @@ Matching is on the lowercased SNI with any trailing dot removed, and is either:
 
 To exclude a site and all of its subdomains, list both. Entries from the CLI and the config file are combined.
 
-An entry that is not a valid host name (an IP address, a wildcard, an empty entry, characters outside letters, digits, `-` and `.`, …) is a **startup error** (exit code 2) that names the offending entry; mqproxy does not skip it silently.
+An entry that is not a valid host name (an IP address, a wildcard, characters outside letters, digits, `-` and `.`, an empty `--ignore-host ""`, …) is a **startup error** (exit code 2) that names the offending entry; mqproxy does not skip it silently. (Empty items in a comma-separated `--ignore-hosts a,,b` are skipped.)
 
 ## Config (`[Mitm]`, client-only)
 
@@ -120,8 +120,8 @@ mqproxy MITMs TCP only. Browsers that see an `Alt-Svc` header or a cached HTTPS 
 
 ```bash
 nft add table inet mqproxy_block
-nft add chain inet mqproxy_block fwd '{ type filter hook forward priority 0; }'
-nft add rule  inet mqproxy_block fwd udp dport 443 reject
+nft add chain inet mqproxy_block forward '{ type filter hook forward priority 0; }'
+nft add rule  inet mqproxy_block forward udp dport 443 reject
 ```
 
 For the local machine's own browsers, hook `output` instead of `forward`.
@@ -129,7 +129,7 @@ For the local machine's own browsers, hook `output` instead of `forward`.
 ## Request handling and limits
 
 - **One host per connection.** Each TLS connection is bound to the SNI it was opened for. A request whose `:authority` names a different host gets `421 Misdirected Request`, and the browser retries on a connection of its own.
-- **Header limits** (the same on both ends of the gateway tunnel): a header field (name + value) up to 8 KiB, a whole header section up to 32 KiB, up to 256 fields, and a request path (with query string) up to about 8 KiB. A browser request head over the limits is answered by the h2 layer with `431`; large cookies, long URLs and big CSP headers within these limits pass.
+- **Header limits** (the same on both ends of the gateway tunnel): a header field (name + value) up to 8 KiB, a whole header section up to 32 KiB, up to 256 fields, and a request path (with query string) up to about 8 KiB. A browser request head over the limits is answered by the h2 layer with `431` (or a stream reset); large cookies, long URLs and big CSP headers within these limits pass.
 - **HTTP/2 limits:** up to 128 concurrent streams per connection, 256 KiB receive window per stream, 512 KiB per connection.
 - **Connections:** at most 256 MITM connections per client; an idle connection with no open streams is closed after 60 seconds, and a peer that has been silent for 60 s while streams are open is pinged and closed after 90 s of silence. A long-lived response such as server-sent events is fine.
 - **Methods** keep their case and may be up to 32 bytes; `CONNECT` and asterisk-form (`OPTIONS *`) requests are rejected with `400`.
