@@ -1,5 +1,6 @@
 //! SP4 spec §7: the MITM front.
 
+pub mod ca;
 pub mod policy;
 
 use mq_runtime::KeepAlive;
