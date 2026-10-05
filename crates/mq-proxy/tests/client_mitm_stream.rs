@@ -878,3 +878,23 @@ fn continuation_timer_when_budget_spent() {
     assert!(t.b.response(&s).expect("complete").1 == body);
     assert!(!t.cont_armed());
 }
+
+/// R2/I13: a bodiless response's `Drain` discards one chunk per step too.
+#[test]
+fn drain_reads_one_chunk_per_step() {
+    let mut t = T::new();
+    let (s, r) = t.req("GET", "/x", &[], b"");
+    t.head(r, "304", &[], false);
+    assert_eq!(t.b.response(&s).expect("ended").0.status, 304);
+    let now = t.mh.now;
+    t.mh.sh.with_app(now, |a, _| a.set_pump_budget(2));
+    let junk = pattern(256 * 1024);
+    t.mh.t.inject_h3_body(r, junk.clone(), false);
+    t.mh.drive();
+    assert_eq!(t.taken(r, junk.len()), 2 * 16 * 1024);
+    assert!(t.cont_armed(), "the continuation drains on");
+    t.flow();
+    assert_eq!(t.taken(r, junk.len()), junk.len());
+    t.body(r, b"", true);
+    assert_eq!(t.streams(), 0);
+}

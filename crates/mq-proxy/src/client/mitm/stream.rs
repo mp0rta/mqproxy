@@ -379,7 +379,8 @@ impl MStream {
         true
     }
 
-    /// `Drain`: read and discard until `Last` or `Fail`.
+    /// `Drain`: read and discard until `Last` or `Fail`, one chunk per step
+    /// (the per-stream budget, R2); the next pass goes on.
     fn drain(
         &mut self,
         cx: &mut Cx<'_>,
@@ -396,15 +397,13 @@ impl MStream {
         }
         self.buf.clear();
         self.buf.resize(DL_CHUNK, 0);
-        loop {
-            match ex.read_body(cx, id, &mut self.buf) {
-                BodyOut::Data(_) => {}
-                BodyOut::Wait => return false,
-                BodyOut::Last(_) | BodyOut::Fail => {
-                    self.ended();
-                    self.down = Down::Done;
-                    return true;
-                }
+        match ex.read_body(cx, id, &mut self.buf) {
+            BodyOut::Data(_) => true,
+            BodyOut::Wait => false,
+            BodyOut::Last(_) | BodyOut::Fail => {
+                self.ended();
+                self.down = Down::Done;
+                true
             }
         }
     }
