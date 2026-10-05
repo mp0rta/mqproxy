@@ -3,10 +3,12 @@ use std::net::SocketAddr;
 
 use mq_transport_api::{ConnId, Transmit, TxKey};
 
-// spec §4.4
-pub const QUEUE_QUOTA: usize = 256 * 1024;
-pub const QUEUE_LOW: usize = 128 * 1024;
-pub const TOTAL_HIGH: usize = 2 * 1024 * 1024;
+// spec §4.4. One drive can hand xquic's output for a path over 256 KiB at ~1 Gbps; each
+// refusal below makes xquic retry on every wakeup, so the quota sits well above that.
+// Queues grow on use, so an idle (conn, path) costs nothing.
+pub const QUEUE_QUOTA: usize = 1024 * 1024;
+pub const QUEUE_LOW: usize = 512 * 1024;
+pub const TOTAL_HIGH: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Refusal {
@@ -37,7 +39,7 @@ struct Queue {
 impl Queue {
     fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(QUEUE_QUOTA + 1500),
+            buf: Vec::new(),
             head: 0,
             tail: 0,
             pkts: VecDeque::new(),
@@ -47,7 +49,7 @@ impl Queue {
 
     fn append(&mut self, dst: SocketAddr, pkt: &[u8]) {
         if self.tail + pkt.len() > self.buf.capacity() {
-            self.compact(); // memmove only here
+            self.compact(); // memmove only here; the extend below grows the buffer if still short
         }
         self.buf.truncate(self.tail);
         self.buf.extend_from_slice(pkt);
@@ -233,6 +235,11 @@ mod tests {
     fn addr(n: u8) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, n], 4433))
     }
+    /// Keys that fill to exactly TOTAL_HIGH; key(N) is the next one.
+    const N: u32 = (TOTAL_HIGH / QUEUE_QUOTA) as u32;
+    /// 1024-byte packets to drain a full queue to exactly QUEUE_LOW.
+    const TO_LOW: usize = (QUEUE_QUOTA - QUEUE_LOW) / 1024;
+
     /// Fill `k` to exactly QUEUE_QUOTA with 1024-byte packets.
     fn fill(t: &mut TxQueues, k: TxKey) {
         for _ in 0..QUEUE_QUOTA / 1024 {
@@ -302,8 +309,17 @@ mod tests {
     }
 
     #[test]
+    fn fresh_queue_reserves_nothing_and_grows_with_use() {
+        let mut q = Queue::new();
+        assert_eq!(q.buf.capacity(), 0);
+        q.append(addr(1), &[0; 1200]);
+        assert!((1200..QUEUE_QUOTA).contains(&q.buf.capacity()));
+    }
+
+    #[test]
     fn compaction_only_when_capacity_reached() {
         let mut q = Queue::new();
+        q.buf.reserve_exact(64 * 1024);
         let cap = q.buf.capacity();
         let p = [9u8; 1000];
         while q.tail + 1000 * 2 <= cap {
@@ -335,7 +351,7 @@ mod tests {
         let k = key(0);
         fill(&mut t, k);
         t.record_blocked(conn(0), k, Refusal::Quota);
-        t.done(k, 128); // exactly at QUEUE_LOW: not below
+        t.done(k, TO_LOW); // exactly at QUEUE_LOW: not below
         assert!(!t.resume_pending());
         t.done(k, 1);
         assert!(t.resume_pending());
@@ -346,24 +362,24 @@ mod tests {
     #[test]
     fn total_refuses_at_high_water() {
         let mut t = TxQueues::default();
-        for i in 0..8 {
+        for i in 0..N {
             fill(&mut t, key(i));
         }
         assert_eq!(t.total, TOTAL_HIGH);
-        assert_eq!(t.push(key(8), addr(1), &[0; 1]), Err(Refusal::Total));
+        assert_eq!(t.push(key(N), addr(1), &[0; 1]), Err(Refusal::Total));
     }
 
     #[test]
     fn total_resumes_on_any_commit_below_high_even_with_two_keys_at_quota() {
         let mut t = TxQueues::default();
-        for i in 0..8 {
+        for i in 0..N {
             fill(&mut t, key(i));
         }
         t.record_blocked(conn(0), key(0), Refusal::Quota);
         t.record_blocked(conn(1), key(1), Refusal::Quota);
-        t.record_blocked(conn(8), key(8), Refusal::Total);
+        t.record_blocked(conn(N), key(N), Refusal::Total);
         t.done(key(3), 1); // unrelated key; total now below high
-        assert_eq!(t.take_resumable(), vec![conn(8)]);
+        assert_eq!(t.take_resumable(), vec![conn(N)]);
         assert!(t.blocked.contains_key(&conn(0)) && t.blocked.contains_key(&conn(1)));
     }
 
@@ -375,7 +391,7 @@ mod tests {
         // blocked on two quota keys: draining only A resumes it
         t.record_blocked(conn(0), key(0), Refusal::Quota);
         t.record_blocked(conn(0), key(1), Refusal::Quota);
-        t.done(key(0), 129);
+        t.done(key(0), TO_LOW + 1);
         assert_eq!(t.take_resumable(), vec![conn(0)]);
         assert!(!t.blocked.contains_key(&conn(0)));
         // quota + total: a commit below high-water clears via total while the quota key stays full
@@ -399,17 +415,17 @@ mod tests {
     #[test]
     fn drop_conn_counts_as_commit_and_forgets_block() {
         let mut t = TxQueues::default();
-        for i in 0..8 {
+        for i in 0..N {
             fill(&mut t, key(i));
         }
         t.push_or_drop((Some(conn(0)), PathId(1)), addr(1), &[0; 1]);
         t.record_blocked(conn(0), key(0), Refusal::Quota);
-        t.record_blocked(conn(8), key(8), Refusal::Total);
+        t.record_blocked(conn(N), key(N), Refusal::Total);
         t.drop_conn(conn(0));
-        assert_eq!(t.total, 7 * QUEUE_QUOTA);
+        assert_eq!(t.total, (N as usize - 1) * QUEUE_QUOTA);
         assert!(t.queues.keys().all(|k| k.0 != Some(conn(0))));
         assert!(!t.blocked.contains_key(&conn(0)));
-        assert_eq!(t.take_resumable(), vec![conn(8)]);
+        assert_eq!(t.take_resumable(), vec![conn(N)]);
     }
 
     #[test]
