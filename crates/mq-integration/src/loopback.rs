@@ -109,6 +109,7 @@ pub fn transport(role: Role, h3: bool) -> Transport {
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
         h3,
+        h3_backend: mq_transport_api::H3Backend::XqcH3,
         qlog: None,
     })
     .expect("transport")

@@ -624,10 +624,39 @@ pub(super) unsafe extern "C" fn conn_create_notify(
     ud: *mut c_void,
     _proto: *mut c_void,
 ) -> c_int {
+    // SAFETY: forwarded from xquic unchanged.
+    unsafe { conn_create(conn, cid, ud, ConnProto::Raw) }
+}
+
+/// adoption spec §3: a raw conn on ALPN `h3`; `no_reset_echo` is set per conn.
+pub(super) unsafe extern "C" fn h3raw_conn_create_notify(
+    conn: *mut xqc_connection_t,
+    cid: *const xqc_cid_t,
+    ud: *mut c_void,
+    _proto: *mut c_void,
+) -> c_int {
+    // SAFETY: forwarded from xquic unchanged; the setter is plain on the conn being created.
+    unsafe {
+        if conn_create(conn, cid, ud, ConnProto::H3) != 0 {
+            return -1;
+        }
+        xqc_conn_set_no_reset_echo(conn, 1);
+    }
+    0
+}
+
+/// # Safety
+/// The arguments of an xquic `conn_create_notify`.
+unsafe fn conn_create(
+    conn: *mut xqc_connection_t,
+    cid: *const xqc_cid_t,
+    ud: *mut c_void,
+    proto: ConnProto,
+) -> c_int {
     // SAFETY: `cid` is null or valid for this call; copied.
     let cid = (!cid.is_null()).then(|| unsafe { cid.read_unaligned() });
     let s = slot_of(ud);
-    if !with_inner(false, |i| on_conn_create(i, conn, cid, s, ConnProto::Raw)) {
+    if !with_inner(false, |i| on_conn_create(i, conn, cid, s, proto)) {
         return -1;
     }
     // SAFETY: plain setters on the connection being created.
@@ -924,6 +953,7 @@ mod tests {
                 cc: CongestionControl::Bbr,
                 realtime_offset_us: 0,
                 h3: false,
+                h3_backend: mq_transport_api::H3Backend::XqcH3,
                 qlog: None,
             },
             CString::new("mqproxy-tcp/1").unwrap(),

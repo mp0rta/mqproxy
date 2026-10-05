@@ -81,6 +81,7 @@ fn transport(r: &Resolved, role: Role, max_conns: u32, err: String) -> Result<Tr
         cc: r.cc,
         realtime_offset_us: realtime_offset_us(),
         h3: cli::wants_h3(r),
+        h3_backend: mq_transport_api::H3Backend::XqcH3,
         qlog: r.qlog.clone(),
     })
     .map_err(|e| match (&e, &r.qlog) {

@@ -26,6 +26,7 @@ fn cfg(role: Role) -> TransportConfig {
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
         h3: false,
+        h3_backend: mq_transport_api::H3Backend::XqcH3,
         qlog: None,
     }
 }

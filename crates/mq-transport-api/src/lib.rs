@@ -10,7 +10,7 @@ pub mod ringbuf;
 mod time;
 
 pub use config::{
-    CongestionControl, ConnConfig, ConnProto, ConnStats, PathStats, Role, Scheduler,
+    CongestionControl, ConnConfig, ConnProto, ConnStats, H3Backend, PathStats, Role, Scheduler,
     TransportConfig,
 };
 pub use error::{ConnectError, DatagramError, Error, PathError, StreamError};
