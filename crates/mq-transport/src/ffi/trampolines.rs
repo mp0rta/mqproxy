@@ -294,21 +294,30 @@ pub(crate) fn on_stream_close(inner: &mut Inner, s: SlotId) {
 }
 
 /// adoption spec §3: the peer's RESET_STREAM / STOP_SENDING code, queued while the stream's
-/// slot is live (when the frame is processed, before any readable it causes).
+/// slot is live (when the frame is processed, before any readable it causes). One-shot per
+/// kind: xquic notifies again for a retransmitted frame.
 pub(crate) fn on_peer_abort(
     inner: &mut Inner,
     s: SlotId,
     kind: xqc_stream_peer_abort_t,
     code: u64,
 ) {
-    if !inner.streams.is_live(s) {
+    let Some(slot) = inner.streams.get_mut(s) else {
         return;
+    };
+    let (reported, e) = match kind {
+        XQC_STREAM_PEER_STOP_SENDING => (
+            &mut slot.stop_sending_reported,
+            Event::StreamStopSending(stream_id(s), code),
+        ),
+        _ => (
+            &mut slot.peer_reset_reported,
+            Event::StreamPeerReset(stream_id(s), code),
+        ),
+    };
+    if !std::mem::replace(reported, true) {
+        inner.events.push(e);
     }
-    let id = stream_id(s);
-    inner.events.push(match kind {
-        XQC_STREAM_PEER_STOP_SENDING => Event::StreamStopSending(id, code),
-        _ => Event::StreamPeerReset(id, code),
-    });
 }
 
 /// Server: the peer opened a request (spec §3.3). `None` = refused: the request keeps NULL
@@ -1287,6 +1296,29 @@ mod tests {
                 .collect();
         assert_eq!(evs.last(), Some(&Event::StreamClosed(stream_id(s))));
         assert_eq!(evs.len(), 3); // NewConn, NewStream, StreamClosed
+    }
+
+    #[test]
+    fn peer_abort_reported_once_per_kind() {
+        let mut i = inner(0);
+        let c = accept(&mut i);
+        assert!(create(&mut i, c, ConnProto::H3));
+        let s =
+            on_peer_stream_create(&mut i, c, core::ptr::null_mut(), 0, StreamKind::Bidi).unwrap();
+        for code in [5, 6] {
+            on_peer_abort(&mut i, s, XQC_STREAM_PEER_RESET_STREAM, code);
+            on_peer_abort(&mut i, s, XQC_STREAM_PEER_STOP_SENDING, code);
+        }
+        let evs: Vec<_> =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
+        assert_eq!(
+            evs[2..],
+            [
+                Event::StreamPeerReset(stream_id(s), 5),
+                Event::StreamStopSending(stream_id(s), 5),
+            ]
+        );
     }
 
     #[test]

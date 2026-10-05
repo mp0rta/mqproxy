@@ -264,7 +264,9 @@ fn late_reset_after_fin_read() {
         .iter()
         .filter(|e| matches!(e, Event::StreamPeerReset(s, _) if *s == ss))
         .count();
-    assert!(n <= 1, "{:?}", p.sev);
+    // Virtual time is deterministic: the FIN's ACK has not reached the client yet, so the
+    // RESET_STREAM is really sent (Review Focus 5); exactly one event.
+    assert_eq!(n, 1, "{:?}", p.sev);
     let r = recv(&p.server, p.now, ss, 1024);
     assert!(
         matches!(

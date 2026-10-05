@@ -144,6 +144,10 @@ pub(crate) struct StreamSlot {
     pub writable_queued: bool,
     pub fin_seen: bool,
     pub abandoned: bool,
+    /// `StreamPeerReset` / `StreamStopSending` already queued: xquic notifies on every
+    /// (retransmitted) frame, the events are one-shot (adoption spec §3).
+    pub peer_reset_reported: bool,
+    pub stop_sending_reported: bool,
 }
 
 impl StreamSlot {
@@ -157,6 +161,8 @@ impl StreamSlot {
             writable_queued: false,
             fin_seen: false,
             abandoned: false,
+            peer_reset_reported: false,
+            stop_sending_reported: false,
         }
     }
 }
