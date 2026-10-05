@@ -15,6 +15,7 @@ use std::time::Duration;
 fn h3_cfg(role: Role) -> TransportConfig {
     TransportConfig {
         h3: true,
+        qlog: None,
         ..cfg(role)
     }
 }

@@ -1,4 +1,4 @@
-//! The transport seam (spec §5.1): §4.2 minus `new`/`close`/`enable_qlog`.
+//! The transport seam (spec §5.1): §4.2 minus `new`/`close`.
 //! Object-safe, so `Cx` can hold `&mut dyn TransportOps`.
 
 use crate::config::{ConnConfig, ConnStats};
