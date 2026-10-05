@@ -835,16 +835,32 @@ fn empty_buf_probe() {
     assert_eq!(h.send(r, b"hello", false), SendOut::Done);
     assert_eq!(h.read_body(r, 0).0, BodyOut::Fail);
     assert_eq!(h.resets(r), 1);
-    // `Body { fin: false }`: `Wait`, no transport call (R1), even with a fin
-    // pending; the next non-empty read sees it.
+    // `Body { fin: false }`: one transport call (R1). Bytes buffered: `Wait`,
+    // nothing consumed; the next non-empty read sees them and the fin.
     let r = h.open(BodyLen::Empty, 7);
     h.respond(r, OK, false);
     h.head_status(r);
     h.body(r, b"abc", true);
     assert_eq!(h.read_body(r, 0).0, BodyOut::Wait);
-    assert_eq!(h.recv_body_calls(r), 0);
+    assert_eq!(h.recv_body_calls(r), 1);
     assert!(h.contains(r));
     assert_eq!(h.read_body(r, 16), (BodyOut::Last(3), b"abc".to_vec()));
+    // Nothing buffered, no fin: `Wait`. Then an empty fin: `Last(0)`.
+    let r = h.open(BodyLen::Empty, 7);
+    h.respond(r, OK, false);
+    h.head_status(r);
+    assert_eq!(h.read_body(r, 0).0, BodyOut::Wait);
+    h.body(r, b"", true);
+    assert_eq!(h.read_body(r, 0), (BodyOut::Last(0), vec![]));
+    assert_eq!(h.recv_body_calls(r), 2);
+    assert!(!h.contains(r));
+    // An empty fin short of the content-length: the end rule fails it.
+    let r = h.open(BodyLen::Empty, 7);
+    h.respond(r, &[(":status", "200"), ("content-length", "5")], false);
+    h.head_status(r);
+    h.body(r, b"", true);
+    assert_eq!(h.read_body(r, 0).0, BodyOut::Fail);
+    assert!(!h.contains(r));
     // `Rescued`: `Wait` while bytes remain, `Last(0)` once empty.
     let r = h.open(BodyLen::Empty, 7);
     h.respond(r, OK, false);

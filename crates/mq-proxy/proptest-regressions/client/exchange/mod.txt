@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bab9d7f83f8d2406a4ecb48c6c3822fbff6ba6714dc15ecfbea79d75ebe06fe3 # shrinks to heads = [("GET", Empty), ("GET", Empty), ("GET", Empty), ("GET", Empty)], ops = [Readable { id: 2, len: 0, cl: false, fin: false, bad: false, err: false }, ReadHead(2), ReadBody { id: 2, cap: 0 }]

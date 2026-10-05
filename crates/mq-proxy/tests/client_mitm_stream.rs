@@ -429,6 +429,34 @@ fn empty_end_stream_with_zero_capacity_completes() {
     assert_eq!(t.streams(), 1);
 }
 
+/// R1: a separate empty H3 FIN after a bodyless head is seen by the terminal
+/// probe, so its END_STREAM needs no h2 credit, even with the upload open
+/// (no `H3Closed` to rescue it).
+#[test]
+fn separate_empty_fin_with_zero_capacity_and_open_upload_completes() {
+    let mut t = T::new();
+    t.b.hold_capacity(true);
+    let (a, ra) = t.req("GET", "/a", &[], b"");
+    t.head(ra, "200", &[], false);
+    t.body(ra, &pattern(WIN), false);
+    assert_eq!(
+        t.b.received(&a).len(),
+        WIN,
+        "the connection window is spent"
+    );
+    let (b, rb) = t.streaming("POST");
+    t.b.send(&b, b"abc", false);
+    t.flow();
+    t.head(rb, "200", &[("content-length", "0")], false);
+    assert!(t.b.head(&b).is_some() && t.b.response(&b).is_none());
+    t.body(rb, b"", true);
+    let (head, got) = t.b.response(&b).expect("END_STREAM without credit");
+    assert_eq!(head.status, 200);
+    assert!(got.is_empty());
+    assert_eq!(t.resets(rb), 1, "the early response resets the upload");
+    assert_eq!(t.streams(), 1);
+}
+
 #[test]
 fn buffered_data_capacity_grant_without_new_h3_event_delivers() {
     let mut t = T::new();
@@ -482,7 +510,10 @@ fn idle_sse_quiescent_no_continuation() {
     t.head(r, "200", &[("content-type", "text/event-stream")], false);
     t.body(r, b"data: 1\n\n", false);
     assert_eq!(t.b.received(&sse), b"data: 1\n\n");
-    let reads = t.recvs(r);
+    // Payload reads; the terminal probe's empty read (R1) is not one.
+    let payload =
+        |t: &T| t.count(|c| matches!(c, Call::H3RecvBody { r: x, cap } if *x == r && *cap > 0));
+    let reads = payload(&t);
     // Unrelated events: another stream's round trip, TCP writable, a timer.
     let (s2, r2) = t.req("GET", "/other", &[], b"");
     t.head(r2, "200", &[("content-length", "2")], false);
@@ -490,7 +521,7 @@ fn idle_sse_quiescent_no_continuation() {
     assert!(t.b.response(&s2).is_some());
     t.mh.advance(Duration::from_secs(1));
     t.flow();
-    assert_eq!(t.recvs(r), reads, "no read without readiness");
+    assert_eq!(payload(&t), reads, "no read without readiness");
     assert!(!t.mh.sh.app().dirty(t.tcp), "dirty clear");
     assert!(!t.cont_armed(), "no continuation");
     assert_eq!(t.streams(), 1);

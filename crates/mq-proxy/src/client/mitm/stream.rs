@@ -293,7 +293,8 @@ impl MStream {
             self.cancel(cx, ex);
             return true;
         }
-        // 2. Terminal probe; it never touches `h3_ready`.
+        // 2. Terminal probe: an empty read sees an empty transport FIN
+        // without capacity (R1). Its `Wait` never touches `h3_ready`.
         match ex.read_body(cx, id, &mut []) {
             BodyOut::Last(_) => return self.finish(cx, ex, Bytes::new()),
             BodyOut::Fail => return self.fail(),

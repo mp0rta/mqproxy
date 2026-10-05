@@ -362,9 +362,11 @@ impl<O: Copy> Exchanges<O> {
 
     /// SP4 spec §4.3 `read_body`: the transport's bytes, or the rescue in
     /// `buf`-sized slices; the read that ends the body goes through the end
-    /// rule. An empty `buf` consumes nothing; on a live body it is `Wait`
-    /// without a transport call (xquic answers it with EAGAIN, R1). Before
-    /// `Head` it is a no-op `Wait`.
+    /// rule. An empty `buf` consumes nothing; on a live body it is still one
+    /// transport read, which xquic answers with the fin only when no body is
+    /// buffered (`Last(0)` through the end rule) and with EAGAIN otherwise
+    /// (`Wait`), so the MITM terminal probe sees an empty FIN without send
+    /// capacity (R1). Before `Head` it is a no-op `Wait`.
     pub fn read_body(&mut self, cx: &mut Cx<'_>, id: H3ReqId, buf: &mut [u8]) -> BodyOut {
         let Some(x) = self.by_id.get_mut(&id) else {
             return BodyOut::Fail;
@@ -391,24 +393,19 @@ impl<O: Copy> Exchanges<O> {
                 cl,
                 delivered,
                 fin: false,
-            } => {
-                if buf.is_empty() {
+            } => match cx.h3_recv_body(id, buf) {
+                Ok((0, false)) | Err(StreamError::Blocked | StreamError::Stale) => {
                     return BodyOut::Wait;
                 }
-                match cx.h3_recv_body(id, buf) {
-                    Ok((0, false)) | Err(StreamError::Blocked | StreamError::Stale) => {
-                        return BodyOut::Wait;
-                    }
-                    Ok((n, fin)) => {
-                        *delivered += n as u64;
-                        (n, fin.then(|| short(*status, *cl, *delivered)))
-                    }
-                    Err(StreamError::Reset | StreamError::Conn) => {
-                        self.fail(cx, id);
-                        return BodyOut::Fail;
-                    }
+                Ok((n, fin)) => {
+                    *delivered += n as u64;
+                    (n, fin.then(|| short(*status, *cl, *delivered)))
                 }
-            }
+                Err(StreamError::Reset | StreamError::Conn) => {
+                    self.fail(cx, id);
+                    return BodyOut::Fail;
+                }
+            },
             Down::Rescued {
                 status,
                 cl,
@@ -818,10 +815,8 @@ mod tests {
                     cl,
                     delivered,
                 } => {
-                    if cap == 0 {
-                        return (BodyOut::Wait, vec![], 0); // R1
-                    }
-                    // One `h3_recv_body`.
+                    // One `h3_recv_body`, an empty `buf` (`cap == 0`) included
+                    // (R1): it reports the fin only when no bytes are buffered.
                     if self.closed {
                         return (BodyOut::Wait, vec![], 1);
                     }
