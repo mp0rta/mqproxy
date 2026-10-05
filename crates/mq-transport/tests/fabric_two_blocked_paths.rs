@@ -8,7 +8,7 @@ use common::xfer::Xfer;
 use mq_transport_api::{CongestionControl, Event, PathId, Role, TransportOps, TxKey};
 
 /// spec §4.4 per-queue quota.
-const QUEUE_QUOTA: usize = 256 * 1024;
+const QUEUE_QUOTA: usize = 1024 * 1024;
 
 #[test]
 fn two_blocked_paths_one_drains_resumes_at_once() {

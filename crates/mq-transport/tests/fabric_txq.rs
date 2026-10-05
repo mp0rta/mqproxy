@@ -1,18 +1,21 @@
 //! spec §4.4, §8.4 "Transmit queue full, then drained".
 mod common;
 
-use common::pair::{MS, Pair};
+use common::pair::{MS, Opts, Pair};
 use common::xfer::Xfer;
-use mq_transport_api::{PathId, TransportOps};
+use mq_transport_api::{CongestionControl, PathId, TransportOps};
 
 /// spec §4.4 per-queue quota.
-const QUEUE_QUOTA: usize = 256 * 1024;
+const QUEUE_QUOTA: usize = 1024 * 1024;
 
 #[test]
 fn txq_full_then_drained_resumes() {
-    let mut p = Pair::new();
+    // Cubic: in the fabric BBR's window settles below one queue quota; cubic's keeps growing.
+    let mut o = Opts::default();
+    o.client.cc = CongestionControl::Cubic;
+    let mut p = Pair::with(o);
     let key = (Some(p.conn), PathId(0));
-    let mut x = Xfer::start(&p, 16 * 1024 * 1024);
+    let mut x = Xfer::start(&p, 64 * 1024 * 1024);
     // Grow the congestion window past the queue quota first, or the window, not the queue,
     // stops the sender.
     assert!(p.pump_until(MS, 20_000, |p| {

@@ -8,7 +8,7 @@ use mq_proxy::config::ClientConfig;
 use mq_proxy::server::Server;
 use mq_runtime::testing::Op;
 use mq_transport_api::fabric::Rule;
-use mq_transport_api::{ConnId, PathId, Time, TransportOps};
+use mq_transport_api::{CongestionControl, ConnId, PathId, Time, TransportOps};
 
 /// spec §8.1: authentication, then a SOCKS5 request relayed to an echo origin.
 #[test]
@@ -36,12 +36,12 @@ fn pair_auth_and_relay() {
 const ACTIVE: u32 = 2; // XQC_PATH_STATE_ACTIVE
 
 /// A client with a second `--path`, authenticated, both paths active.
-fn two_paths() -> (Pair<Server, Client>, ConnId) {
+fn two_paths(cc: CongestionControl) -> (Pair<Server, Client>, ConnId) {
     let cfg = ClientConfig {
         paths: vec![client_addr().ip(), CLIENT_IP2],
         ..client_cfg()
     };
-    let mut p = Pair::new(spawn_server(server_cfg(), 0), spawn_client(cfg));
+    let mut p = Pair::new(spawn_server(server_cfg(), 0), spawn_client_cc(cfg, cc));
     assert!(p.run_until(5 * SEC, |p| p.auth_attempts() == 1));
     let c = p.client_conns()[0];
     let up = move |p: &mut Pair<Server, Client>| {
@@ -59,7 +59,7 @@ fn two_paths() -> (Pair<Server, Client>, ConnId) {
 /// socket and both paths carry the relayed bytes.
 #[test]
 fn pair_two_paths_carry_traffic() {
-    let (mut p, c) = two_paths();
+    let (mut p, c) = two_paths(CongestionControl::Bbr);
     const N: usize = 1 << 20;
     p.origin(OriginMode::Send(bulk(N)));
     let s = p.socks_open(origin_addr(), b"");
@@ -83,10 +83,11 @@ fn pair_two_paths_carry_traffic() {
 /// window has a bandwidth-delay product to grow into.
 #[test]
 fn pair_blocked_path_quota_and_resume() {
-    const QUOTA: usize = 256 * 1024; // spec §4.4
+    const QUOTA: usize = 1024 * 1024; // spec §4.4
     const WARM: usize = 8 << 20;
     const N: usize = 8 << 20;
-    let (mut p, c) = two_paths();
+    // Cubic: in the fabric BBR's window on path 1 settles below one queue quota.
+    let (mut p, c) = two_paths(CongestionControl::Cubic);
     p.fabric.add_rule(Rule::DelayRange {
         min: 5 * MS,
         max: 5 * MS,
@@ -175,7 +176,7 @@ fn pair_blocked_path_quota_and_resume() {
 /// the primary) and both paths are active again.
 fn blackhole_one_path_then_recover(ip: std::net::IpAddr, dead: u64) {
     const CLOSED: u32 = 4; // XQC_PATH_STATE_CLOSED
-    let (mut p, c) = two_paths();
+    let (mut p, c) = two_paths(CongestionControl::Bbr);
     let paths = move |p: &Pair<Server, Client>| {
         let st = p.with_client(move |n| n.transport().conn_stats(c)).unwrap();
         st.paths.iter().map(|x| (x.id, x.state)).collect::<Vec<_>>()

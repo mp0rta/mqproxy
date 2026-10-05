@@ -540,8 +540,14 @@ pub fn spawn_server(cfg: ServerConfig, max_conns: u32) -> Side<Server> {
 
 /// The real `Client` at `client_addr()` with SOCKS5 and transparent listeners.
 pub fn spawn_client(cfg: ClientConfig) -> Side<Client> {
+    spawn_client_cc(cfg, CongestionControl::Bbr)
+}
+
+/// `spawn_client` with another congestion control.
+pub fn spawn_client_cc(cfg: ClientConfig, cc: CongestionControl) -> Side<Client> {
     let mut tc = transport_cfg(Role::Client, 0);
     tc.scheduler = cfg.scheduler;
+    tc.cc = cc;
     Side::spawn(tc, client_addr(), vec![SOCKS5, TRANSPARENT], move || {
         Client::new(cfg)
     })
