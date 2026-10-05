@@ -2,9 +2,9 @@
 mod common;
 
 use common::lockstep::{self, Peer, cfg, server_role};
-use common::pair::{MS, Opts, Pair, new_streams, read_all, recv, send};
+use common::pair::{MS, Opts, Pair, new_streams, read_all, recv, send, stream_count};
 use mq_transport_api::{
-    ConnProto, Error, Event, H3Backend, Role, StreamError, StreamId, StreamKind, Time,
+    ConnId, ConnProto, Error, Event, H3Backend, Role, StreamError, StreamId, StreamKind, Time,
     TransportConfig, TransportOps,
 };
 
@@ -433,4 +433,70 @@ fn raw_conn_keeps_reset_echo() {
     assert_eq!(recv(&p.client, p.now, cs, 4096), Err(StreamError::Reset));
     assert_eq!(aborts(&p.sev), vec![]);
     assert_eq!(aborts(&p.cev), vec![]);
+}
+
+fn open_uni(p: &Peer, now: Time, c: ConnId) -> Result<StreamId, Error> {
+    p.call(now, move |t, now| t.open_uni(now, c))
+}
+
+fn info(p: &Peer, now: Time, s: StreamId) -> mq_transport_api::StreamInfo {
+    p.call(now, move |t, _| t.stream_info(s))
+        .expect("stream_info")
+}
+
+#[test]
+fn open_uni_both_roles() {
+    let mut p = Pair::with(h3raw_opts());
+    let (cc, sc) = (p.conn, p.srv_conn);
+    for (client, quic_id) in [(true, 2u64), (false, 3u64)] {
+        let local = if client { &p.client } else { &p.server };
+        let s = open_uni(local, p.now, if client { cc } else { sc }).expect("open_uni");
+        assert_eq!(info(local, p.now, s).kind, StreamKind::Uni);
+        assert_eq!(info(local, p.now, s).quic_id, quic_id);
+        let data = vec![0x5a; 1024];
+        assert_eq!(send(local, p.now, s, data.clone(), true), Ok(1024));
+        p.exchange();
+        let evs = if client { &p.sev } else { &p.cev };
+        let (rs, ri) = *new_streams(evs)
+            .iter()
+            .find(|(_, i)| i.quic_id == quic_id)
+            .expect("peer NewStream");
+        assert_eq!((ri.kind, ri.quic_id), (StreamKind::Uni, quic_id));
+        assert_eq!(read_to_fin(&mut p, !client, rs), data);
+    }
+    let all_closed = p.pump_until(MS, 2_000, |p| {
+        stream_count(&p.client, p.conn) == 0 && stream_count(&p.server, p.srv_conn) == 0
+    });
+    assert!(all_closed, "slots not retired");
+}
+
+#[test]
+fn open_uni_credit_exhausted() {
+    let p = Pair::with(h3raw_opts());
+    for i in 0..1024 {
+        open_uni(&p.client, p.now, p.conn).unwrap_or_else(|e| panic!("open {i}: {e:?}"));
+    }
+    assert_eq!(stream_count(&p.client, p.conn), 1024);
+    assert_eq!(open_uni(&p.client, p.now, p.conn), Err(Error::Other));
+    assert_eq!(stream_count(&p.client, p.conn), 1024);
+}
+
+#[test]
+fn open_uni_on_xqc_h3_conn() {
+    let p = Pair::with(Opts {
+        server: TransportConfig {
+            h3: true,
+            qlog: None,
+            ..cfg(server_role())
+        },
+        client: TransportConfig {
+            h3: true,
+            qlog: None,
+            ..cfg(Role::Client)
+        },
+        proto: ConnProto::H3,
+        ..Opts::default()
+    });
+    assert_eq!(open_uni(&p.client, p.now, p.conn), Err(Error::Other));
+    assert_eq!(stream_count(&p.client, p.conn), 0);
 }

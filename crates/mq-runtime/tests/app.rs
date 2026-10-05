@@ -78,6 +78,9 @@ impl TransportOps for Null {
     fn datagram_recv(&mut self, _: ConnId, _: &mut [u8]) -> Option<usize> {
         None
     }
+    fn open_uni(&mut self, _: Time, _: ConnId) -> Result<StreamId, Error> {
+        Err(Error::Role)
+    }
     fn open_h3_request(&mut self, _: Time, _: ConnId) -> Result<H3ReqId, Error> {
         Err(Error::Role)
     }

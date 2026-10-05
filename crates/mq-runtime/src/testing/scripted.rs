@@ -30,6 +30,7 @@ pub enum Call {
     },
     Connect(ConnConfig),
     OpenStream(ConnId),
+    OpenUni(ConnId),
     /// `bytes` is everything offered, not just the accepted prefix.
     StreamSend {
         s: StreamId,
@@ -142,6 +143,7 @@ struct ScriptState {
     next_path: u64,
     connect: VecDeque<Result<ConnId, ConnectError>>,
     open_stream: VecDeque<Result<StreamId, Error>>,
+    open_uni: VecDeque<Result<StreamId, Error>>,
     add_path: VecDeque<Result<PathId, PathError>>,
     send: HashMap<StreamId, VecDeque<Result<usize, StreamError>>>,
     recv: HashMap<StreamId, VecDeque<RecvChunk>>,
@@ -253,6 +255,10 @@ impl ScriptedHandle {
     }
     pub fn expect_open_stream(&self, r: Result<StreamId, Error>) {
         self.st().open_stream.push_back(r);
+    }
+    /// Queued results for `open_uni`; the default is a fresh id.
+    pub fn expect_open_uni(&self, r: Result<StreamId, Error>) {
+        self.st().open_uni.push_back(r);
     }
     /// `Ok(n)` with `n` below the offered length accepts only that prefix.
     pub fn expect_stream_send(&self, s: StreamId, r: Result<usize, StreamError>) {
@@ -575,6 +581,16 @@ impl TransportOps for ScriptedTransport {
         }
         run_rule(&self.h, |s| &mut s.on_open_stream, |f| f(&self.h, conn))
             .unwrap_or_else(|| Ok(self.h.new_stream_id()))
+    }
+
+    fn open_uni(&mut self, now: Time, conn: ConnId) -> Result<StreamId, Error> {
+        self.last_now = now;
+        let scripted = {
+            let mut st = self.st();
+            st.log.push(Call::OpenUni(conn));
+            st.open_uni.pop_front()
+        };
+        scripted.unwrap_or_else(|| Ok(self.h.new_stream_id()))
     }
 
     fn stream_send(

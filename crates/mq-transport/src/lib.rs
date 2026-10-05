@@ -181,6 +181,10 @@ impl TransportOps for Transport {
         stream::open_stream(self, now, c)
     }
 
+    fn open_uni(&mut self, now: Time, c: ConnId) -> Result<StreamId, mq_transport_api::Error> {
+        stream::open_uni(self, now, c)
+    }
+
     fn stream_send(
         &mut self,
         now: Time,

@@ -50,6 +50,10 @@ pub trait TransportOps {
         buf: &mut [u8],
     ) -> Result<(usize, bool), StreamError>;
     fn stream_reset(&mut self, now: Time, s: StreamId);
+    /// A local unidirectional stream, either role (adoption spec §3). `Err(Stale)` for a dead
+    /// conn, `Err(Other)` on an xqc_h3 conn or when the peer's uni credit is exhausted,
+    /// `Err(Ceiling)` at 8192 streams.
+    fn open_uni(&mut self, now: Time, conn: ConnId) -> Result<StreamId, Error>;
     /// RESET_STREAM only; the receive side keeps reporting. Stale id: no-op (adoption spec §3).
     fn stream_reset_send(&mut self, now: Time, s: StreamId, code: u64);
     /// STOP_SENDING only; the receive side keeps reporting until FIN or reset is read.
