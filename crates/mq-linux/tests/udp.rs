@@ -204,3 +204,37 @@ fn dual_stack_v6_socket_receives_v4_peer_as_v4() {
     assert_eq!(got[0].0.local, b_v4);
     assert_eq!(got[0].1, vec![9u8; 100]);
 }
+
+fn sockopt(s: &UdpSocket, name: libc::c_int) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut v: libc::c_int = -1;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the kernel writes at most `len` bytes into `v`.
+    let r = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            name,
+            (&raw mut v).cast(),
+            &mut len,
+        )
+    };
+    assert_eq!(r, 0);
+    v as usize
+}
+
+fn sysctl(name: &str) -> usize {
+    let p = format!("/proc/sys/net/core/{name}");
+    std::fs::read_to_string(p).unwrap().trim().parse().unwrap()
+}
+
+/// Both buffers ask for 1 MiB, as mqvpn does: the 208 KiB default send buffer fills in
+/// ~2 ms at 900 Mbps. The kernel caps the request at the sysctl max and doubles it.
+#[test]
+fn socket_buffers_are_sized_like_mqvpn() {
+    for s in [loopback(), loopback6()] {
+        let want = |max| 2 * (1usize << 20).min(sysctl(max));
+        assert_eq!(sockopt(&s, libc::SO_SNDBUF), want("wmem_max"));
+        assert_eq!(sockopt(&s, libc::SO_RCVBUF), want("rmem_max"));
+    }
+}

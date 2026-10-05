@@ -27,6 +27,8 @@ pub const MAX_GSO_BYTES: usize = 65507;
 const SLOT: usize = 65535;
 /// Messages per `recvmmsg`.
 const BATCH: usize = 16;
+/// `SO_SNDBUF` / `SO_RCVBUF` request, mqvpn's value.
+const SOCKET_BUF_BYTES: libc::c_int = 1 << 20;
 
 /// One received datagram. `range` indexes the caller's buffer, so the buffer
 /// and the `Vec<RecvMeta>` are reusable across calls.
@@ -62,6 +64,10 @@ impl UdpSocket {
         inner.set_nonblocking(true)?;
         let fd = inner.as_raw_fd();
         setsockopt_int(fd, libc::SOL_UDP, libc::UDP_GRO, 1)?;
+        // As mqvpn: the 208 KiB default send buffer fills in ~2 ms at 900 Mbps and every
+        // EAGAIN behind it makes xquic retry. The kernel caps this at net.core.{w,r}mem_max.
+        setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, SOCKET_BUF_BYTES)?;
+        setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, SOCKET_BUF_BYTES)?;
         if addr.is_ipv4() {
             setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, 1)?;
         } else {
