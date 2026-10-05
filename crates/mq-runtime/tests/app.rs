@@ -56,6 +56,8 @@ impl TransportOps for Null {
         Err(StreamError::Blocked)
     }
     fn stream_reset(&mut self, _: Time, _: StreamId) {}
+    fn stream_reset_send(&mut self, _: Time, _: StreamId, _: u64) {}
+    fn stream_stop_sending(&mut self, _: Time, _: StreamId, _: u64) {}
     fn add_path(&mut self, _: Time, _: ConnId, _: bool) -> Result<PathId, PathError> {
         Ok(PathId(7))
     }

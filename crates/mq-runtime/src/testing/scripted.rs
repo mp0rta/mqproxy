@@ -41,6 +41,14 @@ pub enum Call {
         cap: usize,
     },
     StreamReset(StreamId),
+    StreamResetSend {
+        s: StreamId,
+        code: u64,
+    },
+    StreamStopSending {
+        s: StreamId,
+        code: u64,
+    },
     AddPath {
         conn: ConnId,
         standby: bool,
@@ -641,6 +649,16 @@ impl TransportOps for ScriptedTransport {
         self.st().log.push(Call::StreamReset(s));
     }
 
+    fn stream_reset_send(&mut self, now: Time, s: StreamId, code: u64) {
+        self.last_now = now;
+        self.st().log.push(Call::StreamResetSend { s, code });
+    }
+
+    fn stream_stop_sending(&mut self, now: Time, s: StreamId, code: u64) {
+        self.last_now = now;
+        self.st().log.push(Call::StreamStopSending { s, code });
+    }
+
     fn add_path(&mut self, now: Time, conn: ConnId, standby: bool) -> Result<PathId, PathError> {
         self.last_now = now;
         let mut st = self.st();
@@ -841,5 +859,28 @@ impl TransportOps for ScriptedTransport {
             Some(q) if !q.closed => q.info.ok_or(Error::Stale),
             _ => Err(Error::Stale),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_directional_aborts_are_logged() {
+        let (mut t, h) = ScriptedTransport::new();
+        let s = h.new_stream_id();
+        t.stream_reset_send(Time::ZERO, s, 0x10c);
+        t.stream_stop_sending(Time::ZERO, s, (1 << 62) - 1);
+        assert_eq!(
+            h.log(),
+            vec![
+                Call::StreamResetSend { s, code: 0x10c },
+                Call::StreamStopSending {
+                    s,
+                    code: (1 << 62) - 1
+                },
+            ]
+        );
     }
 }

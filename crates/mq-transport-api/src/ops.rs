@@ -50,6 +50,11 @@ pub trait TransportOps {
         buf: &mut [u8],
     ) -> Result<(usize, bool), StreamError>;
     fn stream_reset(&mut self, now: Time, s: StreamId);
+    /// RESET_STREAM only; the receive side keeps reporting. Stale id: no-op (adoption spec §3).
+    fn stream_reset_send(&mut self, now: Time, s: StreamId, code: u64);
+    /// STOP_SENDING only; the receive side keeps reporting until FIN or reset is read.
+    /// Stale id: no-op (adoption spec §3).
+    fn stream_stop_sending(&mut self, now: Time, s: StreamId, code: u64);
     fn add_path(&mut self, now: Time, conn: ConnId, standby: bool) -> Result<PathId, PathError>;
     fn close_conn(&mut self, now: Time, conn: ConnId);
     /// The app authenticated the peer: at `max_conns` the server evicts only

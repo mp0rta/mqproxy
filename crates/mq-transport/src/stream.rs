@@ -201,6 +201,35 @@ pub(crate) fn stream_reset(t: &mut Transport, now: Time, s: StreamId) {
     })
 }
 
+/// adoption spec §3: RESET_STREAM only. No `abandoned` flag and no drain: the receive side
+/// keeps reporting. A no-op on a stale id.
+pub(crate) fn stream_reset_send(t: &mut Transport, now: Time, s: StreamId, code: u64) {
+    abort_one_side(t, now, s, code, xqc_stream_reset)
+}
+
+/// adoption spec §3: STOP_SENDING only; the receive side keeps reporting until FIN or reset
+/// is read. A no-op on a stale id.
+pub(crate) fn stream_stop_sending(t: &mut Transport, now: Time, s: StreamId, code: u64) {
+    abort_one_side(t, now, s, code, xqc_stream_stop_sending)
+}
+
+fn abort_one_side(
+    t: &mut Transport,
+    now: Time,
+    s: StreamId,
+    code: u64,
+    op: unsafe extern "C" fn(*mut xqc_stream_t, u64) -> xqc_int_t,
+) {
+    t.inner.last_now = now;
+    let Ok((xs, _)) = xqc_of(t, s) else {
+        return;
+    };
+    // SAFETY: `xs` is valid (live slot). The call runs connection logic, which can close
+    // streams (this one too) or the conn: no reference into Inner is held across it. A failed
+    // frame write is already a connection error inside xquic.
+    t.with_engine(now, |_, _| unsafe { op(xs, code) });
+}
+
 /// spec §4.8 "Abandoned streams": read into scratch until xquic reports nothing more (≤ 0) or
 /// FIN. Runs even after FIN: a RESET_STREAM after FIN is made terminal only by this call.
 /// Must run inside `clock::enter`; holds no reference into `Inner` across `xqc_stream_recv`.

@@ -19,6 +19,12 @@ pub enum Event {
     StreamReadable(StreamId),
     StreamWritable(StreamId),
     StreamClosed(StreamId),
+    /// The peer's RESET_STREAM code; once, raw-H3 conns only (adoption spec §3). A
+    /// `StreamReadable` queued before it pops first, so a read can fail with
+    /// `StreamError::Reset` before this arrives (adoption spec §4.4).
+    StreamPeerReset(StreamId, u64),
+    /// The peer's STOP_SENDING code; once, raw-H3 conns only (adoption spec §3).
+    StreamStopSending(StreamId, u64),
     /// "A path can be created now"; may repeat.
     MpReady(ConnId),
     /// A datagram is in the connection's receive ring; drain with

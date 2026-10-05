@@ -293,6 +293,24 @@ pub(crate) fn on_stream_close(inner: &mut Inner, s: SlotId) {
     inner.events.push(Event::StreamClosed(stream_id(s)));
 }
 
+/// adoption spec §3: the peer's RESET_STREAM / STOP_SENDING code, queued while the stream's
+/// slot is live (when the frame is processed, before any readable it causes).
+pub(crate) fn on_peer_abort(
+    inner: &mut Inner,
+    s: SlotId,
+    kind: xqc_stream_peer_abort_t,
+    code: u64,
+) {
+    if !inner.streams.is_live(s) {
+        return;
+    }
+    let id = stream_id(s);
+    inner.events.push(match kind {
+        XQC_STREAM_PEER_STOP_SENDING => Event::StreamStopSending(id, code),
+        _ => Event::StreamPeerReset(id, code),
+    });
+}
+
 /// Server: the peer opened a request (spec §3.3). `None` = refused: the request keeps NULL
 /// user data, so every later notification for it is a no-op, and the connection closes at the
 /// next `drive` (xquic ignores the create notification's return value).
@@ -902,6 +920,20 @@ pub(super) unsafe extern "C" fn stream_write_notify(
     0
 }
 
+/// adoption spec §3: registered for raw-H3 conns only.
+pub(super) unsafe extern "C" fn stream_peer_abort_notify(
+    _xs: *mut xqc_stream_t,
+    kind: xqc_stream_peer_abort_t,
+    code: u64,
+    ud: *mut c_void,
+) {
+    let s = slot_of(ud);
+    if !s.is_none() {
+        // A null user data is a stream we refused (DISCARDED): not ours.
+        with_inner((), |i| on_peer_abort(i, s, kind, code));
+    }
+}
+
 pub(super) unsafe extern "C" fn stream_close_notify(
     _xs: *mut xqc_stream_t,
     ud: *mut c_void,
@@ -1255,6 +1287,28 @@ mod tests {
                 .collect();
         assert_eq!(evs.last(), Some(&Event::StreamClosed(stream_id(s))));
         assert_eq!(evs.len(), 3); // NewConn, NewStream, StreamClosed
+    }
+
+    #[test]
+    fn peer_abort_for_released_slot_is_dropped() {
+        let mut i = inner(0);
+        let c = accept(&mut i);
+        assert!(create(&mut i, c, ConnProto::H3));
+        let s =
+            on_peer_stream_create(&mut i, c, core::ptr::null_mut(), 0, StreamKind::Bidi).unwrap();
+        on_peer_abort(&mut i, s, XQC_STREAM_PEER_STOP_SENDING, 7);
+        on_stream_close(&mut i, s);
+        on_peer_abort(&mut i, s, XQC_STREAM_PEER_RESET_STREAM, 8);
+        let evs: Vec<_> =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
+        assert_eq!(
+            evs[2..],
+            [
+                Event::StreamStopSending(stream_id(s), 7),
+                Event::StreamClosed(stream_id(s)),
+            ]
+        );
     }
 
     #[test]

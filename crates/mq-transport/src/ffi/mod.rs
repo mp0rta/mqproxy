@@ -69,7 +69,11 @@ pub(crate) fn app_proto_callbacks(proto: ConnProto) -> xqc_app_proto_callbacks_t
             stream_create_notify: Some(stream_create_notify),
             stream_close_notify: Some(stream_close_notify),
             stream_closing_notify: None,
-            stream_peer_abort_notify: None,
+            // adoption spec §3: raw-H3 conns only; raw conns never report peer aborts.
+            stream_peer_abort_notify: match proto {
+                ConnProto::Raw => None,
+                ConnProto::H3 => Some(stream_peer_abort_notify),
+            },
         },
         dgram_cbs: xqc_datagram_callbacks_t {
             datagram_read_notify: Some(datagram_read_notify),
