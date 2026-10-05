@@ -276,6 +276,14 @@ fn late_reset_after_fin_read() {
         "{r:?}"
     );
     assert_eq!(aborts(&p.cev), vec![], "no echo");
+    // Retirement contract: the reset-probe read above is terminal; a bidi stream closes once
+    // the server also ends its own send side.
+    assert_eq!(send(&p.server, p.now, ss, vec![], true), Ok(0));
+    assert!(
+        p.pump_until(MS, 2_000, |p| p.sev.contains(&Event::StreamClosed(ss))),
+        "{:?}",
+        p.sev
+    );
 }
 
 /// adoption spec §3 table: a `StreamReadable` queued before the reset pops first, and the

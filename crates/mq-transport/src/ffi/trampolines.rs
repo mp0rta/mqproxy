@@ -966,20 +966,36 @@ pub(super) unsafe extern "C" fn stream_close_notify(
 ) -> xqc_int_t {
     let s = slot_of(ud);
     if !s.is_none() {
-        // adoption spec §3: a plain read, before `with_inner` (no re-entrancy).
-        // SAFETY: `xs` is the stream being closed, valid inside its close callback; `st` is a
-        // plain C struct, all-zero valid; `close_msg` is null or a static string.
-        let stats = unsafe {
-            let mut st: xqc_stream_close_stats_t = core::mem::zeroed();
-            xqc_stream_get_close_stats(xs, &mut st);
-            StreamCloseStats {
-                fin_send_us: st.fin_send_time,
-                fin_ack_us: st.fin_ack_time,
-                mp_state: st.mp_state,
-                stream_err: st.err,
-                close_msg: close_msg(st.close_msg),
-            }
+        // Only H3-proto conns queue the stats (`on_stream_close`): skip the read otherwise.
+        let h3 = with_inner(false, |i| {
+            i.streams
+                .get(s)
+                .and_then(|st| i.conns.get(st.conn))
+                .is_some_and(|c| c.proto == ConnProto::H3)
+        });
+        let mut stats = StreamCloseStats {
+            fin_send_us: 0,
+            fin_ack_us: 0,
+            mp_state: 0,
+            stream_err: 0,
+            close_msg: None,
         };
+        if h3 {
+            // adoption spec §3: a plain read, before `with_inner` (no re-entrancy).
+            // SAFETY: `xs` is the stream being closed, valid inside its close callback; `st` is
+            // a plain C struct, all-zero valid; `close_msg` is null or a static string.
+            unsafe {
+                let mut st: xqc_stream_close_stats_t = core::mem::zeroed();
+                xqc_stream_get_close_stats(xs, &mut st);
+                stats = StreamCloseStats {
+                    fin_send_us: st.fin_send_time,
+                    fin_ack_us: st.fin_ack_time,
+                    mp_state: st.mp_state,
+                    stream_err: st.err,
+                    close_msg: close_msg(st.close_msg),
+                };
+            }
+        }
         with_inner((), |i| on_stream_close(i, s, stats));
     }
     0

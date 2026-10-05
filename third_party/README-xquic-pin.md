@@ -15,13 +15,8 @@ now. mqvpn shares this fork and has not validated the patch; merging into
 `mqvpn-dev` / `mqvpn-main` is deferred until mqvpn has run with it. Until the
 merge, mqproxy pins the branch head directly.
 
-The branch must still be pushed to the fork remote: until it is, the pin is a
-commit that exists only in a local clone, and a fresh `git submodule update`
-(and CI) cannot fetch it. The fork owner must push the branch first:
-
-```
-git -C third_party/xquic push origin feat/h3wire-raw-streams
-```
+The pin is pushed: `origin/feat/h3wire-raw-streams` (mp0rta/xquic) is at the
+pinned commit, so a fresh `git submodule update` and CI can fetch it.
 
 Effect on mqvpn: none until mqvpn bumps its own pin. The cap only triggers for
 a peer that leaves more than 16384 stream ids unopened at once; sequential
@@ -29,6 +24,10 @@ stream use never accumulates gap entries (fork CUnit: 16400 out-of-order
 creations, no error, count back to 0). If mqvpn wants the old behaviour even
 after bumping, the default can be changed to "0 = disabled" with mqproxy
 setting 16384 explicitly (mq-transport already does).
+
+The new `stream_peer_abort_notify` is the trailing member of
+`xqc_stream_callbacks_t` and NULL by default. With no callback and no
+`xqc_conn_set_no_reset_echo`, behaviour is unchanged.
 
 ## What the patch does
 
@@ -39,7 +38,8 @@ behaves as at `4aa5b1f`.
 
 1. `xqc_stream_reset(stream, code)` sends RESET_STREAM only, with a 62-bit code.
    It drops queued stream frames and resets at the current send offset; a no-op
-   once RESET_SENT or when the conn is closing.
+   once the send side has reached DATA_RECVD (RFC 9000 section 3.1) or when
+   the conn is closing.
 2. `xqc_stream_stop_sending(stream, code)` sends STOP_SENDING only, while the
    receive side is in Recv or Size Known. What arrives afterwards is still read.
 3. `stream_peer_abort_notify(stream, kind, code, user_data)`, a new optional

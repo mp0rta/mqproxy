@@ -25,8 +25,9 @@ pub enum Event {
     StreamPeerReset(StreamId, u64),
     /// The peer's STOP_SENDING code; once, raw-H3 conns only (adoption spec §3).
     StreamStopSending(StreamId, u64),
-    /// Raw-H3 conns only: directly before that stream's `StreamClosed`, never dropped
-    /// (adoption spec §3).
+    /// H3-proto conns only (`ConnProto::H3`; equivalent to raw-H3 today, since xqc_h3-backend
+    /// conns never reach the raw stream-close path): directly before that stream's
+    /// `StreamClosed`, never dropped (adoption spec §3).
     StreamCloseStats(StreamId, Box<StreamCloseStats>),
     /// "A path can be created now"; may repeat.
     MpReady(ConnId),
@@ -73,6 +74,8 @@ pub struct StreamCloseStats {
     pub fin_send_us: u64,
     pub fin_ack_us: u64,
     pub mp_state: i32,
+    /// An `i32`, as `H3ReqStats.stream_err` (xquic's `int`): a 62-bit code is truncated here.
+    /// The full code arrives via `StreamPeerReset` / `StreamStopSending`.
     pub stream_err: i32,
     /// At most 64 bytes, copied as `H3ReqStats.close_msg` is.
     pub close_msg: Option<String>,
