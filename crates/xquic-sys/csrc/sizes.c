@@ -12,3 +12,4 @@ const size_t xqc_sys_sizeof_engine_ssl_config = sizeof(xqc_engine_ssl_config_t);
 const size_t xqc_sys_sizeof_cid = sizeof(xqc_cid_t);
 const size_t xqc_sys_sizeof_conn_stats = sizeof(xqc_conn_stats_t);
 const size_t xqc_sys_sizeof_path_metrics = sizeof(xqc_path_metrics_t);
+const size_t xqc_sys_sizeof_stream_close_stats = sizeof(xqc_stream_close_stats_t);

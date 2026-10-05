@@ -65,6 +65,7 @@ pub(crate) fn app_proto_callbacks() -> xqc_app_proto_callbacks_t {
             stream_create_notify: Some(stream_create_notify),
             stream_close_notify: Some(stream_close_notify),
             stream_closing_notify: None,
+            stream_peer_abort_notify: None,
         },
         dgram_cbs: xqc_datagram_callbacks_t {
             datagram_read_notify: Some(datagram_read_notify),
