@@ -4,8 +4,8 @@ mod common;
 use common::lockstep::{self, Peer, cfg, server_role};
 use common::pair::{MS, Opts, Pair, new_streams, read_all, recv, send, stream_count};
 use mq_transport_api::{
-    ConnId, ConnProto, Error, Event, H3Backend, Role, StreamError, StreamId, StreamKind, Time,
-    TransportConfig, TransportOps,
+    ConnId, ConnProto, ErrType, Error, Event, H3Backend, Role, StreamCloseStats, StreamError,
+    StreamId, StreamKind, Time, TransportConfig, TransportOps,
 };
 
 fn raw_h3_cfg(role: Role) -> TransportConfig {
@@ -499,4 +499,119 @@ fn open_uni_on_xqc_h3_conn() {
     });
     assert_eq!(open_uni(&p.client, p.now, p.conn), Err(Error::Other));
     assert_eq!(stream_count(&p.client, p.conn), 0);
+}
+
+fn close_conn_with(p: &Peer, now: Time, c: ConnId, code: u64) {
+    p.call(now, move |t, now| t.close_conn_with(now, c, code))
+}
+
+/// The stats for `s`, asserting they come directly before its `StreamClosed`.
+fn close_stats(ev: &[Event], s: StreamId) -> StreamCloseStats {
+    let i = ev
+        .iter()
+        .position(|e| *e == Event::StreamClosed(s))
+        .expect("StreamClosed");
+    match &ev[i.checked_sub(1).expect("event before StreamClosed")] {
+        Event::StreamCloseStats(id, st) if *id == s => (**st).clone(),
+        e => panic!("expected stats before StreamClosed, got {e:?}"),
+    }
+}
+
+#[test]
+fn close_conn_with_code() {
+    let mut p = Pair::with(h3raw_opts());
+    close_conn_with(&p.client, p.now, p.conn, 0x101);
+    assert!(p.pump_until(MS, 2_000, |p| p.server_closed().is_some()));
+    let r = p.server_closed().unwrap();
+    assert_eq!((r.err_type, r.code), (ErrType::Application, 0x101));
+    assert!(p.pump_until(MS, 2_000, |p| p.client_closed().is_some()));
+    assert_eq!(p.client_closed().unwrap().err_type, ErrType::Unknown);
+}
+
+#[test]
+fn close_conn_with_stale_is_noop() {
+    let mut p = Pair::with(h3raw_opts());
+    close_conn_with(&p.client, p.now, p.conn, 0x101);
+    assert!(p.pump_until(MS, 2_000, |p| {
+        p.client_closed().is_some() && p.server_closed().is_some()
+    }));
+    let n = p.cev.len();
+    close_conn_with(&p.client, p.now, p.conn, 0x102);
+    p.exchange();
+    assert_eq!(p.cev.len(), n, "{:?}", &p.cev[n..]);
+}
+
+#[test]
+fn close_stats_clean() {
+    let mut p = Pair::with(h3raw_opts());
+    let cs = p.open();
+    assert_eq!(send(&p.client, p.now, cs, b"req".to_vec(), true), Ok(3));
+    p.exchange();
+    let (ss, _) = new_streams(&p.sev)[0];
+    assert_eq!(read_all(&p.server, p.now, ss), Ok((b"req".to_vec(), true)));
+    assert_eq!(send(&p.server, p.now, ss, b"resp".to_vec(), true), Ok(4));
+    assert_eq!(read_to_fin(&mut p, true, cs), b"resp");
+    assert!(pump_closed(&mut p, cs, ss), "{:?} / {:?}", p.cev, p.sev);
+    let st = close_stats(&p.cev, cs);
+    assert!(st.fin_send_us > 0, "{st:?}");
+    assert!(st.fin_ack_us >= st.fin_send_us, "{st:?}");
+    assert_eq!((st.stream_err, st.mp_state), (0, 0));
+    assert_eq!(st.close_msg, Some("finished".into()));
+    close_stats(&p.sev, ss);
+}
+
+#[test]
+fn close_stats_reset() {
+    let mut p = Pair::with(h3raw_opts());
+    let (cs, ss) = open_with_data(&mut p, 4 * 1024);
+    reset_send(&p.client, p.now, cs, CANCELLED);
+    p.exchange();
+    assert_eq!(
+        recv(&p.server, p.now, ss, 64 * 1024),
+        Err(StreamError::Reset)
+    );
+    assert_eq!(send(&p.server, p.now, ss, vec![7; 1024], true), Ok(1024));
+    read_to_fin(&mut p, true, cs);
+    assert!(pump_closed(&mut p, cs, ss), "{:?} / {:?}", p.cev, p.sev);
+    let st = close_stats(&p.cev, cs);
+    assert_eq!(st.stream_err, CANCELLED as i32, "{st:?}");
+    assert_eq!(st.close_msg, Some("local reset".into()));
+}
+
+#[test]
+fn close_stats_conn_error() {
+    let mut p = Pair::with(h3raw_opts());
+    let (a, _) = open_with_data(&mut p, 1024);
+    let (b, _) = open_with_data(&mut p, 1024);
+    close_conn_with(&p.client, p.now, p.conn, 0x101);
+    assert!(p.pump_until(MS, 2_000, |p| p.client_closed().is_some()));
+    for s in [a, b] {
+        let st = close_stats(&p.cev, s);
+        assert_eq!(st.stream_err, 0x101, "{st:?}");
+        assert_eq!(st.close_msg, Some("conn closed".into()));
+        let at = |e: &Event| p.cev.iter().position(|x| x == e).unwrap();
+        assert!(
+            at(&Event::StreamClosed(s))
+                < at(&Event::ConnClosed(p.conn, p.client_closed().unwrap()))
+        );
+    }
+}
+
+#[test]
+fn no_close_stats_on_raw_conns() {
+    let mut p = Pair::new();
+    let cs = p.open();
+    assert_eq!(send(&p.client, p.now, cs, b"x".to_vec(), true), Ok(1));
+    p.exchange();
+    let (ss, _) = new_streams(&p.sev)[0];
+    assert_eq!(read_all(&p.server, p.now, ss), Ok((b"x".to_vec(), true)));
+    assert_eq!(send(&p.server, p.now, ss, b"y".to_vec(), true), Ok(1));
+    read_to_fin(&mut p, true, cs);
+    assert!(pump_closed(&mut p, cs, ss));
+    let n = |ev: &[Event]| {
+        ev.iter()
+            .filter(|e| matches!(e, Event::StreamCloseStats(..)))
+            .count()
+    };
+    assert_eq!((n(&p.cev), n(&p.sev)), (0, 0));
 }

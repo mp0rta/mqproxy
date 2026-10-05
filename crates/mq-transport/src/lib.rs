@@ -161,7 +161,10 @@ impl TransportOps for Transport {
                 Event::H3Request(_, r) | Event::H3Readable(r) | Event::H3Writable(r) => {
                     h3reqs.is_live(r.slot())
                 }
-                Event::ConnClosed(..) | Event::StreamClosed(_) | Event::H3Closed(..) => true,
+                Event::ConnClosed(..)
+                | Event::StreamClosed(_)
+                | Event::StreamCloseStats(..)
+                | Event::H3Closed(..) => true,
             };
             if live {
                 return Some(e);
@@ -222,6 +225,10 @@ impl TransportOps for Transport {
 
     fn close_conn(&mut self, now: Time, c: ConnId) {
         conn::close_conn(self, now, c)
+    }
+
+    fn close_conn_with(&mut self, now: Time, c: ConnId, code: u64) {
+        conn::close_conn_with(self, now, c, code)
     }
 
     fn mark_conn_authed(&mut self, c: ConnId) {

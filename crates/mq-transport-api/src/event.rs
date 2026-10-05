@@ -25,6 +25,9 @@ pub enum Event {
     StreamPeerReset(StreamId, u64),
     /// The peer's STOP_SENDING code; once, raw-H3 conns only (adoption spec §3).
     StreamStopSending(StreamId, u64),
+    /// Raw-H3 conns only: directly before that stream's `StreamClosed`, never dropped
+    /// (adoption spec §3).
+    StreamCloseStats(StreamId, Box<StreamCloseStats>),
     /// "A path can be created now"; may repeat.
     MpReady(ConnId),
     /// A datagram is in the connection's receive ring; drain with
@@ -61,6 +64,17 @@ pub struct H3ReqStats {
     pub mp_state: i32,
     pub stream_err: i32,
     /// At most 64 bytes, copied verbatim (xquic's messages are static ASCII).
+    pub close_msg: Option<String>,
+}
+
+/// xquic's stream close statistics, taken in the close callback (adoption spec §3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamCloseStats {
+    pub fin_send_us: u64,
+    pub fin_ack_us: u64,
+    pub mp_state: i32,
+    pub stream_err: i32,
+    /// At most 64 bytes, copied as `H3ReqStats.close_msg` is.
     pub close_msg: Option<String>,
 }
 

@@ -14,7 +14,7 @@ use core::ffi::{c_int, c_uchar, c_void};
 use libc::{sockaddr, socklen_t};
 use mq_transport_api::{
     CloseReason, ConnId, ConnProto, ErrType, Event, H3Close, H3ReqId, H3ReqStats, PathId, Role,
-    SlotId, StreamId, StreamInfo, StreamKind, Time, Unread,
+    SlotId, StreamCloseStats, StreamId, StreamInfo, StreamKind, Time, Unread,
 };
 use std::time::Duration;
 use xquic_sys::*;
@@ -283,12 +283,20 @@ pub(crate) fn on_local_stream_bind(
 }
 
 /// Stream close notification: every stream slot is released here (spec §4.8).
-pub(crate) fn on_stream_close(inner: &mut Inner, s: SlotId) {
+///
+/// adoption spec §3: `stats` (read by the trampoline before this runs) are queued first when
+/// the stream's connection is raw-H3.
+pub(crate) fn on_stream_close(inner: &mut Inner, s: SlotId, stats: StreamCloseStats) {
     let Some(slot) = inner.streams.remove(s) else {
         return;
     };
     if let Some(c) = inner.conns.get_mut(slot.conn) {
         c.streams -= 1;
+        if c.proto == ConnProto::H3 {
+            inner
+                .events
+                .push(Event::StreamCloseStats(stream_id(s), Box::new(stats)));
+        }
     }
     inner.events.push(Event::StreamClosed(stream_id(s)));
 }
@@ -425,20 +433,29 @@ unsafe fn drain_unread(h3r: *mut xqc_h3_request_t, header: bool) -> Option<Unrea
     }
 }
 
-/// spec §3.1: the fields C's call site reads; `close_msg` copied up to 64 bytes.
+/// `msg` is null or a NUL-terminated string; at most 64 bytes are copied.
 ///
 /// # Safety
-/// `st.stream_close_msg` is null or a NUL-terminated string (xquic's static messages).
-pub(crate) unsafe fn h3_stats(st: &xqc_request_stats_t) -> H3ReqStats {
-    let msg = st.stream_close_msg.cast::<u8>();
-    let close_msg = (!msg.is_null()).then(|| {
+/// `msg` is null or points to a NUL-terminated string (xquic's static messages).
+unsafe fn close_msg(msg: *const core::ffi::c_char) -> Option<String> {
+    let msg = msg.cast::<u8>();
+    (!msg.is_null()).then(|| {
         // SAFETY: guaranteed by the caller; reading stops at the NUL (or after 64 bytes).
         let bytes: Vec<u8> = (0..64)
             .map(|k| unsafe { *msg.add(k) })
             .take_while(|&b| b != 0)
             .collect();
         String::from_utf8_lossy(&bytes).into_owned()
-    });
+    })
+}
+
+/// spec §3.1: the fields C's call site reads; `close_msg` copied up to 64 bytes.
+///
+/// # Safety
+/// `st.stream_close_msg` is null or a NUL-terminated string (xquic's static messages).
+pub(crate) unsafe fn h3_stats(st: &xqc_request_stats_t) -> H3ReqStats {
+    // SAFETY: guaranteed by the caller.
+    let close_msg = unsafe { close_msg(st.stream_close_msg) };
     H3ReqStats {
         send_body: st.send_body_size as u64,
         recv_body: st.recv_body_size as u64,
@@ -944,12 +961,26 @@ pub(super) unsafe extern "C" fn stream_peer_abort_notify(
 }
 
 pub(super) unsafe extern "C" fn stream_close_notify(
-    _xs: *mut xqc_stream_t,
+    xs: *mut xqc_stream_t,
     ud: *mut c_void,
 ) -> xqc_int_t {
     let s = slot_of(ud);
     if !s.is_none() {
-        with_inner((), |i| on_stream_close(i, s));
+        // adoption spec §3: a plain read, before `with_inner` (no re-entrancy).
+        // SAFETY: `xs` is the stream being closed, valid inside its close callback; `st` is a
+        // plain C struct, all-zero valid; `close_msg` is null or a static string.
+        let stats = unsafe {
+            let mut st: xqc_stream_close_stats_t = core::mem::zeroed();
+            xqc_stream_get_close_stats(xs, &mut st);
+            StreamCloseStats {
+                fin_send_us: st.fin_send_time,
+                fin_ack_us: st.fin_ack_time,
+                mp_state: st.mp_state,
+                stream_err: st.err,
+                close_msg: close_msg(st.close_msg),
+            }
+        };
+        with_inner((), |i| on_stream_close(i, s, stats));
     }
     0
 }
@@ -1281,6 +1312,16 @@ mod tests {
         }
     }
 
+    fn no_stats() -> StreamCloseStats {
+        StreamCloseStats {
+            fin_send_us: 0,
+            fin_ack_us: 0,
+            mp_state: 0,
+            stream_err: 0,
+            close_msg: None,
+        }
+    }
+
     #[test]
     fn stream_close_releases_and_reports() {
         let mut i = inner(0);
@@ -1288,8 +1329,8 @@ mod tests {
         assert!(create(&mut i, c, ConnProto::Raw));
         let s =
             on_peer_stream_create(&mut i, c, core::ptr::null_mut(), 0, StreamKind::Uni).unwrap();
-        on_stream_close(&mut i, s);
-        on_stream_close(&mut i, s);
+        on_stream_close(&mut i, s, no_stats());
+        on_stream_close(&mut i, s, no_stats());
         assert_eq!(i.conns.get(c).unwrap().streams, 0);
         let evs: Vec<_> =
             std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
@@ -1329,7 +1370,7 @@ mod tests {
         let s =
             on_peer_stream_create(&mut i, c, core::ptr::null_mut(), 0, StreamKind::Bidi).unwrap();
         on_peer_abort(&mut i, s, XQC_STREAM_PEER_STOP_SENDING, 7);
-        on_stream_close(&mut i, s);
+        on_stream_close(&mut i, s, no_stats());
         on_peer_abort(&mut i, s, XQC_STREAM_PEER_RESET_STREAM, 8);
         let evs: Vec<_> =
             std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
@@ -1338,6 +1379,7 @@ mod tests {
             evs[2..],
             [
                 Event::StreamStopSending(stream_id(s), 7),
+                Event::StreamCloseStats(stream_id(s), Box::new(no_stats())),
                 Event::StreamClosed(stream_id(s)),
             ]
         );

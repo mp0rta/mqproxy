@@ -61,6 +61,9 @@ pub trait TransportOps {
     fn stream_stop_sending(&mut self, now: Time, s: StreamId, code: u64);
     fn add_path(&mut self, now: Time, conn: ConnId, standby: bool) -> Result<PathId, PathError>;
     fn close_conn(&mut self, now: Time, conn: ConnId);
+    /// CONNECTION_CLOSE carrying the HTTP/3 application code `code` (>= 0x100; xquic frames a
+    /// lower code as a transport error, xqc_packet_out.c:799). Stale id: no-op (adoption spec §3).
+    fn close_conn_with(&mut self, now: Time, conn: ConnId, code: u64);
     /// The app authenticated the peer: at `max_conns` the server evicts only
     /// connections never marked (spec §4.7). A no-op on a stale id.
     fn mark_conn_authed(&mut self, conn: ConnId);

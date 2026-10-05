@@ -214,6 +214,23 @@ pub(crate) fn close_conn(t: &mut Transport, now: Time, c: ConnId) {
     });
 }
 
+/// adoption spec §3: CONNECTION_CLOSE with an application code; a stale id is a no-op.
+pub(crate) fn close_conn_with(t: &mut Transport, now: Time, c: ConnId, code: u64) {
+    t.inner.last_now = now;
+    let Some(xqc) = t.inner.conns.get(c.slot()).map(|s| s.xqc) else {
+        return;
+    };
+    t.with_engine(now, |inner, _| {
+        // SAFETY: as `drive`'s pending_close path: a live slot holds a valid (or not yet
+        // bound, null) connection pointer.
+        unsafe {
+            mark_closed_locally(inner, c.slot(), xqc);
+            xqc_conn_close_with_error(xqc, code);
+            xqc_conn_continue_send_by_conn(xqc);
+        }
+    });
+}
+
 /// spec §4.2, §6.5. `paths_info` is heap memory the caller frees with libc `free`.
 pub(crate) fn conn_stats(t: &Transport, c: ConnId) -> Result<ConnStats, Error> {
     let cid = cid_of(t, c).ok_or(Error::Stale)?;

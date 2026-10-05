@@ -131,6 +131,7 @@ impl Events {
             | Event::StreamClosed(_)
             | Event::StreamPeerReset(..)
             | Event::StreamStopSending(..)
+            | Event::StreamCloseStats(..)
             | Event::PathRemoved(..)
             | Event::H3Request(..)
             | Event::H3Closed(..) => {}

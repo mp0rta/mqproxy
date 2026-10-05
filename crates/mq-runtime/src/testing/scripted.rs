@@ -55,6 +55,10 @@ pub enum Call {
         standby: bool,
     },
     CloseConn(ConnId),
+    CloseConnWith {
+        conn: ConnId,
+        code: u64,
+    },
     MarkConnAuthed(ConnId),
     /// `bytes` is what was offered, whether or not the call succeeded.
     DatagramSend {
@@ -241,6 +245,21 @@ impl ScriptedTransport {
 
     fn st(&self) -> MutexGuard<'_, ScriptState> {
         self.h.st()
+    }
+
+    /// The `ConnClosed` a close op produces, unless `hold_close`.
+    fn close_event(&mut self, conn: ConnId) {
+        let mut st = self.st();
+        if st.hold_close {
+            return;
+        }
+        st.events.push_back(Event::ConnClosed(
+            conn,
+            CloseReason {
+                err_type: ErrType::Unknown,
+                code: 0,
+            },
+        ));
     }
 }
 
@@ -687,18 +706,14 @@ impl TransportOps for ScriptedTransport {
 
     fn close_conn(&mut self, now: Time, conn: ConnId) {
         self.last_now = now;
-        let mut st = self.st();
-        st.log.push(Call::CloseConn(conn));
-        if st.hold_close {
-            return;
-        }
-        st.events.push_back(Event::ConnClosed(
-            conn,
-            CloseReason {
-                err_type: ErrType::Unknown,
-                code: 0,
-            },
-        ));
+        self.st().log.push(Call::CloseConn(conn));
+        self.close_event(conn);
+    }
+
+    fn close_conn_with(&mut self, now: Time, conn: ConnId, code: u64) {
+        self.last_now = now;
+        self.st().log.push(Call::CloseConnWith { conn, code });
+        self.close_event(conn);
     }
 
     fn mark_conn_authed(&mut self, conn: ConnId) {

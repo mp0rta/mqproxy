@@ -1068,7 +1068,9 @@ impl App for RawClient {
                 }
             }
             Event::NewConn(..) | Event::MpReady(_) | Event::PathRemoved(..) => {}
-            Event::StreamPeerReset(..) | Event::StreamStopSending(..) => {} // raw-H3 conns only
+            Event::StreamPeerReset(..)
+            | Event::StreamStopSending(..)
+            | Event::StreamCloseStats(..) => {} // raw-H3 conns only
             Event::DatagramReadable(_) => {} // wired with the UDP lane
             Event::H3Request(..)
             | Event::H3Readable(_)
