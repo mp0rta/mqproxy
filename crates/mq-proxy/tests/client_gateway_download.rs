@@ -1,6 +1,7 @@
 //! SP3 spec §5.4: the fetch download (H3 → local TCP) — the rendered head,
 //! 16 KiB reads written raw or chunk-framed, `SendBufFull` backpressure, the
-//! malformed-head 502, the body check, and the abort paths (§5.5).
+//! malformed-head 502, and the abort paths (§5.5). The body check is the
+//! core's, tested in `client_exchange.rs` (SP4 spec §4.3).
 
 mod common;
 
@@ -10,9 +11,8 @@ use mq_runtime::testing::Call;
 use mq_runtime::{IoRequest, TcpId};
 use mq_transport_api::{Event, H3ReqId, StreamError};
 
-/// A gateway-only client with an open fetch request (no body; `method`
-/// as `X-Mq-Method` when given).
-fn open(method: Option<&str>) -> (H, TcpId, H3ReqId) {
+/// A gateway-only client with an open, bodiless fetch request.
+fn open() -> (H, TcpId, H3ReqId) {
     let mut h = H::new(ClientConfig {
         gateway: Some(addr(8080)),
         has_tcp_ingress: false,
@@ -23,8 +23,7 @@ fn open(method: Option<&str>) -> (H, TcpId, H3ReqId) {
     let r = h.t.new_h3_req_id();
     h.t.expect_open_h3_request(gw, Ok(r));
     let tcp = h.accept(h.fetch, meta(None));
-    let extra = method.map_or(String::new(), |m| format!("X-Mq-Method: {m}\r\n"));
-    h.rx(tcp, &fetch_req(&extra, b""));
+    h.rx(tcp, &fetch_req("", b""));
     (h, tcp, r)
 }
 
@@ -68,7 +67,7 @@ const HEAD_CHUNKED: &[u8] =
 
 #[test]
 fn download_cl_passthrough_body() {
-    let (mut h, tcp, r) = open(None);
+    let (mut h, tcp, r) = open();
     let b = pattern(40_000);
     respond(
         &mut h,
@@ -95,7 +94,7 @@ fn download_cl_passthrough_body() {
 
 #[test]
 fn download_chunked_framing_and_terminator() {
-    let (mut h, tcp, r) = open(None);
+    let (mut h, tcp, r) = open();
     let b = pattern(40_000);
     respond(&mut h, r, &[(":status", "200")], false);
     body(&mut h, r, &b, true);
@@ -118,7 +117,7 @@ fn download_chunked_framing_and_terminator() {
 
 #[test]
 fn download_zero_length_read_not_framed() {
-    let (mut h, tcp, r) = open(None);
+    let (mut h, tcp, r) = open();
     respond(&mut h, r, &[(":status", "200")], false);
     body(&mut h, r, b"abc", false);
     body(&mut h, r, b"", true); // `(0, true)`: an empty FIN
@@ -130,7 +129,7 @@ fn download_zero_length_read_not_framed() {
 
 #[test]
 fn download_sendbuffull_holds_pending_until_writable() {
-    let (mut h, tcp, r) = open(None);
+    let (mut h, tcp, r) = open();
     let b = pattern(100 * 1024);
     respond(
         &mut h,
@@ -160,7 +159,7 @@ fn download_sendbuffull_holds_pending_until_writable() {
 
 #[test]
 fn download_sendbuffull_on_last_frame_keeps_terminator() {
-    let (mut h, tcp, r) = open(None);
+    let (mut h, tcp, r) = open();
     let b = pattern(4 * 16_384);
     respond(&mut h, r, &[(":status", "200")], false);
     body(&mut h, r, &b, true);
@@ -172,6 +171,30 @@ fn download_sendbuffull_on_last_frame_keeps_terminator() {
     assert_eq!(close_of(&mut h, tcp), Some(false));
 }
 
+/// An unparsable or repeated `content-length` (`has_cl`, no `cl`): no body
+/// check, and the body is written raw — the head has no `Transfer-Encoding`.
+#[test]
+fn body_check_unparsable_cl_skipped() {
+    for (cl, line) in [
+        (&[("content-length", "1x0")][..], "content-length: 1x0\r\n"),
+        (
+            &[("content-length", "100"), ("content-length", "100")],
+            "content-length: 100\r\ncontent-length: 100\r\n",
+        ),
+    ] {
+        let (mut h, tcp, r) = open();
+        let mut head = vec![(":status", "200")];
+        head.extend_from_slice(cl);
+        respond(&mut h, r, &head, false);
+        body(&mut h, r, &[b'x'; 50], true);
+        let mut want = format!("HTTP/1.1 200 \r\n{line}Connection: close\r\n\r\n").into_bytes();
+        want.extend_from_slice(&[b'x'; 50]);
+        assert_eq!(h.tx_all(tcp), want, "raw passthrough, no chunk framing");
+        assert_eq!(close_of(&mut h, tcp), Some(false));
+        assert_eq!(resets(&h, r), 0);
+    }
+}
+
 #[test]
 fn malformed_head_502_upstream_protocol_and_reset() {
     for head in [
@@ -179,7 +202,7 @@ fn malformed_head_502_upstream_protocol_and_reset() {
         &[(":status", "2x0")],
         &[(":status", "200"), ("x", "a\rb")],
     ] {
-        let (mut h, tcp, r) = open(None);
+        let (mut h, tcp, r) = open();
         respond(&mut h, r, head, false);
         assert_eq!(
             h.tx_all(tcp),
@@ -194,72 +217,8 @@ fn malformed_head_502_upstream_protocol_and_reset() {
 }
 
 #[test]
-fn body_check_short_cl_aborts() {
-    // Review Focus 5: a response cut inside a DATA frame reads as a clean EOF.
-    let (mut h, tcp, r) = open(None);
-    respond(
-        &mut h,
-        r,
-        &[(":status", "200"), ("content-length", "100")],
-        false,
-    );
-    body(&mut h, r, &[b'x'; 50], true);
-    assert_eq!(close_of(&mut h, tcp), Some(true));
-    assert_eq!(resets(&h, r), 1);
-}
-
-#[test]
-fn body_check_unparsable_cl_skipped() {
-    for cl in [
-        &[("content-length", "1x0")][..],
-        &[("content-length", "100"), ("content-length", "100")],
-    ] {
-        let (mut h, tcp, r) = open(None);
-        let mut head = vec![(":status", "200")];
-        head.extend_from_slice(cl);
-        respond(&mut h, r, &head, false);
-        body(&mut h, r, &[b'x'; 50], true);
-        let out = h.tx_all(tcp);
-        assert!(
-            out.ends_with(&[b'x'; 50]),
-            "raw passthrough, no chunk framing"
-        );
-        assert_eq!(close_of(&mut h, tcp), Some(false));
-        assert_eq!(resets(&h, r), 0);
-    }
-}
-
-#[test]
-fn body_check_exempt_statuses_and_head_finish() {
-    // `content-length: 100` on a bodiless response is not a truncation.
-    for (method, status) in [(None, "304"), (None, "204"), (Some("HEAD"), "200")] {
-        let (mut h, tcp, r) = open(method);
-        respond(
-            &mut h,
-            r,
-            &[(":status", status), ("content-length", "100")],
-            true,
-        );
-        assert_eq!(close_of(&mut h, tcp), None);
-        let out = h.tx_all(tcp);
-        let cl: &[u8] = if method.is_some() {
-            b"content-length: 0\r\n"
-        } else {
-            b"content-length: 100\r\n"
-        };
-        assert!(
-            out.windows(cl.len()).any(|w| w == cl),
-            "{}",
-            String::from_utf8_lossy(&out)
-        );
-        assert_eq!(close_of(&mut h, tcp), Some(false));
-        assert_eq!(resets(&h, r), 0);
-    }
-}
-
-#[test]
 fn fin_on_headers_finishes() {
-    let (mut h, tcp, r) = open(None);
+    let (mut h, tcp, r) = open();
     respond(&mut h, r, &[(":status", "204")], true);
     assert_eq!(
         h.tx_all(tcp),
@@ -270,32 +229,30 @@ fn fin_on_headers_finishes() {
     assert_eq!(h.count(|c| matches!(c, Call::H3RecvBody { .. })), 0);
 }
 
+/// SP4 spec §6.2 / §13.20: a receive error before the head is `HeadOut::Fail`,
+/// answered like `H3Closed` without headers (SP3 aborted the socket).
 #[test]
-fn fin_on_headers_with_cl_on_get_aborts() {
-    let (mut h, tcp, r) = open(None);
-    respond(
-        &mut h,
-        r,
-        &[(":status", "200"), ("content-length", "100")],
-        true,
-    );
-    assert_eq!(close_of(&mut h, tcp), Some(true));
-    assert_eq!(resets(&h, r), 1);
-}
-
-#[test]
-fn recv_error_before_head_aborts() {
-    let (mut h, tcp, r) = open(None);
+fn recv_error_before_head_synthesised_502() {
+    let (mut h, tcp, r) = open();
     h.t.inject_h3_error(r, StreamError::Reset);
     h.drive();
-    assert_eq!(h.sh.tcp_tx_buf(tcp).len(), 0, "no 502 on this path");
-    assert_eq!(close_of(&mut h, tcp), Some(true));
+    assert_eq!(
+        h.tx_all(tcp),
+        b"HTTP/1.1 502 \r\nX-Mq-Error: upstream-reset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    assert_eq!(close_of(&mut h, tcp), Some(false));
     assert_eq!(resets(&h, r), 1);
+    // Removed: a later readiness reads nothing.
+    let reads = |h: &H| h.count(|c| matches!(c, Call::H3RecvHeaders(_)));
+    let before = reads(&h);
+    respond(&mut h, r, &[(":status", "200")], true);
+    assert_eq!(reads(&h), before);
+    assert!(!h.sh.app().gateway().unwrap().owns_tcp(tcp));
 }
 
 #[test]
 fn recv_error_after_head_aborts() {
-    let (mut h, tcp, r) = open(None);
+    let (mut h, tcp, r) = open();
     respond(&mut h, r, &[(":status", "200")], false);
     body(&mut h, r, b"abc", false);
     h.t.inject_h3_error(r, StreamError::Reset);

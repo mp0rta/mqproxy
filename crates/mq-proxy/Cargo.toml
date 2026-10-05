@@ -10,9 +10,11 @@ mq-http = { path = "../mq-http" }
 mq-runtime = { path = "../mq-runtime" }
 mq-transport-api = { path = "../mq-transport-api" }
 mq-wire = { path = "../mq-wire" }
+mq-linux = { path = "../mq-linux" }
 log = { workspace = true }
 subtle = { workspace = true }
 hyper = { workspace = true }
+tokio = { workspace = true }
 h2 = { workspace = true }   # floor only (RUSTSEC-2026-0258), see the workspace manifest
 http = { workspace = true }
 http-body = { workspace = true }
@@ -21,10 +23,16 @@ bytes = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls-native-certs = { workspace = true }
+rcgen = { workspace = true }
+x509-parser = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 mq-runtime = { path = "../mq-runtime", features = ["test-support"] }
 mq-proxy = { path = ".", features = ["test-support"] }
+proptest = { workspace = true }
+rustls-webpki = { workspace = true }
 
 [features]
 test-support = []

@@ -144,7 +144,7 @@ fn reject_replies_byte_exact() {
     let req = |hs: &str| format!("POST /_mqproxy/fetch HTTP/1.1\r\n{hs}\r\n").into_bytes();
     let auth = "X-Mq-Auth: Bearer t\r\n";
     let target = "X-Mq-Target: https://example.com/\r\n";
-    let long = "v".repeat(1024);
+    let long = "v".repeat(mq_http::limits::FIELD_MAX);
     let cases = [
         (
             format!("{auth}x-mq-auth: Bearer u\r\n{target}"),

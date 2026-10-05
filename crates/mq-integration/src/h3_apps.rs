@@ -27,6 +27,8 @@ pub struct H3Recorded {
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
     pub body: Vec<u8>,
     pub fin: bool,
+    /// Server: the request header sections it read itself, in arrival order.
+    pub request_headers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Every `H3Closed`, with its arrival time.
     pub closed: Vec<(H3Close, Instant)>,
     /// `CutResponseFrame` / `truncate_after_partial`: what the oversized `h3_send_body`
@@ -148,6 +150,8 @@ struct EchoReq {
 /// An `App` that answers every `H3Request` per its `EchoMode`.
 pub struct H3EchoServer {
     mode: EchoMode,
+    /// Added to every response head after `:status`.
+    resp_headers: Vec<(String, String)>,
     h: H3Handle,
     reqs: HashMap<H3ReqId, EchoReq>,
     timers: HashMap<TimerId, H3ReqId>,
@@ -158,11 +162,18 @@ impl H3EchoServer {
         let h = H3Handle::default();
         let app = H3EchoServer {
             mode,
+            resp_headers: Vec::new(),
             h: h.clone(),
             reqs: HashMap::new(),
             timers: HashMap::new(),
         };
         (app, h)
+    }
+
+    /// Extra response headers (e.g. a section larger than xquic's old 32 KiB default).
+    pub fn with_response_headers(mut self, hs: Vec<(String, String)>) -> H3EchoServer {
+        self.resp_headers = hs;
+        self
     }
 
     fn respond(&mut self, cx: &mut Cx<'_>, r: H3ReqId) {
@@ -171,6 +182,7 @@ impl H3EchoServer {
         };
         q.responding = true;
         let mut hs = vec![(":status".to_owned(), "200".to_owned())];
+        hs.extend(self.resp_headers.iter().cloned());
         let cl = |n: u64| ("content-length".to_owned(), n.to_string());
         match self.mode {
             EchoMode::Echo => (q.resp, q.fin) = (std::mem::take(&mut q.body), true),
@@ -232,7 +244,10 @@ impl App for H3EchoServer {
             }
             Event::H3Readable(r) => {
                 let done = match self.reqs.get_mut(&r) {
-                    Some(q) if !q.responding => read_all(cx, r, &mut Vec::new(), &mut q.body),
+                    Some(q) if !q.responding => {
+                        let mut rec = self.h.lock();
+                        read_all(cx, r, &mut rec.request_headers, &mut q.body)
+                    }
                     _ => false,
                 };
                 if done {
@@ -240,10 +255,10 @@ impl App for H3EchoServer {
                 }
             }
             Event::H3Writable(r) => {
-                if let Some(q) = self.reqs.get_mut(&r).filter(|q| q.responding) {
-                    if q.sent < q.resp.len() {
-                        push(cx, r, &q.resp, &mut q.sent, q.fin);
-                    }
+                if let Some(q) = self.reqs.get_mut(&r).filter(|q| q.responding)
+                    && q.sent < q.resp.len()
+                {
+                    push(cx, r, &q.resp, &mut q.sent, q.fin);
                 }
             }
             Event::H3Closed(r, close) => {

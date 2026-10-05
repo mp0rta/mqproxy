@@ -18,61 +18,63 @@ pub(crate) struct Events {
 impl Events {
     /// spec §4.2: enqueue iff the slot is live, not abandoned and no readable is already queued.
     pub fn push_readable(&mut self, streams: &mut Slots<StreamSlot>, id: StreamId) {
-        if let Some(s) = streams.get_mut(id.slot()) {
-            if !s.abandoned && !s.readable_queued {
-                s.readable_queued = true;
-                self.queue.push_back(Event::StreamReadable(id));
-            }
+        if let Some(s) = streams.get_mut(id.slot())
+            && !s.abandoned
+            && !s.readable_queued
+        {
+            s.readable_queued = true;
+            self.queue.push_back(Event::StreamReadable(id));
         }
     }
 
     /// spec §4.2: as `push_readable`, with the writable flag.
     pub fn push_writable(&mut self, streams: &mut Slots<StreamSlot>, id: StreamId) {
-        if let Some(s) = streams.get_mut(id.slot()) {
-            if !s.abandoned && !s.writable_queued {
-                s.writable_queued = true;
-                self.queue.push_back(Event::StreamWritable(id));
-            }
+        if let Some(s) = streams.get_mut(id.slot())
+            && !s.abandoned
+            && !s.writable_queued
+        {
+            s.writable_queued = true;
+            self.queue.push_back(Event::StreamWritable(id));
         }
     }
 
     /// spec §4.2: enqueue iff the conn is live and no `MpReady` is already queued.
     pub fn push_mp_ready(&mut self, conns: &mut Slots<ConnSlot>, id: ConnId) {
-        if let Some(c) = conns.get_mut(id.slot()) {
-            if !c.mp_ready_queued {
-                c.mp_ready_queued = true;
-                self.queue.push_back(Event::MpReady(id));
-            }
+        if let Some(c) = conns.get_mut(id.slot())
+            && !c.mp_ready_queued
+        {
+            c.mp_ready_queued = true;
+            self.queue.push_back(Event::MpReady(id));
         }
     }
 
     /// SP2 spec §3.1: as `push_mp_ready`, with the datagram-readable flag.
     pub fn push_datagram_readable(&mut self, conns: &mut Slots<ConnSlot>, id: ConnId) {
-        if let Some(c) = conns.get_mut(id.slot()) {
-            if !c.dgram_readable_queued {
-                c.dgram_readable_queued = true;
-                self.queue.push_back(Event::DatagramReadable(id));
-            }
+        if let Some(c) = conns.get_mut(id.slot())
+            && !c.dgram_readable_queued
+        {
+            c.dgram_readable_queued = true;
+            self.queue.push_back(Event::DatagramReadable(id));
         }
     }
 
     /// spec §3.4: enqueue iff the request is live and no `H3Readable` is already queued.
     pub fn push_h3_readable(&mut self, reqs: &mut Slots<H3ReqSlot>, id: H3ReqId) {
-        if let Some(r) = reqs.get_mut(id.slot()) {
-            if !r.readable_queued {
-                r.readable_queued = true;
-                self.queue.push_back(Event::H3Readable(id));
-            }
+        if let Some(r) = reqs.get_mut(id.slot())
+            && !r.readable_queued
+        {
+            r.readable_queued = true;
+            self.queue.push_back(Event::H3Readable(id));
         }
     }
 
     /// spec §3.4: as `push_h3_readable`, with the writable flag.
     pub fn push_h3_writable(&mut self, reqs: &mut Slots<H3ReqSlot>, id: H3ReqId) {
-        if let Some(r) = reqs.get_mut(id.slot()) {
-            if !r.writable_queued {
-                r.writable_queued = true;
-                self.queue.push_back(Event::H3Writable(id));
-            }
+        if let Some(r) = reqs.get_mut(id.slot())
+            && !r.writable_queued
+        {
+            r.writable_queued = true;
+            self.queue.push_back(Event::H3Writable(id));
         }
     }
 

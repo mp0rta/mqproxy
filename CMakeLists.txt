@@ -427,9 +427,12 @@ if(XQUIC_BUILD_DIR AND EVENT_CORE_LIB)
         find_program(OPENSSL_BIN openssl REQUIRED)
         file(MAKE_DIRECTORY "${MQ_CERT_DIR}")
         message(STATUS "Generating MITM CA/leaf fixtures in ${MQ_CERT_DIR}")
-        # P-256 CA with basicConstraints CA:TRUE + keyUsage keyCertSign.
+        # P-256 CA with basicConstraints CA:TRUE + keyUsage keyCertSign. The key is
+        # PKCS#8 ("BEGIN PRIVATE KEY"): the Rust MITM loader accepts only PKCS#8
+        # (ecparam -genkey writes SEC1), and the C loader accepts both.
         execute_process(
-            COMMAND ${OPENSSL_BIN} ecparam -name prime256v1 -genkey -noout -out "${MQ_MITM_CA_KEY}"
+            COMMAND ${OPENSSL_BIN} genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256
+                    -out "${MQ_MITM_CA_KEY}"
             RESULT_VARIABLE _rc1 OUTPUT_QUIET ERROR_QUIET)
         execute_process(
             COMMAND ${OPENSSL_BIN} req -x509 -new -key "${MQ_MITM_CA_KEY}"

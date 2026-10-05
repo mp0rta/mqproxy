@@ -1,7 +1,7 @@
 //! The TCP socket table (spec §5.2, §5.4): app-owned sockets and relays.
 
 use super::{RELAY_BUF, Relay, ShardState, TCP_BUF};
-use crate::app::{Interest, IoRequest, PrereadTooLarge, SendBufFull, StreamPreread};
+use crate::app::{Interest, IoRequest, KeepAlive, PrereadTooLarge, SendBufFull, StreamPreread};
 use crate::ids::TcpId;
 use mq_transport_api::{ConnId, StreamId};
 
@@ -137,6 +137,11 @@ impl ShardState {
     pub(crate) fn tcp_set_nodelay(&mut self, tcp: TcpId) {
         if self.app_tcp(tcp).is_some() {
             self.push_request(IoRequest::TcpSetNodelay { tcp });
+        }
+    }
+    pub(crate) fn tcp_set_keepalive(&mut self, tcp: TcpId, ka: KeepAlive) {
+        if self.app_tcp(tcp).is_some() {
+            self.push_request(IoRequest::TcpSetKeepalive { tcp, ka });
         }
     }
     /// Graceful: closes now if nothing is queued, else once `tx` drains.

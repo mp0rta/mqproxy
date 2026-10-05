@@ -501,6 +501,32 @@ fn head_and_304_with_cl_finish_cleanly() {
     assert_eq!(p.join_both(), (0, 0));
 }
 
+/// SP4 spec §5: an origin answering with about 30 KiB of headers (five 6 KiB values, under
+/// `SECTION_MAX`) is relayed to the local caller; the fetch request itself stays small.
+#[test]
+fn fetch_30k_response_head_relayed() {
+    let value = "v".repeat(6 * 1024);
+    let mut reply = String::from("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n");
+    for i in 0..5 {
+        reply += &format!("x-big-{i}: {value}\r\n");
+    }
+    reply += "\r\nok";
+    let proto = Proto::RawH1 {
+        tls: false,
+        reply: reply.into_bytes(),
+    };
+    let origin = OriginServer::spawn(OriginServerMode::new(proto, Handler::Echo));
+    let p = gateway();
+    wait_up(&p);
+    let raw = fetch(&p, &format!("http://{}/big", origin.addr), &[], b"");
+    let r = parse(&raw.expect("fetch"));
+    assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
+    for i in 0..5 {
+        assert_eq!(r.header(&format!("x-big-{i}")), Some(value.as_str()), "{i}");
+    }
+    assert_eq!(p.join_both(), (0, 0));
+}
+
 /// spec §7.4, §10.3: `/a/../b` reaches the origin as `/b` (the query untouched).
 #[test]
 fn dot_segments_normalised_at_origin() {
@@ -514,10 +540,10 @@ fn dot_segments_normalised_at_origin() {
     assert_eq!(p.join_both(), (0, 0));
 }
 
-/// spec §7.4, §10.3: an empty forwarded `x-test:` is not sent, and an empty `accept:`
-/// suppresses the default `accept: */*`.
+/// SP4 spec §5: an empty forwarded `x-test:` is sent, and an empty `accept:`
+/// is sent and suppresses the default `accept: */*`.
 #[test]
-fn empty_header_not_sent_empty_accept_suppresses_default() {
+fn empty_header_sent_empty_accept_suppresses_default() {
     let o = Capture::spawn();
     let p = gateway();
     wait_up(&p);
@@ -526,8 +552,9 @@ fn empty_header_not_sent_empty_accept_suppresses_default() {
     assert_eq!(r.status, 200);
     let head = o.one().head;
     assert!(head.contains("\r\nx-kept: yes\r\n"), "{head}");
-    assert!(!head.contains("x-test"), "{head}");
-    assert!(!head.contains("\r\naccept:"), "{head}");
+    assert!(head.contains("\r\nx-test:"), "{head}");
+    assert!(head.contains("\r\naccept:"), "{head}");
+    assert!(!head.contains("*/*"), "{head}");
     assert_eq!(p.join_both(), (0, 0));
 }
 

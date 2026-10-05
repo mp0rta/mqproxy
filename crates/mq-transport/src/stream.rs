@@ -166,10 +166,10 @@ pub(crate) fn stream_recv(
     if r < 0 {
         return Err(stream_err(r));
     }
-    if fin != 0 {
-        if let Some(slot) = t.inner.streams.get_mut(s.slot()) {
-            slot.fin_seen = true;
-        }
+    if fin != 0
+        && let Some(slot) = t.inner.streams.get_mut(s.slot())
+    {
+        slot.fin_seen = true;
     }
     Ok((r as usize, fin != 0))
 }

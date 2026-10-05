@@ -9,7 +9,7 @@ use mq_runtime::testing::{
     Call, FakeIo, Op, RecordHandle, Recorded, RecordingApp, ScriptedHandle, ScriptedTransport,
 };
 use mq_runtime::{
-    AcceptMeta, Cx, DialError, DialOpId, Host, ListenerTag, Shard, Target, TcpEnd, TcpId,
+    AcceptMeta, Cx, DialError, DialOpId, Host, KeepAlive, ListenerTag, Shard, Target, TcpEnd, TcpId,
 };
 use mq_transport_api::{PathId, Time, TxKey};
 use std::io::{self, ErrorKind};
@@ -584,6 +584,38 @@ fn tcp_set_nodelay_reaches_the_socket() {
     h.act(|cx| cx.tcp_set_nodelay(tcp));
     h.it();
     assert!(h.ops().contains(&Op::SetNodelay(s)));
+}
+
+#[test]
+fn cx_tcp_set_keepalive_reaches_io() {
+    let mut h = setup();
+    let op = h.dial(ip([10, 0, 0, 1], 80), SEC);
+    h.it();
+    let s = h.io().connect_ok(op);
+    h.it();
+    let tcp = match h.dial_results()[..] {
+        [(o, Ok(t))] if o == op => t,
+        ref r => panic!("{r:?}"),
+    };
+    let ka = KeepAlive {
+        idle: SEC,
+        interval: SEC,
+        count: 3,
+        user_timeout: SEC,
+    };
+    h.ops();
+    h.act(|cx| cx.tcp_set_keepalive(tcp, ka));
+    h.it();
+    assert!(h.ops().contains(&Op::SetKeepalive(s, ka)));
+    h.act(|cx| {
+        cx.tcp_abort(tcp);
+        cx.tcp_set_keepalive(tcp, ka);
+    });
+    h.it();
+    assert!(
+        !h.ops().iter().any(|o| matches!(o, Op::SetKeepalive(..))),
+        "a stale id is ignored"
+    );
 }
 
 #[test]

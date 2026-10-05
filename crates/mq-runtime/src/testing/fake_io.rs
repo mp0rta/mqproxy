@@ -2,7 +2,7 @@
 //! connects (spec §8.1 "Scripted"). Never sleeps: with `auto_advance` on, a
 //! `wait(Until(t))` with nothing pending moves the clock to `t`.
 
-use crate::app::{AcceptMeta, IoResult};
+use crate::app::{AcceptMeta, IoResult, KeepAlive};
 use crate::driver::{
     Io, IoEvent, ListenerKey, RecvBatch, RecvMeta, RecvStop, SockKey, TcpSock, UdpSock, Wait,
 };
@@ -32,6 +32,7 @@ pub enum Op {
     OpenUdp(IpAddr),
     ShutdownWrite(TcpSock),
     SetNodelay(TcpSock),
+    SetKeepalive(TcpSock, KeepAlive),
     CloseTcp(TcpSock, bool),
     CloseUdp(UdpSock),
     SocketError(TcpSock),
@@ -453,6 +454,11 @@ impl Io for FakeIo {
 
     fn set_nodelay(&mut self, s: TcpSock) -> io::Result<()> {
         self.ops.push(Op::SetNodelay(s));
+        Ok(())
+    }
+
+    fn set_keepalive(&mut self, s: TcpSock, ka: KeepAlive) -> io::Result<()> {
+        self.ops.push(Op::SetKeepalive(s, ka));
         Ok(())
     }
 

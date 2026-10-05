@@ -11,10 +11,13 @@
 //! control stream is Connecting, with one but not `authed` is Authing.
 
 pub mod backoff;
+pub mod exchange;
 pub mod gateway;
 mod ingress_glue;
+pub mod mitm;
 mod paths;
 pub mod pending;
+pub mod tunnel_h3;
 mod udp_assoc;
 mod udp_session;
 
@@ -24,8 +27,10 @@ use crate::ingress::{INGRESS_CAP, socks5_assoc_reply, target_from_original_dst};
 use crate::metrics::format_metrics;
 use crate::udp::SessionEnd;
 use backoff::Backoff;
+use exchange::Exchanges;
 use gateway::Gateway;
 use ingress_glue::{Fed, Ingress, kind_of};
+use mitm::{Handoff, Mitm};
 use mq_runtime::{
     AcceptMeta, App, Cx, DialError, DialOpId, Host, ListenerTag, SocketOpId, StreamPreread, Target,
     TcpEnd, TcpId, TimerId, UdpSocketId,
@@ -40,6 +45,7 @@ use pending::{IngressKind, Pending, PendingOpen};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use tunnel_h3::H3Tunnel;
 use udp_assoc::Assoc;
 use udp_session::Sessions;
 
@@ -129,8 +135,22 @@ pub struct Client {
     assocs: HashMap<TcpId, Assoc>,
     /// SP2 spec §6.3: the UDP sessions.
     sess: Sessions,
-    /// SP3 spec §5: the fetch gateway, with its own H3 tunnel.
+    /// SP4 spec §3: the shared H3 tunnel (layer ③), created iff `--gateway`
+    /// or `--mitm`.
+    h3: Option<H3Tunnel>,
+    /// SP4 spec §2.2: the H3 requests of every front (layer ②).
+    ex: Exchanges<Owner>,
+    /// SP3 spec §5: the fetch gateway, over the H3 tunnel.
     gw: Option<Gateway>,
+    /// SP4 spec §7: the MITM front, over the H3 tunnel.
+    mitm: Option<Mitm>,
+}
+
+/// SP4 spec §2.2: the front an exchange belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Owner {
+    Fetch(TcpId),
+    Mitm(mitm::MStreamKey),
 }
 
 /// spec §6.2: truncate to the wire limit with a warning (C truncates silently).
@@ -207,7 +227,10 @@ impl Client {
             udp: UdpAvail::Unknown,
             assocs: HashMap::new(),
             sess: Sessions::new(),
+            h3: (cfg.gateway.is_some() || cfg.mitm.is_some()).then(|| H3Tunnel::new(&cfg)),
+            ex: Exchanges::new(),
             gw: cfg.gateway.map(|_| Gateway::new(&cfg)),
+            mitm: cfg.mitm.as_ref().map(|m| Mitm::new(m, &cfg.token)),
             cfg,
         }
     }
@@ -216,6 +239,18 @@ impl Client {
     #[cfg(feature = "test-support")]
     pub fn gateway(&self) -> Option<&Gateway> {
         self.gw.as_ref()
+    }
+
+    /// SP4 spec §3: the H3 tunnel's usable connection (`H3Tunnel::pick_conn`).
+    #[cfg(feature = "test-support")]
+    pub fn h3_tunnel_conn(&self) -> Option<ConnId> {
+        self.h3.as_ref().and_then(H3Tunnel::pick_conn)
+    }
+
+    /// SP4 spec §3: `H3Tunnel::gone`; `false` without a tunnel.
+    #[cfg(feature = "test-support")]
+    pub fn h3_tunnel_gone(&self) -> bool {
+        self.h3.as_ref().is_some_and(H3Tunnel::gone)
     }
 
     /// SP2 spec §6.3: the source an association locked.
@@ -439,6 +474,22 @@ impl Client {
         }
     }
 
+    /// SP4 spec §7.3 "Opaque" steps 2–3: the socket leaves the MITM front
+    /// for the raw tunnel; the peeked bytes in `rx` are relayed first.
+    fn handoff(&mut self, cx: &mut Cx<'_>, h: Option<Handoff>) {
+        if let Some(h) = h {
+            cx.tcp_set_read(h.tcp, false);
+            self.request(cx, h.tcp, IngressKind::Transparent, h.target);
+        }
+    }
+
+    /// SP4 spec §7.10: the `mq.mitm` line, after the tunnel's block.
+    fn log_mitm_metrics(&self) {
+        if let Some(l) = self.mitm.as_ref().and_then(Mitm::metrics_line) {
+            log::info!("{l}");
+        }
+    }
+
     /// spec §6.2 "Open": a data stream with the type byte and `CONNECT_TCP_REQUEST`.
     fn open(&mut self, cx: &mut Cx<'_>, conn: ConnId, tcp: TcpId, kind: IngressKind, t: &Target) {
         let s = match cx.open_stream(conn) {
@@ -579,9 +630,7 @@ impl Client {
 
     /// SP3 spec §5.9: shutting down, exit once both tunnels are gone (or never existed).
     fn maybe_exit(&self, cx: &mut Cx<'_>) {
-        if self.shutting_down
-            && self.conn.is_none()
-            && self.gw.as_ref().is_none_or(Gateway::tunnel_gone)
+        if self.shutting_down && self.conn.is_none() && self.h3.as_ref().is_none_or(H3Tunnel::gone)
         {
             cx.request_exit(0);
         }
@@ -605,20 +654,37 @@ impl App for Client {
         if self.cfg.has_tcp_ingress {
             self.connect(cx);
         }
-        if let Some(g) = self.gw.as_mut() {
-            g.on_start(cx);
+        if let Some(t) = self.h3.as_mut() {
+            t.on_start(cx);
         }
     }
 
     fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
-        // SP3 spec §5.8: the gateway's tunnel and every H3 event go to the gateway.
-        let ev = match self.gw.as_mut() {
-            Some(g) => match g.on_transport_event(cx, ev) {
+        // SP4 spec §2.2: the H3 tunnel's events, then the H3 request events,
+        // routed by the exchange's owner.
+        let mut ev = match self.h3.as_mut() {
+            Some(t) => match t.on_transport_event(cx, ev) {
                 Some(ev) => ev,
                 None => return self.maybe_exit(cx),
             },
             None => ev,
         };
+        if let Some((owner, _, ready)) = self.ex.on_event(&mut ev) {
+            match owner {
+                Owner::Fetch(tcp) => {
+                    if let Some(g) = self.gw.as_mut() {
+                        g.on_ready(cx, &mut self.ex, tcp, ready);
+                    }
+                }
+                Owner::Mitm(key) => {
+                    let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
+                    if let Some(m) = self.mitm.as_mut() {
+                        m.on_ready(cx, &mut self.ex, tunnel, key, ready);
+                    }
+                }
+            }
+            return self.maybe_exit(cx);
+        }
         match ev {
             Event::ConnEstablished(c) if self.current(c) => self.on_established(cx),
             // spec §6.5: the stats line is per ConnClosed; a synchronous
@@ -691,6 +757,11 @@ impl App for Client {
         if kind == IngressKind::Transparent {
             // spec §6.1: the target is the original destination, IPv4 only.
             return match target_from_original_dst(&meta) {
+                // SP4 spec §7.3: with `--mitm`, the front peeks first.
+                Some(t) if self.mitm.is_some() => {
+                    let h = self.mitm.as_mut().expect("checked").on_accepted(cx, tcp, t);
+                    self.handoff(cx, h);
+                }
                 Some(t) => {
                     cx.tcp_set_read(tcp, false);
                     self.request(cx, tcp, kind, t);
@@ -707,8 +778,13 @@ impl App for Client {
     }
 
     fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
-            return g.on_tcp_data(cx, tcp);
+            return g.on_tcp_data(cx, &mut self.ex, tunnel, tcp);
+        }
+        if let Some(m) = self.mitm.as_mut().filter(|m| m.owns_tcp(tcp)) {
+            let h = m.on_tcp_data(cx, &mut self.ex, tunnel, tcp);
+            return self.handoff(cx, h);
         }
         if self.assocs.contains_key(&tcp) {
             return discard(cx, tcp);
@@ -732,7 +808,12 @@ impl App for Client {
 
     fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
-            return g.on_tcp_end(cx, tcp, end);
+            return g.on_tcp_end(cx, &mut self.ex, tcp, end);
+        }
+        if let Some(m) = self.mitm.as_mut().filter(|m| m.owns_tcp(tcp)) {
+            let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
+            let h = m.on_tcp_end(cx, &mut self.ex, tunnel, tcp, end);
+            return self.handoff(cx, h);
         }
         if let Some(ing) = self.ingress.remove(&tcp) {
             self.cancel(cx, ing.timer);
@@ -770,7 +851,11 @@ impl App for Client {
 
     fn on_tcp_writable(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
         if let Some(g) = self.gw.as_mut().filter(|g| g.owns_tcp(tcp)) {
-            g.on_tcp_writable(cx, tcp);
+            return g.on_tcp_writable(cx, &mut self.ex, tcp);
+        }
+        if let Some(m) = self.mitm.as_mut().filter(|m| m.owns_tcp(tcp)) {
+            let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
+            m.on_tcp_writable(cx, &mut self.ex, tunnel, tcp);
         }
     }
 
@@ -796,11 +881,11 @@ impl App for Client {
     ) {
         let assoc = self.assocs.iter_mut().find(|(_, a)| a.open_op == Some(op));
         let Some((&tcp, a)) = assoc else {
-            // SP3 spec §5.7: the raw tunnel's paths first, then the gateway's;
+            // SP3 spec §5.7: the raw tunnel's paths first, then the H3 tunnel's;
             // an op owned by neither is closed by the raw `Paths`.
             if !self.paths.owns(op)
-                && let Some(g) = self.gw.as_mut()
-                && g.on_udp_socket(cx, op, r)
+                && let Some(t) = self.h3.as_mut()
+                && t.on_udp_socket(cx, op, r)
             {
                 return;
             }
@@ -835,12 +920,17 @@ impl App for Client {
 
     fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
         let Some(tm) = self.timers.remove(&id) else {
-            // A path retry of the raw tunnel, else the gateway's (SP3 spec §5.8).
+            // A path retry of the raw tunnel, else the H3 tunnel's, else the
+            // gateway's (SP3 spec §5.8), else the MITM front's (SP4 spec §2.2).
             let conn = self.conn.as_ref().filter(|c| !c.closing).map(|c| c.id);
-            if !self.paths.on_timer(cx, conn, id) {
-                if let Some(g) = self.gw.as_mut() {
-                    g.on_timer(cx, id);
-                }
+            if !self.paths.on_timer(cx, conn, id)
+                && !self.h3.as_mut().is_some_and(|t| t.on_timer(cx, id))
+                && !self.gw.as_mut().is_some_and(|g| g.on_timer(cx, id))
+                && let Some(m) = self.mitm.as_mut()
+            {
+                let tunnel = self.h3.as_ref().and_then(H3Tunnel::pick_conn);
+                let (_, h) = m.on_timer(cx, &mut self.ex, tunnel, id);
+                self.handoff(cx, h);
             }
             return;
         };
@@ -861,11 +951,12 @@ impl App for Client {
                     self.timer(cx, every, Tm::Metrics);
                 }
                 // spec §6.5: nothing without a connection, as C `cli_metrics_tick`;
-                // SP3 spec §5.7: then the gateway tunnel's block.
+                // SP3 spec §5.7: then the H3 tunnel's block.
                 self.dump_metrics(cx);
-                if let Some(g) = self.gw.as_ref() {
-                    g.dump_metrics(cx);
+                if let Some(t) = self.h3.as_ref() {
+                    t.dump_metrics(cx);
                 }
+                self.log_mitm_metrics();
             }
             Tm::Ingress(tcp) => {
                 if self.ingress.remove(&tcp).is_some() {
@@ -896,8 +987,16 @@ impl App for Client {
         }
         self.dump_metrics(cx);
         self.close(cx);
+        if let Some(t) = self.h3.as_mut() {
+            t.on_shutdown(cx);
+        }
+        self.log_mitm_metrics();
         if let Some(g) = self.gw.as_mut() {
-            g.on_shutdown(cx);
+            g.on_shutdown(cx, &mut self.ex);
+        }
+        // SP4 spec §7.9: exit does not wait for `Closing` conns.
+        if let Some(m) = self.mitm.as_mut() {
+            m.on_shutdown(cx, &mut self.ex);
         }
         // SP3 spec §5.9: replaces the early exit for "no raw conn".
         self.maybe_exit(cx);

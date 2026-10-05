@@ -23,6 +23,18 @@ pub enum ListenKind {
     Redirect,
     /// `getsockname`.
     Tproxy,
+    /// Tests: every accepted socket gets this original destination.
+    #[cfg(feature = "test-support")]
+    Fixed(SocketAddr),
+}
+
+/// SP4 spec §7.8: TCP keepalive for a long-lived app socket.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct KeepAlive {
+    pub idle: Duration,
+    pub interval: Duration,
+    pub count: u32,
+    pub user_timeout: Duration,
 }
 
 /// spec §5.2: what the driver knows about an accepted socket.
@@ -108,6 +120,11 @@ pub enum IoRequest {
     /// `TCP_NODELAY` on the socket (SP3: the origin bridge, libcurl parity).
     TcpSetNodelay {
         tcp: TcpId,
+    },
+    /// `SO_KEEPALIVE` and friends (SP4 spec §7.8: the MITM client socket).
+    TcpSetKeepalive {
+        tcp: TcpId,
+        ka: KeepAlive,
     },
     /// `abort`: `SO_LINGER` 0 then close, so the peer sees `ECONNRESET`.
     TcpClose {
@@ -436,6 +453,10 @@ impl<'a> Cx<'a> {
     /// Disables Nagle (`TCP_NODELAY`) on an app-owned socket; a stale id is ignored.
     pub fn tcp_set_nodelay(&mut self, tcp: TcpId) {
         self.st.tcp_set_nodelay(tcp)
+    }
+    /// Enables TCP keepalive on an app-owned socket; a stale id is ignored.
+    pub fn tcp_set_keepalive(&mut self, tcp: TcpId, ka: KeepAlive) {
+        self.st.tcp_set_keepalive(tcp, ka)
     }
 
     // --- Relay (spec §5.4, §5.6) ---

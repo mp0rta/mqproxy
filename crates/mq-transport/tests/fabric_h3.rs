@@ -595,6 +595,40 @@ fn h3_unread_headers_when_never_read() {
     assert_eq!(u.body, b"tail");
 }
 
+/// An empty `buf` reads nothing and reports the fin only once no body is
+/// buffered (the MITM terminal probe, SP4 R1); a separate empty FIN that is
+/// never read is rescued as an empty body, not `None`.
+#[test]
+fn h3_empty_buf_probe_and_unread_empty_fin_rescued() {
+    let probe = |p: &Pair, r| {
+        p.client
+            .call(p.now, move |t, now| t.h3_recv_body(now, r, &mut []))
+    };
+    let mut p = Pair::with(h3_opts(ConnProto::H3));
+    let (cr, sr) = respond(&mut p, b"", false);
+    assert_eq!(recv_headers(&p.client, p.now, cr), Ok((owned(RESP), false)));
+    assert_eq!(probe(&p, cr), Err(StreamError::Blocked));
+    assert_eq!(send_body(&p.server, p.now, sr, b"ab", false), Ok(2));
+    p.tick(Duration::ZERO);
+    assert_eq!(probe(&p, cr), Err(StreamError::Blocked), "bytes buffered");
+    assert_eq!(recv_body(&p.client, p.now, cr), Ok((b"ab".to_vec(), false)));
+    let fin = p.server.call(p.now, move |t, now| t.h3_finish(now, sr));
+    assert_eq!(fin, Ok(()));
+    p.tick(Duration::ZERO);
+    assert_eq!(probe(&p, cr), Ok((0, true)));
+
+    // The same empty FIN, never read: `H3Closed` rescues an empty body.
+    p.sev.clear();
+    let (cr, sr) = respond(&mut p, b"", false);
+    assert_eq!(recv_headers(&p.client, p.now, cr), Ok((owned(RESP), false)));
+    let fin = p.server.call(p.now, move |t, now| t.h3_finish(now, sr));
+    assert_eq!(fin, Ok(()));
+    p.tick(Duration::ZERO);
+    let u = wait_one(&mut p, true, cr).unread.expect("rescued");
+    assert_eq!(u.headers, None);
+    assert!(u.body.is_empty());
+}
+
 #[test]
 fn h3_server_never_rescues() {
     let mut p = Pair::with(h3_opts(ConnProto::H3));

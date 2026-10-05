@@ -7,4 +7,5 @@ pub mod config;
 pub mod ingress;
 pub mod metrics;
 pub mod server;
+pub mod tls_pipe;
 pub mod udp;

@@ -15,6 +15,9 @@ use xquic_sys::*;
 /// `idle` is the client's `--keepalive-idle`; the server passes `None`.
 /// spec §7: live skipped-id entries a peer may make xquic hold per connection.
 pub(crate) const MAX_IMPLICIT_STREAMS: u64 = 16384;
+/// SP4 spec §5: the H3 field-section limit on both engines (xquic's default is 32 KiB), with
+/// headroom above `mq_http::limits::SECTION_MAX`.
+pub const H3_FIELD_SECTION_MAX: usize = 64 * 1024;
 
 pub(crate) fn conn_settings(cfg: &TransportConfig, idle: Option<Duration>) -> xqc_conn_settings_t {
     let server = matches!(cfg.role, Role::Server { .. });
@@ -162,6 +165,9 @@ impl Transport {
                 if h3_on && xqc_h3_ctx_init(engine, &mut h3) != 0 {
                     xqc_engine_destroy(engine);
                     return ptr::null_mut();
+                }
+                if h3_on {
+                    xqc_h3_engine_set_max_field_section_size(engine, H3_FIELD_SECTION_MAX);
                 }
                 if let Some(s) = &settings {
                     xqc_server_set_conn_settings(engine, s);

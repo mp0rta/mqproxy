@@ -69,7 +69,7 @@ impl Fabric {
         for (rule, rng) in self.rules.iter_mut() {
             match rule {
                 Rule::DropEvery(n) => {
-                    if *n != 0 && self.pushed % u64::from(*n) == 0 {
+                    if *n != 0 && self.pushed.is_multiple_of(u64::from(*n)) {
                         return;
                     }
                 }

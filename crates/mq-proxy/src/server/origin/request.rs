@@ -5,7 +5,7 @@ use super::{OriginProto, Scheme, StartErr, StoredRequest, UploadBody};
 use http::Request;
 
 /// Origin-form for h1, absolute URI for h2; `host` first, empty-valued
-/// forwarded headers dropped, `accept: */*` unless present or suppressed,
+/// forwarded headers kept (empty ones too), `accept: */*` unless present or suppressed,
 /// `content-length` for a known length, `transfer-encoding: chunked` for an
 /// unknown length on h1 only. A residual build error is
 /// 502 `origin-start-failed` (§7.4): intake already validated every part.
@@ -26,7 +26,6 @@ pub(super) fn build_request(
     uri.extend(remove_dot_segments(path));
     uri.extend_from_slice(query);
 
-    let blank = |v: &[u8]| v.iter().all(|&b| b == b' ' || b == b'\t');
     let mut b = Request::builder()
         .method(req.method.as_bytes())
         .uri(uri)
@@ -39,7 +38,7 @@ pub(super) fn build_request(
     {
         b = b.header("accept", "*/*");
     }
-    for (n, v) in req.headers.iter().filter(|(_, v)| !blank(v)) {
+    for (n, v) in &req.headers {
         b = b.header(n.as_slice(), v.as_slice());
     }
     let buf = req.body.borrow();
@@ -128,7 +127,8 @@ mod tests {
     fn build_h1_origin_form_and_host_first() {
         let s = bodiless(stored("get", "/x?q=1", &[("user-agent", "t")]));
         let r = build_request(&s, OriginProto::H1).unwrap();
-        assert_eq!(r.method(), http::Method::GET);
+        // Case preserved: "get" is an extension method, not `Method::GET`.
+        assert_eq!(r.method().as_str(), "get");
         assert_eq!(r.uri().to_string(), "/x?q=1");
         assert_eq!(r.uri().scheme(), None);
         assert_eq!(names(&r), ["host", "accept", "user-agent"]);
@@ -165,21 +165,30 @@ mod tests {
     }
 
     #[test]
-    fn empty_value_header_dropped_and_suppresses_accept_default() {
+    fn empty_value_header_forwarded_and_suppresses_accept_default() {
         let s = bodiless(stored(
             "GET",
             "/",
             &[("x-a", ""), ("x-b", " \t "), ("x-c", "1")],
         ));
         let r = build_request(&s, OriginProto::H1).unwrap();
-        assert_eq!(names(&r), ["host", "accept", "x-c"]);
+        assert_eq!(names(&r), ["host", "accept", "x-a", "x-b", "x-c"]);
+        assert_eq!(r.headers()["x-a"], "");
+        assert_eq!(r.headers()["x-b"], " \t ");
         let s = bodiless(stored("GET", "/", &[("accept", "")]));
         let r = build_request(&s, OriginProto::H1).unwrap();
-        assert_eq!(
-            names(&r),
-            ["host"],
-            "an empty accept suppresses the default"
-        );
+        assert_eq!(names(&r), ["host", "accept"]);
+        assert_eq!(r.headers()["accept"], "", "forwarded, and no default");
+    }
+
+    #[test]
+    fn empty_header_value_forwarded() {
+        let s = bodiless(stored("GET", "/", &[("x-empty", "")]));
+        for proto in [OriginProto::H1, OriginProto::H2] {
+            let r = build_request(&s, proto).unwrap();
+            assert!(r.headers().contains_key("x-empty"));
+            assert_eq!(r.headers()["x-empty"], "");
+        }
     }
 
     #[test]

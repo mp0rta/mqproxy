@@ -1,6 +1,7 @@
 //! spec §6.4: the CLI flag table, in process through `cli::parse`; only the last
 //! three tests spawn the binary.
 
+use mq_proxy::client::mitm::MitmTuning;
 use mq_proxy::config::GatewayConfig;
 use mq_runtime::ListenKind;
 use mq_transport_api::{CongestionControl, Scheduler};
@@ -439,16 +440,164 @@ fn client_accepted_no_effect_flags() {
     assert_eq!(r, parse(CLIENT, &[]).unwrap());
 }
 
-/// spec §8: `--mitm` stays a startup error (SP4), with or without `--gateway`.
+/// `--tproxy` + `--mitm` + a staged P-256 CA (a test-unique 0600 dir), then `extra`.
+fn parse_mitm(test: &str, extra: &[&str]) -> Result<Resolved, Exit> {
+    let (c, k) = common::stage_ca(test, "ca-p256.crt", "ca-p256.key");
+    let argv = [
+        &[
+            "--tproxy",
+            "127.0.0.1:18443",
+            "--mitm",
+            "--ca-cert",
+            &c,
+            "--ca-key",
+            &k,
+        ][..],
+        extra,
+    ]
+    .concat();
+    parse(CLIENT, &argv)
+}
+
+/// spec §9: `--mitm` needs `--tproxy`, with or without another ingress.
 #[test]
-fn mitm_still_unavailable() {
-    for extra in [&["--mitm"][..], &["--gateway", "127.0.0.1:8081", "--mitm"]] {
-        let e = exit(parse(CLIENT, extra));
+fn mitm_without_tproxy_exit2() {
+    let (c, k) = common::stage_ca("no-tproxy", "ca-p256.crt", "ca-p256.key");
+    for extra in [&[][..], &["--gateway", "127.0.0.1:8081"]] {
+        let argv = [extra, &["--mitm", "--ca-cert", &c, "--ca-key", &k]].concat();
+        let e = exit(parse(CLIENT, &argv));
         assert_eq!(e.code, 2, "{extra:?}");
-        assert!(e.message.contains("--mitm"), "{}", e.message);
-        assert!(e.message.contains("not available"), "{}", e.message);
+        assert!(
+            e.message.contains("--mitm requires --tproxy"),
+            "{}",
+            e.message
+        );
         assert!(e.message.contains("Usage"), "{}", e.message);
     }
+}
+
+#[test]
+fn mitm_without_ca_exit2() {
+    let (c, k) = common::stage_ca("no-ca", "ca-p256.crt", "ca-p256.key");
+    for (extra, missing) in [
+        (vec![], "--ca-cert"),
+        (vec!["--ca-key", &k], "--ca-cert"),
+        (vec!["--ca-cert", &c], "--ca-key"),
+    ] {
+        let argv = [&["--tproxy", "127.0.0.1:2", "--mitm"][..], &extra].concat();
+        let e = exit(parse(CLIENT, &argv));
+        assert_eq!(e.code, 2, "{extra:?}");
+        assert!(e.message.contains(missing), "{}", e.message);
+    }
+}
+
+/// spec §7.1: the `CaError` message reaches the user (PKCS#1 → the openssl hint).
+#[test]
+fn mitm_bad_ca_exit2_names_error() {
+    let (c, k) = common::stage_ca("bad-ca", "ca-p256.crt", "key-rsa-pkcs1.pem");
+    let argv = [
+        "--tproxy",
+        "127.0.0.1:2",
+        "--mitm",
+        "--ca-cert",
+        &c,
+        "--ca-key",
+        &k,
+    ];
+    let e = exit(parse(CLIENT, &argv));
+    assert_eq!(e.code, 2);
+    assert!(
+        e.message
+            .contains("convert with: openssl pkcs8 -topk8 -nocrypt -in <key> -out <new>"),
+        "{}",
+        e.message
+    );
+    // A missing file is an error too, naming the path.
+    let argv = [
+        "--tproxy",
+        "127.0.0.1:2",
+        "--mitm",
+        "--ca-cert",
+        "/nope.crt",
+        "--ca-key",
+        &k,
+    ];
+    let e = exit(parse(CLIENT, &argv));
+    assert_eq!(e.code, 2);
+    assert!(e.message.contains("/nope.crt"), "{}", e.message);
+}
+
+#[test]
+fn mitm_invalid_ignore_entry_exit2_names_entry() {
+    for (flag, value) in [
+        ("--ignore-host", "bad host"),
+        ("--ignore-hosts", "ok.com,bad host"),
+    ] {
+        let e = exit(parse_mitm("bad-ignore", &[flag, value]));
+        assert_eq!(e.code, 2, "{flag}");
+        assert!(
+            e.message
+                .contains(r#"invalid IgnoreHosts entry "bad host""#),
+            "{}",
+            e.message
+        );
+    }
+}
+
+/// spec §9: `--mitm` is client-only; the server's parser does not know it.
+#[test]
+fn mitm_on_server_exit2() {
+    let e = exit(parse(SERVER, &["--mitm"]));
+    assert_eq!(e.code, 2);
+    assert!(e.message.contains("--mitm"), "{}", e.message);
+}
+
+/// A good CA + tproxy builds `config.mitm`; repeated and comma-split ignore
+/// flags (empty tokens skipped, as in C) are unioned.
+#[test]
+fn mitm_ok_builds_config() {
+    let r = parse_mitm(
+        "ok",
+        &[
+            "--ignore-host",
+            "a.org",
+            "--ignore-hosts",
+            "b.org,,.c.org,",
+            "--ignore-host",
+            "d.org",
+        ],
+    )
+    .unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let m = client(&r).config.mitm.as_ref().unwrap();
+    assert_eq!(m.ignore.len(), 4);
+    assert_eq!(m.tuning, MitmTuning::default());
+    assert_eq!(client(&r).tproxy, Some(addr("127.0.0.1:18443")));
+}
+
+/// spec §8: the MITM front rides the H3 tunnel, so `--mitm` alone wants the H3 layer.
+#[test]
+fn mitm_only_wants_h3() {
+    assert!(!cli::wants_h3(&parse(CLIENT, &[]).unwrap()));
+    let r = parse_mitm("wants-h3", &[]).unwrap();
+    assert!(client(&r).config.gateway.is_none());
+    assert!(cli::wants_h3(&r));
+}
+
+/// spec §9: CA and ignore flags without `--mitm` are accepted and do nothing.
+#[test]
+fn ca_flags_without_mitm_no_effect() {
+    let argv = [
+        "--ca-cert",
+        "/nope",
+        "--ca-key",
+        "/nope",
+        "--ignore-host",
+        "bad host",
+    ];
+    let r = parse(CLIENT, &argv).unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(client(&r).config.mitm.is_none());
 }
 
 /// The cache was removed: one warning, gateway on or off (it replaces C's
@@ -773,14 +922,20 @@ fn run(args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-/// spec §11.5: every C long option is listed; only `--mitm` still says "not
-/// available in this build", and no gateway flag carries an old SP1 marker.
+/// spec §9: `--mitm` lost its "(not available in this build)" marker.
+#[test]
+fn mitm_help_no_unavailable_marker() {
+    let out = run(&["client", "--help"]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("--mitm"), "{text}");
+    assert!(!text.contains("not available"), "{text}");
+}
+
+/// spec §11.5: every C long option is listed, and no flag carries an old SP1 marker.
 #[test]
 fn help_lists_every_longopt() {
-    for (sub, opts, unavailable) in [
-        ("server", SERVER_LONGOPTS, &[][..]),
-        ("client", CLIENT_LONGOPTS, &["--mitm"]),
-    ] {
+    for (sub, opts) in [("server", SERVER_LONGOPTS), ("client", CLIENT_LONGOPTS)] {
         let out = run(&[sub, "--help"]);
         assert_eq!(out.status.code(), Some(0));
         let text = String::from_utf8(out.stdout).unwrap();
@@ -812,13 +967,8 @@ fn help_lists_every_longopt() {
                 .map_or(entry.len(), |(i, _)| i);
             entry[..end].to_string()
         };
-        // The entry of each unavailable flag says so.
-        for flag in unavailable {
-            assert!(
-                entry(flag).contains("not available in this build"),
-                "{flag}"
-            );
-        }
+        // Nothing is "not available" any more (SP4 shipped `--mitm`).
+        assert!(!text.contains("not available in this build"), "{text}");
         for flag in [
             "--origin-ca",
             "--no-gateway",

@@ -1,4 +1,4 @@
-//! SP3 spec §7.1: hyper is polled from the shard — one `Dirty` waker per
+//! SP3 spec §7.1 / SP4 spec §2.1: hyper (and h2, rustls) is polled from the shard — one `Dirty` waker per
 //! `Origin` and a single-thread executor; no tokio task or channel.
 
 use std::cell::RefCell;
@@ -22,6 +22,11 @@ impl Dirty {
     /// Reads and clears the flag.
     pub fn take(&self) -> bool {
         self.0.swap(false, Ordering::Relaxed)
+    }
+
+    /// Reads the flag, leaving it as it is.
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -101,7 +106,7 @@ impl ShardExec {
         drop(s);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

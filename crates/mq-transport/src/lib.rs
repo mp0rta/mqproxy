@@ -10,6 +10,7 @@ mod clock;
 mod conn;
 mod datagram;
 mod engine;
+pub use engine::H3_FIELD_SECTION_MAX;
 mod events;
 mod ffi;
 mod h3;

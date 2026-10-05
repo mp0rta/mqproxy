@@ -207,10 +207,10 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
         let expired = self.deadlines.expire(now);
         for e in &expired {
             // The retry is a latch update: the accept below sees it.
-            if let Expired::ListenerRetry(lid) = e {
-                if let Some(&l) = self.listeners.get(lid) {
-                    self.set_lat(l.0, |l| l.readable = true);
-                }
+            if let Expired::ListenerRetry(lid) = e
+                && let Some(&l) = self.listeners.get(lid)
+            {
+                self.set_lat(l.0, |l| l.readable = true);
             }
         }
 
@@ -580,10 +580,10 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
                 self.held.push_back((op, r));
             }
             IoRequest::CancelUdpSocket { op } => {
-                if let Some(i) = self.held.iter().position(|h| h.0 == op) {
-                    if let Some((_, Ok((s, _)))) = self.held.remove(i) {
-                        self.io.close_udp(s);
-                    }
+                if let Some(i) = self.held.iter().position(|h| h.0 == op)
+                    && let Some((_, Ok((s, _)))) = self.held.remove(i)
+                {
+                    self.io.close_udp(s);
                 }
             }
             IoRequest::CloseUdpSocket { sock } => {
@@ -594,17 +594,24 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
                 }
             }
             IoRequest::TcpShutdownWrite { tcp } => {
-                if let Some(&s) = self.tcp.get(&tcp) {
-                    if let Err(e) = self.io.shutdown_write(s) {
-                        log::debug!("shutdown(SHUT_WR): {e}");
-                    }
+                if let Some(&s) = self.tcp.get(&tcp)
+                    && let Err(e) = self.io.shutdown_write(s)
+                {
+                    log::debug!("shutdown(SHUT_WR): {e}");
                 }
             }
             IoRequest::TcpSetNodelay { tcp } => {
-                if let Some(&s) = self.tcp.get(&tcp) {
-                    if let Err(e) = self.io.set_nodelay(s) {
-                        log::debug!("setsockopt(TCP_NODELAY): {e}");
-                    }
+                if let Some(&s) = self.tcp.get(&tcp)
+                    && let Err(e) = self.io.set_nodelay(s)
+                {
+                    log::debug!("setsockopt(TCP_NODELAY): {e}");
+                }
+            }
+            IoRequest::TcpSetKeepalive { tcp, ka } => {
+                if let Some(&s) = self.tcp.get(&tcp)
+                    && let Err(e) = self.io.set_keepalive(s, ka)
+                {
+                    log::debug!("setsockopt(SO_KEEPALIVE): {e}");
                 }
             }
             IoRequest::TcpClose { tcp, abort } => {

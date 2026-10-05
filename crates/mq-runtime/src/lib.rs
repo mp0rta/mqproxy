@@ -9,8 +9,8 @@ mod shard;
 pub mod testing;
 
 pub use app::{
-    AcceptMeta, App, Cx, DialError, Host, Interest, IoRequest, IoResult, ListenKind, ListenerTag,
-    PrereadTooLarge, SendBufFull, StreamPreread, Target, TcpEnd,
+    AcceptMeta, App, Cx, DialError, Host, Interest, IoRequest, IoResult, KeepAlive, ListenKind,
+    ListenerTag, PrereadTooLarge, SendBufFull, StreamPreread, Target, TcpEnd,
 };
 pub use ids::{DialOpId, ListenerId, SocketOpId, TcpId, TimerId, UdpSocketId};
 pub use shard::{

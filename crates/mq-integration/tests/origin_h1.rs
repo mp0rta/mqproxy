@@ -357,10 +357,11 @@ fn sixty_set_cookie_in_order() {
     assert_eq!(cookies, want);
 }
 
-/// The gateway's own 64-header cap (§6.4), well inside hyper's 256.
+/// The gateway's own 8192-byte field cap (SP4 spec §5), well inside hyper's
+/// 64 KiB buffer: one 9 KiB field is 502 `upstream-protocol`, not a hyper error.
 #[test]
-fn sixty_five_forwarded_headers_overflow() {
-    let srv = spawn(Proto::H1Plain, Handler::Headers(65, 8));
+fn h1_single_9k_field_overflows() {
+    let srv = spawn(Proto::H1Plain, Handler::HeaderListBytes(9 * 1024));
     let mut lp = plain_loop();
     let (_, o) = fetch(&mut lp, get(url(&srv, "/")));
     let f = o.failure();
@@ -380,15 +381,10 @@ fn head_257() -> (OriginLoop, OriginServer, Outcome) {
     (lp, srv, o)
 }
 
-/// hyper's h1 limits (`max_headers(256)`, `max_buf_size(64 KiB)`): 502
+/// hyper's own h1 header-count limit (`max_headers(COUNT_MAX)`): 502
 /// `upstream-protocol` through `is_parse_too_large`, not the gateway's cap.
-/// hyper checks `max_buf_size` only after a partial parse and its read buffer
-/// may overshoot it by one read: a 70 KiB head that arrives within one read
-/// is parsed whole, and the gateway's value cap trips instead (the same
-/// 502). Each read takes at most the 64 KiB pipe, so a head ≥ 128 KiB always
-/// passes a partial parse above 64 KiB: that one is hyper's, deterministically.
 #[test]
-fn h1_257_headers_or_70k_head_is_upstream_protocol() {
+fn h1_257_headers_hyper_parse_limit() {
     let (lp, _srv, o) = head_257();
     let f = o.failure();
     assert!(f.upstream_protocol && f.status == 502, "{f:?}");
@@ -396,7 +392,17 @@ fn h1_257_headers_or_70k_head_is_upstream_protocol() {
         lp.host().origin().error_classes(),
         [ErrClass::ParseTooLarge]
     );
+}
 
+/// hyper's h1 `max_buf_size(64 KiB)`: 502 `upstream-protocol` through
+/// `is_parse_too_large`, not the gateway's cap.
+/// hyper checks `max_buf_size` only after a partial parse and its read buffer
+/// may overshoot it by one read: a 70 KiB head that arrives within one read
+/// is parsed whole, and the gateway's field cap trips instead (the same
+/// 502). Each read takes at most the 64 KiB pipe, so a head ≥ 128 KiB always
+/// passes a partial parse above 64 KiB: that one is hyper's, deterministically.
+#[test]
+fn h1_70k_or_160k_head_is_upstream_protocol() {
     for (kib, hypers) in [(70, false), (160, true)] {
         let srv = spawn(Proto::H1Plain, Handler::HeaderListBytes(kib * 1024));
         let mut lp = plain_loop();

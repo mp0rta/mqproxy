@@ -109,12 +109,10 @@ fn socket_calls(oh: &mut OH, tcp: TcpId) -> usize {
         .count()
 }
 
-/// A response head with `n` forwarded headers (the gateway's cap is 64).
-fn head_with(n: usize) -> Vec<u8> {
+/// A response head with one `len`-byte field (the gateway's field cap is 8192).
+fn head_with(len: usize) -> Vec<u8> {
     let mut h = b"HTTP/1.1 200 OK\r\n".to_vec();
-    for i in 0..n {
-        h.extend(format!("x-h{i}: v\r\n").bytes());
-    }
+    h.extend(format!("x-big: {}\r\n", "v".repeat(len)).bytes());
     h.extend(b"content-length: 2\r\n\r\nok");
     h
 }
@@ -272,7 +270,7 @@ fn h1_ended_unreleased_is_class_e_at_settling() {
 fn h1_rejected_response_conn_not_pooled_class_c() {
     let mut oh = oh();
     let (h3, tcp, conn) = plain(&mut oh, get("http://o.test/"));
-    oh.tcp_in(tcp, &head_with(65));
+    oh.tcp_in(tcp, &head_with(9 * 1024));
     let f = failures(&oh);
     assert!(
         f.len() == 1 && f[0].0 == h3 && f[0].1.upstream_protocol,

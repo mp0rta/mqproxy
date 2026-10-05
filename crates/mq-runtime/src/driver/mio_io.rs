@@ -7,7 +7,7 @@ use super::io::{
     Io, IoEvent, ListenerKey, RecvBatch, RecvMeta, RecvStop, Resolver, SockKey, TcpSock, UdpSock,
     Wait,
 };
-use crate::app::{AcceptMeta, IoResult, ListenKind};
+use crate::app::{AcceptMeta, IoResult, KeepAlive, ListenKind};
 use crate::ids::DialOpId;
 use mio::net::TcpStream;
 use mio::unix::SourceFd;
@@ -491,6 +491,8 @@ impl Io for MioIo {
                 .inspect_err(|e| log::debug!("SO_ORIGINAL_DST: {e}"))
                 .ok(),
             ListenKind::Tproxy => Some(local),
+            #[cfg(feature = "test-support")]
+            ListenKind::Fixed(a) => Some(a),
         };
         let key = self.insert(Sock::Tcp(TcpStream::from_std(s)))?;
         Ok((
@@ -616,13 +618,21 @@ impl Io for MioIo {
         }
     }
 
+    fn set_keepalive(&mut self, s: TcpSock, ka: KeepAlive) -> io::Result<()> {
+        let Some(t) = self.tcp(s) else {
+            return Err(ErrorKind::NotConnected.into());
+        };
+        let secs = |d: Duration| d.as_secs().min(u32::MAX as u64) as u32;
+        let ms = ka.user_timeout.as_millis().min(u32::MAX as u128) as u32;
+        mq_linux::set_keepalive(t, secs(ka.idle), secs(ka.interval), ka.count, ms)
+    }
+
     fn close_tcp(&mut self, s: TcpSock, abort: bool) {
-        if let Some(Sock::Tcp(t) | Sock::Connecting(_, t)) = self.remove(s.0) {
-            if abort {
-                if let Err(e) = mq_linux::set_linger_zero(&t) {
-                    log::debug!("SO_LINGER: {e}");
-                }
-            }
+        if let Some(Sock::Tcp(t) | Sock::Connecting(_, t)) = self.remove(s.0)
+            && abort
+            && let Err(e) = mq_linux::set_linger_zero(&t)
+        {
+            log::debug!("SO_LINGER: {e}");
         }
     }
 
@@ -919,6 +929,51 @@ mod tests {
         );
         io.set_nodelay(s).unwrap();
         assert!(io.tcp(s).unwrap().nodelay().unwrap());
+    }
+
+    #[test]
+    fn set_keepalive_ok_on_connected_socket() {
+        let mut io = MioIo::new(Arc::new(super::super::io::StdResolver), false).unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let op = DialOpId::from_slot(mq_transport_api::SlotId::new(1, 1)).unwrap();
+        io.start_connect(op, l.local_addr().unwrap());
+        let deadline = io.now() + std::time::Duration::from_secs(10);
+        let s = loop {
+            assert!(io.now() < deadline, "no Connected within 10 s");
+            let ev = io.wait(Wait::Until(deadline));
+            if let Some(s) = ev.into_iter().find_map(|e| match e {
+                IoEvent::Connected { r, .. } => Some(r.unwrap()),
+                _ => None,
+            }) {
+                break s;
+            }
+        };
+        let d = std::time::Duration::from_secs;
+        let ka = crate::KeepAlive {
+            idle: d(60),
+            interval: d(10),
+            count: 3,
+            user_timeout: d(90),
+        };
+        io.set_keepalive(s, ka).unwrap();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn fixed_listen_kind_stamps_original_dst() {
+        let mut io = MioIo::new(Arc::new(super::super::io::StdResolver), false).unwrap();
+        let fixed: std::net::SocketAddr = "203.0.113.7:443".parse().unwrap();
+        let l = mq_linux::TcpListenerBuilder::new(
+            "127.0.0.1:0".parse::<std::net::SocketAddrV4>().unwrap(),
+        )
+        .build()
+        .unwrap();
+        let addr = l.local_addr().unwrap();
+        let l = io.add_listener(l, ListenKind::Fixed(fixed)).unwrap();
+        let _c = std::net::TcpStream::connect(addr).unwrap();
+        let (_, meta) = io.accept(l).unwrap();
+        assert_eq!(meta.original_dst, Some(fixed));
+        assert_eq!(meta.local, addr);
     }
 
     #[test]

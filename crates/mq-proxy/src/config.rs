@@ -1,9 +1,14 @@
 //! spec §6.2, §6.3, §6.5: client and server settings; the CLI maps onto these (Task 9.1).
 
+use crate::client::mitm::MitmTuning;
+use crate::client::mitm::ca::Ca;
+use crate::client::mitm::policy::IgnoreHosts;
 use crate::udp::DEFAULT_IDLE;
 use mq_transport_api::Scheduler;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// spec §6.2: client settings.
@@ -41,6 +46,8 @@ pub struct ClientConfig {
     /// SP3 spec §5.7: a TCP ingress (`--socks5` / `--http-connect` / `--tproxy`)
     /// is configured, so the raw tunnel is created (C `need_client`).
     pub has_tcp_ingress: bool,
+    /// SP4 spec §9: `--mitm` with its CA and IgnoreHosts.
+    pub mitm: Option<MitmConfig>,
 }
 
 impl Default for ClientConfig {
@@ -60,6 +67,7 @@ impl Default for ClientConfig {
             ingress_deadline: Duration::from_secs(10),
             gateway: None,
             has_tcp_ingress: true,
+            mitm: None,
         }
     }
 }
@@ -120,5 +128,93 @@ impl Default for ServerConfig {
             udp_idle_timeout: DEFAULT_IDLE,
             gateway: None,
         }
+    }
+}
+
+/// SP4 spec §9: the MITM front's settings, present iff `--mitm`.
+#[derive(Clone)]
+pub struct MitmConfig {
+    pub ca: Arc<Ca>,
+    pub ignore: IgnoreHosts,
+    pub tuning: MitmTuning,
+}
+
+// Redacted: the CA key never reaches a log line.
+impl fmt::Debug for MitmConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MitmConfig")
+            .field("ca", &self.ca.subject)
+            .field("ignore", &format_args!("{} entries", self.ignore.len()))
+            .field("tuning", &self.tuning)
+            .finish()
+    }
+}
+
+// The CA compares by identity: one load is one CA.
+impl PartialEq for MitmConfig {
+    fn eq(&self, o: &Self) -> bool {
+        Arc::ptr_eq(&self.ca, &o.ca) && self.ignore == o.ignore && self.tuning == o.tuning
+    }
+}
+impl Eq for MitmConfig {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::mitm::ca::tests::stage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn ca() -> Arc<Ca> {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let d = stage(&format!("cfg{n}"), &["ca-p256.crt", "ca-p256.key"]);
+        let ca = Ca::load(&d.join("ca-p256.crt"), &d.join("ca-p256.key")).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        Arc::new(ca)
+    }
+
+    fn cfg(ca: Arc<Ca>) -> MitmConfig {
+        MitmConfig {
+            ca,
+            ignore: IgnoreHosts::parse(["a.test", ".b.test"]).unwrap(),
+            tuning: MitmTuning::default(),
+        }
+    }
+
+    #[test]
+    fn mitm_config_debug_redacts_key() {
+        let c = cfg(ca());
+        assert_eq!(
+            format!("{c:?}"),
+            format!(
+                "MitmConfig {{ ca: \"CN=mqproxy test ca-p256\", ignore: 2 entries, tuning: {:?} }}",
+                c.tuning
+            )
+        );
+        let client = ClientConfig {
+            mitm: Some(c),
+            ..ClientConfig::default()
+        };
+        assert!(
+            format!("{client:?}")
+                .contains("mitm: Some(MitmConfig { ca: \"CN=mqproxy test ca-p256\", ignore")
+        );
+        assert_eq!(ClientConfig::default().mitm, None);
+    }
+
+    #[test]
+    fn mitm_config_eq_by_arc() {
+        let a = ca();
+        let c = cfg(a.clone());
+        assert_eq!(c, c.clone());
+        assert_eq!(c, cfg(a.clone()));
+        // The same files loaded twice are two CAs.
+        assert_ne!(c, cfg(ca()));
+        let mut d = cfg(a.clone());
+        d.ignore = IgnoreHosts::default();
+        assert_ne!(c, d);
+        let mut d = cfg(a);
+        d.tuning.max_conns = 1;
+        assert_ne!(c, d);
     }
 }

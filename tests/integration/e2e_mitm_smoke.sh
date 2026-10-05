@@ -15,12 +15,23 @@
 #     - "ALPN protocol: h2"            (h2 was negotiated)
 #     - "Verify return code: 0 (ok)"   (the forged leaf chains to the CA we trust)
 #
+# TWO MODES:
+#   * C helper (default; used by CTest): mitm_smoke_server terminates one connection.
+#   * Rust binary (MQPROXY_RUST_BIN set): `mqproxy server` (gateway on) + `mqproxy
+#     client --tproxy ... --mitm` with an nft REDIRECT for one unused destination
+#     port; s_client connects to that port and is captured. Needs root + NET_ADMIN
+#     + nft. The client's --tproxy-uid is a uid nobody runs, so root's s_client
+#     is captured (the default exempts the client's own uid, i.e. root).
+#
 # ENV (passed by CMake; overridable):
-#   MITM_SERVER_BIN   the mitm_smoke_server helper binary.
+#   MITM_SERVER_BIN   the mitm_smoke_server helper binary (C mode).
+#   MQPROXY_RUST_BIN  the Rust `mqproxy` binary (selects the Rust mode).
+#   MQPROXY_CERT/KEY  tunnel TLS cert/key for the Rust server (default tests/certs/test.*).
 #   MITM_CA_CRT/KEY   the MITM CA cert/key (configure-time fixtures).
 #
-# SKIP semantics: exit 77 ONLY when `openssl` is absent. Any assertion failure is
-# a hard failure (non-zero, not 77).
+# SKIP semantics: exit 77 when `openssl` is absent, or (Rust mode) when root/nft/
+# NET_ADMIN/python3 is missing. Any assertion failure is a hard failure (non-zero,
+# not 77).
 #
 set -u
 
@@ -36,11 +47,26 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 MITM_SERVER_BIN="${MITM_SERVER_BIN:-${REPO_ROOT}/build/mitm_smoke_server}"
+RUST_BIN="${MQPROXY_RUST_BIN:-}"
+MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
+MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 MITM_CA_CRT="${MITM_CA_CRT:-${REPO_ROOT}/tests/certs/mitm-ca.crt}"
 MITM_CA_KEY="${MITM_CA_KEY:-${REPO_ROOT}/tests/certs/mitm-ca.key}"
 
 # ── pre-flight (real errors, not skips) ──────────────────────────────────────
-if [ ! -x "${MITM_SERVER_BIN}" ]; then
+if [ -n "${RUST_BIN}" ]; then
+    if [ ! -x "${RUST_BIN}" ]; then
+        note "ERROR: Rust binary not found/executable: ${RUST_BIN}"
+        exit 1
+    fi
+    if [ "$(id -u)" -ne 0 ] || ! command -v nft >/dev/null 2>&1 \
+        || ! command -v python3 >/dev/null 2>&1 \
+        || ! nft add table ip mqproxy_probe 2>/dev/null; then
+        note "SKIP: Rust mode needs root + CAP_NET_ADMIN + nft + python3."
+        exit "${SKIP}"
+    fi
+    nft delete table ip mqproxy_probe 2>/dev/null || true
+elif [ ! -x "${MITM_SERVER_BIN}" ]; then
     note "ERROR: helper not found/executable: ${MITM_SERVER_BIN} (build mitm_smoke_server)."
     exit 1
 fi
@@ -54,9 +80,9 @@ done
 # ── free-port selection ──────────────────────────────────────────────────────
 free_port() {
     if command -v python3 >/dev/null 2>&1; then
-        python3 - <<'PY'
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        python3 - "${1:-tcp}" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if sys.argv[1] == "udp" else socket.SOCK_STREAM)
 s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()
@@ -68,7 +94,7 @@ PY
     fi
 }
 
-PORT="$(free_port)"
+PORT="$(free_port tcp)"
 if [ -z "${PORT}" ]; then
     note "ERROR: free-port selection failed."
     exit 1
@@ -77,15 +103,31 @@ fi
 # ── workspace + cleanup ──────────────────────────────────────────────────────
 WORK="$(mktemp -d /tmp/mqproxy_e2e_mitm_smoke.XXXXXX)"
 SERVER_PID=""
+CLIENT_PID=""
 
 cleanup() {
     rc=$?
     set +e
+    # Client first: SIGTERM lets it remove its nft table (--setup-redirect).
+    if [ -n "${CLIENT_PID}" ]; then
+        kill -TERM "${CLIENT_PID}" 2>/dev/null
+        for _ in $(seq 1 30); do
+            kill -0 "${CLIENT_PID}" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL "${CLIENT_PID}" 2>/dev/null
+        wait "${CLIENT_PID}" 2>/dev/null
+        nft delete table ip mqproxy 2>/dev/null
+    fi
     if [ -n "${SERVER_PID}" ]; then
         kill -KILL "${SERVER_PID}" 2>/dev/null
         wait "${SERVER_PID}" 2>/dev/null
     fi
     if [ "${rc}" -ne 0 ] && [ "${rc}" -ne "${SKIP}" ]; then
+        if [ -s "${WORK}/client.log" ]; then
+            note "──── client.log (tail) ────"
+            tail -n 40 "${WORK}/client.log" | sed 's/^/  client| /' >&2
+        fi
         if [ -s "${WORK}/server.log" ]; then
             note "──── server.log ────"
             sed 's/^/  server| /' "${WORK}/server.log" >&2
@@ -101,30 +143,68 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── launch the single-shot helper ────────────────────────────────────────────
-note "launching helper on 127.0.0.1:${PORT} ..."
-"${MITM_SERVER_BIN}" "${MITM_CA_CRT}" "${MITM_CA_KEY}" "${PORT}" \
-    >"${WORK}/server.log" 2>&1 &
-SERVER_PID=$!
-
-# ── wait for the listener to be ready (retry-connect, not a fixed sleep) ──────
-ready=0
-for _ in $(seq 1 100); do
-    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-        note "ERROR: helper exited before becoming ready; see ${WORK}/server.log:"
-        sed 's/^/  server| /' "${WORK}/server.log" >&2 2>/dev/null
+if [ -n "${RUST_BIN}" ]; then
+    # ── Rust mode: server + MITM client + nft REDIRECT for one unused port ────
+    QUIC_PORT="$(free_port udp)"
+    PORT="$(free_port tcp)"     # the redirected destination: nothing listens here
+    TPROXY_PORT="$(free_port tcp)"
+    while [ "${TPROXY_PORT}" = "${PORT}" ]; do TPROXY_PORT="$(free_port tcp)"; done
+    # The key must be owned by the running uid with mode 0600 (Rust loader gate).
+    cp "${MITM_CA_CRT}" "${WORK}/ca.crt" && cp "${MITM_CA_KEY}" "${WORK}/ca.key" \
+        && chmod 600 "${WORK}/ca.crt" "${WORK}/ca.key" || { note "ERROR: staging CA failed."; exit 1; }
+    note "launching Rust server (udp ${QUIC_PORT}) + MITM client (tproxy ${TPROXY_PORT}, dport ${PORT}) ..."
+    "${RUST_BIN}" server --listen "127.0.0.1:${QUIC_PORT}" --token smoke-token \
+        --cert "${MQPROXY_CERT}" --key "${MQPROXY_KEY}" >"${WORK}/server.log" 2>&1 &
+    SERVER_PID=$!
+    "${RUST_BIN}" client --server "127.0.0.1:${QUIC_PORT}" --token smoke-token \
+        --tproxy "127.0.0.1:${TPROXY_PORT}" --tproxy-mode redirect \
+        --tproxy-dport "${PORT}" --setup-redirect --tproxy-uid 65433 \
+        --mitm --ca-cert "${WORK}/ca.crt" --ca-key "${WORK}/ca.key" \
+        >"${WORK}/client.log" 2>&1 &
+    CLIENT_PID=$!
+    ready=0
+    for _ in $(seq 1 120); do
+        if ! kill -0 "${SERVER_PID}" 2>/dev/null || ! kill -0 "${CLIENT_PID}" 2>/dev/null; then
+            note "ERROR: server or client exited during startup."
+            exit 1
+        fi
+        if grep -q "tunnel conn established" "${WORK}/client.log" 2>/dev/null \
+            && grep -q "REDIRECT rules installed" "${WORK}/client.log" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "${ready}" -ne 1 ]; then
+        note "ERROR: Rust client did not become ready within timeout."
         exit 1
     fi
-    # The helper prints "LISTENING" once it has bound+listen()ed.
-    if grep -q "LISTENING" "${WORK}/server.log" 2>/dev/null; then
-        ready=1
-        break
+else
+    # ── launch the single-shot helper ────────────────────────────────────────────
+    note "launching helper on 127.0.0.1:${PORT} ..."
+    "${MITM_SERVER_BIN}" "${MITM_CA_CRT}" "${MITM_CA_KEY}" "${PORT}" \
+        >"${WORK}/server.log" 2>&1 &
+    SERVER_PID=$!
+
+    # ── wait for the listener to be ready (retry-connect, not a fixed sleep) ──────
+    ready=0
+    for _ in $(seq 1 100); do
+        if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+            note "ERROR: helper exited before becoming ready; see ${WORK}/server.log:"
+            sed 's/^/  server| /' "${WORK}/server.log" >&2 2>/dev/null
+            exit 1
+        fi
+        # The helper prints "LISTENING" once it has bound+listen()ed.
+        if grep -q "LISTENING" "${WORK}/server.log" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "${ready}" -ne 1 ]; then
+        note "ERROR: helper did not become ready within timeout."
+        exit 1
     fi
-    sleep 0.1
-done
-if [ "${ready}" -ne 1 ]; then
-    note "ERROR: helper did not become ready within timeout."
-    exit 1
 fi
 
 # ── drive openssl s_client (cross-impl TLS client) ───────────────────────────
@@ -141,10 +221,13 @@ timeout 20 openssl s_client \
     -CAfile "${MITM_CA_CRT}" \
     </dev/null >"${SCLIENT_OUT}" 2>&1 || true
 
-# Reap the single-shot helper now that the connection is done.
-wait "${SERVER_PID}" 2>/dev/null
-helper_rc=$?
-SERVER_PID=""
+# Reap the single-shot helper now that the connection is done (C mode only).
+helper_rc=0
+if [ -z "${RUST_BIN}" ]; then
+    wait "${SERVER_PID}" 2>/dev/null
+    helper_rc=$?
+    SERVER_PID=""
+fi
 
 # ── assertions ───────────────────────────────────────────────────────────────
 fail=0
@@ -164,7 +247,7 @@ else
 fi
 
 # Defensive: confirm the helper itself reported a clean ALPN=h2 termination.
-if ! grep -q "ALPN=h2" "${WORK}/server.log" 2>/dev/null; then
+if [ -z "${RUST_BIN}" ] && ! grep -q "ALPN=h2" "${WORK}/server.log" 2>/dev/null; then
     note "WARN: helper did not log ALPN=h2 (rc=${helper_rc}); see server.log."
 fi
 

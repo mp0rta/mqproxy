@@ -20,6 +20,7 @@ harness = [
     "dep:h2",
     "dep:rustls",
     "dep:tokio-rustls",
+    "dep:socket2",
     "mq-proxy/test-support",
     "mq-runtime/test-support",
     "mq-transport/test-support",
@@ -44,6 +45,9 @@ rustls = { workspace = true, optional = true }
 # Without default features: they enable aws-lc-rs next to ring, and rustls's
 # default-provider selection then panics.
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+
+# The dual-stack origin listener (IPV6_V6ONLY off); already in the lock via tokio.
+socket2 = { version = "0.6", optional = true }
 
 [dev-dependencies]
 mq-integration = { path = ".", features = ["harness"] }

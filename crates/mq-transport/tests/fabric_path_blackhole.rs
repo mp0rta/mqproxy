@@ -32,7 +32,7 @@ fn run_blackholed(p: &mut Pair, dead: std::net::SocketAddr, dur: Duration) {
     let mut step = 0u32;
     while p.now < end {
         p.now = p.now + Duration::from_millis(50);
-        if step % 4 == 0 {
+        if step.is_multiple_of(4) {
             let _ = send(&p.client, p.now, s, vec![0u8; 100], false);
         }
         step += 1;

@@ -65,32 +65,31 @@ echo "$out" | grep -q -- "--socks5" || fail "no-ingress error missing '--socks5'
 echo "$out" | grep -q -- "--http-connect" || fail "no-ingress error missing '--http-connect'"
 echo "$out" | grep -q -- "--gateway" || fail "no-ingress error missing '--gateway'"
 
-# ── MITM fail-closed validation (Slice 3 Task 15) ─────────────────────────────
-# These run before any bind/CA load, so they're privilege-free regardless of
-# whether the binary was built with or without BoringSSL: a no-archive build
-# hard-errors "built without BoringSSL"; an archive build hits the
-# --tproxy/--ca-cert/--ca-key requirements. Either way the exit is non-zero.
+# ── MITM fail-closed validation ───────────────────────────────────────────────
+# These run before any bind or CA file read, so they are privilege-free.
 
-# --mitm with a non-tproxy ingress (gateway) must be rejected (requires --tproxy,
-# or unavailable on a no-archive build).
+# --mitm with a non-tproxy ingress (gateway) must be rejected: it requires --tproxy.
 out=$("$BIN" client --server 127.0.0.1:4433 --token t --gateway 127.0.0.1:8080 --mitm 2>&1)
 rc=$?
 [ "$rc" -ne 0 ] || fail "--mitm without --tproxy exited 0 (want non-zero)"
+echo "$out" | grep -q -- "--tproxy" || fail "--mitm-without-tproxy error missing '--tproxy'"
 
-# --mitm + --tproxy but no CA must be rejected (requires --ca-cert/--ca-key, or
-# unavailable on a no-archive build).
+# --mitm + --tproxy but no CA must be rejected: it requires --ca-cert/--ca-key.
 out=$("$BIN" client --server 127.0.0.1:4433 --token t --tproxy 127.0.0.1:18443 --mitm 2>&1)
 rc=$?
 [ "$rc" -ne 0 ] || fail "--mitm without CA exited 0 (want non-zero)"
-# On an archive build this names the missing CA flags; tolerate the no-archive
-# "built without BoringSSL" message by only asserting the error mentions mitm.
-echo "$out" | grep -qi -- "mitm" || fail "--mitm-without-CA error missing 'mitm'"
+echo "$out" | grep -q -- "--ca-cert" || fail "--mitm-without-CA error missing '--ca-cert'"
 
-# --mitm is a CLIENT-only flag; the server subcommand must reject it (unknown
-# option) — getopt_long has no --mitm in the server longopts.
+# --mitm is a CLIENT-only flag; the server subcommand must reject it (unknown option).
 "$BIN" server --mitm >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] || fail "server --mitm exited 0 (want non-zero; --mitm is client-only)"
+
+# --help no longer marks --mitm as unavailable.
+out=$("$BIN" client --help 2>&1)
+if echo "$out" | grep -q "not available"; then
+    fail "'client --help' still says 'not available'"
+fi
 
 # ── unknown subcommand: non-zero exit ─────────────────────────────────────────
 "$BIN" bogus-subcommand >/dev/null 2>&1
