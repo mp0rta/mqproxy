@@ -15,6 +15,7 @@ fn cfg(role: Role) -> TransportConfig {
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
         h3: false,
+        qlog: None,
     }
 }
 
@@ -67,13 +68,26 @@ fn close_then_drop_does_not_destroy_twice() {
 }
 
 #[test]
-fn enable_qlog_opens_role_file() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("enable_qlog_opens_role_file");
+fn qlog_opens_role_file_at_creation() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("qlog_opens_role_file_at_creation");
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("client.qlog");
     std::fs::write(&file, b"stale").unwrap();
-    let mut t = Transport::new(cfg(Role::Client)).unwrap();
-    assert_eq!(t.enable_qlog(&dir).unwrap(), file);
+    let t = Transport::new(TransportConfig {
+        qlog: Some(dir.clone()),
+        ..cfg(Role::Client)
+    })
+    .unwrap();
     assert_eq!(std::fs::metadata(&file).unwrap().len(), 0, "O_TRUNC");
     t.close(Time(1));
+    // An unopenable file fails creation and frees the thread claim.
+    let bad = Some(dir.join("missing-subdir"));
+    assert!(matches!(
+        Transport::new(TransportConfig {
+            qlog: bad,
+            ..cfg(Role::Client)
+        }),
+        Err(Error::Qlog(_))
+    ));
+    Transport::new(cfg(Role::Client)).unwrap().close(Time(1));
 }

@@ -38,7 +38,7 @@ pub struct Opts {
     /// Client local addresses (path k uses `cli_addr(k)`).
     pub paths: usize,
     pub idle: Option<Duration>,
-    /// Client qlog directory, enabled before `connect`.
+    /// Client qlog directory, opened at creation.
     pub qlog: Option<PathBuf>,
     /// Client connection protocol.
     pub proto: ConnProto,
@@ -81,12 +81,13 @@ impl Pair {
     /// Spawns both peers and completes the handshake at `T0`.
     pub fn with(o: Opts) -> Pair {
         let server = Peer::spawn(o.server, vec![srv_addr()]);
-        let client = Peer::spawn(o.client, (0..o.paths).map(cli_addr).collect());
-        if let Some(dir) = o.qlog {
-            client
-                .call(T0, move |t, _| t.enable_qlog(&dir))
-                .expect("enable_qlog");
-        }
+        let client = Peer::spawn(
+            TransportConfig {
+                qlog: o.qlog,
+                ..o.client
+            },
+            (0..o.paths).map(cli_addr).collect(),
+        );
         let mut cc = conn_cfg(o.idle);
         cc.proto = o.proto;
         let conn = client

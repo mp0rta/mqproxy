@@ -260,6 +260,7 @@ mod tests {
             cc: CongestionControl::Bbr,
             realtime_offset_us: 0,
             h3: true,
+            qlog: None,
         })
         .expect("transport");
         let cc = ConnConfig {

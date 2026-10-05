@@ -8,7 +8,7 @@ use mq_proxy::server::origin::{build_client_config, native_roots};
 use mq_proxy::{client, client::Client, server::Server};
 use mq_runtime::driver::{Driver, DriverConfig, StdResolver};
 use mq_runtime::{App, ListenKind, Shard};
-use mq_transport::Transport;
+use mq_transport::{Error, Transport};
 use mq_transport_api::{CongestionControl, Role, Scheduler, Time, TransportConfig};
 use std::cell::Cell;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -73,7 +73,7 @@ fn transport(r: &Resolved, role: Role, max_conns: u32, err: String) -> Result<Tr
     } else {
         "server"
     };
-    let mut t = Transport::new(TransportConfig {
+    let t = Transport::new(TransportConfig {
         role,
         alpn: "mqproxy-tcp/1",
         max_conns,
@@ -81,13 +81,19 @@ fn transport(r: &Resolved, role: Role, max_conns: u32, err: String) -> Result<Tr
         cc: r.cc,
         realtime_offset_us: realtime_offset_us(),
         h3: cli::wants_h3(r),
+        qlog: r.qlog.clone(),
     })
-    .map_err(|e| format!("{err} ({e:?})"))?;
+    .map_err(|e| match (&e, &r.qlog) {
+        (Error::Qlog(_), Some(dir)) => {
+            format!("failed to enable qlog in {} ({e:?})", dir.display())
+        }
+        _ => format!("{err} ({e:?})"),
+    })?;
     if let Some(dir) = &r.qlog {
-        let p = t
-            .enable_qlog(dir)
-            .map_err(|e| format!("failed to enable qlog in {} ({e:?})", dir.display()))?;
-        log::info!("{name} qlog -> {}", p.display());
+        log::info!(
+            "{name} qlog -> {}",
+            dir.join(format!("{name}.qlog")).display()
+        );
     }
     Ok(t)
 }

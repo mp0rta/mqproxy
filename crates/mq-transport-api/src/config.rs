@@ -18,6 +18,9 @@ pub struct TransportConfig {
     pub realtime_offset_us: i64,
     /// Register the H3 context (spec §3.1).
     pub h3: bool,
+    /// Write `<dir>/{client,server}.qlog`, opened (truncated) at creation. xquic formats qlog
+    /// events only when this is set (spec §4.9).
+    pub qlog: Option<PathBuf>,
 }
 
 /// Client or server; the server needs a cert and key (spec §4.2).

@@ -7,7 +7,6 @@ use core::ptr;
 use mq_transport_api::{CongestionControl, Role, Scheduler, Time, TransportConfig};
 use std::ffi::CString;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 use xquic_sys::*;
 
@@ -68,7 +67,7 @@ fn server_settings(cfg: &TransportConfig) -> xqc_conn_settings_t {
 
 /// xquic's default engine config with the fields this tree pins. The log level stays WARN:
 /// `xqc_h3_request_close` reads a destroyed request in a DEBUG log (spec §3.1).
-fn engine_config(ty: xqc_engine_type_t) -> Option<xqc_config_t> {
+fn engine_config(ty: xqc_engine_type_t, qlog: bool) -> Option<xqc_config_t> {
     // SAFETY: a plain C struct; xquic fills it.
     let mut config: xqc_config_t = unsafe { core::mem::zeroed() };
     // SAFETY: `config` outlives the call.
@@ -76,9 +75,10 @@ fn engine_config(ty: xqc_engine_type_t) -> Option<xqc_config_t> {
         return None;
     }
     config.cfg_log_level = XQC_LOG_WARN;
-    // As mq_transport_new: event qlog at EXTRA importance (also xquic's defaults, pinned so a
-    // fork default change cannot silently drop events).
-    config.cfg_log_event = 1;
+    // Event qlog at EXTRA importance, but only with a qlog file: xquic formats every event
+    // before the sink can drop it, and conns copy this flag at creation, so it is fixed here.
+    // Pinned rather than left to xquic's defaults so a fork default change cannot drop events.
+    config.cfg_log_event = qlog.into();
     config.cfg_qlog_importance = EVENT_IMPORTANCE_EXTRA;
     Some(config)
 }
@@ -102,6 +102,14 @@ impl Transport {
         let mut t = Transport {
             inner: Box::new(Inner::new(cfg, alpn)),
         };
+        if let Some(dir) = &t.inner.cfg.qlog {
+            let name = match t.inner.cfg.role {
+                Role::Client => "client.qlog",
+                Role::Server { .. } => "server.qlog",
+            };
+            t.inner.qlog = Some(std::fs::File::create(dir.join(name)).map_err(Error::Qlog)?);
+        }
+        let qlog_on = t.inner.qlog.is_some();
         let (server, cert, key) = match &t.inner.cfg.role {
             Role::Client => (false, None, None),
             Role::Server { cert, key } => (
@@ -126,7 +134,7 @@ impl Transport {
             // strings, the callback tables and the ALPN registration (xqc_engine.c). Engine user
             // data is SlotId::NONE (= null, spec §4.8): callbacks find Inner via clock::current().
             unsafe {
-                let Some(config) = engine_config(ty) else {
+                let Some(config) = engine_config(ty, qlog_on) else {
                     return ptr::null_mut();
                 };
                 let mut ssl: xqc_engine_ssl_config_t = core::mem::zeroed();
@@ -185,18 +193,6 @@ impl Transport {
     /// Destroys the engine under the clock guard (spec §4.2).
     pub fn close(mut self, now: Time) {
         self.destroy(now);
-    }
-
-    /// Opens `<dir>/{client,server}.qlog`, truncated; the sink registered at creation starts
-    /// writing to it (spec §4.9).
-    pub fn enable_qlog(&mut self, dir: &Path) -> Result<PathBuf, Error> {
-        let name = match self.inner.cfg.role {
-            Role::Client => "client.qlog",
-            Role::Server { .. } => "server.qlog",
-        };
-        let path = dir.join(name);
-        self.inner.qlog = Some(std::fs::File::create(&path).map_err(Error::Qlog)?);
-        Ok(path)
     }
 
     fn destroy(&mut self, now: Time) {
@@ -301,6 +297,7 @@ mod tests {
             cc,
             realtime_offset_us: 0,
             h3: false,
+            qlog: None,
         }
     }
 
@@ -388,10 +385,20 @@ mod tests {
     #[test]
     fn engine_config_pins_log_level_warn() {
         for ty in [XQC_ENGINE_CLIENT, XQC_ENGINE_SERVER] {
-            let c = engine_config(ty).expect("default config");
+            let c = engine_config(ty, true).expect("default config");
             assert_eq!(c.cfg_log_level, XQC_LOG_WARN);
             assert_eq!(c.cfg_log_event, 1);
             assert_eq!(c.cfg_qlog_importance, EVENT_IMPORTANCE_EXTRA);
+        }
+    }
+
+    /// Without a qlog file xquic must not format qlog events at all: formatting them only to
+    /// drop them cost ~40% of a saturated server core on the WAN bench (2026-10-05).
+    #[test]
+    fn engine_config_formats_qlog_events_only_with_a_qlog_file() {
+        for ty in [XQC_ENGINE_CLIENT, XQC_ENGINE_SERVER] {
+            assert_eq!(engine_config(ty, false).unwrap().cfg_log_event, 0);
+            assert_eq!(engine_config(ty, true).unwrap().cfg_log_event, 1);
         }
     }
 

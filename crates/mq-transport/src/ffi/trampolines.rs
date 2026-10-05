@@ -924,6 +924,7 @@ mod tests {
                 cc: CongestionControl::Bbr,
                 realtime_offset_us: 0,
                 h3: false,
+                qlog: None,
             },
             CString::new("mqproxy-tcp/1").unwrap(),
         )
