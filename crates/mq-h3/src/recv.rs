@@ -92,7 +92,7 @@ impl<T: TransportOps> H3Wire<T> {
                     if let Some(b) = req.pending_block.take() {
                         conn.h3.release(b);
                     }
-                    req.carry = Vec::new();
+                    req.carry.clear();
                     req.carry_fin = false;
                     // Aborted: a later StreamClosed is not a peer reset to pass on.
                     req.reset_code_pending = false;
@@ -138,10 +138,10 @@ impl<T: TransportOps> H3Wire<T> {
                 return Ok(0);
             }
             if req.carry.is_empty() && !req.carry_fin {
-                req.carry.resize(cap, 0);
-                match self.inner.stream_recv(now, req.stream, &mut req.carry) {
+                let buf = req.carry.start_read(cap);
+                match self.inner.stream_recv(now, req.stream, buf) {
                     Ok((n, fin)) => {
-                        req.carry.truncate(n);
+                        req.carry.filled(n);
                         req.carry_fin = fin;
                         req.fin_read = fin;
                         if n == 0 && !fin {
@@ -161,33 +161,37 @@ impl<T: TransportOps> H3Wire<T> {
             let Some(conn) = self.conns.get_mut(&req.conn) else {
                 return Err(StreamError::Conn);
             };
-            let (consumed, body) = match conn.h3.recv(Q(req.quic_id), &req.carry[..len], fin) {
-                Err(e) => {
-                    log::debug!("h3wire: {e}");
-                    req.carry = Vec::new(); // never fed again
-                    return Err(StreamError::Conn);
-                }
-                Ok(Recv::Paused) => return Ok(0),
-                Ok(Recv::Body { consumed, range }) => (consumed, Some(range)),
-                Ok(
-                    Recv::Consumed(n)
-                    | Recv::Frame { consumed: n, .. }
-                    | Recv::Raw { consumed: n, .. },
-                ) => (n, None),
-            };
+            let (consumed, body) =
+                match conn
+                    .h3
+                    .recv(Q(req.quic_id), &req.carry.pending()[..len], fin)
+                {
+                    Err(e) => {
+                        log::debug!("h3wire: {e}");
+                        req.carry.clear(); // never fed again
+                        return Err(StreamError::Conn);
+                    }
+                    Ok(Recv::Paused) => return Ok(0),
+                    Ok(Recv::Body { consumed, range }) => (consumed, Some(range)),
+                    Ok(
+                        Recv::Consumed(n)
+                        | Recv::Frame { consumed: n, .. }
+                        | Recv::Raw { consumed: n, .. },
+                    ) => (n, None),
+                };
             let mut n = 0;
             if let Some(range) = body {
                 // The range lies inside a slice of at most `buf.len()` bytes.
                 match out.as_deref_mut() {
                     Some(buf) => {
                         n = range.len();
-                        buf[..n].copy_from_slice(&req.carry[range]);
+                        buf[..n].copy_from_slice(&req.carry.pending()[range]);
                     }
                     None => debug_assert!(false, "the bootstrap never produces body bytes"),
                 }
             }
             let fin_fed = fin && consumed == len;
-            req.carry.drain(..consumed);
+            req.carry.consume(consumed);
             req.carry_fin &= !fin_fed;
             // An abort by this feed (malformed, content-length, no final response) gets its
             // retirement read here: raw xquic does not re-notify for bytes it already

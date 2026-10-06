@@ -12,6 +12,52 @@ pub(crate) enum Terminal {
     Aborted { code: H3Code, source: AbortSource },
 }
 
+/// The raw bytes read from the transport and not yet consumed by h3wire.
+#[derive(Default)]
+pub(crate) struct Carry {
+    buf: Vec<u8>,
+    off: usize,
+}
+
+impl Carry {
+    /// The unconsumed bytes.
+    pub(crate) fn pending(&self) -> &[u8] {
+        &self.buf[self.off..]
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len() - self.off
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.buf = Vec::new();
+        self.off = 0;
+    }
+
+    /// A `cap`-byte buffer to read into; the carry must be empty. Call `filled` after.
+    pub(crate) fn start_read(&mut self, cap: usize) -> &mut [u8] {
+        self.buf.clear();
+        self.off = 0;
+        self.buf.resize(cap, 0);
+        &mut self.buf
+    }
+
+    pub(crate) fn filled(&mut self, n: usize) {
+        self.buf.truncate(n);
+    }
+
+    pub(crate) fn consume(&mut self, n: usize) {
+        // No mid-buffer compaction: the carry is refilled only once empty (`start_read`
+        // resets it), so the buffer never outgrows one read.
+        self.off += n;
+        debug_assert!(self.off <= self.buf.len());
+    }
+}
+
 pub(crate) struct Req {
     pub(crate) conn: ConnId,
     pub(crate) stream: StreamId,
@@ -34,7 +80,7 @@ pub(crate) struct Req {
     /// FIN is fed, so a complete message stays complete (adoption spec §5.3 (7)).
     pub(crate) reset_deferred: Option<u64>,
     /// Raw bytes read and not consumed by h3wire; never parsed payload.
-    pub(crate) carry: Vec<u8>,
+    pub(crate) carry: Carry,
     /// The transport reported FIN after the carry; not yet fed.
     pub(crate) carry_fin: bool,
     /// The transport receive side was read to its end (FIN or `Err(Reset)`): no
@@ -84,7 +130,7 @@ impl Req {
             handed: false,
             reset_code_pending: false,
             reset_deferred: None,
-            carry: Vec::new(),
+            carry: Carry::default(),
             carry_fin: false,
             fin_read: false,
             stream_closed: false,
@@ -148,4 +194,30 @@ impl Req {
 /// The request id is the request stream's slot (adoption spec §4.1).
 pub(crate) fn req_id(s: StreamId) -> H3ReqId {
     H3ReqId::from_slot(s.slot()).expect("a live slot has a nonzero generation")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Carry;
+
+    /// Tiny frames consume the carry in O(1) each: the remaining bytes never move.
+    #[test]
+    fn consume_never_moves_the_rest() {
+        let mut c = Carry::default();
+        c.start_read(16 * 1024).fill(7);
+        let base = c.pending().as_ptr();
+        for i in 0..16 * 1024 - 1 {
+            c.consume(1);
+            assert_eq!(
+                c.pending().as_ptr(),
+                base.wrapping_add(i + 1),
+                "moved at {i}"
+            );
+        }
+        assert_eq!(c.len(), 1);
+        c.consume(1);
+        assert!(c.is_empty());
+        c.start_read(8).fill(1);
+        assert_eq!(c.pending(), [1; 8], "refill after drain starts clean");
+    }
 }
