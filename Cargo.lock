@@ -378,6 +378,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3wire"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -524,6 +531,17 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mq-h3"
+version = "0.0.4"
+dependencies = [
+ "h3wire",
+ "log",
+ "mq-runtime",
+ "mq-transport-api",
+ "proptest",
 ]
 
 [[package]]
