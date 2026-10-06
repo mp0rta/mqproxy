@@ -25,8 +25,7 @@ pub enum Event {
     StreamPeerReset(StreamId, u64),
     /// The peer's STOP_SENDING code; once, raw-H3 conns only (adoption spec §3).
     StreamStopSending(StreamId, u64),
-    /// H3-proto conns only (`ConnProto::H3`; equivalent to raw-H3 today, since xqc_h3-backend
-    /// conns never reach the raw stream-close path): directly before that stream's
+    /// H3-proto conns only (`ConnProto::H3`): directly before that stream's
     /// `StreamClosed`, never dropped (adoption spec §3).
     StreamCloseStats(StreamId, Box<StreamCloseStats>),
     /// "A path can be created now"; may repeat.
@@ -84,17 +83,6 @@ pub struct StreamCloseStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct H3Close {
     pub stats: H3ReqStats,
-    /// Present iff the app had not yet consumed the request's fin AND the drain inside
-    /// the close notification ended with xquic's `fin` set (a complete body); a partial
-    /// body (idle timeout, CONNECTION_CLOSE, reset, local close) is never rescued (§3.7).
-    pub unread: Option<Unread>,
-}
-
-/// What the close-time drain read; the fin is implied (spec §3.1).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Unread {
-    pub headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
-    pub body: Vec<u8>,
 }
 
 /// Facade request metadata (spec §3.1).

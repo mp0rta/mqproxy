@@ -6,12 +6,12 @@ use mq_runtime::{
     AcceptMeta, App, Cx, DialError, DialOpId, ListenerTag, SocketOpId, TcpEnd, TcpId, TimerId,
     UdpSocketId,
 };
-use mq_transport_api::{ConnConfig, ConnId, ConnProto, Event, H3Close, H3Header, H3ReqId};
+use mq_transport_api::{ConnConfig, ConnProto, Event, H3Close, H3Header, H3ReqId};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// What an app observed.
 #[derive(Debug, Default)]
@@ -26,10 +26,6 @@ pub struct H3Recorded {
     pub request_headers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Every `H3Closed`, with its arrival time.
     pub closed: Vec<(H3Close, Instant)>,
-    /// `ResetBeforeFin` / `CloseConnMidResponse`: when the server cut the response, and the
-    /// connection's srtt then.
-    pub cut_at: Option<Instant>,
-    pub srtt_us: u64,
 }
 
 /// `Clone + Send` view of an app's `H3Recorded`.
@@ -116,19 +112,12 @@ pub enum EchoMode {
     /// The request body + FIN.
     #[default]
     Echo,
-    /// The request body without FIN, then (100 ms later) `h3_reset`.
-    ResetBeforeFin,
-    /// The request body without FIN, then (100 ms later) `close_conn` (CONNECTION_CLOSE 0).
-    CloseConnMidResponse,
     /// `content-length: cl` over a complete `sent`-byte DATA frame + FIN.
     ShortCl { cl: u64, sent: usize },
 }
 
-const CUT_DELAY: Duration = Duration::from_millis(100);
-
 #[derive(Default)]
 struct EchoReq {
-    conn: Option<ConnId>,
     body: Vec<u8>,
     resp: Vec<u8>,
     sent: usize,
@@ -143,7 +132,6 @@ pub struct H3EchoServer {
     resp_headers: Vec<(String, String)>,
     h: H3Handle,
     reqs: HashMap<H3ReqId, EchoReq>,
-    timers: HashMap<TimerId, H3ReqId>,
 }
 
 impl H3EchoServer {
@@ -154,7 +142,6 @@ impl H3EchoServer {
             resp_headers: Vec::new(),
             h: h.clone(),
             reqs: HashMap::new(),
-            timers: HashMap::new(),
         };
         (app, h)
     }
@@ -175,10 +162,6 @@ impl H3EchoServer {
         let cl = |n: u64| ("content-length".to_owned(), n.to_string());
         match self.mode {
             EchoMode::Echo => (q.resp, q.fin) = (std::mem::take(&mut q.body), true),
-            EchoMode::ResetBeforeFin | EchoMode::CloseConnMidResponse => {
-                q.resp = std::mem::take(&mut q.body);
-                self.timers.insert(cx.set_timer(CUT_DELAY), r);
-            }
             EchoMode::ShortCl { cl: n, sent } => {
                 hs.push(cl(n));
                 (q.resp, q.fin) = (vec![b'x'; sent], true);
@@ -189,37 +172,16 @@ impl H3EchoServer {
             push(cx, r, &q.resp, &mut q.sent, q.fin);
         }
     }
-
-    fn cut(&mut self, cx: &mut Cx<'_>, r: H3ReqId) {
-        let Some(conn) = self.reqs.get(&r).and_then(|q| q.conn) else {
-            return;
-        };
-        let srtt = cx
-            .conn_stats(conn)
-            .map_or(0, |s| s.paths.iter().map(|p| p.srtt_us).max().unwrap_or(0));
-        {
-            let mut rec = self.h.lock();
-            rec.cut_at = Some(Instant::now());
-            rec.srtt_us = srtt;
-        }
-        if self.mode == EchoMode::ResetBeforeFin {
-            cx.h3_reset(r);
-        } else {
-            cx.close_conn(conn);
-        }
-    }
 }
 
 impl App for H3EchoServer {
+    fn on_timer(&mut self, _: &mut Cx<'_>, _: TimerId) {}
     fn on_start(&mut self, _: &mut Cx<'_>) {}
 
     fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
         match ev {
-            Event::H3Request(c, r) => {
-                let q = EchoReq {
-                    conn: Some(c),
-                    ..EchoReq::default()
-                };
+            Event::H3Request(_, r) => {
+                let q = EchoReq::default();
                 self.reqs.insert(r, q);
                 self.h.lock().requests += 1;
             }
@@ -250,12 +212,6 @@ impl App for H3EchoServer {
         }
     }
 
-    fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
-        if let Some(r) = self.timers.remove(&id) {
-            self.cut(cx, r);
-        }
-    }
-
     no_io!();
 }
 
@@ -265,9 +221,6 @@ pub struct H3Script {
     pub headers: Vec<(String, String)>,
     /// Sent with FIN (on the headers when empty).
     pub body: Vec<u8>,
-    /// On the first `H3Readable`, read nothing for this long (reading the FIN would set
-    /// `fin_consumed` and nothing would be rescued, spec §3.3), then read everything.
-    pub pause_reads: Option<Duration>,
 }
 
 /// An `App` that connects (H3) to `peer` on start, sends its one scripted request once the
@@ -278,7 +231,6 @@ pub struct H3Client {
     h: H3Handle,
     req: Option<H3ReqId>,
     sent: usize,
-    held: bool,
 }
 
 impl H3Client {
@@ -290,7 +242,6 @@ impl H3Client {
             h: h.clone(),
             req: None,
             sent: 0,
-            held: false,
         };
         (app, h)
     }
@@ -329,25 +280,13 @@ impl App for H3Client {
                 self.send(cx, r);
             }
             Event::H3Writable(r) => self.send(cx, r),
-            Event::H3Readable(r) => {
-                if let Some(d) = self.s.pause_reads.take() {
-                    self.held = true;
-                    cx.set_timer(d);
-                } else if !self.held {
-                    self.read(cx, r);
-                }
-            }
+            Event::H3Readable(r) => self.read(cx, r),
             Event::H3Closed(_, close) => self.h.lock().closed.push((*close, Instant::now())),
             _ => {}
         }
     }
 
-    fn on_timer(&mut self, cx: &mut Cx<'_>, _: TimerId) {
-        self.held = false;
-        if let Some(r) = self.req {
-            self.read(cx, r);
-        }
-    }
+    fn on_timer(&mut self, _: &mut Cx<'_>, _: TimerId) {}
 
     no_io!();
 }

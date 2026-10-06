@@ -1,6 +1,6 @@
 //! SP3 spec §5.5 the fetch request's ends (the finish write order with
-//! rescued leftovers, `H3Closed` after `ConnClosed`, abort), §5.9 shutdown,
-//! and §5.7 the metrics tick's two blocks. The stale readiness, rescue,
+//! pending output, `H3Closed` after `ConnClosed`, abort), §5.9 shutdown,
+//! and §5.7 the metrics tick's two blocks. The stale readiness,
 //! body check and early-response rules are the core's, tested in
 //! `client_exchange.rs` (SP4 spec §4.3).
 
@@ -11,7 +11,7 @@ use mq_proxy::config::ClientConfig;
 use mq_runtime::testing::{Call, log_capture};
 use mq_runtime::{IoRequest, IoResult, TcpId};
 use mq_transport_api::{
-    CloseReason, ConnId, ConnStats, ErrType, Event, H3Close, H3ReqId, H3ReqStats, PathStats, Unread,
+    CloseReason, ConnId, ConnStats, ErrType, Event, H3Close, H3ReqId, H3ReqStats, PathStats,
 };
 use std::io;
 use std::time::Duration;
@@ -59,8 +59,8 @@ fn body(h: &mut H, r: H3ReqId, bytes: &[u8], fin: bool) {
     h.drive();
 }
 
-/// `H3Closed` for `r` with `unread`, then let the client run.
-fn closed(h: &mut H, r: H3ReqId, unread: Option<Unread>) {
+/// `H3Closed` for `r`, then let the client run.
+fn closed(h: &mut H, r: H3ReqId) {
     let stats = H3ReqStats {
         send_body: 0,
         recv_body: 0,
@@ -72,15 +72,8 @@ fn closed(h: &mut H, r: H3ReqId, unread: Option<Unread>) {
         stream_err: 0,
         close_msg: None,
     };
-    h.t.close_h3(r, H3Close { stats, unread });
+    h.t.close_h3(r, H3Close { stats });
     h.drive();
-}
-
-fn unread(headers: Option<&[(&str, &str)]>, body: &[u8]) -> Option<Unread> {
-    Some(Unread {
-        headers: headers.map(hs),
-        body: body.to_vec(),
-    })
 }
 
 fn resets(h: &H, r: H3ReqId) -> usize {
@@ -119,17 +112,15 @@ const UPSTREAM_RESET: &[u8] =
     b"HTTP/1.1 502 \r\nX-Mq-Error: upstream-reset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 #[test]
-fn finish_write_order_pending_src_terminator_close() {
+fn finish_write_order_pending_terminator_close() {
     // Review Focus 2: a consumer > 3 PTO behind a completed download.
     let (mut h, tcp, r) = open();
     respond(&mut h, r, &[(":status", "200")], false);
     let first = pattern(4 * 16_384, 0);
-    body(&mut h, r, &first, false); // the fourth frame is stuck (`SendBufFull`)
-    let rescued = pattern(100 * 1024, 7);
-    closed(&mut h, r, unread(None, &rescued));
+    body(&mut h, r, &first, true); // the fourth frame is stuck (`SendBufFull`)
+    closed(&mut h, r);
     let mut want = HEAD_CHUNKED.to_vec();
     want.extend(chunked(&first));
-    want.extend(chunked(&rescued));
     want.extend_from_slice(b"0\r\n\r\n");
     let mut out = Vec::new();
     for _ in 0..16 {
@@ -141,21 +132,7 @@ fn finish_write_order_pending_src_terminator_close() {
         }
     }
     assert_eq!(out.len(), want.len());
-    assert!(out == want, "pending, then rescued frames, then terminator");
-    assert!(!owned(&h, tcp));
-    assert_eq!(resets(&h, r), 0);
-}
-
-/// A rescue that arrives before the head: the core serves head and body,
-/// the front renders head, chunked body and terminator.
-#[test]
-fn finish_from_unread_src() {
-    let (mut h, tcp, r) = open();
-    closed(&mut h, r, unread(Some(&[(":status", "200")]), b"hello"));
-    let mut want = HEAD_CHUNKED.to_vec();
-    want.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
-    assert_eq!(h.tx_all(tcp), want);
-    assert_eq!(close_of(&mut h, tcp), Some(false));
+    assert!(out == want, "pending, then terminator");
     assert!(!owned(&h, tcp));
     assert_eq!(resets(&h, r), 0);
 }
@@ -213,7 +190,7 @@ fn h3closed_after_tunnel_closed_still_ends_request() {
             },
         ));
         assert!(owned(&h, tcp), "ConnClosed alone does not end it");
-        closed(&mut h, r, None);
+        closed(&mut h, r);
         if started {
             assert_eq!(close_of(&mut h, tcp), Some(true));
         } else {
@@ -255,7 +232,7 @@ fn shutdown_aborts_live_fetch_requests() {
         assert!(!owned(&h, t));
     }
     assert_eq!(resets(&h, r), 1);
-    closed(&mut h, r, None); // the reset's own close: ignored
+    closed(&mut h, r); // the reset's own close: ignored
     assert_eq!(resets(&h, r), 1);
 }
 

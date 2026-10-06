@@ -431,7 +431,6 @@ impl<T: TransportOps> H3Wire<T> {
         if req.known {
             let close = H3Close {
                 stats: req.stats(conn_err),
-                unread: None,
             };
             self.queue.push(Event::H3Closed(id, Box::new(close)));
         }

@@ -7,8 +7,8 @@ use crate::slots::ConnSlot;
 use crate::{Inner, Transport, clock};
 use core::ptr;
 use mq_transport_api::{
-    ConnConfig, ConnId, ConnProto, ConnStats, ConnectError, Error, H3Backend, PathError, PathId,
-    PathStats, SlotId, Time,
+    ConnConfig, ConnId, ConnProto, ConnStats, ConnectError, Error, PathError, PathId, PathStats,
+    SlotId, Time,
 };
 use std::ffi::CString;
 use std::net::SocketAddr;
@@ -115,11 +115,10 @@ pub(crate) fn connect(
     let sni = CString::new(cfg.sni).map_err(|_| ConnectError::Other(-1))?;
     let settings = conn_settings(&t.inner.cfg, cfg.idle_timeout);
     let (peer, peerlen) = to_sockaddr(cfg.peer);
-    let alpn = t.inner.alpn.as_ptr();
-    // adoption spec §3: an H3 conn on the raw backend is a raw conn on ALPN `h3`.
-    let raw_h3 =
-        cfg.proto == ConnProto::H3 && t.inner.cfg.h3 && t.inner.cfg.h3_backend == H3Backend::Raw;
-    let raw_alpn = raw_h3.then(|| c"h3".as_ptr());
+    let alpn = match cfg.proto {
+        ConnProto::Raw => t.inner.alpn.as_ptr(),
+        ConnProto::H3 => c"h3".as_ptr(),
+    };
     // SAFETY: a plain C struct; all-zero is valid and what C passes.
     let zero_cid: xqc_cid_t = unsafe { core::mem::zeroed() };
     let s = t
@@ -133,35 +132,20 @@ pub(crate) fn connect(
             let ssl: xqc_conn_ssl_config_t = core::mem::zeroed();
             let peer = (&peer as *const libc::sockaddr_storage).cast();
             // spec §3.2: same settings and user data (the conn slot) for both protocols; the
-            // create notification fires synchronously inside either call and binds the slot.
-            let cid = if cfg.proto == ConnProto::Raw || raw_h3 {
-                xqc_connect(
-                    engine,
-                    &settings,
-                    ptr::null(),
-                    0,
-                    sni.as_ptr(),
-                    0,
-                    &ssl,
-                    peer,
-                    peerlen,
-                    raw_alpn.unwrap_or(alpn),
-                    ud_of(s),
-                )
-            } else {
-                xqc_h3_connect(
-                    engine,
-                    &settings,
-                    ptr::null(),
-                    0,
-                    sni.as_ptr(),
-                    0,
-                    &ssl,
-                    peer,
-                    peerlen,
-                    ud_of(s),
-                )
-            };
+            // create notification fires synchronously inside the call and binds the slot.
+            let cid = xqc_connect(
+                engine,
+                &settings,
+                ptr::null(),
+                0,
+                sni.as_ptr(),
+                0,
+                &ssl,
+                peer,
+                peerlen,
+                alpn,
+                ud_of(s),
+            );
             // Copied before any other xquic call (spec §4.8 "Borrowed data").
             (!cid.is_null()).then(|| cid.read_unaligned())
         }

@@ -95,7 +95,7 @@ impl<T: TransportOps> H3Wire<T> {
     /// Client request start (adoption spec §4.3): the request exists from `open_stream`;
     /// h3wire holds state for it once `send_headers` succeeds.
     pub(crate) fn open_req(&mut self, now: Time, c: ConnId) -> Result<H3ReqId, Error> {
-        // The xqc_h3 backend's order (`reserve_local`): role, conn, protocol.
+        // Request admission order: role, conn, protocol.
         let r = match self.conns.get(&c) {
             _ if self.server => Err(Error::Role),
             None if self.inner.conn_stats(c).is_ok() => Err(Error::Other), // a raw conn
@@ -137,6 +137,7 @@ impl<T: TransportOps> H3Wire<T> {
         let r = conn.h3.send_headers(Q(req.quic_id), &fields, fin);
         req.core |= r.is_ok();
         if r.is_ok() {
+            req.coalesced_header_fin = fin;
             conn.core.insert(req.quic_id);
         }
         self.drive_inner(now);
@@ -185,7 +186,7 @@ impl<T: TransportOps> H3Wire<T> {
         // A retained request (client only) accepts and discards like after SendStopped,
         // so a running upload pump cannot abort the response (adoption spec §4.3).
         if req.send_stopped || self.conns[&req.conn].gone {
-            // RFC 9114 §4.1: the client's response keeps flowing; xqc_h3 resets the server.
+            // RFC 9114 §4.1: the client's response keeps flowing after cancelling the upload.
             return if client {
                 Ok(data.len())
             } else {
@@ -283,7 +284,7 @@ impl<T: TransportOps> H3Wire<T> {
     }
 
     /// `h3_finish`: latches the finish intent and returns `Ok` while HEADERS bytes are
-    /// queued, as xqc_h3 does (adoption spec §4.5).
+    /// queued (adoption spec §4.5).
     pub(crate) fn finish(&mut self, now: Time, id: H3ReqId) -> Result<(), StreamError> {
         let client = self.client_of(id)?;
         let r = self.body(now, id, &[], true, client).map(drop);
@@ -402,10 +403,17 @@ impl<T: TransportOps> H3Wire<T> {
                 // A `Blocked` FIN is kept and retried; it survives a peer RESET_STREAM
                 // (adoption spec §3, §4.5).
                 Action::FinishStream(q) => {
-                    if let Some(s) = mq(q)
-                        && self.inner.stream_send(now, s, &[], true) == Err(StreamError::Blocked)
-                    {
-                        conn.fins.insert(s);
+                    if let Some(s) = mq(q) {
+                        let headers_fin = self
+                            .reqs
+                            .get_mut(&req_id(s))
+                            .is_some_and(|req| std::mem::take(&mut req.coalesced_header_fin));
+                        if !headers_fin
+                            && self.inner.stream_send(now, s, &[], true)
+                                == Err(StreamError::Blocked)
+                        {
+                            conn.fins.insert(s);
+                        }
                     }
                 }
                 // Direction guard (adoption spec §4.5): the transport ops do not check.
@@ -456,8 +464,9 @@ impl<T: TransportOps> H3Wire<T> {
             let mut req = reqs.get_mut(&req_id(s)).filter(|_| q.is_request());
             while let Some(bytes) = conn.h3.poll_send(q).filter(|b| !b.is_empty()) {
                 let len = bytes.len();
+                let fin = req.as_ref().is_some_and(|req| req.coalesced_header_fin);
                 // Another error is final for the stream: no retry owed.
-                let n = match inner.stream_send(now, s, bytes, false) {
+                let n = match inner.stream_send(now, s, bytes, fin) {
                     Ok(n) => n,
                     Err(e) => {
                         short |= e == StreamError::Blocked;

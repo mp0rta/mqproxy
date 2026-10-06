@@ -1,6 +1,6 @@
 //! `H3Wire<T>`: a `TransportOps` decorator serving HTTP/3 from h3wire (adoption spec §4.1).
 //!
-//! Active mode (`H3Wire::new`) runs one h3wire `Connection` per H3 conn and serves the
+//! Runs one h3wire `Connection` per H3 conn and serves the
 //! requests from it.
 #![forbid(unsafe_code)]
 
@@ -26,8 +26,6 @@ pub const BOOT_READ: usize = 4096;
 
 pub struct H3Wire<T> {
     inner: T,
-    /// `false`: create no H3 state; every op and event passes through (adoption spec §4.1).
-    active: bool,
     queue: OutQueue,
     /// Request streams of H3 conns, by request id (adoption spec §4.3).
     reqs: HashMap<H3ReqId, Req>,
@@ -49,20 +47,10 @@ pub struct H3Wire<T> {
 }
 
 impl<T: TransportOps> H3Wire<T> {
-    /// Serves H3 conns from h3wire (inner must be `h3_backend: Raw`).
+    /// Serves H3 conns over the raw transport.
     pub fn new(inner: T) -> Self {
-        Self::make(inner, true)
-    }
-
-    /// Creates no H3 state: every op and event passes through unfiltered (inner may be xqc_h3).
-    pub fn passthrough(inner: T) -> Self {
-        Self::make(inner, false)
-    }
-
-    fn make(inner: T, active: bool) -> Self {
         H3Wire {
             inner,
-            active,
             queue: OutQueue::default(),
             reqs: HashMap::new(),
             conns: HashMap::new(),
@@ -141,11 +129,7 @@ impl<T: TransportOps> H3Wire<T> {
             self.service(now, c);
         }
         while let Some(e) = self.inner.poll_event() {
-            let out = if self.active {
-                self.on_event(now, e)
-            } else {
-                Some(e)
-            };
+            let out = self.on_event(now, e);
             if let Some(e) = out {
                 self.queue.push(e);
             }
@@ -192,11 +176,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
     /// stale between that drain and this pop, so the same checks run again here.
     fn poll_event(&mut self) -> Option<Event> {
         let Self {
-            inner,
-            active,
-            queue,
-            reqs,
-            ..
+            inner, queue, reqs, ..
         } = self;
         queue.pop(|e| match e {
             Event::ConnEstablished(c)
@@ -209,9 +189,6 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
             | Event::StreamWritable(s)
             | Event::StreamPeerReset(s, _)
             | Event::StreamStopSending(s, _) => inner.stream_info(*s).is_ok(),
-            Event::H3Request(_, r) | Event::H3Readable(r) | Event::H3Writable(r) if !*active => {
-                inner.h3_req_info(*r).is_ok()
-            }
             // An H3Readable after the receive end was handed over has nothing to deliver.
             Event::H3Readable(r) => reqs.get(r).is_some_and(|q| !q.handed),
             Event::H3Request(_, r) | Event::H3Writable(r) => reqs.contains_key(r),
@@ -228,7 +205,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
 
     fn connect(&mut self, now: Time, cfg: &ConnConfig) -> Result<ConnId, ConnectError> {
         let r = self.inner.connect(now, cfg);
-        if let (true, ConnProto::H3, Ok(c)) = (self.active, cfg.proto, r) {
+        if let (ConnProto::H3, Ok(c)) = (cfg.proto, r) {
             self.add_conn(now, c, h3wire::Role::Client);
         }
         self.drive_inner(now);
@@ -314,13 +291,10 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         self.inner.datagram_recv(conn, buf)
     }
 
-    // H3 ops. Active: served from h3wire, never forwarded; an id not held is stale
+    // H3 ops are served from h3wire; an id not held is stale
     // (adoption spec §4.1).
     fn open_h3_request(&mut self, now: Time, conn: ConnId) -> Result<H3ReqId, Error> {
-        if self.active {
-            return self.open_req(now, conn);
-        }
-        fwd!(self, now, self.inner.open_h3_request(now, conn))
+        self.open_req(now, conn)
     }
 
     fn h3_send_headers(
@@ -330,11 +304,8 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         hs: &[H3Header<'_>],
         fin: bool,
     ) -> Result<(), StreamError> {
-        if self.active {
-            self.touch(r);
-            return self.send_headers(now, r, hs, fin);
-        }
-        fwd!(self, now, self.inner.h3_send_headers(now, r, hs, fin))
+        self.touch(r);
+        self.send_headers(now, r, hs, fin)
     }
 
     fn h3_send_body(
@@ -344,19 +315,13 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         data: &[u8],
         fin: bool,
     ) -> Result<usize, StreamError> {
-        if self.active {
-            self.touch(r);
-            return self.send_body(now, r, data, fin);
-        }
-        fwd!(self, now, self.inner.h3_send_body(now, r, data, fin))
+        self.touch(r);
+        self.send_body(now, r, data, fin)
     }
 
     fn h3_finish(&mut self, now: Time, r: H3ReqId) -> Result<(), StreamError> {
-        if self.active {
-            self.touch(r);
-            return self.finish(now, r);
-        }
-        fwd!(self, now, self.inner.h3_finish(now, r))
+        self.touch(r);
+        self.finish(now, r)
     }
 
     fn h3_recv_headers(
@@ -365,11 +330,8 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         r: H3ReqId,
         each: &mut dyn FnMut(&[u8], &[u8]),
     ) -> Result<bool, StreamError> {
-        if self.active {
-            self.touch(r);
-            return self.recv_headers(now, r, each);
-        }
-        fwd!(self, now, self.inner.h3_recv_headers(now, r, each))
+        self.touch(r);
+        self.recv_headers(now, r, each)
     }
 
     fn h3_recv_body(
@@ -382,32 +344,23 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         {
             self.max_buf = self.max_buf.max(buf.len());
         }
-        if self.active {
-            self.touch(r);
-            return self.recv_body(now, r, buf);
-        }
-        fwd!(self, now, self.inner.h3_recv_body(now, r, buf))
+        self.touch(r);
+        self.recv_body(now, r, buf)
     }
 
     fn h3_reset(&mut self, now: Time, r: H3ReqId) {
-        if self.active {
-            self.touch(r);
-            return self.reset(now, r);
-        }
-        fwd!(self, now, self.inner.h3_reset(now, r))
+        self.touch(r);
+        self.reset(now, r)
     }
 
     fn h3_req_info(&self, r: H3ReqId) -> Result<H3ReqInfo, Error> {
-        if self.active {
-            // Cached at request start: the inner slot is gone before StreamClosed.
-            return match self.reqs.get(&r) {
-                Some(q) if q.known => Ok(H3ReqInfo {
-                    conn: q.conn,
-                    quic_id: q.quic_id,
-                }),
-                _ => Err(Error::Stale),
-            };
+        // Cached at request start: the inner slot is gone before StreamClosed.
+        match self.reqs.get(&r) {
+            Some(q) if q.known => Ok(H3ReqInfo {
+                conn: q.conn,
+                quic_id: q.quic_id,
+            }),
+            _ => Err(Error::Stale),
         }
-        self.inner.h3_req_info(r)
     }
 }

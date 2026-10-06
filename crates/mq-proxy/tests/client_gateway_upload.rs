@@ -8,7 +8,7 @@ use common::*;
 use mq_proxy::config::ClientConfig;
 use mq_runtime::testing::Call;
 use mq_runtime::{IoRequest, IoResult, TcpId};
-use mq_transport_api::{ConnId, Event, H3Close, H3ReqId, H3ReqStats, StreamError, Unread};
+use mq_transport_api::{ConnId, Event, H3Close, H3ReqId, H3ReqStats, StreamError};
 use std::io;
 
 /// A gateway-only client whose tunnel is established.
@@ -172,9 +172,9 @@ fn send_body_conn_error_aborts() {
 }
 
 /// SP4 spec §4.3 / §13.20: a `Stale` send is `Blocked` — the request's
-/// `H3Closed` is queued; its rescue completes the request (SP3 aborted).
+/// `H3Closed` is queued; it settles the failed response.
 #[test]
-fn send_stale_waits_for_h3closed_then_rescues() {
+fn send_stale_waits_for_h3closed_then_fails() {
     let (mut h, tcp, r) = open(5, b"hello", &[Err(StreamError::Stale)]);
     assert_eq!(close_of(&mut h, tcp), None, "no abort");
     assert_eq!(resets(&h, r), 0);
@@ -189,21 +189,11 @@ fn send_stale_waits_for_h3closed_then_rescues() {
         stream_err: 0,
         close_msg: None,
     };
-    let unread = Unread {
-        headers: Some(vec![(b":status".to_vec(), b"200".to_vec())]),
-        body: b"ok".to_vec(),
-    };
-    h.t.close_h3(
-        r,
-        H3Close {
-            stats,
-            unread: Some(unread),
-        },
-    );
+    h.t.close_h3(r, H3Close { stats });
     h.drive();
     assert_eq!(
         h.tx_all(tcp),
-        b"HTTP/1.1 200 \r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+        b"HTTP/1.1 502 \r\nX-Mq-Error: upstream-reset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     assert_eq!(close_of(&mut h, tcp), Some(false));
     assert_eq!(resets(&h, r), 0);

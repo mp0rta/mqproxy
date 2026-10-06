@@ -106,7 +106,6 @@ fn stats_clean() {
                     stream_err: 0,
                     close_msg: Some("finished".into()),
                 },
-                unread: None,
             }
         )]
     );

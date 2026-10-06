@@ -10,6 +10,7 @@ mq-proxy = { path = "../mq-proxy" }
 mq-runtime = { path = "../mq-runtime" }
 mq-transport = { path = "../mq-transport" }
 mq-transport-api = { path = "../mq-transport-api" }
+mq-h3 = { path = "../mq-h3" }
 mq-linux = { path = "../mq-linux" }
 clap = { workspace = true }
 log = { workspace = true }

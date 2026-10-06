@@ -51,7 +51,7 @@ pub trait TransportOps {
     ) -> Result<(usize, bool), StreamError>;
     fn stream_reset(&mut self, now: Time, s: StreamId);
     /// A local unidirectional stream, either role (adoption spec §3). `Err(Stale)` for a dead
-    /// conn, `Err(Other)` on an xqc_h3 conn or when the peer's uni credit is exhausted,
+    /// conn, `Err(Other)` when the peer's uni credit is exhausted,
     /// `Err(Ceiling)` at 8192 streams.
     fn open_uni(&mut self, now: Time, conn: ConnId) -> Result<StreamId, Error>;
     /// RESET_STREAM only; the receive side keeps reporting. Stale id: no-op (adoption spec §3).
@@ -82,40 +82,167 @@ pub trait TransportOps {
 
     // H3 requests (spec §3.1)
     /// Client only: a server-role transport returns `Error::Role`.
-    fn open_h3_request(&mut self, now: Time, conn: ConnId) -> Result<H3ReqId, Error>;
+    fn open_h3_request(&mut self, _: Time, _: ConnId) -> Result<H3ReqId, Error> {
+        Err(Error::Role)
+    }
     /// All-or-error; `Blocked` cannot occur with the vendored xquic (spec §3.1).
     fn h3_send_headers(
         &mut self,
-        now: Time,
-        r: H3ReqId,
-        hs: &[H3Header<'_>],
-        fin: bool,
-    ) -> Result<(), StreamError>;
+        _: Time,
+        _: H3ReqId,
+        _: &[H3Header<'_>],
+        _: bool,
+    ) -> Result<(), StreamError> {
+        Err(StreamError::Conn)
+    }
     /// The `stream_send` contract: `Ok(n)` accepted, FIN only when `n == data.len()`.
     fn h3_send_body(
         &mut self,
-        now: Time,
-        r: H3ReqId,
-        data: &[u8],
-        fin: bool,
-    ) -> Result<usize, StreamError>;
+        _: Time,
+        _: H3ReqId,
+        _: &[u8],
+        _: bool,
+    ) -> Result<usize, StreamError> {
+        Err(StreamError::Conn)
+    }
     /// A bare FIN (spec §3.1).
-    fn h3_finish(&mut self, now: Time, r: H3ReqId) -> Result<(), StreamError>;
+    fn h3_finish(&mut self, _: Time, _: H3ReqId) -> Result<(), StreamError> {
+        Err(StreamError::Conn)
+    }
     /// Drains one header section; `Ok(fin)`. `Blocked` when none is pending.
     fn h3_recv_headers(
         &mut self,
-        now: Time,
-        r: H3ReqId,
-        each: &mut dyn FnMut(&[u8], &[u8]),
-    ) -> Result<bool, StreamError>;
+        _: Time,
+        _: H3ReqId,
+        _: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<bool, StreamError> {
+        Err(StreamError::Conn)
+    }
     /// `(bytes, fin)`; `(0, false)` is `Blocked`.
     fn h3_recv_body(
         &mut self,
-        now: Time,
-        r: H3ReqId,
-        buf: &mut [u8],
-    ) -> Result<(usize, bool), StreamError>;
+        _: Time,
+        _: H3ReqId,
+        _: &mut [u8],
+    ) -> Result<(usize, bool), StreamError> {
+        Err(StreamError::Conn)
+    }
     /// A no-op on a stale id.
-    fn h3_reset(&mut self, now: Time, r: H3ReqId);
-    fn h3_req_info(&self, r: H3ReqId) -> Result<H3ReqInfo, Error>;
+    fn h3_reset(&mut self, _: Time, _: H3ReqId) {}
+    fn h3_req_info(&self, _: H3ReqId) -> Result<H3ReqInfo, Error> {
+        Err(Error::Role)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    struct RawOnly;
+
+    impl TransportOps for RawOnly {
+        fn recv_datagram(&mut self, _: Time, _: SocketAddr, _: SocketAddr, _: &[u8]) {}
+        fn drive(&mut self, _: Time) {}
+        fn pending_transmit(&self, _: &mut Vec<TxKey>) {}
+        fn peek_transmit(&mut self, _: TxKey) -> Option<Transmit<'_>> {
+            None
+        }
+        fn transmit_done(&mut self, _: TxKey, _: usize) {}
+        fn resume_pending(&self) -> bool {
+            false
+        }
+        fn poll_event(&mut self) -> Option<Event> {
+            None
+        }
+        fn next_timeout(&self) -> Option<Time> {
+            None
+        }
+        fn connect(&mut self, _: Time, _: &ConnConfig) -> Result<ConnId, ConnectError> {
+            unimplemented!()
+        }
+        fn open_stream(&mut self, _: Time, _: ConnId) -> Result<StreamId, Error> {
+            unimplemented!()
+        }
+        fn stream_send(
+            &mut self,
+            _: Time,
+            _: StreamId,
+            _: &[u8],
+            _: bool,
+        ) -> Result<usize, StreamError> {
+            unimplemented!()
+        }
+        fn stream_recv(
+            &mut self,
+            _: Time,
+            _: StreamId,
+            _: &mut [u8],
+        ) -> Result<(usize, bool), StreamError> {
+            unimplemented!()
+        }
+        fn stream_reset(&mut self, _: Time, _: StreamId) {}
+        fn open_uni(&mut self, _: Time, _: ConnId) -> Result<StreamId, Error> {
+            unimplemented!()
+        }
+        fn stream_reset_send(&mut self, _: Time, _: StreamId, _: u64) {}
+        fn stream_stop_sending(&mut self, _: Time, _: StreamId, _: u64) {}
+        fn add_path(&mut self, _: Time, _: ConnId, _: bool) -> Result<PathId, PathError> {
+            unimplemented!()
+        }
+        fn close_conn(&mut self, _: Time, _: ConnId) {}
+        fn close_conn_with(&mut self, _: Time, _: ConnId, _: u64) {}
+        fn mark_conn_authed(&mut self, _: ConnId) {}
+        fn conn_stats(&self, _: ConnId) -> Result<ConnStats, Error> {
+            unimplemented!()
+        }
+        fn conn_live(&self, _: ConnId) -> bool {
+            false
+        }
+        fn stream_info(&self, _: StreamId) -> Result<StreamInfo, Error> {
+            unimplemented!()
+        }
+        fn datagram_send(&mut self, _: Time, _: ConnId, _: &[u8]) -> Result<(), DatagramError> {
+            unimplemented!()
+        }
+        fn datagram_mss(&self, _: ConnId) -> usize {
+            0
+        }
+        fn datagram_recv(&mut self, _: ConnId, _: &mut [u8]) -> Option<usize> {
+            None
+        }
+    }
+
+    #[test]
+    fn raw_transport_h3_defaults() {
+        let mut transport = RawOnly;
+        let request = H3ReqId::from_slot(crate::ids::SlotId::new(0, 1)).unwrap();
+        let conn = ConnId::from_slot(crate::ids::SlotId::new(0, 1)).unwrap();
+        assert_eq!(
+            transport.open_h3_request(Time::ZERO, conn),
+            Err(Error::Role)
+        );
+        assert_eq!(
+            transport.h3_send_headers(Time::ZERO, request, &[], false),
+            Err(StreamError::Conn)
+        );
+        assert_eq!(
+            transport.h3_send_body(Time::ZERO, request, &[], false),
+            Err(StreamError::Conn)
+        );
+        assert_eq!(
+            transport.h3_finish(Time::ZERO, request),
+            Err(StreamError::Conn)
+        );
+        assert_eq!(
+            transport.h3_recv_headers(Time::ZERO, request, &mut |_, _| {}),
+            Err(StreamError::Conn)
+        );
+        assert_eq!(
+            transport.h3_recv_body(Time::ZERO, request, &mut []),
+            Err(StreamError::Conn)
+        );
+        transport.h3_reset(Time::ZERO, request);
+        assert_eq!(transport.h3_req_info(request), Err(Error::Role));
+    }
 }

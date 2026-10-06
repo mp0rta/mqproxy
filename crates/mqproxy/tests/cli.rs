@@ -350,7 +350,7 @@ fn client_gateway_counts_as_ingress() {
     );
 }
 
-/// spec §8: the client's H3 ctx exists only with `--gateway` (`xqc_h3_connect`).
+/// spec §8: the client enables H3 only with `--gateway`.
 #[test]
 fn client_gateway_enables_h3() {
     let r = parse(CLIENT, &[]).unwrap();

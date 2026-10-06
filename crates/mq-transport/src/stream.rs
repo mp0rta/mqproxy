@@ -26,7 +26,7 @@ pub(crate) fn open_stream(t: &mut Transport, now: Time, c: ConnId) -> Result<Str
         now,
         c,
         StreamKind::Bidi,
-        |i, c| reserve_local(i, c, false),
+        reserve_local,
         |engine, cid, ud| unsafe { xqc_stream_create(engine, cid, ptr::null_mut(), ud) },
     )
 }
@@ -60,7 +60,7 @@ pub(crate) fn open_stream_with_id(
         now,
         c,
         StreamKind::Bidi,
-        |i, c| reserve_local(i, c, false),
+        reserve_local,
         |engine, cid, ud| unsafe { xqc_stream_create_with_id(engine, cid, quic_id, ud) },
     )
 }
@@ -105,19 +105,14 @@ fn open_with<R>(
     }
 }
 
-/// A client's local stream (`h3 = false`) or H3 request (`h3 = true`) on `c`: role, protocol,
-/// then the per-connection ceiling both share (spec §4.2, §3.3). Counts it; the caller undoes
+/// A client's local stream on `c`: role, then the per-connection ceiling (spec §4.2).
+/// Counts it; the caller undoes
 /// the count if xquic then fails to create it.
-pub(crate) fn reserve_local(inner: &mut Inner, c: ConnId, h3: bool) -> Result<xqc_cid_t, Error> {
+pub(crate) fn reserve_local(inner: &mut Inner, c: ConnId) -> Result<xqc_cid_t, Error> {
     if matches!(inner.cfg.role, Role::Server { .. }) {
         return Err(Error::Role); // xquic creates only client-initiated ids
     }
     let conn = inner.conns.get_mut(c.slot()).ok_or(Error::Stale)?;
-    // A raw stream on an H3 conn (or a request on a raw one) would reach the other protocol's
-    // callbacks with our slot id as their user data.
-    if conn.h3c.is_null() == h3 {
-        return Err(Error::Other);
-    }
     if conn.streams >= STREAM_CEILING {
         return Err(Error::Ceiling);
     }
@@ -125,13 +120,9 @@ pub(crate) fn reserve_local(inner: &mut Inner, c: ConnId, h3: bool) -> Result<xq
     Ok(conn.cid)
 }
 
-/// adoption spec §3: both roles may open uni streams; raw conns only (an xqc_h3 conn's stream
-/// callbacks would take our slot id for their own state). Counts the stream.
+/// adoption spec §3: both roles may open uni streams. Counts the stream.
 pub(crate) fn reserve_uni(inner: &mut Inner, c: ConnId) -> Result<*mut xqc_connection_t, Error> {
     let conn = inner.conns.get_mut(c.slot()).ok_or(Error::Stale)?;
-    if !conn.h3c.is_null() {
-        return Err(Error::Other);
-    }
     if conn.streams >= STREAM_CEILING {
         return Err(Error::Ceiling);
     }
@@ -326,7 +317,6 @@ mod tests {
             cc: CongestionControl::Bbr,
             realtime_offset_us: 0,
             h3: false,
-            h3_backend: mq_transport_api::H3Backend::XqcH3,
             qlog: None,
         })
         .expect("transport");

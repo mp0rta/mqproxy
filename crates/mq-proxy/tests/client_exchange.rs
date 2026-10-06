@@ -1,6 +1,6 @@
 //! SP4 spec §4.2/§4.3: the H3 exchange core — open, the upload send rules,
 //! the upload EOF rule, reset, event routing, the pull reads, the `H3Closed`
-//! rescue, the end rule and failure settlement — on a
+//! close handling, the end rule and failure settlement — on a
 //! `Shard<ScriptedTransport, ExApp>`.
 
 use mq_http::headers::{Reject, parse_method, parse_target};
@@ -12,9 +12,7 @@ use mq_runtime::{
     AcceptMeta, App, Cx, DialError, DialOpId, ListenerTag, Shard, SocketOpId, TcpEnd, TcpId,
     TimerId, UdpSocketId,
 };
-use mq_transport_api::{
-    ConnId, Error, Event, H3Close, H3ReqId, H3ReqStats, StreamError, Time, Unread,
-};
+use mq_transport_api::{ConnId, Error, Event, H3Close, H3ReqId, H3ReqStats, StreamError, Time};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -171,15 +169,9 @@ impl H {
             .with_app(self.now, |a, _| std::mem::take(&mut a.out))
     }
 
-    /// `H3Closed` for `r` with `unread`; the recorded outputs.
-    fn closed(&mut self, r: H3ReqId, unread: Option<Unread>) -> Vec<(u32, H3ReqId, Ready)> {
-        self.t.close_h3(
-            r,
-            H3Close {
-                stats: stats(),
-                unread,
-            },
-        );
+    /// `H3Closed` for `r`; the recorded outputs.
+    fn closed(&mut self, r: H3ReqId) -> Vec<(u32, H3ReqId, Ready)> {
+        self.t.close_h3(r, H3Close { stats: stats() });
         self.drive()
     }
 
@@ -223,13 +215,6 @@ fn hs(pairs: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
         .iter()
         .map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec()))
         .collect()
-}
-
-fn unread(headers: Option<&[(&str, &str)]>, body: &[u8]) -> Option<Unread> {
-    Some(Unread {
-        headers: headers.map(hs),
-        body: body.to_vec(),
-    })
 }
 
 const OK: &[(&str, &str)] = &[(":status", "200")];
@@ -381,7 +366,7 @@ fn send_stale_is_blocked_then_done_after_h3closed() {
     h.t.expect_h3_send_body(r, Err(StreamError::Stale));
     assert_eq!(h.send(r, b"hello", false), SendOut::Blocked);
     assert_eq!(h.resets(r), 0);
-    assert_eq!(h.closed(r, None), [(9, r, Ready::Readable)]);
+    assert_eq!(h.closed(r), [(9, r, Ready::Readable)]);
     assert_eq!(h.send(r, b"hello", false), SendOut::Done);
     assert!(h.contains(r));
     assert_eq!(h.send_calls(r).len(), 1);
@@ -468,7 +453,7 @@ fn on_event_unknown_id_none() {
     let never = h.t.new_h3_req_id();
     assert!(h.event(Event::H3Readable(never)).is_empty());
     assert!(h.event(Event::H3Writable(never)).is_empty());
-    assert!(h.closed(never, None).is_empty());
+    assert!(h.closed(never).is_empty());
     assert!(h.event(Event::ConnEstablished(h.conn)).is_empty());
     let r = h.open(BodyLen::Unknown, 3);
     assert_eq!(h.event(Event::H3Readable(r)), [(3, r, Ready::Readable)]);
@@ -483,7 +468,7 @@ fn drain_owner_resets_only_matching() {
     let b = h.open(BodyLen::Unknown, 2);
     let c = h.open(BodyLen::Unknown, 1);
     // `c` is closed already: drained without a reset.
-    assert_eq!(h.closed(c, None), [(1, c, Ready::Readable)]);
+    assert_eq!(h.closed(c), [(1, c, Ready::Readable)]);
     h.ex(|ex, cx| ex.drain_owner(cx, |o| *o == 1));
     assert_eq!((h.resets(a), h.resets(b), h.resets(c)), (1, 0, 0));
     assert!(!h.contains(a) && h.contains(b) && !h.contains(c));
@@ -502,13 +487,7 @@ fn send_done_never_removes_exchange() {
     assert_eq!(h.send(empty, b"x", false), SendOut::Done);
     assert_eq!(h.send(known, b"ab", false), SendOut::Accepted(2));
     assert_eq!(h.send(known, b"c", false), SendOut::Done);
-    h.closed(
-        closed,
-        Some(Unread {
-            headers: None,
-            body: vec![],
-        }),
-    );
+    h.closed(closed);
     assert_eq!(h.send(closed, b"x", true), SendOut::Done);
     assert!(h.contains(empty) && h.contains(known) && h.contains(closed));
     assert_eq!(h.len(), 3);
@@ -570,15 +549,14 @@ fn head_fin_then_h3closed_none_still_last_zero() {
     let r = h.open(BodyLen::Empty, 7);
     h.respond(r, OK, true);
     h.head_status(r);
-    assert_eq!(h.closed(r, None), [(7, r, Ready::Readable)]);
+    assert_eq!(h.closed(r), [(7, r, Ready::Readable)]);
     assert_eq!(h.read_body(r, 16), (BodyOut::Last(0), vec![]));
     assert!(!h.contains(r));
     assert_eq!(h.resets(r), 0);
 }
 
 /// A stale `H3Readable` (xquic signalled readability, then destroyed the
-/// request: QPACK-blocked HEADERS decoded after the close timer) queued
-/// ahead of `H3Closed`: the read waits, and the rescue still completes.
+/// request) queued ahead of `H3Closed`: the read waits for the terminal event.
 #[test]
 fn stale_head_readiness_waits_for_h3closed() {
     let mut h = H::new();
@@ -587,12 +565,11 @@ fn stale_head_readiness_waits_for_h3closed() {
     assert_eq!(h.drive(), [(7, r, Ready::Readable)]);
     assert_eq!(h.read_head(r), HeadOut::Wait);
     assert!(h.contains(r));
-    h.closed(r, unread(Some(OK), b"hello"));
-    assert_eq!(h.head_status(r), 200);
-    assert_eq!(h.read_body(r, 16), (BodyOut::Last(5), b"hello".to_vec()));
+    h.closed(r);
+    assert_eq!(h.read_head(r), HeadOut::Fail(Reject::UpstreamReset));
     assert_eq!(h.resets(r), 0);
 
-    // The same in the body: the stale read waits, the rescue finishes it.
+    // The same in the body: the stale read waits for the terminal event.
     let r = h.open(BodyLen::Empty, 7);
     h.respond(r, OK, false);
     h.head_status(r);
@@ -601,42 +578,18 @@ fn stale_head_readiness_waits_for_h3closed() {
     h.t.inject_h3_error(r, StreamError::Stale);
     h.drive();
     assert_eq!(h.read_body(r, 16).0, BodyOut::Wait);
-    h.closed(r, unread(None, b"de"));
-    assert_eq!(h.read_body(r, 16), (BodyOut::Last(2), b"de".to_vec()));
+    h.closed(r);
+    assert_eq!(h.read_body(r, 16).0, BodyOut::Fail);
     assert_eq!(h.resets(r), 0);
     assert_eq!(h.len(), 0);
 }
 
 #[test]
-fn closed_before_head_with_headers_rescued_head_then_body() {
-    let mut h = H::new();
-    let r = h.open(BodyLen::Empty, 7);
-    let hd = [(":status", "200"), ("content-length", "5")];
-    assert_eq!(
-        h.closed(r, unread(Some(&hd), b"hello")),
-        [(7, r, Ready::Readable)]
-    );
-    match h.read_head(r) {
-        HeadOut::Head(hd) => assert_eq!((hd.status, hd.cl), (200, Some(5))),
-        o => panic!("{o:?}"),
-    }
-    assert_eq!(h.read_body(r, 16), (BodyOut::Last(5), b"hello".to_vec()));
-    assert!(!h.contains(r));
-    // Malformed rescued headers: `UpstreamProtocol`; the request is gone, no reset.
-    let r = h.open(BodyLen::Empty, 7);
-    h.closed(r, unread(Some(&[("x", "y")]), b"hello"));
-    assert_eq!(h.read_head(r), HeadOut::Fail(Reject::UpstreamProtocol));
-    assert!(!h.contains(r));
-    assert_eq!(h.count(|c| matches!(c, Call::H3Reset(_))), 0);
-    assert_eq!(h.count(|c| matches!(c, Call::H3RecvHeaders(_))), 0);
-}
-
-#[test]
 fn closed_before_head_without_headers_upstream_reset() {
-    for u in [None, unread(None, b"abc")] {
+    {
         let mut h = H::new();
         let r = h.open(BodyLen::Empty, 7);
-        h.closed(r, u);
+        h.closed(r);
         assert_eq!(h.read_head(r), HeadOut::Fail(Reject::UpstreamReset));
         assert!(!h.contains(r));
         assert_eq!(h.resets(r), 0, "the H3 side is gone");
@@ -644,50 +597,14 @@ fn closed_before_head_without_headers_upstream_reset() {
 }
 
 #[test]
-fn body_h3closed_with_unread_serves_rescue_in_slices() {
+fn body_h3closed_fails() {
     let mut h = H::new();
     let r = h.open(BodyLen::Empty, 7);
     h.respond(r, OK, false);
     h.head_status(r);
     h.body(r, b"abc", false);
     assert_eq!(h.read_body(r, 16).0, BodyOut::Data(3));
-    h.closed(r, unread(None, b"0123456789"));
-    assert_eq!(h.read_body(r, 4), (BodyOut::Data(4), b"0123".to_vec()));
-    assert_eq!(h.read_body(r, 4), (BodyOut::Data(4), b"4567".to_vec()));
-    assert_eq!(h.read_body(r, 4), (BodyOut::Last(2), b"89".to_vec()));
-    assert!(!h.contains(r));
-    assert_eq!(h.resets(r), 0);
-
-    // The body check counts delivered plus rescued bytes: 10 + 50 < 100
-    // fails, 10 + 90 completes.
-    for (rescued, last) in [(50, false), (90, true)] {
-        let r = h.open(BodyLen::Empty, 7);
-        h.respond(r, &[(":status", "200"), ("content-length", "100")], false);
-        h.head_status(r);
-        h.body(r, &[b'x'; 10], false);
-        assert_eq!(h.read_body(r, 16).0, BodyOut::Data(10));
-        h.closed(r, unread(None, &vec![b'y'; rescued]));
-        let got = h.read_body(r, 1000).0;
-        let want = if last {
-            BodyOut::Last(rescued)
-        } else {
-            BodyOut::Fail
-        };
-        assert_eq!(got, want, "rescued={rescued}");
-        assert!(!h.contains(r));
-        assert_eq!(h.resets(r), 0);
-    }
-}
-
-#[test]
-fn body_h3closed_without_unread_fail() {
-    let mut h = H::new();
-    let r = h.open(BodyLen::Empty, 7);
-    h.respond(r, OK, false);
-    h.head_status(r);
-    h.body(r, b"abc", false);
-    assert_eq!(h.read_body(r, 16).0, BodyOut::Data(3));
-    assert_eq!(h.closed(r, None), [(7, r, Ready::Readable)]);
+    assert_eq!(h.closed(r), [(7, r, Ready::Readable)]);
     assert_eq!(h.read_body(r, 16).0, BodyOut::Fail);
     assert!(!h.contains(r));
     assert_eq!(h.resets(r), 0, "the H3 side is gone");
@@ -760,7 +677,7 @@ fn cl_shortfall_fail_resets_live_request() {
     let r = h.open(BodyLen::Empty, 7);
     h.respond(r, &[(":status", "200"), ("content-length", "100")], true);
     h.head_status(r);
-    h.closed(r, None);
+    h.closed(r);
     assert_eq!(h.read_body(r, 16).0, BodyOut::Fail);
     assert_eq!(h.resets(r), 0);
     // An unparsable or repeated content-length is not checked.
@@ -812,7 +729,7 @@ fn early_response_resets_unfinished_upload() {
     let r = h.open(BodyLen::Known(10), 7);
     h.respond(r, OK, true);
     h.head_status(r);
-    h.closed(r, None);
+    h.closed(r);
     assert_eq!(h.read_body(r, 16).0, BodyOut::Last(0));
     assert_eq!(h.resets(r), 0);
     assert_eq!(h.len(), 0);
@@ -861,19 +778,6 @@ fn empty_buf_probe() {
     h.body(r, b"", true);
     assert_eq!(h.read_body(r, 0).0, BodyOut::Fail);
     assert!(!h.contains(r));
-    // `Rescued`: `Wait` while bytes remain, `Last(0)` once empty.
-    let r = h.open(BodyLen::Empty, 7);
-    h.respond(r, OK, false);
-    h.head_status(r);
-    h.closed(r, unread(None, b"xy"));
-    assert_eq!(h.read_body(r, 0).0, BodyOut::Wait);
-    assert_eq!(h.read_body(r, 1), (BodyOut::Data(1), b"x".to_vec()));
-    assert_eq!(h.read_body(r, 1), (BodyOut::Last(1), b"y".to_vec()));
-    let r = h.open(BodyLen::Empty, 7);
-    h.respond(r, OK, false);
-    h.head_status(r);
-    h.closed(r, unread(None, b""));
-    assert_eq!(h.read_body(r, 0).0, BodyOut::Last(0));
     assert_eq!(h.len(), 0);
 }
 

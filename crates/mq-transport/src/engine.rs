@@ -1,12 +1,10 @@
 //! Engine creation, connection settings, logs and qlog (spec §4.9).
 
-use crate::ffi::{app_proto_callbacks, guard, h3_callbacks, transport_callbacks};
+use crate::ffi::{app_proto_callbacks, guard, transport_callbacks};
 use crate::{Error, Inner, Transport, clock};
 use core::ffi::{c_char, c_void};
 use core::ptr;
-use mq_transport_api::{
-    CongestionControl, ConnProto, H3Backend, Role, Scheduler, Time, TransportConfig,
-};
+use mq_transport_api::{CongestionControl, ConnProto, Role, Scheduler, Time, TransportConfig};
 use std::ffi::CString;
 use std::io::Write;
 use std::time::Duration;
@@ -67,8 +65,7 @@ fn server_settings(cfg: &TransportConfig) -> xqc_conn_settings_t {
     conn_settings(cfg, None)
 }
 
-/// xquic's default engine config with the fields this tree pins. The log level stays WARN:
-/// `xqc_h3_request_close` reads a destroyed request in a DEBUG log (spec §3.1).
+/// xquic's default engine config with the fields this tree pins.
 fn engine_config(ty: xqc_engine_type_t, qlog: bool) -> Option<xqc_config_t> {
     // SAFETY: a plain C struct; xquic fills it.
     let mut config: xqc_config_t = unsafe { core::mem::zeroed() };
@@ -129,7 +126,6 @@ impl Transport {
         let alpn_ptr = t.inner.alpn.as_ptr();
         let alpn_len = t.inner.alpn.as_bytes().len();
         let h3_on = t.inner.cfg.h3;
-        let h3_raw = h3_on && t.inner.cfg.h3_backend == H3Backend::Raw;
         let inner: *mut Inner = &mut *t.inner;
 
         let engine = clock::enter(inner, Time(0), || {
@@ -171,8 +167,8 @@ impl Transport {
                     xqc_engine_destroy(engine);
                     return ptr::null_mut();
                 }
-                if h3_raw {
-                    // adoption spec §3, §7 item 1: ALPN `h3` on raw stream callbacks, no h3 ctx.
+                if h3_on {
+                    // adoption spec §3, §7 item 1: ALPN `h3` on raw stream callbacks.
                     let mut ap = app_proto_callbacks(ConnProto::H3);
                     if xqc_engine_register_alpn(engine, c"h3".as_ptr(), 2, &mut ap, ptr::null_mut())
                         != 0
@@ -180,15 +176,6 @@ impl Transport {
                         xqc_engine_destroy(engine);
                         return ptr::null_mut();
                     }
-                }
-                // spec §3.2: registers `h3` and `h3-29`; cleans up after itself on failure.
-                let mut h3 = h3_callbacks();
-                if h3_on && !h3_raw && xqc_h3_ctx_init(engine, &mut h3) != 0 {
-                    xqc_engine_destroy(engine);
-                    return ptr::null_mut();
-                }
-                if h3_on && !h3_raw {
-                    xqc_h3_engine_set_max_field_section_size(engine, H3_FIELD_SECTION_MAX);
                 }
                 if let Some(s) = &settings {
                     xqc_server_set_conn_settings(engine, s);
@@ -214,15 +201,8 @@ impl Transport {
             return;
         }
         let inner: *mut Inner = &mut *self.inner;
-        let h3 = self.inner.cfg.h3 && self.inner.cfg.h3_backend == H3Backend::XqcH3;
         // SAFETY: `engine` is live (non-null) and destroyed exactly once: it is nulled below.
-        // spec §3.2: the H3 ctx is freed through the live engine, so it goes first.
-        clock::enter(inner, now, || unsafe {
-            if h3 {
-                xqc_h3_ctx_destroy(engine);
-            }
-            xqc_engine_destroy(engine)
-        });
+        clock::enter(inner, now, || unsafe { xqc_engine_destroy(engine) });
         self.inner.engine = ptr::null_mut();
     }
 }
@@ -310,7 +290,6 @@ mod tests {
             cc,
             realtime_offset_us: 0,
             h3: false,
-            h3_backend: mq_transport_api::H3Backend::XqcH3,
             qlog: None,
         }
     }
@@ -395,7 +374,7 @@ mod tests {
         assert!(d.datagram_mss_updated_notify.is_none());
     }
 
-    /// spec §3.1: `xqc_h3_request_close` reads freed memory in a DEBUG log; never raise it.
+    /// The transport pins the engine log level to WARN.
     #[test]
     fn engine_config_pins_log_level_warn() {
         for ty in [XQC_ENGINE_CLIENT, XQC_ENGINE_SERVER] {

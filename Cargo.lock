@@ -662,6 +662,7 @@ version = "0.0.4"
 dependencies = [
  "clap",
  "log",
+ "mq-h3",
  "mq-linux",
  "mq-proxy",
  "mq-runtime",

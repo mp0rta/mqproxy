@@ -91,6 +91,9 @@ pub(crate) struct Req {
     pub(crate) stream_closed: bool,
     /// The DATA frame `h3_send_body` started and has not written whole (adoption spec §4.5).
     pub(crate) frame: Option<InFlight>,
+    /// HEADERS were sent with `fin=true`; the raw FIN rides their final bytes, so
+    /// suppress h3wire's corresponding empty `FinishStream` action.
+    pub(crate) coalesced_header_fin: bool,
     /// `h3_finish` (or a bare `fin`) is waiting for `send_data(0, true)` to stop being
     /// `Blocked` behind queued HEADERS bytes.
     pub(crate) finish_latched: bool,
@@ -135,6 +138,7 @@ impl Req {
             fin_read: false,
             stream_closed: false,
             frame: None,
+            coalesced_header_fin: false,
             finish_latched: false,
             writable_wanted: false,
             send_stopped: false,

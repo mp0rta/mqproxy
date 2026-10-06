@@ -1,13 +1,13 @@
 //! Coalescing event queue (spec §4.2 "Event coalescing").
 //!
-//! `StreamReadable`/`StreamWritable`/`MpReady`/`DatagramReadable`/`H3Readable`/`H3Writable` are
+//! `StreamReadable`/`StreamWritable`/`MpReady`/`DatagramReadable` are
 //! level flags: at most one is queued per object (tracked by the `*_queued` flag on the slot); lifecycle events never
 //! coalesce.
 //! Ids are invalidated inside notifications (spec §4.8), so a queued event may outlive its
 //! slot; `pop` returns it as-is and the consumer drops stale ones.
 
-use crate::slots::{ConnSlot, H3ReqSlot, Slots, StreamSlot};
-use mq_transport_api::{ConnId, Event, H3ReqId, StreamId};
+use crate::slots::{ConnSlot, Slots, StreamSlot};
+use mq_transport_api::{ConnId, Event, StreamId};
 use std::collections::VecDeque;
 
 #[derive(Default)]
@@ -58,26 +58,6 @@ impl Events {
         }
     }
 
-    /// spec §3.4: enqueue iff the request is live and no `H3Readable` is already queued.
-    pub fn push_h3_readable(&mut self, reqs: &mut Slots<H3ReqSlot>, id: H3ReqId) {
-        if let Some(r) = reqs.get_mut(id.slot())
-            && !r.readable_queued
-        {
-            r.readable_queued = true;
-            self.queue.push_back(Event::H3Readable(id));
-        }
-    }
-
-    /// spec §3.4: as `push_h3_readable`, with the writable flag.
-    pub fn push_h3_writable(&mut self, reqs: &mut Slots<H3ReqSlot>, id: H3ReqId) {
-        if let Some(r) = reqs.get_mut(id.slot())
-            && !r.writable_queued
-        {
-            r.writable_queued = true;
-            self.queue.push_back(Event::H3Writable(id));
-        }
-    }
-
     /// Lifecycle events: unconditional, never coalesced.
     pub fn push(&mut self, e: Event) {
         self.queue.push_back(e);
@@ -89,7 +69,6 @@ impl Events {
         &mut self,
         streams: &mut Slots<StreamSlot>,
         conns: &mut Slots<ConnSlot>,
-        reqs: &mut Slots<H3ReqSlot>,
     ) -> Option<Event> {
         let e = self.queue.pop_front()?;
         match &e {
@@ -113,16 +92,6 @@ impl Events {
                     c.dgram_readable_queued = false;
                 }
             }
-            Event::H3Readable(id) => {
-                if let Some(r) = reqs.get_mut(id.slot()) {
-                    r.readable_queued = false;
-                }
-            }
-            Event::H3Writable(id) => {
-                if let Some(r) = reqs.get_mut(id.slot()) {
-                    r.writable_queued = false;
-                }
-            }
             // Never coalesced. Listed, not wildcarded: a new level flag must clear here.
             Event::ConnEstablished(_)
             | Event::ConnClosed(..)
@@ -134,7 +103,9 @@ impl Events {
             | Event::StreamCloseStats(..)
             | Event::PathRemoved(..)
             | Event::H3Request(..)
-            | Event::H3Closed(..) => {}
+            | Event::H3Closed(..)
+            | Event::H3Readable(_)
+            | Event::H3Writable(_) => {}
         }
         Some(e)
     }
@@ -181,20 +152,12 @@ mod tests {
 
     #[test]
     fn readable_coalesced_until_popped() {
-        let (mut st, mut cs, mut rs, mut ev) = (
-            Slots::default(),
-            Slots::default(),
-            Slots::default(),
-            Events::default(),
-        );
+        let (mut st, mut cs, mut ev) = (Slots::default(), Slots::default(), Events::default());
         let id = sid(&mut st, false);
         ev.push_readable(&mut st, id);
         ev.push_readable(&mut st, id);
         assert_eq!(ev.len(), 1);
-        assert_eq!(
-            ev.pop(&mut st, &mut cs, &mut rs),
-            Some(Event::StreamReadable(id))
-        );
+        assert_eq!(ev.pop(&mut st, &mut cs), Some(Event::StreamReadable(id)));
         assert!(ev.is_empty());
         ev.push_readable(&mut st, id);
         assert_eq!(ev.len(), 1);
@@ -202,100 +165,43 @@ mod tests {
 
     #[test]
     fn writable_coalesced() {
-        let (mut st, mut cs, mut rs, mut ev) = (
-            Slots::default(),
-            Slots::default(),
-            Slots::default(),
-            Events::default(),
-        );
+        let (mut st, mut cs, mut ev) = (Slots::default(), Slots::default(), Events::default());
         let id = sid(&mut st, false);
         ev.push_writable(&mut st, id);
         ev.push_writable(&mut st, id);
         assert_eq!(ev.len(), 1);
-        assert_eq!(
-            ev.pop(&mut st, &mut cs, &mut rs),
-            Some(Event::StreamWritable(id))
-        );
+        assert_eq!(ev.pop(&mut st, &mut cs), Some(Event::StreamWritable(id)));
         ev.push_writable(&mut st, id);
         assert_eq!(ev.len(), 1);
     }
 
     #[test]
     fn mp_ready_coalesced() {
-        let (mut st, mut cs, mut rs, mut ev) = (
-            Slots::default(),
-            Slots::default(),
-            Slots::default(),
-            Events::default(),
-        );
+        let (mut st, mut cs, mut ev) = (Slots::default(), Slots::default(), Events::default());
         let id = ConnId::from_slot(cs.insert(conn())).unwrap();
         ev.push_mp_ready(&mut cs, id);
         ev.push_mp_ready(&mut cs, id);
         assert_eq!(ev.len(), 1);
-        assert_eq!(ev.pop(&mut st, &mut cs, &mut rs), Some(Event::MpReady(id)));
+        assert_eq!(ev.pop(&mut st, &mut cs), Some(Event::MpReady(id)));
         ev.push_mp_ready(&mut cs, id);
         assert_eq!(ev.len(), 1);
     }
 
     #[test]
     fn datagram_readable_coalesced() {
-        let (mut st, mut cs, mut rs, mut ev) = (
-            Slots::default(),
-            Slots::default(),
-            Slots::default(),
-            Events::default(),
-        );
+        let (mut st, mut cs, mut ev) = (Slots::default(), Slots::default(), Events::default());
         let id = ConnId::from_slot(cs.insert(conn())).unwrap();
         ev.push_datagram_readable(&mut cs, id);
         ev.push_datagram_readable(&mut cs, id);
         assert_eq!(ev.len(), 1);
-        assert_eq!(
-            ev.pop(&mut st, &mut cs, &mut rs),
-            Some(Event::DatagramReadable(id))
-        );
+        assert_eq!(ev.pop(&mut st, &mut cs), Some(Event::DatagramReadable(id)));
         ev.push_datagram_readable(&mut cs, id);
         assert_eq!(ev.len(), 1);
     }
 
     #[test]
-    fn h3_readable_and_writable_coalesced() {
-        let (mut st, mut cs, mut rs, mut ev) = (
-            Slots::default(),
-            Slots::default(),
-            Slots::default(),
-            Events::default(),
-        );
-        let c = mq_transport_api::SlotId::new(0, 1);
-        let id = H3ReqId::from_slot(rs.insert(H3ReqSlot::new(c, std::ptr::null_mut(), 0))).unwrap();
-        ev.push_h3_readable(&mut rs, id);
-        ev.push_h3_writable(&mut rs, id);
-        ev.push_h3_readable(&mut rs, id);
-        ev.push_h3_writable(&mut rs, id);
-        assert_eq!(ev.len(), 2);
-        assert_eq!(
-            ev.pop(&mut st, &mut cs, &mut rs),
-            Some(Event::H3Readable(id))
-        );
-        ev.push_h3_readable(&mut rs, id);
-        ev.push_h3_writable(&mut rs, id);
-        assert_eq!(ev.len(), 2, "readable re-queued, writable still pending");
-        assert_eq!(
-            ev.pop(&mut st, &mut cs, &mut rs),
-            Some(Event::H3Writable(id))
-        );
-        rs.remove(id.slot());
-        ev.push_h3_writable(&mut rs, id);
-        assert_eq!(ev.len(), 1, "nothing queued for a released request");
-    }
-
-    #[test]
     fn lifecycle_not_coalesced() {
-        let (mut st, mut cs, mut rs, mut ev) = (
-            Slots::default(),
-            Slots::default(),
-            Slots::default(),
-            Events::default(),
-        );
+        let (mut st, mut cs, mut ev) = (Slots::default(), Slots::default(), Events::default());
         let c = ConnId::from_slot(cs.insert(conn())).unwrap();
         let r = CloseReason {
             err_type: ErrType::Unknown,
@@ -305,10 +211,7 @@ mod tests {
         ev.push(Event::ConnEstablished(c));
         ev.push(Event::ConnClosed(c, r));
         assert_eq!(ev.len(), 3);
-        assert_eq!(
-            ev.pop(&mut st, &mut cs, &mut rs),
-            Some(Event::ConnEstablished(c))
-        );
+        assert_eq!(ev.pop(&mut st, &mut cs), Some(Event::ConnEstablished(c)));
     }
 
     #[test]
@@ -322,18 +225,10 @@ mod tests {
 
     #[test]
     fn pop_after_slot_release_returns_owned_event() {
-        let (mut st, mut cs, mut rs, mut ev) = (
-            Slots::default(),
-            Slots::default(),
-            Slots::default(),
-            Events::default(),
-        );
+        let (mut st, mut cs, mut ev) = (Slots::default(), Slots::default(), Events::default());
         let id = sid(&mut st, false);
         ev.push_readable(&mut st, id);
         st.remove(id.slot());
-        assert_eq!(
-            ev.pop(&mut st, &mut cs, &mut rs),
-            Some(Event::StreamReadable(id))
-        );
+        assert_eq!(ev.pop(&mut st, &mut cs), Some(Event::StreamReadable(id)));
     }
 }

@@ -16,21 +16,11 @@ pub struct TransportConfig {
     pub cc: CongestionControl,
     /// Wall clock minus monotonic, fixed at creation (spec §4.3).
     pub realtime_offset_us: i64,
-    /// Register the H3 context (spec §3.1).
+    /// Register ALPN `h3` on raw stream callbacks (adoption spec §3).
     pub h3: bool,
-    /// Which stack serves ALPN `h3`; read only when `h3` is true (adoption spec §3).
-    pub h3_backend: H3Backend,
     /// Write `<dir>/{client,server}.qlog`, opened (truncated) at creation. xquic formats qlog
     /// events only when this is set (spec §4.9).
     pub qlog: Option<PathBuf>,
-}
-
-/// Which stack serves ALPN `h3` (adoption spec §3); read only when `h3` is true.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub enum H3Backend {
-    #[default]
-    XqcH3,
-    Raw,
 }
 
 /// Client or server; the server needs a cert and key (spec §4.2).

@@ -126,13 +126,7 @@ fn stats0() -> H3ReqStats {
 /// `H3Closed` with `stats`; returns every log line it produced.
 fn close_log(h: &mut H, r: H3ReqId, stats: H3ReqStats) -> Vec<String> {
     log_capture::take();
-    h.t.close_h3(
-        r,
-        H3Close {
-            stats,
-            unread: None,
-        },
-    );
+    h.t.close_h3(r, H3Close { stats });
     h.drive();
     log_capture::take()
 }
