@@ -176,6 +176,72 @@ fn client_request_round_trip() {
 }
 
 #[test]
+fn headers_fin_rides_final_header_bytes() {
+    let mut r = client();
+    let (id, s) = open(&mut r);
+    assert_eq!(
+        r.w.h3_send_headers(r.now, id, &request("GET"), true),
+        Ok(())
+    );
+    let fin_calls: Vec<_> =
+        r.h.log()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::StreamSend {
+                    s: sent,
+                    bytes,
+                    fin: true,
+                } if sent == s => Some(bytes),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(fin_calls.len(), 1);
+    assert!(!fin_calls[0].is_empty(), "FIN should ride HEADERS bytes");
+    assert_eq!(r.fins(s), 1);
+    r.pump();
+    assert_peer_finished(&r, Q(0));
+}
+
+#[test]
+fn headers_fin_survives_partial_write_once() {
+    let mut r = client();
+    let (id, s) = open(&mut r);
+    r.limit(s, Some(1));
+    assert_eq!(
+        r.w.h3_send_headers(r.now, id, &request("GET"), true),
+        Ok(())
+    );
+    assert_eq!(r.h.sent_bytes(s).len(), 1);
+    assert_eq!(r.fins(s), 0, "partial headers must not commit FIN");
+
+    r.limit(s, None);
+    r.h.push_event(Event::StreamWritable(s));
+    r.w.drive(r.now);
+    assert_eq!(r.fins(s), 1);
+    let fin_calls: Vec<_> =
+        r.h.log()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::StreamSend {
+                    s: sent,
+                    bytes,
+                    fin: true,
+                } if sent == s => Some(bytes),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(
+        fin_calls.len(),
+        2,
+        "the unfinished header tail retries with FIN"
+    );
+    assert!(fin_calls.iter().all(|bytes| !bytes.is_empty()));
+    r.pump();
+    assert_peer_finished(&r, Q(0));
+    assert_eq!(r.fins(s), 1, "the retry commits exactly one FIN");
+}
+
+#[test]
 fn send_body_partial_payload() {
     let (mut r, id, s, head) = posting();
     let body = body_of(1000);

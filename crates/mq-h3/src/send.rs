@@ -137,6 +137,7 @@ impl<T: TransportOps> H3Wire<T> {
         let r = conn.h3.send_headers(Q(req.quic_id), &fields, fin);
         req.core |= r.is_ok();
         if r.is_ok() {
+            req.coalesced_header_fin = fin;
             conn.core.insert(req.quic_id);
         }
         self.drive_inner(now);
@@ -402,10 +403,17 @@ impl<T: TransportOps> H3Wire<T> {
                 // A `Blocked` FIN is kept and retried; it survives a peer RESET_STREAM
                 // (adoption spec §3, §4.5).
                 Action::FinishStream(q) => {
-                    if let Some(s) = mq(q)
-                        && self.inner.stream_send(now, s, &[], true) == Err(StreamError::Blocked)
-                    {
-                        conn.fins.insert(s);
+                    if let Some(s) = mq(q) {
+                        let headers_fin = self
+                            .reqs
+                            .get_mut(&req_id(s))
+                            .is_some_and(|req| std::mem::take(&mut req.coalesced_header_fin));
+                        if !headers_fin
+                            && self.inner.stream_send(now, s, &[], true)
+                                == Err(StreamError::Blocked)
+                        {
+                            conn.fins.insert(s);
+                        }
                     }
                 }
                 // Direction guard (adoption spec §4.5): the transport ops do not check.
@@ -456,8 +464,9 @@ impl<T: TransportOps> H3Wire<T> {
             let mut req = reqs.get_mut(&req_id(s)).filter(|_| q.is_request());
             while let Some(bytes) = conn.h3.poll_send(q).filter(|b| !b.is_empty()) {
                 let len = bytes.len();
+                let fin = req.as_ref().is_some_and(|req| req.coalesced_header_fin);
                 // Another error is final for the stream: no retry owed.
-                let n = match inner.stream_send(now, s, bytes, false) {
+                let n = match inner.stream_send(now, s, bytes, fin) {
                     Ok(n) => n,
                     Err(e) => {
                         short |= e == StreamError::Blocked;
