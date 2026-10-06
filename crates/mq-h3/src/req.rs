@@ -29,6 +29,9 @@ pub(crate) struct Req {
     /// The transport read failed with `Reset` before its `StreamPeerReset` popped
     /// (adoption spec §4.4).
     pub(crate) reset_code_pending: bool,
+    /// A peer RESET's code, held while the raw FIN is carried: h3wire takes it once the
+    /// FIN is fed, so a complete message stays complete (adoption spec §5.3 (7)).
+    pub(crate) reset_deferred: Option<u64>,
     /// Raw bytes read and not consumed by h3wire; never parsed payload.
     pub(crate) carry: Vec<u8>,
     /// The transport reported FIN after the carry; not yet fed.
@@ -79,6 +82,7 @@ impl Req {
             terminal: None,
             handed: false,
             reset_code_pending: false,
+            reset_deferred: None,
             carry: Vec::new(),
             carry_fin: false,
             fin_read: false,

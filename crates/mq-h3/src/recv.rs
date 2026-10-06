@@ -203,6 +203,11 @@ impl<T: TransportOps> H3Wire<T> {
             // holds, and later StreamReadables continue it (spec §3).
             let c = req.conn;
             self.dispatch_retire(now, c);
+            if fin_fed
+                && let Some(code) = self.reqs.get_mut(&id).and_then(|r| r.reset_deferred.take())
+            {
+                self.peer_reset(id, code);
+            }
             if n > 0 || (consumed == 0 && !fin_fed) {
                 return Ok(n);
             }
@@ -332,16 +337,10 @@ impl<T: TransportOps> H3Wire<T> {
                     && !req.aborted()
                 {
                     req.reset_code_pending = false;
-                    if let Some(conn) = self.conns.get_mut(&c) {
-                        log_closed(conn.h3.stream_reset_received(q, H3Code(*code)));
-                    }
-                    // After `Finished` h3wire resets our send side with no event: as
-                    // `SendStopped`.
-                    if req.terminal == Some(Terminal::Finished) {
-                        req.stop_send();
-                        if req.known {
-                            self.queue.push(Event::H3Writable(id));
-                        }
+                    if req.carry_fin {
+                        req.reset_deferred = Some(*code); // `feed` passes it after the FIN
+                    } else {
+                        self.peer_reset(id, *code);
                     }
                 }
                 // The probe always runs (spec §3), before the events are dispatched by
@@ -382,6 +381,23 @@ impl<T: TransportOps> H3Wire<T> {
             _ => return false,
         }
         true
+    }
+
+    /// Passes a peer RESET of request `id` to h3wire. After `Finished` h3wire resets our
+    /// send side with no event: as `SendStopped` (adoption spec §4.5).
+    fn peer_reset(&mut self, id: H3ReqId, code: u64) {
+        let Some(req) = self.reqs.get_mut(&id).filter(|r| !r.aborted()) else {
+            return;
+        };
+        if let Some(conn) = self.conns.get_mut(&req.conn) {
+            log_closed(conn.h3.stream_reset_received(Q(req.quic_id), H3Code(code)));
+        }
+        if req.terminal == Some(Terminal::Finished) {
+            req.stop_send();
+            if req.known {
+                self.queue.push(Event::H3Writable(id));
+            }
+        }
     }
 
     /// Closure (adoption spec §4.3): once the transport closed the stream (1) and the

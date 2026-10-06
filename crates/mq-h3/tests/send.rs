@@ -628,3 +628,21 @@ fn send_headers_after_peer_reset_resets() {
         );
     }
 }
+
+/// A peer RESET while the raw FIN is still carried, before h3wire reached `Finished`: the
+/// reset waits for the carry to be fed, so the complete response is delivered as after
+/// `Finished` (adoption spec §5.3 (7)) instead of being aborted.
+#[test]
+fn peer_reset_with_fin_carried_client_discards() {
+    let (mut r, id, s, _) = posting();
+    let body = body_of(1000);
+    respond(&mut r, Q(0), &body); // read whole by the bootstrap: DATA + FIN carried
+    r.events();
+    r.h.expect_stream_recv(s, Err(StreamError::Reset));
+    r.h.push_event(Event::StreamPeerReset(s, 0x10c));
+    r.w.drive(r.now);
+    assert_eq!(aborts(&r, s), [], "deferred until the carry is fed");
+    assert_eq!(read_response(&mut r, id), body);
+    assert_eq!(aborts(&r, s), [Call::StreamResetSend { s, code: 0x10c }]);
+    assert_eq!(r.w.h3_send_body(r.now, id, &[7u8; 64], false), Ok(64));
+}
