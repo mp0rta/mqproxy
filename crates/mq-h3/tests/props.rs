@@ -99,6 +99,9 @@ struct Gw {
     /// `h3_send_headers` succeeded: the gateway sends body only after it.
     headers: bool,
     fin_sent: bool,
+    /// A body `fin` was offered: the gateway's body has ended, so a re-offer adds no
+    /// bytes and keeps the `fin`.
+    fin_offered: bool,
     /// The gateway got `fin` or `Err(Reset)` from a read, or called `h3_reset`.
     done: bool,
 }
@@ -288,7 +291,9 @@ impl Model {
                 let Some(g) = self.gw(r).filter(|g| g.headers && !g.fin_sent) else {
                     return;
                 };
-                let (id, offer) = (g.id, g.pending + add);
+                let add = if g.fin_offered { 0 } else { add };
+                let (id, offer, fin) = (g.id, g.pending + add, fin || g.fin_offered);
+                g.fin_offered = fin;
                 let data: Vec<u8> = (0..offer).map(|i| i as u8).collect();
                 let res = self.r.w.h3_send_body(now, id, &data, fin);
                 self.not_stale(id, res.err());
@@ -436,6 +441,7 @@ impl Model {
             pending: 0,
             headers: false,
             fin_sent: false,
+            fin_offered: false,
             done: false,
         });
     }
