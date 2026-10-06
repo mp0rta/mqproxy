@@ -127,6 +127,11 @@ impl<T: TransportOps> H3Wire<T> {
             .get_mut(&id)
             .filter(|r| r.known)
             .ok_or(StreamError::Stale)?;
+        // Our send side is over (adoption spec §4.5): h3wire would answer `UnknownStream`
+        // (reaped) or `WrongPhase`, but the request is still held.
+        if req.aborted() || req.send_stopped {
+            return Err(StreamError::Reset);
+        }
         let conn = self.conns.get_mut(&req.conn).ok_or(StreamError::Conn)?;
         let fields: Vec<_> = hs.iter().map(|h| FieldRef::new(h.name, h.value)).collect();
         let r = conn.h3.send_headers(Q(req.quic_id), &fields, fin);

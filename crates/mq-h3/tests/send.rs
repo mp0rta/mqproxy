@@ -558,3 +558,39 @@ fn peer_reset_after_finished_ends_send() {
     assert_eq!(r.w.h3_finish(r.now, id), Err(StreamError::Reset));
     assert_eq!(sends(&r, s, false), n, "nothing written after the reset");
 }
+
+/// The gateway answers a request the peer already reset: `Err(Reset)` as for the body, not
+/// `Stale` for a request still held. Before `Finished` the request is aborted; after it the
+/// send side is stopped (found by the property test).
+#[test]
+fn send_headers_after_peer_reset_resets() {
+    for fin in [false, true] {
+        let mut r = server();
+        let get = [
+            f(":method", "GET"),
+            f(":scheme", "https"),
+            f(":authority", "example.com"),
+            f(":path", "/"),
+        ];
+        r.peer.send_headers(Q(0), &get, fin).unwrap();
+        r.pump();
+        let id = r
+            .events()
+            .iter()
+            .find_map(|e| match *e {
+                Event::H3Request(_, id) => Some(id),
+                _ => None,
+            })
+            .expect("H3Request");
+        assert_eq!(r.w.h3_recv_headers(r.now, id, &mut |_, _| {}), Ok(fin));
+        let s = r.peer_stream(Q(0));
+        r.h.expect_stream_recv(s, Err(StreamError::Reset));
+        r.h.push_event(Event::StreamPeerReset(s, 0x10c));
+        r.w.drive(r.now);
+        assert_eq!(
+            r.w.h3_send_headers(r.now, id, &[h(":status", "200")], false),
+            Err(StreamError::Reset),
+            "fin = {fin}"
+        );
+    }
+}
