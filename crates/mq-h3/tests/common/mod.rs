@@ -1,14 +1,14 @@
 //! `Rig`: an `H3Wire<ScriptedTransport>` joined to a real `h3wire::Connection` peer.
 #![allow(dead_code)]
 
-use h3wire::{Action, Config, Connection, Recv, Role, StreamId as Q};
+use h3wire::{Action, Config, Connection, H3Code, Recv, Role, StreamId as Q};
 use mq_h3::H3Wire;
 use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
 use mq_transport_api::{
-    CloseReason, ConnConfig, ConnId, ConnProto, ErrType, Event, StreamError, StreamId, StreamInfo,
-    StreamKind, Time, TransportOps,
+    CloseReason, ConnConfig, ConnId, ConnProto, ErrType, Error, Event, StreamCloseStats,
+    StreamError, StreamId, StreamInfo, StreamKind, Time, TransportOps,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// `w` → peer bytes of one stream, as the transport accepted them.
@@ -33,6 +33,8 @@ struct Wire {
     limit: HashMap<StreamId, VecDeque<Option<usize>>>,
     /// Quic id of the next request stream `w` opens.
     next_req: u64,
+    /// The conn is closed: `open_stream` fails like the real transport's (`Stale`).
+    conn_closed: bool,
 }
 
 impl Wire {
@@ -56,6 +58,18 @@ pub struct Rig {
     to_w: BTreeMap<u64, (Vec<u8>, bool)>,
     /// Quic id of the next uni stream the peer opens.
     next_peer_uni: u64,
+    /// Streams the transport closed (`close_stream`).
+    closed: HashSet<StreamId>,
+    /// Streams whose transport receive side was given its end (FIN or reset).
+    recv_end: HashSet<StreamId>,
+    /// Streams whose send side `w` reset, or the transport reset on a peer STOP_SENDING.
+    send_reset: HashSet<StreamId>,
+    /// `relay_aborts` cursor into the call log.
+    log_at: usize,
+    /// `relay_aborts` saw `w` close the conn.
+    w_closed: bool,
+    /// Quic ids `peer_raw_reset` reset: later peer bytes on them are dropped.
+    raw_reset: HashSet<u64>,
 }
 
 /// Generous; hitting it means the two sides never settle.
@@ -97,8 +111,11 @@ impl Rig {
         }
         let ww = wire.clone();
         h.on_open_stream(move |h, conn| {
-            let s = h.new_stream_id();
             let mut w = lock(&ww);
+            if w.conn_closed {
+                return Err(Error::Stale);
+            }
+            let s = h.new_stream_id();
             let q = w.next_req;
             w.next_req += 4;
             w.map(s, q);
@@ -131,11 +148,22 @@ impl Rig {
             wire,
             to_w: BTreeMap::new(),
             next_peer_uni: if peer_role == Role::Client { 2 } else { 3 },
+            closed: HashSet::new(),
+            recv_end: HashSet::new(),
+            send_reset: HashSet::new(),
+            log_at: 0,
+            w_closed: false,
+            raw_reset: HashSet::new(),
         }
     }
 
     /// Moves accepted bytes both ways and executes actions on both sides until nothing moves.
+    /// After the transport conn closed, only drives `w`.
     pub fn pump(&mut self) {
+        if self.conn_closed() {
+            self.w.drive(self.now);
+            return;
+        }
         for _ in 0..MAX_ROUNDS {
             self.w.drive(self.now);
             let mut moved = self.feed_peer();
@@ -176,17 +204,23 @@ impl Rig {
 
     /// Peer DATA through send_data / data_written; the bytes reach `w` on the next pump.
     pub fn peer_send_body(&mut self, q: Q, body: &[u8], fin: bool) {
+        assert!(self.try_peer_send_body(q, body, fin), "peer send_data");
+    }
+
+    /// `peer_send_body`, returning false if the peer refuses.
+    pub fn try_peer_send_body(&mut self, q: Q, body: &[u8], fin: bool) -> bool {
         self.drain_peer(); // queued HEADERS go first
-        let f = self
-            .peer
-            .send_data(q, body.len() as u64, fin)
-            .expect("peer send_data");
+        let Ok(f) = self.peer.send_data(q, body.len() as u64, fin) else {
+            return false;
+        };
         let pipe = &mut self.to_w.entry(q.0).or_default().0;
         pipe.extend_from_slice(f.prefix());
         pipe.extend_from_slice(body);
-        self.peer
-            .data_written(q, f.prefix().len() + body.len())
-            .expect("peer data_written");
+        let n = f.prefix().len() + body.len();
+        if n > 0 {
+            self.peer.data_written(q, n).expect("peer data_written");
+        }
+        true
     }
 
     /// Raw bytes on a peer stream (the "raw" cases only).
@@ -196,9 +230,165 @@ impl Rig {
         e.1 |= fin;
     }
 
-    /// Pushes ConnClosed(conn, reason) into the inner transport (transport close, not H3).
+    /// Pushes ConnClosed(conn, reason) into the inner transport (transport close, not H3),
+    /// once; nothing moves between the two sides afterwards.
     pub fn close_transport(&mut self, reason: CloseReason) {
-        self.h.push_event(Event::ConnClosed(self.conn, reason));
+        if !std::mem::replace(&mut lock(&self.wire).conn_closed, true) {
+            self.h.push_event(Event::ConnClosed(self.conn, reason));
+        }
+    }
+
+    /// `close_transport` as xquic does it: every stream's `StreamCloseStats` +
+    /// `StreamClosed` first, then `ConnClosed` (adoption spec §3, A.5).
+    pub fn close_transport_streams(&mut self, reason: CloseReason) {
+        if self.conn_closed() {
+            return;
+        }
+        for (_, s) in self.streams() {
+            self.close_stream(s);
+        }
+        self.close_transport(reason);
+    }
+
+    /// The transport conn is closed: nothing moves between the two sides any more.
+    pub fn conn_closed(&self) -> bool {
+        lock(&self.wire).conn_closed
+    }
+
+    /// `w` closed the conn (`close_conn` / `close_conn_with`) and the transport has not
+    /// reported it yet; seen by `relay_aborts`.
+    pub fn w_closed(&self) -> bool {
+        self.w_closed && !self.conn_closed()
+    }
+
+    /// The mq id of quic id `q`, if mapped.
+    pub fn stream_of(&self, q: u64) -> Option<StreamId> {
+        lock(&self.wire).mq_of.get(&q).copied()
+    }
+
+    /// Every mapped stream (quic id, mq id) the transport has not closed, by quic id.
+    pub fn streams(&self) -> Vec<(u64, StreamId)> {
+        let w = lock(&self.wire);
+        let mut v: Vec<_> = w
+            .mq_of
+            .iter()
+            .filter(|(_, s)| !self.closed.contains(s))
+            .map(|(&q, &s)| (q, s))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The transport closed `s` (`close_stream`).
+    pub fn is_closed(&self, s: StreamId) -> bool {
+        self.closed.contains(&s)
+    }
+
+    /// `StreamCloseStats` + `StreamClosed` for `s`, once (xquic destroys the stream).
+    pub fn close_stream(&mut self, s: StreamId) {
+        if !self.closed.insert(s) {
+            return;
+        }
+        let st = StreamCloseStats {
+            fin_send_us: 0,
+            fin_ack_us: 0,
+            mp_state: 0,
+            stream_err: 0,
+            close_msg: None,
+        };
+        self.h.push_event(Event::StreamCloseStats(s, Box::new(st)));
+        self.h.push_event(Event::StreamClosed(s));
+    }
+
+    /// xquic may close `s` on its own: both directions are over. Receive: the transport
+    /// gave its end (FIN or reset) and `w` read everything. Send: `w`'s FIN was accepted,
+    /// or the send side was reset (by `w`, or by xquic on a peer STOP_SENDING). Needs
+    /// `relay_aborts` to have seen the latest calls.
+    pub fn retirable(&self, s: StreamId) -> bool {
+        let Some(&q) = lock(&self.wire).q_of.get(&s) else {
+            return false;
+        };
+        !self.closed.contains(&s)
+            && self.recv_end.contains(&s)
+            && self.h.recv_pending(s) == 0
+            && !self.to_w.contains_key(&q)
+            && (self.fins(s) > 0 || self.send_reset.contains(&s))
+    }
+
+    /// A peer STOP_SENDING on `w`'s stream `q`: the transport event, then xquic's
+    /// RESET_STREAM reply (unless `w`'s FIN was accepted), which the peer receives.
+    pub fn peer_stop_sending(&mut self, q: u64, code: u64) {
+        let Some(s) = self.stream_of(q) else {
+            return;
+        };
+        if self.conn_closed() || self.closed.contains(&s) {
+            return;
+        }
+        self.h.push_event(Event::StreamStopSending(s, code));
+        if self.fins(s) == 0 && self.send_reset.insert(s) {
+            self.abandon(s);
+            let _ = self
+                .peer
+                .stream_reset_received(Q(q), H3Code::REQUEST_CANCELLED);
+        }
+    }
+
+    /// A RESET_STREAM on `q` from a peer stack that resets whatever its h3 state (e.g.
+    /// xqc_h3, even after its FIN); the h3wire peer is not told and its later bytes on `q`
+    /// are dropped.
+    pub fn peer_raw_reset(&mut self, q: u64, code: u64) {
+        let Some(s) = self.stream_of(q) else {
+            return;
+        };
+        if self.conn_closed() || self.closed.contains(&s) || !self.raw_reset.insert(q) {
+            return;
+        }
+        self.to_w.remove(&q);
+        self.recv_end.insert(s);
+        self.h.expect_stream_recv(s, Err(StreamError::Reset));
+        self.h.push_event(Event::StreamPeerReset(s, code));
+    }
+
+    /// Delivers `w`'s RESET_STREAM / STOP_SENDING calls since the last call to the peer.
+    /// A STOP_SENDING makes the peer reset its send side, as its transport would.
+    pub fn relay_aborts(&mut self) {
+        let log = self.h.log();
+        let new = &log[self.log_at..];
+        self.log_at = log.len();
+        for c in new {
+            let (s, reset, stop) = match *c {
+                Call::StreamResetSend { s, code } => (s, Some(code), None),
+                Call::StreamStopSending { s, code } => (s, None, Some(code)),
+                Call::StreamReset(s) => (s, Some(0x10c), Some(0x10c)),
+                Call::CloseConn(_) | Call::CloseConnWith { .. } => {
+                    self.w_closed = true;
+                    continue;
+                }
+                _ => continue,
+            };
+            if reset.is_some() {
+                self.send_reset.insert(s);
+            }
+            let q = lock(&self.wire).q_of.get(&s).copied();
+            let Some(q) = q.filter(|_| !self.conn_closed() && !self.closed.contains(&s)) else {
+                continue;
+            };
+            if let Some(code) = reset {
+                self.abandon(s);
+                let _ = self.peer.stream_reset_received(Q(q), H3Code(code));
+            }
+            if let Some(code) = stop {
+                let _ = self.peer.stop_sending_received(Q(q), H3Code(code));
+            }
+        }
+    }
+
+    /// RESET_STREAM abandons what `w` sent on `s` and the peer has not received.
+    fn abandon(&mut self, s: StreamId) {
+        if let Some(o) = lock(&self.wire).out.get_mut(&s) {
+            o.at = o.buf.len();
+            o.fin_fed = true;
+        }
     }
 
     /// Feeds every accepted `w` → peer byte to the peer; returns whether anything moved.
@@ -265,6 +455,9 @@ impl Rig {
     }
 
     fn peer_action(&mut self, a: Action) {
+        if self.conn_closed() {
+            return;
+        }
         match a {
             Action::OpenUni(kind) => {
                 let q = self.next_peer_uni;
@@ -276,11 +469,18 @@ impl Rig {
             Action::ResetStream { stream, code } => {
                 self.to_w.remove(&stream.0); // RESET_STREAM abandons what is unsent
                 let s = self.mq(stream.0);
+                if self.closed.contains(&s) {
+                    return;
+                }
+                self.recv_end.insert(s);
                 self.h.expect_stream_recv(s, Err(StreamError::Reset));
                 self.h.push_event(Event::StreamPeerReset(s, code.0));
             }
             Action::StopSending { stream, code } => {
                 let s = self.mq(stream.0);
+                if self.closed.contains(&s) {
+                    return;
+                }
                 self.h.push_event(Event::StreamStopSending(s, code.0));
             }
             Action::CloseConnection { code, .. } => self.close_transport(CloseReason {
@@ -295,10 +495,16 @@ impl Rig {
         let staged = std::mem::take(&mut self.to_w);
         let mut moved = false;
         for (q, (bytes, fin)) in staged {
-            if bytes.is_empty() && !fin {
+            if self.conn_closed() || self.raw_reset.contains(&q) || (bytes.is_empty() && !fin) {
                 continue;
             }
             let s = self.mq(q);
+            if self.closed.contains(&s) {
+                continue; // the transport stream is gone
+            }
+            if fin {
+                self.recv_end.insert(s);
+            }
             self.h.expect_stream_recv(s, Ok((bytes, fin)));
             self.h.push_event(Event::StreamReadable(s));
             moved = true;

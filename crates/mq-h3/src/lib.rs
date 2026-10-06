@@ -37,6 +37,9 @@ pub struct H3Wire<T> {
     /// A `NewConn` was seen: the inner transport is a server. ponytail: learned, not
     /// configured; before its first conn a server reports an unknown conn as `Stale`.
     server: bool,
+    /// The largest `h3_recv_body` buf so far: the carry bound (adoption spec §5.4).
+    #[cfg(feature = "test-support")]
+    max_buf: usize,
 }
 
 impl<T: TransportOps> H3Wire<T> {
@@ -59,6 +62,8 @@ impl<T: TransportOps> H3Wire<T> {
             conns: HashMap::new(),
             streams: HashMap::new(),
             server: false,
+            #[cfg(feature = "test-support")]
+            max_buf: 0,
         }
     }
 
@@ -81,6 +86,18 @@ impl<T: TransportOps> H3Wire<T> {
             req::Terminal::Aborted { code, source } => Some((code, source)),
             req::Terminal::Finished => None,
         }
+    }
+
+    /// Every request's carry <= max(BOOT_READ, largest buf passed so far), and every
+    /// connection's h3wire `debug_buffered_bytes() <= debug_bound()` (adoption spec §5.4).
+    #[cfg(feature = "test-support")]
+    pub fn debug_bounds_hold(&self) -> bool {
+        let carry = BOOT_READ.max(self.max_buf);
+        self.reqs.values().all(|r| r.carry.len() <= carry)
+            && self
+                .conns
+                .values()
+                .all(|c| c.h3.debug_buffered_bytes() <= c.h3.debug_bound())
     }
 
     /// Services every H3 conn, then moves the inner queue into ours, consuming what belongs
@@ -314,6 +331,10 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         r: H3ReqId,
         buf: &mut [u8],
     ) -> Result<(usize, bool), StreamError> {
+        #[cfg(feature = "test-support")]
+        {
+            self.max_buf = self.max_buf.max(buf.len());
+        }
         if self.active {
             return self.recv_body(now, r, buf);
         }
