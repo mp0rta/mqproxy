@@ -3,12 +3,12 @@
 
 use h3wire::{Action, Config, Connection, Recv, Role, StreamId as Q};
 use mq_h3::H3Wire;
-use mq_runtime::testing::{ScriptedHandle, ScriptedTransport};
+use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
 use mq_transport_api::{
     CloseReason, ConnConfig, ConnId, ConnProto, ErrType, Event, StreamError, StreamId, StreamInfo,
     StreamKind, Time, TransportOps,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// `w` → peer bytes of one stream, as the transport accepted them.
@@ -19,6 +19,8 @@ struct Out {
     at: usize,
     fin: bool,
     fin_fed: bool,
+    /// Accepted `stream_send` calls with `fin`.
+    fins: usize,
 }
 
 /// State shared with the `on_stream_send` / `on_open_stream` rules.
@@ -27,8 +29,8 @@ struct Wire {
     q_of: HashMap<StreamId, u64>,
     mq_of: HashMap<u64, StreamId>,
     out: BTreeMap<StreamId, Out>,
-    /// One-shot cap on the next `stream_send` per stream.
-    limit: HashMap<StreamId, usize>,
+    /// Caps on the next `stream_send` calls per stream, one each (None: uncapped).
+    limit: HashMap<StreamId, VecDeque<Option<usize>>>,
     /// Quic id of the next request stream `w` opens.
     next_req: u64,
 }
@@ -45,6 +47,8 @@ pub struct Rig {
     pub h: ScriptedHandle,
     pub peer: Connection,
     pub peer_events: Vec<h3wire::Event>,
+    /// DATA payload the peer received, per quic id.
+    peer_body: BTreeMap<u64, Vec<u8>>,
     pub conn: ConnId,
     pub now: Time,
     wire: Arc<Mutex<Wire>>,
@@ -104,14 +108,16 @@ impl Rig {
         let ww = wire.clone();
         h.on_stream_send(move |_, s, data, fin| {
             let mut w = lock(&ww);
-            let n = match w.limit.remove(&s) {
+            let n = match w.limit.get_mut(&s).and_then(VecDeque::pop_front).flatten() {
                 Some(0) => return Err(StreamError::Blocked),
                 Some(cap) => data.len().min(cap),
                 None => data.len(),
             };
             let out = w.out.entry(s).or_default();
             out.buf.extend_from_slice(&data[..n]);
-            out.fin |= fin && n == data.len();
+            let fin = fin && n == data.len();
+            out.fin |= fin;
+            out.fins += usize::from(fin);
             Ok(n)
         });
         Rig {
@@ -119,6 +125,7 @@ impl Rig {
             h,
             peer: Connection::new(peer_role, Config::default()),
             peer_events: Vec::new(),
+            peer_body: BTreeMap::new(),
             conn,
             now: Time::ZERO,
             wire,
@@ -151,13 +158,20 @@ impl Rig {
         lock(&self.wire).mq_of[&q.0]
     }
 
-    /// Caps how many bytes the next `stream_send` on `s` accepts (None = all); 0 is `Blocked`.
+    /// Caps how many bytes one later `stream_send` on `s` accepts (None = all); 0 is
+    /// `Blocked`. Caps queue: the n-th call caps the n-th following send.
     pub fn limit(&mut self, s: StreamId, n: Option<usize>) {
-        let mut w = lock(&self.wire);
-        match n {
-            Some(n) => w.limit.insert(s, n),
-            None => w.limit.remove(&s),
-        };
+        lock(&self.wire).limit.entry(s).or_default().push_back(n);
+    }
+
+    /// How many `stream_send` calls with `fin` on `s` the transport accepted.
+    pub fn fins(&self, s: StreamId) -> usize {
+        lock(&self.wire).out.get(&s).map_or(0, |o| o.fins)
+    }
+
+    /// The DATA payload the peer received on `q`.
+    pub fn peer_body(&self, q: Q) -> Vec<u8> {
+        self.peer_body.get(&q.0).cloned().unwrap_or_default()
     }
 
     /// Peer DATA through send_data / data_written; the bytes reach `w` on the next pump.
@@ -203,9 +217,13 @@ impl Rig {
                 }
                 let n = match self.peer.recv(q, rest, fin) {
                     Ok(Recv::Paused) => break,
+                    Ok(Recv::Body { consumed, range }) => {
+                        let body = self.peer_body.entry(q.0).or_default();
+                        body.extend_from_slice(&rest[range]);
+                        consumed
+                    }
                     Ok(
                         Recv::Consumed(n)
-                        | Recv::Body { consumed: n, .. }
                         | Recv::Frame { consumed: n, .. }
                         | Recv::Raw { consumed: n, .. },
                     ) => n,
@@ -318,4 +336,23 @@ fn info(conn: ConnId, q: u64) -> StreamInfo {
 
 fn lock(w: &Mutex<Wire>) -> MutexGuard<'_, Wire> {
     w.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Reset / STOP_SENDING calls on `s`, in order.
+pub fn aborts(r: &Rig, s: StreamId) -> Vec<Call> {
+    r.h.log()
+        .into_iter()
+        .filter(|c| {
+            matches!(c, Call::StreamResetSend { s: x, .. } | Call::StreamStopSending { s: x, .. }
+                | Call::StreamReset(x) if *x == s)
+        })
+        .collect()
+}
+
+/// `stream_recv` calls on `s`.
+pub fn recvs(r: &Rig, s: StreamId) -> usize {
+    r.h.log()
+        .iter()
+        .filter(|c| matches!(c, Call::StreamRecv { s: x, .. } if *x == s))
+        .count()
 }

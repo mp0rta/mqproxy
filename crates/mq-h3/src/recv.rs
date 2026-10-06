@@ -18,18 +18,21 @@ fn slice(carry: usize, carry_fin: bool, cap: usize) -> (usize, bool) {
 
 impl<T: TransportOps> H3Wire<T> {
     /// Applies `c`'s h3wire events to the requests and queues what the gateway sees
-    /// (adoption spec §4.3 "Start", §4.4).
-    pub(crate) fn dispatch(&mut self, c: ConnId) {
+    /// (adoption spec §4.3 "Start", §4.4). Returns the streams aborted with their FIN
+    /// unread: they need the retirement read of spec §3.
+    pub(crate) fn dispatch(&mut self, c: ConnId) -> Vec<StreamId> {
+        let mut retire = Vec::new();
         let Some(conn) = self.conns.get_mut(&c) else {
-            return;
+            return retire;
         };
         while let Some(e) = conn.h3.poll_event() {
             let q = match e {
                 H3Event::Headers { stream, .. }
                 | H3Event::Finished(stream)
-                | H3Event::StreamAborted { stream, .. } => stream,
-                // SendStopped, GoAway: Task C4. Closed: Task C5. PeerSettings, UniStream:
-                // nothing to do.
+                | H3Event::StreamAborted { stream, .. }
+                | H3Event::SendStopped { stream, .. } => stream,
+                // GoAway: its cutoff arrives as StreamAborted. Closed: Task C5.
+                // PeerSettings, UniStream: nothing to do.
                 _ => continue,
             };
             let id = conn.mq.get(&q.0).map(|&s| req_id(s));
@@ -62,9 +65,22 @@ impl<T: TransportOps> H3Wire<T> {
                     conn.h3.release(block);
                     continue;
                 }
+                // adoption spec §4.5: the client discards later body, the server resets.
+                H3Event::SendStopped { .. } => {
+                    req.send_stopped = true;
+                    req.frame = None;
+                    req.finish_latched = false;
+                    if req.known {
+                        self.queue.push(Event::H3Writable(id)); // a blocked pump learns it
+                    }
+                    continue;
+                }
                 H3Event::Finished(_) => req.terminal = Some(Terminal::Finished),
                 H3Event::StreamAborted { code, source, .. } => {
                     req.terminal = Some(Terminal::Aborted { code, source });
+                    if !req.carry_fin && !req.reset_code_pending {
+                        retire.push(req.stream);
+                    }
                     if let Some(b) = req.pending_block.take() {
                         conn.h3.release(b);
                     }
@@ -80,6 +96,7 @@ impl<T: TransportOps> H3Wire<T> {
                 self.queue.push(Event::H3Readable(id));
             }
         }
+        retire
     }
 
     /// Feeds request `id` until a stop condition (adoption spec §4.4).
@@ -290,6 +307,11 @@ impl<T: TransportOps> H3Wire<T> {
                 }
                 self.retire_read(now, s);
             }
+            Event::StreamWritable(_) => {
+                if self.reqs.get(&id).is_some_and(|r| r.known) {
+                    self.queue.push(Event::H3Writable(id)); // adoption spec §4.5
+                }
+            }
             Event::StreamClosed(_) => {
                 // A pending code was dropped with the slot: "reset, code unknown".
                 if let Some(req) = self.reqs.get_mut(&id)
@@ -301,6 +323,7 @@ impl<T: TransportOps> H3Wire<T> {
                 // Unmapped first, so actions queued for the gone stream are dropped.
                 if let Some(conn) = self.conns.get_mut(&c) {
                     conn.mq.remove(&q.0);
+                    conn.fins.remove(&s);
                 }
                 self.streams.remove(&s);
                 self.close_req(id);
@@ -342,7 +365,7 @@ impl<T: TransportOps> H3Wire<T> {
 
     /// Retirement read (adoption spec §3): discards what is left until FIN, the reset
     /// or a blocked transport.
-    fn retire_read(&mut self, now: Time, s: StreamId) {
+    pub(crate) fn retire_read(&mut self, now: Time, s: StreamId) {
         let mut buf = [0u8; BOOT_READ];
         while let Ok((n, fin)) = self.inner.stream_recv(now, s, &mut buf) {
             if fin || n == 0 {

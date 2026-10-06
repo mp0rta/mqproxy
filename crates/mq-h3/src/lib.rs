@@ -74,6 +74,15 @@ impl<T: TransportOps> H3Wire<T> {
         self.inner
     }
 
+    /// The h3wire abort of request `r` (code, source), if it was aborted.
+    #[cfg(feature = "test-support")]
+    pub fn debug_abort(&self, r: H3ReqId) -> Option<(h3wire::H3Code, h3wire::AbortSource)> {
+        match self.reqs.get(&r)?.terminal? {
+            req::Terminal::Aborted { code, source } => Some((code, source)),
+            req::Terminal::Finished => None,
+        }
+    }
+
     /// Services every H3 conn, then moves the inner queue into ours, consuming what belongs
     /// to H3 conns; runs at the end of every method that takes `now` (adoption spec §4.1).
     fn drive_inner(&mut self, now: Time) {
@@ -275,14 +284,14 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         fin: bool,
     ) -> Result<usize, StreamError> {
         if self.active {
-            return Err(StreamError::Stale); // Task C4
+            return self.send_body(now, r, data, fin);
         }
         fwd!(self, now, self.inner.h3_send_body(now, r, data, fin))
     }
 
     fn h3_finish(&mut self, now: Time, r: H3ReqId) -> Result<(), StreamError> {
         if self.active {
-            return Err(StreamError::Stale); // Task C4
+            return self.finish(now, r);
         }
         fwd!(self, now, self.inner.h3_finish(now, r))
     }
@@ -313,7 +322,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
 
     fn h3_reset(&mut self, now: Time, r: H3ReqId) {
         if self.active {
-            return; // Task C5
+            return self.reset(now, r);
         }
         fwd!(self, now, self.inner.h3_reset(now, r))
     }

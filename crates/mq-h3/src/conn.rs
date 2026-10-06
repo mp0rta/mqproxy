@@ -31,6 +31,9 @@ pub(crate) struct H3Conn {
     pub(crate) uni_done: HashSet<StreamId>,
     /// We closed the transport; h3wire's actions and bytes are dropped from then on.
     pub(crate) closing: bool,
+    /// Request streams whose `FinishStream` write was `Blocked`: retried by `service`
+    /// (adoption spec §4.5). At most one per stream.
+    pub(crate) fins: HashSet<StreamId>,
 }
 
 impl H3Conn {
@@ -47,6 +50,7 @@ impl<T: TransportOps> H3Wire<T> {
             mq: HashMap::new(),
             uni_done: HashSet::new(),
             closing: false,
+            fins: HashSet::new(),
         };
         self.conns.insert(c, conn);
         self.service(now, c);

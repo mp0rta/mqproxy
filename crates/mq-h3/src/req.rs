@@ -1,7 +1,8 @@
 //! Per-request state (adoption spec §4.3).
 
+use crate::send::InFlight;
 use h3wire::{AbortSource, H3Code, HeaderBlockId};
-use mq_transport_api::{ConnId, H3ReqId, H3ReqStats, StreamId};
+use mq_transport_api::{ConnId, H3ReqId, H3ReqStats, StreamId, Time};
 
 /// The h3wire terminal event of a request's receive side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +33,19 @@ pub(crate) struct Req {
     pub(crate) carry: Vec<u8>,
     /// The transport reported FIN after the carry; not yet fed.
     pub(crate) carry_fin: bool,
-    // send-side fields: Task C4; stats: Task C6
+    /// The DATA frame `h3_send_body` started and has not written whole (adoption spec §4.5).
+    pub(crate) frame: Option<InFlight>,
+    /// `h3_finish` (or a bare `fin`) is waiting for `send_data(0, true)` to stop being
+    /// `Blocked` behind queued HEADERS bytes.
+    pub(crate) finish_latched: bool,
+    /// `h3_send_body` returned `Blocked` behind queued HEADERS bytes: `H3Writable` once
+    /// they drain.
+    pub(crate) writable_wanted: bool,
+    /// The peer's STOP_SENDING ended our send side.
+    pub(crate) send_stopped: bool,
+    /// `now` when the first HEADERS byte was accepted (adoption spec §4.6).
+    pub(crate) headers_sent_at: Option<Time>,
+    // stats: Task C6
 }
 
 impl Req {
@@ -50,6 +63,11 @@ impl Req {
             reset_code_pending: false,
             carry: Vec::new(),
             carry_fin: false,
+            frame: None,
+            finish_latched: false,
+            writable_wanted: false,
+            send_stopped: false,
+            headers_sent_at: None,
         }
     }
 

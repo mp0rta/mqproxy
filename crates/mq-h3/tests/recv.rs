@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::Rig;
+use common::{Rig, aborts, recvs};
 use h3wire::{FieldRef, HeaderBlockId, HeadersKind, StreamId as Q};
 use mq_runtime::testing::Call;
 use mq_transport_api::{
@@ -125,24 +125,6 @@ fn assert_body(got: &[Result<(Vec<u8>, bool), StreamError>], body: &[u8], cap: u
     }
     assert_eq!(all.len(), body.len());
     assert!(all == body, "body bytes differ");
-}
-
-/// Reset / STOP_SENDING calls on `s`, in order.
-fn aborts(r: &Rig, s: StreamId) -> Vec<Call> {
-    r.h.log()
-        .into_iter()
-        .filter(|c| {
-            matches!(c, Call::StreamResetSend { s: x, .. } | Call::StreamStopSending { s: x, .. }
-                | Call::StreamReset(x) if *x == s)
-        })
-        .collect()
-}
-
-fn recvs(r: &Rig, s: StreamId) -> usize {
-    r.h.log()
-        .iter()
-        .filter(|c| matches!(c, Call::StreamRecv { s: x, .. } if *x == s))
-        .count()
 }
 
 fn close_codes(r: &Rig) -> Vec<u64> {
