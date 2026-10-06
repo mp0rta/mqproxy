@@ -4,7 +4,7 @@
 //! After every step: no panic and `debug_bounds_hold()`. Throughout: `H3Request` once per
 //! request, no H3 event after a request's `H3Closed`, at most one `ConnClosed`, and a
 //! request whose stream the transport closed has its `H3Closed` once the gateway has its
-//! receive end or called `h3_reset` (§4.3 "Closure"). At the end, after the transport close
+//! receive end or called `h3_reset` (§4.3 "Closure"); `Err(Stale)` only after `H3Closed`. At the end, after the transport close
 //! and a drain of every request still open, each request that got `H3Request` or was opened
 //! has exactly one `H3Closed`.
 //!
@@ -20,7 +20,8 @@
 //! - `ConnClosed` comes once: from the close step, the peer's `CloseConnection`, or after
 //!   `w`'s own `close_conn_with` (held, then replayed with or without the stream closes).
 //! - The gateway keeps its contract: `h3_send_body` re-offers every unaccepted byte, no send
-//!   after its FIN, `h3_finish` only with nothing pending. Op order is otherwise random.
+//!   after its FIN (headers included), `h3_finish` only with nothing pending, body and finish only after its
+//!   headers were accepted. Op order is otherwise random.
 #![cfg(feature = "test-support")]
 
 mod common;
@@ -68,7 +69,7 @@ fn step() -> impl Strategy<Value = Step> {
             .prop_map(|(q, len, fin)| Step::PeerBody { q, len, fin }),
         4 => q().prop_map(|q| Step::PeerFin { q }),
         4 => q().prop_map(|q| Step::PeerReset { q }),
-        2 => q().prop_map(|q| Step::PeerRawReset { q }),
+        4 => q().prop_map(|q| Step::PeerRawReset { q }),
         4 => q().prop_map(|q| Step::PeerStopSending { q }),
         4 => any::<bool>().prop_map(|finish| Step::PeerGoaway { finish }),
         16 => Just(Step::Open),
@@ -95,6 +96,8 @@ struct Gw {
     quic: Option<u64>,
     /// Body bytes offered and not accepted: re-offered first.
     pending: usize,
+    /// `h3_send_headers` succeeded: the gateway sends body only after it.
+    headers: bool,
     fin_sent: bool,
     /// The gateway got `fin` or `Err(Reset)` from a read, or called `h3_reset`.
     done: bool,
@@ -225,8 +228,17 @@ impl Model {
                 }
             }
             Step::PeerRawReset { q } => {
-                if let Some(q) = self.peer_q(q) {
-                    self.r.peer_raw_reset(q.0, H3Code::REQUEST_CANCELLED.0);
+                // Mostly after the peer's FIN, where h3wire may have reached `Finished`
+                // and aborts with no event (the case behind `peer_reset_after_finished_*`).
+                let fin: Vec<u64> = self
+                    .r
+                    .streams()
+                    .into_iter()
+                    .filter(|&(q, s)| q % 4 == 0 && self.r.recv_ended(s))
+                    .map(|(q, _)| q)
+                    .collect();
+                if let Some(q) = pick(&fin, q).or_else(|| self.peer_q(q).map(|q| q.0)) {
+                    self.r.peer_raw_reset(q, H3Code::REQUEST_CANCELLED.0);
                 }
             }
             Step::PeerStopSending { q } => {
@@ -248,7 +260,7 @@ impl Model {
                 }
             }
             Step::SendHeaders { r, set, fin } => {
-                let Some(id) = self.gw(r).map(|g| g.id) else {
+                let Some(id) = self.gw(r).filter(|g| !g.fin_sent).map(|g| g.id) else {
                     return;
                 };
                 let req = [
@@ -265,18 +277,21 @@ impl Model {
                     6 => &[h(":status", "103")],
                     _ => &[h(":status", "200"), h("X-Upper", "invalid")],
                 };
-                let ok = self.r.w.h3_send_headers(now, id, hs, fin).is_ok();
-                if let Some(g) = self.gw(r).filter(|_| ok && fin) {
-                    g.fin_sent = true;
-                }
+                let res = self.r.w.h3_send_headers(now, id, hs, fin);
+                self.not_stale(id, res.err());
+                let ok = res.is_ok();
+                let g = self.gw(r).expect("picked above");
+                g.headers |= ok;
+                g.fin_sent |= ok && fin;
             }
             Step::SendBody { r, add, fin } => {
-                let Some(g) = self.gw(r).filter(|g| !g.fin_sent) else {
+                let Some(g) = self.gw(r).filter(|g| g.headers && !g.fin_sent) else {
                     return;
                 };
                 let (id, offer) = (g.id, g.pending + add);
                 let data: Vec<u8> = (0..offer).map(|i| i as u8).collect();
                 let res = self.r.w.h3_send_body(now, id, &data, fin);
+                self.not_stale(id, res.err());
                 let g = self.gw(r).expect("picked above");
                 match res {
                     Ok(n) => {
@@ -289,11 +304,16 @@ impl Model {
                 }
             }
             Step::Finish { r } => {
-                let Some(g) = self.gw(r).filter(|g| !g.fin_sent && g.pending == 0) else {
+                let Some(g) = self
+                    .gw(r)
+                    .filter(|g| g.headers && !g.fin_sent && g.pending == 0)
+                else {
                     return;
                 };
                 let id = g.id;
-                let ok = self.r.w.h3_finish(now, id).is_ok();
+                let res = self.r.w.h3_finish(now, id);
+                self.not_stale(id, res.err());
+                let ok = res.is_ok();
                 self.gw(r).expect("picked above").fin_sent = ok;
             }
             Step::Reset { r } => {
@@ -306,6 +326,7 @@ impl Model {
             Step::RecvHeaders { r } => {
                 if let Some(id) = self.gw(r).map(|g| g.id) {
                     let res = self.r.w.h3_recv_headers(now, id, &mut |_, _| {});
+                    self.not_stale(id, res.err());
                     let g = self.gw(r).expect("picked above");
                     g.done |= matches!(res, Ok(true) | Err(StreamError::Reset));
                 }
@@ -314,6 +335,7 @@ impl Model {
                 if let Some(id) = self.gw(r).map(|g| g.id) {
                     let mut buf = vec![0u8; cap];
                     let res = self.r.w.h3_recv_body(now, id, &mut buf);
+                    self.not_stale(id, res.err());
                     if let Ok((n, _)) = res {
                         assert!(n <= cap);
                     }
@@ -396,12 +418,23 @@ impl Model {
         }
     }
 
+    /// `Stale` only for a request H3Wire no longer holds (Global Constraints).
+    fn not_stale(&self, id: H3ReqId, e: Option<StreamError>) {
+        if e == Some(StreamError::Stale) {
+            assert!(
+                self.closed.contains_key(&id),
+                "{id:?}: Stale before H3Closed"
+            );
+        }
+    }
+
     fn add(&mut self, id: H3ReqId) {
         let quic = self.r.w.h3_req_info(id).ok().map(|i| i.quic_id);
         self.reqs.push(Gw {
             id,
             quic,
             pending: 0,
+            headers: false,
             fin_sent: false,
             done: false,
         });
@@ -411,11 +444,12 @@ impl Model {
     fn drain(&mut self) {
         let now = self.r.now;
         for _ in 0..64 {
+            // In `reqs` order, so a shrunk case replays the same way.
             let open: Vec<H3ReqId> = self
-                .known
+                .reqs
                 .iter()
+                .map(|g| g.id)
                 .filter(|id| !self.closed.contains_key(id))
-                .copied()
                 .collect();
             if open.is_empty() {
                 return;
@@ -448,7 +482,10 @@ fn run(server: bool, steps: &[Step], streams_first: bool) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    // `PROPTEST_CASES` overrides the count for a deep run.
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(200)
+    ))]
 
     #[test]
     fn random_ops_hold_invariants(

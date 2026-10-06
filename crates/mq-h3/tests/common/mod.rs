@@ -279,6 +279,11 @@ impl Rig {
         v
     }
 
+    /// The transport handed `s`'s receive end to `w` (FIN or reset).
+    pub fn recv_ended(&self, s: StreamId) -> bool {
+        self.recv_end.contains(&s)
+    }
+
     /// The transport closed `s` (`close_stream`).
     pub fn is_closed(&self, s: StreamId) -> bool {
         self.closed.contains(&s)
@@ -315,13 +320,19 @@ impl Rig {
             && (self.fins(s) > 0 || self.send_reset.contains(&s))
     }
 
+    /// The peer knows stream `s`: it opened it, or `w` has sent it bytes.
+    fn peer_knows(&self, s: StreamId) -> bool {
+        let peer_client = self.next_peer_uni % 4 == 2;
+        peer_client || lock(&self.wire).out.get(&s).is_some_and(|o| o.at > 0)
+    }
+
     /// A peer STOP_SENDING on `w`'s stream `q`: the transport event, then xquic's
     /// RESET_STREAM reply (unless `w`'s FIN was accepted), which the peer receives.
     pub fn peer_stop_sending(&mut self, q: u64, code: u64) {
         let Some(s) = self.stream_of(q) else {
             return;
         };
-        if self.conn_closed() || self.closed.contains(&s) {
+        if self.conn_closed() || self.closed.contains(&s) || !self.peer_knows(s) {
             return;
         }
         self.h.push_event(Event::StreamStopSending(s, code));
@@ -340,7 +351,11 @@ impl Rig {
         let Some(s) = self.stream_of(q) else {
             return;
         };
-        if self.conn_closed() || self.closed.contains(&s) || !self.raw_reset.insert(q) {
+        if self.conn_closed()
+            || self.closed.contains(&s)
+            || !self.peer_knows(s)
+            || !self.raw_reset.insert(q)
+        {
             return;
         }
         self.to_w.remove(&q);

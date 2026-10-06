@@ -559,6 +559,40 @@ fn peer_reset_after_finished_ends_send() {
     assert_eq!(sends(&r, s, false), n, "nothing written after the reset");
 }
 
+/// Client role of `peer_reset_after_finished_ends_send` (adoption spec §4.5 "A peer RESET
+/// after Finished"): the upload is accepted and discarded and the response still ends
+/// clean.
+#[test]
+fn peer_reset_after_finished_client_discards() {
+    let (mut r, id, s, _) = posting();
+    let b = peer_block(&r, Q(0));
+    r.peer.release(b);
+    r.peer
+        .send_headers(Q(0), &[f(":status", "200")], true)
+        .expect("peer response");
+    r.pump();
+    r.events();
+    r.h.expect_stream_recv(s, Err(StreamError::Reset));
+    r.h.push_event(Event::StreamPeerReset(s, 0x10c));
+    r.w.drive(r.now);
+    assert_eq!(aborts(&r, s), [Call::StreamResetSend { s, code: 0x10c }]);
+    assert_eq!(r.events(), [Event::H3Writable(id)]);
+    let n = sends(&r, s, false);
+    assert_eq!(r.w.h3_send_body(r.now, id, &[7u8; 4096], false), Ok(4096));
+    assert_eq!(r.w.h3_finish(r.now, id), Ok(()));
+    assert_eq!(sends(&r, s, false), n, "nothing written");
+    assert_eq!(r.w.h3_recv_headers(r.now, id, &mut |_, _| {}), Ok(true));
+    let mut buf = [0u8; 64];
+    assert_eq!(r.w.h3_recv_body(r.now, id, &mut buf), Ok((0, true)));
+    r.h.push_event(Event::StreamClosed(s));
+    r.w.drive(r.now);
+    let ev = r.events();
+    assert!(
+        matches!(ev[..], [Event::H3Closed(x, _)] if x == id),
+        "one H3Closed: {ev:?}"
+    );
+}
+
 /// The gateway answers a request the peer already reset: `Err(Reset)` as for the body, not
 /// `Stale` for a request still held. Before `Finished` the request is aborted; after it the
 /// send side is stopped (found by the property test).
