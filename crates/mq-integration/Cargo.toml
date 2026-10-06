@@ -36,7 +36,7 @@ mq-transport = { path = "../mq-transport" }
 mq-transport-api = { path = "../mq-transport-api" }
 mq-linux = { path = "../mq-linux" }
 mq-wire = { path = "../mq-wire", optional = true }
-# The h3wire backend (loopback::Backend::Wire) and the raw-H3 peer's byte builders (raw_h3.rs).
+# The h3wire transport (loopback::h3_transport) and the raw-H3 peer's byte builders (raw_h3.rs).
 mq-h3 = { path = "../mq-h3", optional = true, features = ["test-support"] }
 h3wire = { path = "../../third_party/h3wire/h3wire", optional = true }
 log = { workspace = true, optional = true }

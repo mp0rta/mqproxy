@@ -3,7 +3,7 @@
 use mq_runtime::testing::{Call, ScriptedTransport};
 use mq_transport_api::{
     ConnConfig, ConnProto, DatagramError, Error, Event, H3Close, H3Header, H3ReqStats, PathId,
-    StreamError, Time, TransportOps, Unread,
+    StreamError, Time, TransportOps,
 };
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -435,17 +435,11 @@ fn scripted_h3_recv_error_injected() {
 }
 
 #[test]
-fn scripted_h3_close_carries_unread() {
+fn scripted_h3_close_carries_stats() {
     let (mut t, h) = ScriptedTransport::new();
     let c = h.new_conn_id();
     let r = h.new_h3_request(c);
-    let close = H3Close {
-        stats: stats(),
-        unread: Some(Unread {
-            headers: Some(pairs(&[("k", "v")])),
-            body: b"tail".to_vec(),
-        }),
-    };
+    let close = H3Close { stats: stats() };
     h.close_h3(r, close.clone());
     let _ = t.poll_event(); // H3Request
     assert_eq!(t.poll_event(), Some(Event::H3Closed(r, Box::new(close))));
@@ -456,13 +450,7 @@ fn scripted_h3_stale_after_close() {
     let (mut t, h) = ScriptedTransport::new();
     let c = h.new_conn_id();
     let r = h.new_h3_request(c);
-    h.close_h3(
-        r,
-        H3Close {
-            stats: stats(),
-            unread: None,
-        },
-    );
+    h.close_h3(r, H3Close { stats: stats() });
     let mut buf = [0u8; 8];
     assert_eq!(t.h3_send_headers(T, r, &[], false), Err(StreamError::Stale));
     assert_eq!(t.h3_send_body(T, r, b"x", false), Err(StreamError::Stale));

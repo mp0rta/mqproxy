@@ -620,7 +620,7 @@ fn invalid_field_maps_to_reset() {
     assert!(r.h.sent_bytes(s).is_empty());
 }
 
-/// A peer RESET_STREAM after the request's FIN (xqc_h3 sends one on any cancel): h3wire
+/// A peer RESET_STREAM after the request's FIN (a peer cancels its stream): h3wire
 /// resets our send side but emits no `StreamAborted` after `Finished`, so it ends the send
 /// side as `SendStopped` does, here with a DATA frame in flight.
 #[test]

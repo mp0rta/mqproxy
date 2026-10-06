@@ -120,13 +120,7 @@ fn closed(h: &mut H, r: H3ReqId) {
         stream_err: 0,
         close_msg: None,
     };
-    h.t.close_h3(
-        r,
-        H3Close {
-            stats,
-            unread: None,
-        },
-    );
+    h.t.close_h3(r, H3Close { stats });
     h.drive();
 }
 

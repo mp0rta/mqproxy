@@ -10,7 +10,7 @@ use mitm_harness::*;
 use mq_proxy::client::mitm::MitmTuning;
 use mq_runtime::TcpId;
 use mq_runtime::testing::Call;
-use mq_transport_api::{ConnId, Event, H3Close, H3ReqId, H3ReqStats, StreamError, Unread};
+use mq_transport_api::{ConnId, Event, H3ReqId, StreamError};
 use std::time::Duration;
 
 const US: Duration = Duration::from_micros(1);
@@ -30,20 +30,6 @@ fn hs(pairs: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
     (pairs.iter())
         .map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec()))
         .collect()
-}
-
-fn stats() -> H3ReqStats {
-    H3ReqStats {
-        send_body: 0,
-        recv_body: 0,
-        begin_us: 0,
-        header_send_us: 0,
-        fin_send_us: 0,
-        fin_ack_us: 0,
-        mp_state: 0,
-        stream_err: 0,
-        close_msg: None,
-    }
 }
 
 /// A MITM conn with a live tunnel conn and a handshaken browser.
@@ -431,7 +417,7 @@ fn empty_end_stream_with_zero_capacity_completes() {
 
 /// R1: a separate empty H3 FIN after a bodyless head is seen by the terminal
 /// probe, so its END_STREAM needs no h2 credit, even with the upload open
-/// (no `H3Closed` to rescue it).
+/// before `H3Closed` arrives.
 #[test]
 fn separate_empty_fin_with_zero_capacity_and_open_upload_completes() {
     let mut t = T::new();
@@ -474,33 +460,6 @@ fn buffered_data_capacity_grant_without_new_h3_event_delivers() {
     assert!(t.b.received(&s) == body);
     t.body(r, b"", true);
     assert!(t.b.response(&s).expect("complete").1 == body);
-}
-
-#[test]
-fn rescued_body_capacity_grant_without_new_h3_event_delivers() {
-    let mut t = T::new();
-    t.b.hold_capacity(true);
-    let (s, r) = t.req("GET", "/x", &[], b"");
-    t.head(r, "200", &[], false);
-    let body = pattern(WIN + 1000);
-    t.body(r, &body[..WIN], false);
-    assert_eq!(t.b.received(&s).len(), WIN);
-    let unread = Unread {
-        headers: None,
-        body: body[WIN..].to_vec(),
-    };
-    let close = H3Close {
-        stats: stats(),
-        unread: Some(unread),
-    };
-    t.mh.t.close_h3(r, close);
-    t.flow();
-    assert_eq!(t.b.received(&s).len(), WIN, "no capacity yet");
-    t.b.hold_capacity(false);
-    t.b.release(&s);
-    t.flow();
-    assert!(t.b.response(&s).expect("complete").1 == body);
-    assert_eq!(t.streams(), 0);
 }
 
 #[test]

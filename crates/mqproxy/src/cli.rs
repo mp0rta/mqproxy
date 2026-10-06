@@ -563,7 +563,7 @@ pub fn ip_port(flag: &str, s: &str) -> Result<SocketAddr, String> {
 }
 
 /// spec §8: the transport's H3 layer — the server's gateway, or the client's
-/// fetch ingress or MITM front (their tunnel conn is an `xqc_h3_connect`).
+/// fetch ingress or MITM front (their gateway conn uses ALPN `h3`).
 pub fn wants_h3(r: &Resolved) -> bool {
     match &r.mode {
         Mode::Server(s) => s.config.gateway.is_some(),

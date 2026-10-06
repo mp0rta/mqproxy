@@ -95,7 +95,7 @@ impl<T: TransportOps> H3Wire<T> {
     /// Client request start (adoption spec §4.3): the request exists from `open_stream`;
     /// h3wire holds state for it once `send_headers` succeeds.
     pub(crate) fn open_req(&mut self, now: Time, c: ConnId) -> Result<H3ReqId, Error> {
-        // The xqc_h3 backend's order (`reserve_local`): role, conn, protocol.
+        // Request admission order: role, conn, protocol.
         let r = match self.conns.get(&c) {
             _ if self.server => Err(Error::Role),
             None if self.inner.conn_stats(c).is_ok() => Err(Error::Other), // a raw conn
@@ -186,7 +186,7 @@ impl<T: TransportOps> H3Wire<T> {
         // A retained request (client only) accepts and discards like after SendStopped,
         // so a running upload pump cannot abort the response (adoption spec §4.3).
         if req.send_stopped || self.conns[&req.conn].gone {
-            // RFC 9114 §4.1: the client's response keeps flowing; xqc_h3 resets the server.
+            // RFC 9114 §4.1: the client's response keeps flowing after cancelling the upload.
             return if client {
                 Ok(data.len())
             } else {
@@ -284,7 +284,7 @@ impl<T: TransportOps> H3Wire<T> {
     }
 
     /// `h3_finish`: latches the finish intent and returns `Ok` while HEADERS bytes are
-    /// queued, as xqc_h3 does (adoption spec §4.5).
+    /// queued (adoption spec §4.5).
     pub(crate) fn finish(&mut self, now: Time, id: H3ReqId) -> Result<(), StreamError> {
         let client = self.client_of(id)?;
         let r = self.body(now, id, &[], true, client).map(drop);

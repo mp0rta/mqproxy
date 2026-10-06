@@ -345,8 +345,8 @@ impl Rig {
         }
     }
 
-    /// A RESET_STREAM on `q` from a peer stack that resets whatever its h3 state (e.g.
-    /// xqc_h3, even after its FIN); the h3wire peer is not told and its later bytes on `q`
+    /// A RESET_STREAM on `q` from a peer stack that resets even after its FIN;
+    /// the h3wire peer is not told and its later bytes on `q`
     /// are dropped.
     pub fn peer_raw_reset(&mut self, q: u64, code: u64) {
         let Some(s) = self.stream_of(q) else {

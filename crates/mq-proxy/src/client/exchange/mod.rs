@@ -7,7 +7,7 @@ pub(crate) mod wire;
 
 use mq_http::headers::{HttpVer, Method, Reject, Target, body_check_applies};
 use mq_runtime::Cx;
-use mq_transport_api::{ConnId, Event, H3Header, H3ReqId, StreamError, Unread};
+use mq_transport_api::{ConnId, Event, H3Header, H3ReqId, StreamError};
 use resp::{HeadCollector, RespHead};
 use std::collections::HashMap;
 
@@ -97,21 +97,14 @@ enum Up {
 /// SP4 spec §4.2: the response side.
 enum Down {
     AwaitHead,
-    /// `H3Closed` arrived first: rescue or none.
-    ClosedBeforeHead(Option<Unread>),
+    /// `H3Closed` arrived before the response head.
+    ClosedBeforeHead,
     /// `fin`: the transport fin was observed.
     Body {
         status: u16,
         cl: Option<u64>,
         delivered: u64,
         fin: bool,
-    },
-    Rescued {
-        status: u16,
-        cl: Option<u64>,
-        delivered: u64,
-        body: Vec<u8>,
-        off: usize,
     },
     /// The next `read_head` / `read_body` returns `Fail`.
     Failed,
@@ -254,36 +247,21 @@ impl<O: Copy> Exchanges<O> {
     }
 
     /// SP4 spec §4.3: readiness goes to the owner; `H3Closed` ends the upload,
-    /// moves the response side (rescue or failure) and reads as `Readable`.
+    /// settles the response side and reads as `Readable`.
     /// Events for unknown ids give `None` and are left as they were; a known
-    /// `H3Closed`'s rescue is taken out of `ev` (no second copy of the body).
+    /// `H3Closed` preserves a response whose FIN was already consumed.
     pub fn on_event(&mut self, ev: &mut Event) -> Option<(O, H3ReqId, Ready)> {
         let (id, ready) = match ev {
             Event::H3Readable(id) => (*id, Ready::Readable),
             Event::H3Writable(id) => (*id, Ready::Writable),
-            Event::H3Closed(id, close) => {
+            Event::H3Closed(id, _) => {
                 let x = self.by_id.get_mut(id)?;
                 // The transport already removed the request slot: later ops are `Stale`.
                 x.live = false;
                 x.up = Up::Done;
                 x.down = match std::mem::replace(&mut x.down, Down::Failed) {
-                    Down::AwaitHead => Down::ClosedBeforeHead(close.unread.take()),
-                    // `fin: true` keeps `Body`: nothing is rescued after a consumed fin.
-                    Down::Body {
-                        status,
-                        cl,
-                        delivered,
-                        fin: false,
-                    } => match close.unread.take() {
-                        Some(u) => Down::Rescued {
-                            status,
-                            cl,
-                            delivered,
-                            body: u.body,
-                            off: 0,
-                        },
-                        None => Down::Failed,
-                    },
+                    Down::AwaitHead => Down::ClosedBeforeHead,
+                    Down::Body { fin: false, .. } => Down::Failed,
                     d => d,
                 };
                 (*id, Ready::Readable)
@@ -306,7 +284,7 @@ impl<O: Copy> Exchanges<O> {
     }
 
     /// SP4 spec §4.3 `read_head`: collect the head under the §5 limits, from
-    /// the transport or from a rescue. `Blocked` / `Stale` wait (a stale
+    /// the transport. `Blocked` / `Stale` wait (a stale
     /// readiness waits for `H3Closed`, SP3-1). A `Fail` removes the exchange.
     /// After `Head` it is a no-op `Wait`.
     pub fn read_head(&mut self, cx: &mut Cx<'_>, id: H3ReqId) -> HeadOut {
@@ -314,53 +292,36 @@ impl<O: Copy> Exchanges<O> {
             return HeadOut::Fail(Reject::UpstreamReset);
         };
         let mut col = HeadCollector::default();
-        // `rescue`: `Ok(body)` from a rescue, else `Err(fin)` of the section.
-        let (head, rescue) = match &mut x.down {
+        let (head, fin) = match &mut x.down {
             Down::AwaitHead => match cx.h3_recv_headers(id, &mut |n, v| col.push(n, v)) {
-                Ok(fin) => (col.finish(), Err(fin)),
+                Ok(fin) => (col.finish(), fin),
                 Err(StreamError::Blocked | StreamError::Stale) => return HeadOut::Wait,
                 Err(StreamError::Reset | StreamError::Conn) => {
                     self.fail(cx, id);
                     return HeadOut::Fail(Reject::UpstreamReset);
                 }
             },
-            Down::ClosedBeforeHead(Some(u)) if u.headers.is_some() => {
-                for (n, v) in u.headers.iter().flatten() {
-                    col.push(n, v);
-                }
-                // The end comes from the rescue, through `read_body`.
-                (col.finish(), Ok(std::mem::take(&mut u.body)))
-            }
-            Down::ClosedBeforeHead(_) | Down::Failed => {
+            Down::ClosedBeforeHead | Down::Failed => {
                 self.fail(cx, id);
                 return HeadOut::Fail(Reject::UpstreamReset);
             }
-            Down::Body { .. } | Down::Rescued { .. } => return HeadOut::Wait,
+            Down::Body { .. } => return HeadOut::Wait,
         };
         let Ok(head) = head else {
             self.fail(cx, id);
             return HeadOut::Fail(Reject::UpstreamProtocol);
         };
         let (status, cl) = (head.status, head.cl);
-        x.down = match rescue {
-            Err(fin) => Down::Body {
-                status,
-                cl,
-                delivered: 0,
-                fin,
-            },
-            Ok(body) => Down::Rescued {
-                status,
-                cl,
-                delivered: 0,
-                body,
-                off: 0,
-            },
+        x.down = Down::Body {
+            status,
+            cl,
+            delivered: 0,
+            fin,
         };
         HeadOut::Head(head)
     }
 
-    /// SP4 spec §4.3 `read_body`: the transport's bytes, or the rescue in
+    /// SP4 spec §4.3 `read_body`: the transport's bytes in
     /// `buf`-sized slices; the read that ends the body goes through the end
     /// rule. An empty `buf` consumes nothing; on a live body it is still one
     /// transport read, which xquic answers with the fin only when no body is
@@ -377,7 +338,7 @@ impl<O: Copy> Exchanges<O> {
         };
         // `(n, Some(short))` when this read ends the body.
         let (n, end) = match &mut x.down {
-            Down::AwaitHead | Down::ClosedBeforeHead(_) => return BodyOut::Wait,
+            Down::AwaitHead | Down::ClosedBeforeHead => return BodyOut::Wait,
             Down::Failed => {
                 self.fail(cx, id);
                 return BodyOut::Fail;
@@ -406,23 +367,6 @@ impl<O: Copy> Exchanges<O> {
                     return BodyOut::Fail;
                 }
             },
-            Down::Rescued {
-                status,
-                cl,
-                delivered,
-                body,
-                off,
-            } => {
-                let n = buf.len().min(body.len() - *off);
-                if n == 0 && *off < body.len() {
-                    return BodyOut::Wait;
-                }
-                buf[..n].copy_from_slice(&body[*off..*off + n]);
-                *off += n;
-                *delivered += n as u64;
-                let end = *off == body.len();
-                (n, end.then(|| short(*status, *cl, *delivered)))
-            }
         };
         match end {
             None => BodyOut::Data(n),
@@ -480,8 +424,6 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     const IDS: usize = 4;
-    /// Every rescue carries these bytes (`Unread.body`).
-    const RESCUE: &[u8] = b"xyz";
 
     #[derive(Clone, Debug)]
     enum Op {
@@ -499,8 +441,6 @@ mod tests {
         Writable(usize),
         Closed {
             id: usize,
-            unread: bool,
-            headers: bool,
         },
         /// `err` queues a `Reset` for the next `h3_send_body`.
         Send {
@@ -543,13 +483,7 @@ mod tests {
                     err
                 }),
             id.clone().prop_map(Op::Writable),
-            (id.clone(), any::<bool>(), any::<bool>()).prop_map(|(id, unread, headers)| {
-                Op::Closed {
-                    id,
-                    unread,
-                    headers,
-                }
-            }),
+            id.clone().prop_map(|id| Op::Closed { id }),
             (id.clone(), 0..4usize, any::<bool>(), rare())
                 .prop_map(|(id, len, fin, err)| Op::Send { id, len, fin, err }),
             (id.clone(), 0..6u64).prop_map(|(id, buffered)| Op::Eof { id, buffered }),
@@ -582,17 +516,11 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum MDown {
         AwaitHead,
-        /// `Some(headers present)` with a rescue.
-        ClosedBeforeHead(Option<bool>),
+        ClosedBeforeHead,
         Body {
             fin: bool,
             cl: Option<u64>,
             delivered: u64,
-        },
-        Rescued {
-            cl: Option<u64>,
-            delivered: u64,
-            left: usize,
         },
         Failed,
     }
@@ -678,7 +606,7 @@ mod tests {
             (BodyOut::Last(n), r)
         }
 
-        fn on_closed(&mut self, unread: Option<bool>) {
+        fn on_closed(&mut self) {
             self.closed = true;
             if self.removed {
                 return;
@@ -686,19 +614,8 @@ mod tests {
             self.live = false;
             self.up = MUp::Done;
             self.down = match self.down {
-                MDown::AwaitHead => MDown::ClosedBeforeHead(unread),
-                MDown::Body {
-                    fin: false,
-                    cl,
-                    delivered,
-                } => match unread {
-                    Some(_) => MDown::Rescued {
-                        cl,
-                        delivered,
-                        left: RESCUE.len(),
-                    },
-                    None => MDown::Failed,
-                },
+                MDown::AwaitHead => MDown::ClosedBeforeHead,
+                MDown::Body { fin: false, .. } => MDown::Failed,
                 d => d,
             };
         }
@@ -779,18 +696,10 @@ mod tests {
                         }
                     }
                 }
-                MDown::ClosedBeforeHead(Some(true)) => {
-                    self.down = MDown::Rescued {
-                        cl: None,
-                        delivered: 0,
-                        left: RESCUE.len(),
-                    };
-                    (MHead::Head(200, None), 0)
-                }
-                MDown::ClosedBeforeHead(_) | MDown::Failed => {
+                MDown::ClosedBeforeHead | MDown::Failed => {
                     (MHead::Fail(Reject::UpstreamReset), self.fail())
                 }
-                MDown::Body { .. } | MDown::Rescued { .. } => (MHead::Wait, 0),
+                MDown::Body { .. } => (MHead::Wait, 0),
             }
         }
 
@@ -800,7 +709,7 @@ mod tests {
                 return (BodyOut::Fail, vec![], 0);
             }
             match self.down {
-                MDown::AwaitHead | MDown::ClosedBeforeHead(_) => (BodyOut::Wait, vec![], 0),
+                MDown::AwaitHead | MDown::ClosedBeforeHead => (BodyOut::Wait, vec![], 0),
                 MDown::Failed => (BodyOut::Fail, vec![], self.fail()),
                 MDown::Body {
                     fin: true,
@@ -842,34 +751,11 @@ mod tests {
                     let (o, c) = self.end(n, cl, delivered);
                     (o, bytes, 1 + c)
                 }
-                MDown::Rescued {
-                    cl,
-                    delivered,
-                    left,
-                } => {
-                    let n = cap.min(left);
-                    if n == 0 && left > 0 {
-                        return (BodyOut::Wait, vec![], 0);
-                    }
-                    let off = RESCUE.len() - left;
-                    let bytes = RESCUE[off..off + n].to_vec();
-                    let (delivered, left) = (delivered + n as u64, left - n);
-                    self.down = MDown::Rescued {
-                        cl,
-                        delivered,
-                        left,
-                    };
-                    if left > 0 {
-                        return (BodyOut::Data(n), bytes, 0);
-                    }
-                    let (o, c) = self.end(n, cl, delivered);
-                    (o, bytes, c)
-                }
             }
         }
     }
 
-    fn close(unread: Option<Unread>) -> H3Close {
+    fn close() -> H3Close {
         let stats = H3ReqStats {
             send_body: 0,
             recv_body: 0,
@@ -881,7 +767,7 @@ mod tests {
             stream_err: 0,
             close_msg: None,
         };
-        H3Close { stats, unread }
+        H3Close { stats }
     }
 
     fn resets(t: &ScriptedHandle, r: H3ReqId) -> usize {
@@ -970,18 +856,14 @@ mod tests {
                         prop_assert_eq!(got, want);
                         0
                     }
-                    Op::Closed { id, unread, headers } => {
+                    Op::Closed { id } => {
                         let (r, s) = (ids[id], &mut m[id]);
                         if !s.closed {
-                            let u = unread.then(|| Unread {
-                                headers: headers.then(|| hs(&[(":status", "200".to_owned())])),
-                                body: RESCUE.to_vec(),
-                            });
-                            t.close_h3(r, close(u.clone()));
-                            let got = ex.on_event(&mut Event::H3Closed(r, Box::new(close(u))));
+                            t.close_h3(r, close());
+                            let got = ex.on_event(&mut Event::H3Closed(r, Box::new(close())));
                             let want = (!s.removed).then_some((owner(id), r, Ready::Readable));
                             prop_assert_eq!(got, want);
-                            s.on_closed(unread.then_some(headers));
+                            s.on_closed();
                         }
                         0
                     }

@@ -8,8 +8,8 @@ use common::pair::{
     stream_count,
 };
 use mq_transport_api::{
-    ConnId, ConnProto, ErrType, Error, Event, H3Backend, Role, StreamCloseStats, StreamError,
-    StreamId, StreamKind, Time, TransportConfig, TransportOps,
+    ConnId, ConnProto, ErrType, Error, Event, Role, StreamCloseStats, StreamError, StreamId,
+    StreamKind, Time, TransportConfig, TransportOps,
 };
 
 use std::net::SocketAddr;
@@ -18,7 +18,6 @@ use std::time::Duration;
 fn raw_h3_cfg(role: Role) -> TransportConfig {
     TransportConfig {
         h3: true,
-        h3_backend: H3Backend::Raw,
         qlog: None,
         ..cfg(role)
     }
@@ -85,7 +84,7 @@ fn raw_h3_rejects_open_h3_request() {
     let r = p
         .client
         .call(p.now, move |t, now| t.open_h3_request(now, c));
-    assert_eq!(r.err(), Some(Error::Other));
+    assert_eq!(r.err(), Some(Error::Role));
 }
 
 #[test]
@@ -494,26 +493,6 @@ fn open_uni_credit_exhausted() {
     assert_eq!(stream_count(&p.client, p.conn), 1024);
     assert_eq!(open_uni(&p.client, p.now, p.conn), Err(Error::Other));
     assert_eq!(stream_count(&p.client, p.conn), 1024);
-}
-
-#[test]
-fn open_uni_on_xqc_h3_conn() {
-    let p = Pair::with(Opts {
-        server: TransportConfig {
-            h3: true,
-            qlog: None,
-            ..cfg(server_role())
-        },
-        client: TransportConfig {
-            h3: true,
-            qlog: None,
-            ..cfg(Role::Client)
-        },
-        proto: ConnProto::H3,
-        ..Opts::default()
-    });
-    assert_eq!(open_uni(&p.client, p.now, p.conn), Err(Error::Other));
-    assert_eq!(stream_count(&p.client, p.conn), 0);
 }
 
 fn close_conn_with(p: &Peer, now: Time, c: ConnId, code: u64) {

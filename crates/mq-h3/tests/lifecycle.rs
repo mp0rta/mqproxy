@@ -77,14 +77,11 @@ fn started(r: &mut Rig) -> H3ReqId {
     ids[0]
 }
 
-/// The `H3Closed` ids in `ev`, each asserting `unread: None`.
+/// The `H3Closed` ids in `ev`, with their close stats.
 fn closed(ev: &[Event]) -> Vec<H3ReqId> {
     ev.iter()
         .filter_map(|e| match e {
-            Event::H3Closed(id, c) => {
-                assert_eq!(c.unread, None);
-                Some(*id)
-            }
+            Event::H3Closed(id, _) => Some(*id),
             _ => None,
         })
         .collect()

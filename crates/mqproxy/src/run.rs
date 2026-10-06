@@ -87,7 +87,6 @@ fn transport(
         cc: r.cc,
         realtime_offset_us: realtime_offset_us(),
         h3: cli::wants_h3(r),
-        h3_backend: mq_transport_api::H3Backend::Raw,
         qlog: r.qlog.clone(),
     })
     .map_err(|e| match (&e, &r.qlog) {

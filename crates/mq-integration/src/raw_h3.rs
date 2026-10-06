@@ -45,7 +45,7 @@ pub struct RawH3Script {
 }
 
 /// A peer that speaks HTTP/3 by writing fixed bytes on raw streams (spec §6.2): no H3 stack,
-/// so it can send what no compliant stack sends. Runs on `Transport` with `h3_backend: Raw`
+/// so it can send what no compliant stack sends. Runs on the raw `Transport` with ALPN `h3` enabled
 /// (`loopback::raw_h3_transport`).
 pub struct RawH3Peer {
     /// Client role: the server to connect to.

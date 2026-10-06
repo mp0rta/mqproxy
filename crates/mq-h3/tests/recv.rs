@@ -383,11 +383,11 @@ fn reset_code_pending_then_stream_closed() {
         .filter(|e| matches!(e, Event::H3Closed(..)))
         .collect();
     assert_eq!(closed.len(), 1, "{ev:?}");
-    let Event::H3Closed(cid, close) = closed[0] else {
+    let Event::H3Closed(cid, _) = closed[0] else {
         unreachable!()
     };
     assert_eq!(*cid, id);
-    assert_eq!(close.unread, None);
+
     assert_eq!(aborts(&r, s), [], "actions on the gone stream are dropped");
     // The id is stale from now on.
     let now = r.now;
@@ -461,7 +461,7 @@ fn abort_in_feed_retires() {
     );
 }
 
-/// The xqc_h3 backend's order (`reserve_local`): role, then conn, then protocol.
+/// Request admission order: role, then conn, then protocol.
 #[test]
 fn open_h3_request_errors() {
     let mut r = Rig::client();
@@ -536,7 +536,7 @@ fn oversized_headers_closes() {
 }
 
 /// The MITM's terminal probe `h3_recv_body(id, &mut [])` (mq-proxy `client/mitm/stream.rs`)
-/// answers as on xqc_h3: `Blocked` while payload or nothing is left, `(0, true)` once only
+/// answers: `Blocked` while payload or nothing is left, `(0, true)` once only
 /// the FIN is. The FIN comes alone here: the probe reads it into the empty carry and feeds
 /// it as a bare carried FIN (a carried FIN never outlives a feed otherwise: a slice passes it
 /// with the whole carry).
@@ -559,8 +559,7 @@ fn empty_probe_bare_fin() {
 }
 
 /// Framing alone (an empty DATA frame) left before the FIN: the probe feeds no byte (slices
-/// of at most `buf.len()`, adoption spec §4.4) and stays `Blocked`, where xqc_h3, which parsed
-/// the frame on arrival, answers `(0, true)`. Open against the spec (final-fix report, I3);
+/// of at most `buf.len()`, adoption spec §4.4) and stays `Blocked`;
 /// the next read with a buffer ends the body.
 #[test]
 fn empty_probe_framing_before_fin() {

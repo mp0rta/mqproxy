@@ -74,7 +74,7 @@ impl<T: TransportOps> H3Wire<T> {
         self.service(now, c);
     }
 
-    /// An inner event, active mode. Returns it if it passes through; the raw stream events
+    /// An inner event. Returns it if it passes through; the raw stream events
     /// of H3 conns are consumed here (adoption spec §4.1).
     pub(crate) fn on_event(&mut self, now: Time, e: Event) -> Option<Event> {
         match e {

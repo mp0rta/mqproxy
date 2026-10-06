@@ -3,7 +3,7 @@
 
 use mq_transport_api::ringbuf::RingBuf;
 use mq_transport_api::{ConnProto, SlotId, StreamKind, Time};
-use xquic_sys::{xqc_cid_t, xqc_connection_t, xqc_h3_conn_t, xqc_h3_request_t, xqc_stream_t};
+use xquic_sys::{xqc_cid_t, xqc_connection_t, xqc_stream_t};
 
 pub(crate) struct Slots<T> {
     entries: Vec<Entry<T>>,
@@ -85,8 +85,6 @@ pub(crate) struct ConnSlot {
     pub server: bool,
     /// Set by the create notification (spec §3.2).
     pub proto: ConnProto,
-    /// Bound in the H3 create notification; null for raw connections (spec §3.2).
-    pub h3c: *mut xqc_h3_conn_t,
     /// Counted in `n_provisional` while true; cleared only by a successful ALPN admission (spec §4.7).
     pub provisional: bool,
     /// Scheduling input for `next_timeout()`; cleared when the deadline closes the connection.
@@ -118,7 +116,6 @@ impl ConnSlot {
             counted: false,
             server,
             proto: ConnProto::Raw,
-            h3c: core::ptr::null_mut(),
             provisional: false,
             provisional_deadline: None,
             streams: 0,
@@ -163,36 +160,6 @@ impl StreamSlot {
             abandoned: false,
             peer_reset_reported: false,
             stop_sending_reported: false,
-        }
-    }
-}
-
-/// An H3 request (spec §3.3). Counted in its connection's `streams` (the shared ceiling).
-pub(crate) struct H3ReqSlot {
-    /// Bound in the create notification; null until then (client) — ops report `Stale`.
-    pub xqc: *mut xqc_h3_request_t,
-    pub conn: SlotId,
-    pub quic_id: u64,
-    /// `XQC_REQ_NOTIFY_READ_*` bits accumulated from read notifications (spec §3.4).
-    pub read_flags: u8,
-    pub header_consumed: bool,
-    /// The app has seen the request's fin (`h3_recv_headers` / `h3_recv_body`).
-    pub fin_consumed: bool,
-    pub readable_queued: bool,
-    pub writable_queued: bool,
-}
-
-impl H3ReqSlot {
-    pub fn new(conn: SlotId, xqc: *mut xqc_h3_request_t, quic_id: u64) -> Self {
-        Self {
-            xqc,
-            conn,
-            quic_id,
-            read_flags: 0,
-            header_consumed: false,
-            fin_consumed: false,
-            readable_queued: false,
-            writable_queued: false,
         }
     }
 }
