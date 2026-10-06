@@ -199,13 +199,11 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
             ..
         } = self;
         queue.pop(|e| match e {
-            // ponytail: `conn_stats` is the only conn probe `TransportOps` has, and on xquic
-            // it collects path stats; add a cheap `conn_live` op if these pops show up.
             Event::ConnEstablished(c)
             | Event::NewConn(c, _)
             | Event::MpReady(c)
             | Event::DatagramReadable(c)
-            | Event::PathRemoved(c, _) => inner.conn_stats(*c).is_ok(),
+            | Event::PathRemoved(c, _) => inner.conn_live(*c),
             Event::NewStream(_, s, _)
             | Event::StreamReadable(s)
             | Event::StreamWritable(s)
@@ -294,6 +292,10 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
 
     fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error> {
         self.inner.conn_stats(conn)
+    }
+
+    fn conn_live(&self, conn: ConnId) -> bool {
+        self.inner.conn_live(conn)
     }
 
     fn stream_info(&self, s: StreamId) -> Result<StreamInfo, Error> {

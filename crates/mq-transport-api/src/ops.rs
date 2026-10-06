@@ -68,6 +68,8 @@ pub trait TransportOps {
     /// connections never marked (spec §4.7). A no-op on a stale id.
     fn mark_conn_authed(&mut self, conn: ConnId);
     fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error>;
+    /// Whether `conn` is a live conn id: the cheap liveness probe (no stats collected).
+    fn conn_live(&self, conn: ConnId) -> bool;
     fn stream_info(&self, s: StreamId) -> Result<StreamInfo, Error>;
 
     // datagrams (spec §3.1)

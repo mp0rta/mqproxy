@@ -241,6 +241,10 @@ impl TransportOps for Transport {
         conn::conn_stats(self, c)
     }
 
+    fn conn_live(&self, c: ConnId) -> bool {
+        self.inner.conns.is_live(c.slot())
+    }
+
     fn stream_info(&self, s: StreamId) -> Result<StreamInfo, mq_transport_api::Error> {
         stream::stream_info(self, s)
     }

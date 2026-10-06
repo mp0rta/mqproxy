@@ -258,3 +258,25 @@ fn stale_on_pop_dropped_like_bare_transport() {
         );
     }
 }
+
+/// The liveness check of a conn-level pop is the cheap `conn_live`, not `conn_stats` (which
+/// collects path stats on xquic): after the cutover the UDP lane pops these constantly.
+#[test]
+fn conn_pops_do_not_collect_stats() {
+    for active in [false, true] {
+        let (mut w, h) = mk(active);
+        let (live, gone) = (h.new_conn_id(), h.new_conn_id());
+        h.set_conn_stats(live, Default::default());
+        h.push_event(Event::DatagramReadable(live));
+        h.push_event(Event::MpReady(gone));
+        w.drive(NOW);
+        let before = h.conn_stats_calls();
+        let got: Vec<_> = std::iter::from_fn(|| w.poll_event()).collect();
+        assert_eq!(got, [Event::DatagramReadable(live)], "active={active}");
+        assert_eq!(
+            h.conn_stats_calls(),
+            before,
+            "conn_stats probed, active={active}"
+        );
+    }
+}
