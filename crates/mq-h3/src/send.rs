@@ -136,6 +136,9 @@ impl<T: TransportOps> H3Wire<T> {
         let fields: Vec<_> = hs.iter().map(|h| FieldRef::new(h.name, h.value)).collect();
         let r = conn.h3.send_headers(Q(req.quic_id), &fields, fin);
         req.core |= r.is_ok();
+        if r.is_ok() {
+            conn.core.insert(req.quic_id);
+        }
         self.drive_inner(now);
         r.map_err(usage_err)
     }
@@ -381,6 +384,7 @@ impl<T: TransportOps> H3Wire<T> {
                     match bound {
                         Some((s, q)) => {
                             conn.mq.insert(q, s);
+                            conn.core.insert(q);
                             self.streams.insert(s, (c, Q(q)));
                         }
                         // The peer granted fewer than three uni streams (RFC 9114 §6.2).
@@ -443,8 +447,10 @@ impl<T: TransportOps> H3Wire<T> {
             return false;
         }
         let mut short = false;
-        for q in conn.h3.sendable().collect::<Vec<_>>() {
-            let Some(&s) = conn.mq.get(&q.0) else {
+        for id in conn.core.iter().copied().collect::<Vec<_>>() {
+            let q = Q(id);
+            let Some(&s) = conn.mq.get(&id) else {
+                conn.core.remove(&id); // the stream is gone
                 continue;
             };
             let mut req = reqs.get_mut(&req_id(s)).filter(|_| q.is_request());
@@ -467,6 +473,9 @@ impl<T: TransportOps> H3Wire<T> {
                     short = true;
                     break;
                 }
+            }
+            if conn.h3.poll_send(q).is_none() && q.is_request() {
+                conn.core.remove(&id); // drained: `send_headers` adds it again
             }
             if let Some(req) = req.filter(|_| conn.h3.poll_send(q).is_none()) {
                 // An error drops the latched finish: `Closed` / `GoingAway` (the conn is

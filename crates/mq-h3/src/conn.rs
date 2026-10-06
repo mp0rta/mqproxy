@@ -5,7 +5,7 @@ use crate::req::{Req, Terminal, req_id};
 use crate::{BOOT_READ, H3Wire};
 use h3wire::{Config, Connection, H3Code, Role, StreamId as Q};
 use mq_transport_api::{ConnId, ConnProto, Event, StreamError, StreamId, Time, TransportOps};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Equals `mq_transport::H3_FIELD_SECTION_MAX`; mq-h3 does not depend on mq-transport.
 const FIELD_SECTION_MAX: usize = 64 * 1024;
@@ -29,6 +29,12 @@ pub(crate) struct H3Conn {
     /// Peer uni streams read to FIN or reset: never fed again, since h3wire would take
     /// further bytes for a new stream's type.
     pub(crate) uni_done: HashSet<StreamId>,
+    /// Quic ids of the streams that may hold core bytes: our uni streams (kept; they carry
+    /// SETTINGS, the stream types and any GOAWAY) and the request streams whose HEADERS
+    /// were queued, until `poll_send` drains them. All the bytes h3wire owns come from
+    /// `bind_uni`, `send_headers` and GOAWAY, so `flush` visits these instead of scanning
+    /// every stream with `sendable()`. Ascending, like `sendable()`.
+    pub(crate) core: BTreeSet<u64>,
     /// We closed the transport; h3wire's actions and bytes are dropped from then on.
     pub(crate) closing: bool,
     /// Request streams whose `FinishStream` write was `Blocked`: retried by `service`
@@ -57,6 +63,7 @@ impl<T: TransportOps> H3Wire<T> {
             client: role == Role::Client,
             mq: HashMap::new(),
             uni_done: HashSet::new(),
+            core: BTreeSet::new(),
             closing: false,
             fins: HashSet::new(),
             gone: false,

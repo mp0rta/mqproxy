@@ -110,6 +110,13 @@ impl<T: TransportOps> H3Wire<T> {
         self.services
     }
 
+    /// Streams the core-bytes flush visits per service: our uni streams plus the request
+    /// streams with HEADERS bytes not yet drained.
+    #[cfg(feature = "test-support")]
+    pub fn debug_core_streams(&self) -> usize {
+        self.conns.values().map(|c| c.core.len()).sum()
+    }
+
     /// Every request's carry <= max(BOOT_READ, largest buf passed so far), and every
     /// connection's h3wire `debug_buffered_bytes() <= debug_bound()` (adoption spec §5.4).
     #[cfg(feature = "test-support")]

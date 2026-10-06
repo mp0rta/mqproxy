@@ -646,3 +646,30 @@ fn peer_reset_with_fin_carried_client_discards() {
     assert_eq!(aborts(&r, s), [Call::StreamResetSend { s, code: 0x10c }]);
     assert_eq!(r.w.h3_send_body(r.now, id, &[7u8; 64], false), Ok(64));
 }
+
+/// The core-bytes flush visits only the streams that may hold core bytes (adoption spec
+/// §4.5): drained requests leave the set, so a body op is not O(live requests).
+#[cfg(feature = "test-support")]
+#[test]
+fn flush_set_drops_drained_requests() {
+    let mut r = client();
+    let base = r.w.debug_core_streams();
+    let ids: Vec<_> = (0..64)
+        .map(|_| {
+            let (id, _) = open(&mut r);
+            r.w.h3_send_headers(r.now, id, &request("POST"), false)
+                .expect("send_headers");
+            id
+        })
+        .collect();
+    r.pump();
+    r.events();
+    assert_eq!(
+        r.w.debug_core_streams(),
+        base,
+        "drained requests left the set"
+    );
+    assert_eq!(r.w.h3_send_body(r.now, ids[0], b"x", false), Ok(1));
+    r.pump();
+    assert_eq!(r.w.debug_core_streams(), base);
+}
