@@ -72,6 +72,36 @@ fn wait_log(markers: &[&str]) -> String {
     find().unwrap()
 }
 
+/// adoption spec §6.2: `line` is the `mq.req` record `want` (written without its `mq.req
+/// cid=- ` prefix), field for field. A timing field written `T` in `want` (`ttfb_ms`,
+/// `duration_ms`, `origin_connect_ms`, `completion_ms`) only needs a value ≥ 0, i.e. its
+/// stamps were set; `-1` (a stamp unset) stays exact.
+fn assert_req(line: &str, want: &str) {
+    let got = line.split_once("mq.req cid=- ").map_or("", |(_, r)| r);
+    let (g, w): (Vec<&str>, Vec<&str>) = (got.split(' ').collect(), want.split(' ').collect());
+    assert_eq!(g.len(), w.len(), "\n got: {got}\nwant: {want}");
+    for (g, w) in g.iter().zip(&w) {
+        let ok = match w.strip_suffix("=T") {
+            Some(k) => g
+                .strip_prefix(k)
+                .and_then(|v| v.strip_prefix('='))
+                .is_some_and(|v| v.parse::<u64>().is_ok()),
+            None => g == w,
+        };
+        assert!(ok, "{w}\n got: {got}\nwant: {want}");
+    }
+}
+
+/// The `mq.req` line of the request to `path` (at most `T`).
+fn req_line(path: &str) -> String {
+    wait_log(&["mq.req", &format!("path=\"{path}\"")])
+}
+
+/// The cell's index (xx 0, xw 1, wx 2, ww 3), for a marker unique to the cell.
+fn cell_index((c, s): (Backend, Backend)) -> usize {
+    2 * usize::from(c == Backend::Wire) + usize::from(s == Backend::Wire)
+}
+
 // ---- the local fetch caller ----
 
 /// Sends `POST /_mqproxy/fetch` with `headers` and `body` (written on its own thread, so a
@@ -445,6 +475,12 @@ matrix!(
             "body differs ({} bytes)",
             r.body.len()
         );
+        let path = format!("/dl-{tag}");
+        let a = format!("127.0.0.1:{}", o.addr.port());
+        let want = format!(
+            "sid=4 method=GET status=200 authority=\"{a}\" path=\"{path}\" req_bytes=0 resp_bytes=8388608 ttfb_ms=T duration_ms=T origin_protocol=h2 origin_tls=ok content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=T mp_state=0 completion_ms=T reset=\"\""
+        );
+        assert_req(&req_line(&path), &want);
         assert_eq!(p.join_both(), (0, 0));
     }
 );
@@ -462,6 +498,12 @@ matrix!(
         assert_eq!(r.status, 200);
         assert_eq!(r.header("content-length"), Some("8388608"));
         assert!(r.body == body, "echo differs ({} bytes)", r.body.len());
+        let path = format!("/up-{tag}");
+        let want = format!(
+            "sid=4 method=PUT status=200 authority=\"{}\" path=\"{path}\" req_bytes=8388608 resp_bytes=8388608 ttfb_ms=T duration_ms=T origin_protocol=h1 origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=T mp_state=0 completion_ms=T reset=\"\"",
+            o.addr
+        );
+        assert_req(&req_line(&path), &want);
         assert_eq!(p.join_both(), (0, 0));
     }
 );
@@ -575,6 +617,15 @@ matrix!(
         );
         assert_eq!((r.status, r.header("content-length")), (304, Some("100")));
         assert!(r.body.is_empty());
+        for (sid, method, status, addr, path) in [
+            (4, "HEAD", 200, head.addr, format!("/h-{tag}")),
+            (8, "GET", 304, nm.addr, format!("/n-{tag}")),
+        ] {
+            let want = format!(
+                "sid={sid} method={method} status={status} authority=\"{addr}\" path=\"{path}\" req_bytes=0 resp_bytes=0 ttfb_ms=T duration_ms=T origin_protocol=h1 origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=T mp_state=0 completion_ms=T reset=\"\""
+            );
+            assert_req(&req_line(&path), &want);
+        }
         assert_eq!(p.join_both(), (0, 0));
     }
 );
@@ -603,6 +654,12 @@ matrix!(
         for i in 0..5 {
             assert_eq!(r.header(&format!("x-big-{i}")), Some(value.as_str()), "{i}");
         }
+        let path = format!("/big-{tag}");
+        let want = format!(
+            "sid=4 method=GET status=200 authority=\"{}\" path=\"{path}\" req_bytes=0 resp_bytes=2 ttfb_ms=T duration_ms=T origin_protocol=h1 origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=T mp_state=0 completion_ms=T reset=\"\"",
+            origin.addr
+        );
+        assert_req(&req_line(&path), &want);
         assert_eq!(p.join_both(), (0, 0));
     }
 );
@@ -620,6 +677,13 @@ matrix!(
         let head = o.one().head;
         let want = format!("get /b-{tag}?q=/../x http/1.1\r\n");
         assert!(head.starts_with(&want), "{head}");
+        // The line keeps the path as sent, cut at `?`.
+        let path = format!("/a/../b-{tag}");
+        let want = format!(
+            "sid=4 method=GET status=200 authority=\"{}\" path=\"{path}\" req_bytes=0 resp_bytes=2 ttfb_ms=T duration_ms=T origin_protocol=h1 origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=T mp_state=0 completion_ms=T reset=\"\"",
+            o.authority()
+        );
+        assert_req(&req_line(&path), &want);
         assert_eq!(p.join_both(), (0, 0));
     }
 );
@@ -640,6 +704,12 @@ matrix!(
         assert!(head.contains("\r\nx-test:"), "{head}");
         assert!(head.contains("\r\naccept:"), "{head}");
         assert!(!head.contains("*/*"), "{head}");
+        let path = format!("/empty-{tag}");
+        let want = format!(
+            "sid=4 method=GET status=200 authority=\"{}\" path=\"{path}\" req_bytes=0 resp_bytes=2 ttfb_ms=T duration_ms=T origin_protocol=h1 origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=T mp_state=0 completion_ms=T reset=\"\"",
+            o.authority()
+        );
+        assert_req(&req_line(&path), &want);
         assert_eq!(p.join_both(), (0, 0));
     }
 );
@@ -668,6 +738,17 @@ matrix!(
         let r = parse(&r.expect("h1-forced request"));
         assert_eq!((r.status, r.body.len()), (200, 2));
         assert_eq!(o.accepted(), 1);
+        let path = format!("/c13-{tag}");
+        let a = format!("127.0.0.1:{}", o.addr.port());
+        // The two lines may close in either order: each is found by its stream id.
+        for (sid, reuse) in [(4, 0), (8, 1)] {
+            let marker = format!("path=\"{path}\"");
+            let line = wait_log(&["mq.req", &format!("sid={sid} "), &marker]);
+            let want = format!(
+                "sid={sid} method=GET status=200 authority=\"{a}\" path=\"{path}\" req_bytes=0 resp_bytes=2 ttfb_ms=T duration_ms=T origin_protocol=h1 origin_tls=ok content_encoding=none cache=bypass origin_reuse={reuse} origin_connect_ms=T mp_state=0 completion_ms=T reset=\"\""
+            );
+            assert_req(&line, &want);
+        }
         assert_eq!(p.join_both(), (0, 0));
     }
 );
@@ -692,9 +773,15 @@ matrix!(
             "{:?}",
             r.as_ref().map(|b| String::from_utf8_lossy(b).into_owned())
         );
-        // The reset is the server's (its check), not only the client's own body check.
-        let line = wait_log(&["mq.req", &format!("path=\"/h2-short-{tag}\"")]);
-        assert!(line.contains("reset=\"local reset\""), "{line}");
+        // The reset is the server's (its check), not only the client's own body check. The
+        // origin's failure leaves `origin_tls=connect_fail` and `origin_connect_ms=-1`; the
+        // reset leaves no FIN stamps.
+        let path = format!("/h2-short-{tag}");
+        let want = format!(
+            "sid=4 method=GET status=200 authority=\"127.0.0.1:{}\" path=\"{path}\" req_bytes=0 resp_bytes=50 ttfb_ms=T duration_ms=-1 origin_protocol=h2 origin_tls=connect_fail content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=-1 mp_state=0 completion_ms=-1 reset=\"local reset\"",
+            o.addr.port()
+        );
+        assert_req(&req_line(&path), &want);
         assert_eq!(p.join_both(), (0, 0));
     }
 );
@@ -720,8 +807,11 @@ matrix!(
             (":authority", "127.0.0.1:1"),
             ("x-mq-auth", &auth),
         ];
+        // Its line has `path="-"`: a body of `cell + 1` bytes (drained, `req_bytes`) marks it.
+        let n = cell_index(cells) + 1;
         let s = H3Script {
             headers: headers.map(|(n, v)| (n.into(), v.into())).to_vec(),
+            body: vec![0; n],
             ..H3Script::default()
         };
         let c = h3_client(p.server.udp_addr, s, cells.0);
@@ -731,6 +821,11 @@ matrix!(
             assert_eq!(h3_header(&r, ":status").as_deref(), Some("400"));
             assert_eq!(h3_header(&r, "x-mq-error").as_deref(), Some("bad-request"));
         }
+        let line = wait_log(&["mq.req", "status=400", &format!("req_bytes={n} ")]);
+        let want = format!(
+            "sid=0 method=- status=400 authority=\"-\" path=\"-\" req_bytes={n} resp_bytes=0 ttfb_ms=T duration_ms=T origin_protocol=none origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=-1 mp_state=0 completion_ms=T reset=\"\""
+        );
+        assert_req(&line, &want);
         stop(c);
         assert_eq!(p.join_both(), (0, 0));
     }
@@ -745,8 +840,7 @@ matrix!(
     drain_after_403_counts_whole_body,
     |cells: (Backend, Backend), tag: &str| {
         let p = gateway(cells);
-        let cell = ["xx", "xw", "wx", "ww"].iter().position(|t| *t == tag);
-        let body_len = 4 * MIB + cell.unwrap();
+        let body_len = 4 * MIB + cell_index(cells);
         let extra = [("x-mq-auth", "Bearer wrong")];
         let path = format!("/drain-{tag}");
         let s = script("POST", "127.0.0.1:1", &path, &extra, vec![7; body_len]);
@@ -758,7 +852,11 @@ matrix!(
             assert_eq!(r.closed[0].0.stats.stream_err, 0, "{:?}", r.closed);
             assert_eq!(r.closed[0].0.stats.send_body, body_len as u64);
         }
-        wait_log(&["mq.req", "status=403", &format!("req_bytes={body_len} ")]);
+        let line = wait_log(&["mq.req", "status=403", &format!("req_bytes={body_len} ")]);
+        let want = format!(
+            "sid=0 method=- status=403 authority=\"-\" path=\"-\" req_bytes={body_len} resp_bytes=0 ttfb_ms=T duration_ms=T origin_protocol=none origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=-1 mp_state=0 completion_ms=T reset=\"\""
+        );
+        assert_req(&line, &want);
         stop(c);
         assert_eq!(p.join_both(), (0, 0));
     }
@@ -767,7 +865,8 @@ matrix!(
 // spec §6.2 step 8, §10.3: `content-length: 10` with FIN on HEADERS reaches the origin
 // bodiless (no chunked framing, no positive length). adoption spec §5.3 (6): a `Wire` server
 // finds the mismatch in the read that delivers the HEADERS, so the gateway's intake read
-// fails (its line has `path="-"`, which no cell can match) and the origin sees nothing.
+// fails and the origin sees nothing. Its line has `path="-"` and no field unique to the
+// cell, so the cell asserts no `mq.req` (as the brief rules); the client sees the reset.
 matrix!(
     direct_h3_cl_with_fin_on_headers_is_bodiless,
     |cells: (Backend, Backend), tag: &str| {
@@ -780,8 +879,11 @@ matrix!(
         let c = h3_client(p.server.udp_addr, s, cells.0);
         if cells.1 == Backend::Wire {
             wait_h3(&c.handle, |r| !r.closed.is_empty());
-            let stats = c.handle.lock().closed[0].0.stats.clone();
-            assert_ne!(stats.stream_err, 0, "{stats:?}");
+            {
+                let r = c.handle.lock();
+                assert_eq!(r.closed[0].0.stats.stream_err, 0x10e, "{r:?}");
+                assert!(r.headers.is_empty() && !r.fin, "{r:?}");
+            }
             stop(c);
             assert_eq!(p.join_both(), (0, 0));
             assert!(o.settled().is_empty(), "the origin saw a request");
@@ -800,6 +902,11 @@ matrix!(
             .lines()
             .find_map(|l| l.strip_prefix("content-length:"));
         assert!(cl.is_none_or(|v| v.trim() == "0"), "{}", seen.head);
+        let want = format!(
+            "sid=0 method=POST status=200 authority=\"{}\" path=\"{path}\" req_bytes=0 resp_bytes=2 ttfb_ms=T duration_ms=T origin_protocol=h1 origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=T mp_state=0 completion_ms=T reset=\"\"",
+            o.authority()
+        );
+        assert_req(&req_line(&path), &want);
         stop(c);
         assert_eq!(p.join_both(), (0, 0));
     }
@@ -829,6 +936,11 @@ matrix!(
             seen.head
         );
         assert_eq!(dechunk(&seen.body).as_deref(), Some(&b"hello body"[..]));
+        let want = format!(
+            "sid=0 method=GET status=200 authority=\"{}\" path=\"{path}\" req_bytes=10 resp_bytes=2 ttfb_ms=T duration_ms=T origin_protocol=h1 origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=T mp_state=0 completion_ms=T reset=\"\"",
+            o.authority()
+        );
+        assert_req(&req_line(&path), &want);
         stop(c);
         assert_eq!(p.join_both(), (0, 0));
     }
@@ -836,8 +948,9 @@ matrix!(
 
 /// A direct-H3 upload the server must reset (§6.3): the client sees the reset, the server
 /// logs the request, and the origin never received a complete body. On a `Wire` server the
-/// reset is h3wire's (`H3_MESSAGE_ERROR`, adoption spec §5.3 (6)), and the gateway still logs
-/// it as `local reset`.
+/// reset is h3wire's (`H3_MESSAGE_ERROR`, adoption spec §5.3 (6)) and comes before any body
+/// byte reaches the gateway (`req_bytes=0`, where xqc_h3 delivers the 50 bytes); the gateway
+/// still logs it as `local reset`.
 fn upload_reset(cells: (Backend, Backend), path: &str, cl: &str, body: Vec<u8>) {
     let o = Capture::spawn();
     let p = gateway(cells);
@@ -846,13 +959,19 @@ fn upload_reset(cells: (Backend, Backend), path: &str, cl: &str, body: Vec<u8>) 
     let s = script("POST", &o.authority(), path, &extra, body);
     let c = h3_client(p.server.udp_addr, s, cells.0);
     wait_h3(&c.handle, |r| !r.closed.is_empty());
+    let wire = cells.1 == Backend::Wire;
     {
         let r = c.handle.lock();
-        assert_ne!(r.closed[0].0.stats.stream_err, 0, "{r:?}");
+        let code = r.closed[0].0.stats.stream_err;
+        assert!(if wire { code == 0x10e } else { code != 0 }, "{r:?}");
         assert!(!r.fin, "{r:?}");
     }
-    let line = wait_log(&["mq.req", &format!("path=\"{path}\"")]);
-    assert!(line.contains("reset=\"local reset\""), "{line}");
+    let want = format!(
+        "sid=0 method=POST status=0 authority=\"{}\" path=\"{path}\" req_bytes={} resp_bytes=0 ttfb_ms=-1 duration_ms=-1 origin_protocol=none origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=-1 mp_state=0 completion_ms=-1 reset=\"local reset\"",
+        o.authority(),
+        if wire { 0 } else { 50 },
+    );
+    assert_req(&req_line(path), &want);
     let seen = o.settled();
     assert!(seen.iter().all(|s| !s.complete), "{seen:?}");
     stop(c);
