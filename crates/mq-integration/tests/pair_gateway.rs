@@ -851,9 +851,10 @@ matrix!(
             "{:?}",
             r.as_ref().map(|b| String::from_utf8_lossy(b).into_owned())
         );
-        // The reset is the server's (its check), not only the client's own body check. The
-        // origin's failure leaves `origin_tls=connect_fail` and `origin_connect_ms=-1`; the
-        // reset leaves no FIN stamps.
+        // The reset is the server's (its check), not only the client's own body check; it
+        // leaves no FIN stamps. `origin_tls=connect_fail` and `origin_connect_ms=-1` pin an
+        // existing gateway misreport, outside this plan: the origin connect succeeded. A
+        // later gateway fix that changes these two fields is not a regression.
         let path = format!("/h2-short-{tag}");
         let want = format!(
             "sid=4 method=GET status=200 authority=\"127.0.0.1:{}\" path=\"{path}\" req_bytes=0 resp_bytes=50 ttfb_ms=T duration_ms=-1 origin_protocol=h2 origin_tls=connect_fail content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=-1 mp_state=0 completion_ms=-1 reset=\"local reset\"",
