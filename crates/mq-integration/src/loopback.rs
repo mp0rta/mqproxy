@@ -339,23 +339,36 @@ impl LoopbackProxy {
     /// against `Server::with_gateway` (`origin_ca` its only trust root); H3 on both
     /// transports. The client keeps its raw tunnel for the opaque relay.
     pub fn spawn_mitm(
+        client: ClientConfig,
+        server: ServerConfig,
+        origin_ca: &Path,
+        mitm: MitmConfig,
+        fixed_dst: SocketAddr,
+    ) -> LoopbackProxy {
+        let cells = (Backend::XqcH3, Backend::XqcH3);
+        Self::spawn_mitm_on(client, server, origin_ca, mitm, fixed_dst, cells)
+    }
+
+    /// `spawn_mitm` with the (client, server) H3 backends (adoption spec §6.2).
+    pub fn spawn_mitm_on(
         mut client: ClientConfig,
         mut server: ServerConfig,
         origin_ca: &Path,
         mitm: MitmConfig,
         fixed_dst: SocketAddr,
+        (client_b, server_b): (Backend, Backend),
     ) -> LoopbackProxy {
         server.gateway.get_or_insert_with(GatewayConfig::default);
         let tls = build_client_config(Some(origin_ca), &Vec::new).expect("origin CA");
         let respawn = move |udp: SocketAddr| {
             let (server, tls) = (server.clone(), tls.clone());
             DriverThread::spawn_on_addr(udp, driver_config(), Vec::new(), move |local| {
-                let t = transport(
+                let t = h3_transport(
                     Role::Server {
                         cert: cert("test.crt"),
                         key: cert("test.key"),
                     },
-                    true,
+                    server_b,
                 );
                 let app = Server::with_gateway(server, tls);
                 (Shard::new(t, app, local, 1), ())
@@ -369,7 +382,7 @@ impl LoopbackProxy {
             vec![(ListenKind::Fixed(fixed_dst), TRANSPARENT)],
             move |local, server_udp| {
                 client.server = server_udp;
-                let t = transport(Role::Client, true);
+                let t = h3_transport(Role::Client, client_b);
                 (Shard::new(t, Client::new(client), local, 2), ())
             },
         );

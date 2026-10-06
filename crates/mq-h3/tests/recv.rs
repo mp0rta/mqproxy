@@ -534,3 +534,48 @@ fn oversized_headers_closes() {
             .any(|e| matches!(e, Event::H3Request(..) | Event::H3Readable(_)))
     );
 }
+
+/// The MITM's terminal probe `h3_recv_body(id, &mut [])` (mq-proxy `client/mitm/stream.rs`)
+/// answers as on xqc_h3: `Blocked` while payload or nothing is left, `(0, true)` once only
+/// the FIN is. The FIN comes alone here: the probe reads it into the empty carry and feeds
+/// it as a bare carried FIN (a carried FIN never outlives a feed otherwise: a slice passes it
+/// with the whole carry).
+#[test]
+fn empty_probe_bare_fin() {
+    let (mut r, id, _) = reading_request();
+    let body = body_of(100);
+    r.peer_send_body(Q(0), &body, false);
+    r.pump();
+    let probe = |r: &mut Rig| r.w.h3_recv_body(r.now, id, &mut []);
+    assert_eq!(probe(&mut r), Err(StreamError::Blocked), "payload left");
+    assert_eq!(
+        pull(&mut r, id, 4096),
+        [Ok((body, false)), Err(StreamError::Blocked)]
+    );
+    assert_eq!(probe(&mut r), Err(StreamError::Blocked), "nothing left");
+    r.peer_send_body(Q(0), &[], true);
+    r.pump();
+    assert_eq!(probe(&mut r), Ok((0, true)), "only the FIN left");
+}
+
+/// Framing alone (an empty DATA frame) left before the FIN: the probe feeds no byte (slices
+/// of at most `buf.len()`, adoption spec §4.4) and stays `Blocked`, where xqc_h3, which parsed
+/// the frame on arrival, answers `(0, true)`. Open against the spec (final-fix report, I3);
+/// the next read with a buffer ends the body.
+#[test]
+fn empty_probe_framing_before_fin() {
+    let (mut r, id, _) = reading_request();
+    let mut bytes = Vec::new();
+    h3wire::frame::encode_header(0x00, 3, &mut bytes);
+    bytes.extend_from_slice(b"abc");
+    h3wire::frame::encode_header(0x00, 0, &mut bytes);
+    r.deliver(Q(0), &bytes, true);
+    r.pump();
+    let mut buf = [0u8; 64];
+    assert_eq!(r.w.h3_recv_body(r.now, id, &mut buf), Ok((3, false)));
+    assert_eq!(
+        r.w.h3_recv_body(r.now, id, &mut []),
+        Err(StreamError::Blocked)
+    );
+    assert_eq!(r.w.h3_recv_body(r.now, id, &mut buf), Ok((0, true)));
+}
