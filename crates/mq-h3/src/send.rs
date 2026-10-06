@@ -1,8 +1,10 @@
 //! h3wire actions and core bytes on the transport (adoption spec §4.5).
 
 use crate::H3Wire;
-use crate::req::{Req, req_id};
-use h3wire::{Action, Connection, DataFrame, FieldRef, H3Code, StreamId as Q, UsageError};
+use crate::req::{Req, Terminal, req_id};
+use h3wire::{
+    AbortSource, Action, Connection, DataFrame, FieldRef, H3Code, StreamId as Q, UsageError,
+};
 use mq_transport_api::{ConnId, Error, Event, H3Header, H3ReqId, StreamError, Time, TransportOps};
 
 /// The DATA frame `h3_send_body` started: its prefix, then `payload_left` bytes the
@@ -169,7 +171,9 @@ impl<T: TransportOps> H3Wire<T> {
         client: bool,
     ) -> Result<usize, StreamError> {
         let req = &self.reqs[&id];
-        if req.send_stopped {
+        // A retained request (client only) accepts and discards like after SendStopped,
+        // so a running upload pump cannot abort the response (adoption spec §4.3).
+        if req.send_stopped || self.conns[&req.conn].gone {
             // RFC 9114 §4.1: the client's response keeps flowing; xqc_h3 resets the server.
             return if client {
                 Ok(data.len())
@@ -276,16 +280,31 @@ impl<T: TransportOps> H3Wire<T> {
         r
     }
 
-    /// `h3_reset` (adoption spec §4.3). Without h3wire state (a client request whose
-    /// `send_headers` failed) the raw stream is reset directly.
+    /// `h3_reset` (adoption spec §4.3): `Connection::abort` with `REQUEST_CANCELLED`, or,
+    /// without h3wire state (a client request whose `send_headers` failed), the raw
+    /// stream's `stream_reset`, once. The gateway gave the request up, so nothing is left
+    /// to deliver: closure needs only the transport's `StreamClosed`.
     pub(crate) fn reset(&mut self, now: Time, id: H3ReqId) {
-        let Some(req) = self.reqs.get(&id).filter(|r| r.known) else {
+        let Some(req) = self.reqs.get_mut(&id).filter(|r| r.known) else {
             return; // stale: a no-op
         };
-        if !req.core {
+        if req.core {
+            if let Some(conn) = self.conns.get_mut(&req.conn) {
+                // A reaped stream is a no-op; Closed: the conn's close covers it.
+                if let Err(e) = conn.h3.abort(Q(req.quic_id), H3Code::REQUEST_CANCELLED) {
+                    log::debug!("h3wire abort: {e}");
+                }
+            }
+        } else if !req.aborted() {
             self.inner.stream_reset(now, req.stream);
-        } // ponytail: Task C5 adds `Connection::abort` for a request with h3wire state.
-        self.drive_inner(now);
+            req.terminal = Some(Terminal::Aborted {
+                code: H3Code::REQUEST_CANCELLED,
+                source: AbortSource::Local,
+            });
+        }
+        req.handed = true;
+        self.maybe_close(id);
+        self.drive_inner(now); // its sweep runs the abort's actions and retirement read
     }
 
     /// Executes `c`'s actions and writes its core bytes; runs whenever `c`'s h3wire state
@@ -315,9 +334,7 @@ impl<T: TransportOps> H3Wire<T> {
     fn run_actions(&mut self, now: Time, c: ConnId) {
         // Aborts from outside a feed (GOAWAY cutoff, local abort): read the stream to
         // FIN or the reset so it retires (adoption spec §3).
-        for s in self.dispatch(c) {
-            self.retire_read(now, s);
-        }
+        self.dispatch_retire(now, c);
         let Some(conn) = self.conns.get_mut(&c) else {
             return;
         };
@@ -325,7 +342,14 @@ impl<T: TransportOps> H3Wire<T> {
             if conn.closing {
                 continue; // drained and dropped
             }
-            let mq = |q: Q| conn.mq.get(&q.0).copied();
+            // A stream the transport closed is no longer routed: its actions are dropped.
+            let streams = &self.streams;
+            let mq = |q: Q| {
+                conn.mq
+                    .get(&q.0)
+                    .copied()
+                    .filter(|s| streams.contains_key(s))
+            };
             match a {
                 Action::OpenUni(kind) => {
                     let inner = &mut self.inner;

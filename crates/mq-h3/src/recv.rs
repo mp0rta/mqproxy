@@ -31,8 +31,27 @@ impl<T: TransportOps> H3Wire<T> {
                 | H3Event::Finished(stream)
                 | H3Event::StreamAborted { stream, .. }
                 | H3Event::SendStopped { stream, .. } => stream,
-                // GoAway: its cutoff arrives as StreamAborted. Closed: Task C5.
-                // PeerSettings, UniStream: nothing to do.
+                // The last event. On a live conn the fan-out follows the transport's
+                // ConnClosed; with the transport gone, the retained requests close now
+                // (adoption spec §4.3 step 4).
+                H3Event::Closed { .. } => {
+                    conn.h3_closed = true;
+                    if conn.gone {
+                        let ids: Vec<H3ReqId> = self
+                            .reqs
+                            .iter()
+                            .filter(|(_, r)| r.conn == c)
+                            .map(|(&id, _)| id)
+                            .collect();
+                        for id in ids {
+                            self.close_req(id);
+                        }
+                        self.settle_conn(c);
+                    }
+                    return retire;
+                }
+                // GoAway: its cutoff arrives as StreamAborted. PeerSettings, UniStream:
+                // nothing to do.
                 _ => continue,
             };
             let id = conn.mq.get(&q.0).map(|&s| req_id(s));
@@ -78,7 +97,7 @@ impl<T: TransportOps> H3Wire<T> {
                 H3Event::Finished(_) => req.terminal = Some(Terminal::Finished),
                 H3Event::StreamAborted { code, source, .. } => {
                     req.terminal = Some(Terminal::Aborted { code, source });
-                    if !req.carry_fin && !req.reset_code_pending {
+                    if !req.fin_read {
                         retire.push(req.stream);
                     }
                     if let Some(b) = req.pending_block.take() {
@@ -97,6 +116,16 @@ impl<T: TransportOps> H3Wire<T> {
             }
         }
         retire
+    }
+
+    /// `dispatch`, then the retirement read (adoption spec §3) of every stream it
+    /// aborted with the FIN unread, unless the transport already closed it.
+    pub(crate) fn dispatch_retire(&mut self, now: Time, c: ConnId) {
+        for s in self.dispatch(c) {
+            if self.streams.contains_key(&s) {
+                self.retire_read(now, s);
+            }
+        }
     }
 
     /// Feeds request `id` until a stop condition (adoption spec §4.4).
@@ -125,6 +154,7 @@ impl<T: TransportOps> H3Wire<T> {
                     Ok((n, fin)) => {
                         req.carry.truncate(n);
                         req.carry_fin = fin;
+                        req.fin_read = fin;
                         if n == 0 && !fin {
                             return Ok(0);
                         }
@@ -133,6 +163,7 @@ impl<T: TransportOps> H3Wire<T> {
                         req.carry.clear();
                         // "Reset, code pending": fed nothing more until the code pops.
                         req.reset_code_pending = e == StreamError::Reset;
+                        req.fin_read = req.reset_code_pending;
                         return Err(e);
                     }
                 }
@@ -167,18 +198,13 @@ impl<T: TransportOps> H3Wire<T> {
                 }
             }
             let fin_fed = fin && consumed == len;
-            let fin_read = req.carry_fin;
             req.carry.drain(..consumed);
             req.carry_fin &= !fin_fed;
-            let (c, s) = (req.conn, req.stream);
-            self.dispatch(c);
-            // Aborted by this feed (malformed, content-length, no final response): read the
-            // rest to FIN or the reset so the stream retires; raw xquic does not re-notify
-            // for bytes it already holds, and later StreamReadables continue it (spec §3).
-            if !fin_read && self.reqs.get(&id).is_some_and(|r| r.aborted()) {
-                self.retire_read(now, s);
-                return Ok(0);
-            }
+            // An abort by this feed (malformed, content-length, no final response) gets its
+            // retirement read here: raw xquic does not re-notify for bytes it already
+            // holds, and later StreamReadables continue it (spec §3).
+            let c = req.conn;
+            self.dispatch_retire(now, c);
             if n > 0 || (consumed == 0 && !fin_fed) {
                 return Ok(n);
             }
@@ -238,6 +264,7 @@ impl<T: TransportOps> H3Wire<T> {
         if !req.carry.is_empty() || req.carry_fin {
             self.queue.push(Event::H3Readable(id));
         }
+        self.maybe_close(id);
         self.drive_inner(now);
         Ok(fin)
     }
@@ -266,6 +293,7 @@ impl<T: TransportOps> H3Wire<T> {
             Err(e) => Err(e),
         };
         req.handed |= matches!(out, Ok((_, true)) | Err(StreamError::Reset));
+        self.maybe_close(id);
         self.drive_inner(now);
         out
     }
@@ -303,8 +331,12 @@ impl<T: TransportOps> H3Wire<T> {
                     && !req.aborted()
                 {
                     req.reset_code_pending = false;
-                    self.peer_reset(c, q, H3Code(code));
+                    if let Some(conn) = self.conns.get_mut(&c) {
+                        log_closed(conn.h3.stream_reset_received(q, H3Code(code)));
+                    }
                 }
+                // The probe always runs (spec §3), before the events are dispatched by
+                // the caller's `service`, so the abort owes no second read.
                 self.retire_read(now, s);
             }
             Event::StreamWritable(_) => {
@@ -313,46 +345,56 @@ impl<T: TransportOps> H3Wire<T> {
                 }
             }
             Event::StreamClosed(_) => {
-                // A pending code was dropped with the slot: "reset, code unknown".
-                if let Some(req) = self.reqs.get_mut(&id)
-                    && req.reset_code_pending
-                {
-                    req.reset_code_pending = false;
-                    self.peer_reset(c, q, H3Code::REQUEST_CANCELLED);
-                }
-                // Unmapped first, so actions queued for the gone stream are dropped.
+                // Unrouted first, so actions queued for the gone stream are dropped. The
+                // quic id stays mapped: carried bytes may still yield its h3wire events.
+                self.streams.remove(&s);
                 if let Some(conn) = self.conns.get_mut(&c) {
-                    conn.mq.remove(&q.0);
                     conn.fins.remove(&s);
                 }
-                self.streams.remove(&s);
-                self.close_req(id);
+                let Some(req) = self.reqs.get_mut(&id) else {
+                    return true;
+                };
+                req.stream_closed = true;
+                // A pending code was dropped with the slot: "reset, code unknown".
+                if std::mem::take(&mut req.reset_code_pending) {
+                    if let Some(conn) = self.conns.get_mut(&c) {
+                        log_closed(conn.h3.stream_reset_received(q, H3Code::REQUEST_CANCELLED));
+                    }
+                    self.dispatch_retire(now, c);
+                }
+                self.maybe_close(id);
             }
             _ => return false,
         }
         true
     }
 
-    fn peer_reset(&mut self, c: ConnId, q: Q, code: H3Code) {
-        if let Some(conn) = self.conns.get_mut(&c) {
-            log_closed(conn.h3.stream_reset_received(q, code));
-        }
-        self.dispatch(c);
-    }
-
-    /// Closure on `StreamClosed` (adoption spec §4.3): `H3Closed` once the gateway has
-    /// the receive end or the request was aborted; a request it never saw just goes.
-    fn close_req(&mut self, id: H3ReqId) {
+    /// Closure (adoption spec §4.3): once the transport closed the stream (1) and the
+    /// gateway has the receive end or the request was aborted (2). A request the gateway
+    /// never saw goes at (1).
+    pub(crate) fn maybe_close(&mut self, id: H3ReqId) {
         let Some(req) = self.reqs.get(&id) else {
             return;
         };
-        let closed = req.handed || req.aborted();
-        if req.known && !closed {
-            return; // ponytail: Task C5 defers closure until the gateway has the end
+        if !req.stream_closed || (req.known && !req.handed && !req.aborted()) {
+            return;
         }
-        let req = self.reqs.remove(&id).expect("present");
-        if let (Some(b), Some(conn)) = (req.pending_block, self.conns.get_mut(&req.conn)) {
-            conn.h3.release(b);
+        let c = req.conn;
+        self.close_req(id);
+        self.settle_conn(c); // the last retained request of a gone conn
+    }
+
+    /// Removes request `id`, with one `H3Closed` if the gateway knows it: the single place
+    /// that builds the `H3Close` (Task C6 fills its stats).
+    pub(crate) fn close_req(&mut self, id: H3ReqId) {
+        let Some(req) = self.reqs.remove(&id) else {
+            return;
+        };
+        if let Some(conn) = self.conns.get_mut(&req.conn) {
+            conn.mq.remove(&req.quic_id);
+            if let Some(b) = req.pending_block {
+                conn.h3.release(b);
+            }
         }
         if req.known {
             let close = H3Close {
@@ -367,10 +409,15 @@ impl<T: TransportOps> H3Wire<T> {
     /// or a blocked transport.
     pub(crate) fn retire_read(&mut self, now: Time, s: StreamId) {
         let mut buf = [0u8; BOOT_READ];
-        while let Ok((n, fin)) = self.inner.stream_recv(now, s, &mut buf) {
-            if fin || n == 0 {
-                return;
+        let end = loop {
+            match self.inner.stream_recv(now, s, &mut buf) {
+                Ok((_, true)) | Err(StreamError::Reset) => break true,
+                Ok((n, false)) if n > 0 => {}
+                _ => break false,
             }
+        };
+        if let Some(req) = self.reqs.get_mut(&req_id(s)) {
+            req.fin_read |= end;
         }
     }
 }

@@ -33,6 +33,12 @@ pub(crate) struct Req {
     pub(crate) carry: Vec<u8>,
     /// The transport reported FIN after the carry; not yet fed.
     pub(crate) carry_fin: bool,
+    /// The transport receive side was read to its end (FIN or `Err(Reset)`): no
+    /// retirement read is owed (adoption spec §3).
+    pub(crate) fin_read: bool,
+    /// Closure condition 1: the transport closed the stream, or its conn (adoption spec
+    /// §4.3).
+    pub(crate) stream_closed: bool,
     /// The DATA frame `h3_send_body` started and has not written whole (adoption spec §4.5).
     pub(crate) frame: Option<InFlight>,
     /// `h3_finish` (or a bare `fin`) is waiting for `send_data(0, true)` to stop being
@@ -63,6 +69,8 @@ impl Req {
             reset_code_pending: false,
             carry: Vec::new(),
             carry_fin: false,
+            fin_read: false,
+            stream_closed: false,
             frame: None,
             finish_latched: false,
             writable_wanted: false,

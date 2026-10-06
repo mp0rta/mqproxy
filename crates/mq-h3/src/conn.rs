@@ -1,10 +1,12 @@
 //! One `h3wire::Connection` per H3 conn, and the raw events it consumes (adoption spec §4.2,
 //! §4.4).
 
-use crate::req::{Req, req_id};
+use crate::req::{Req, Terminal, req_id};
 use crate::{BOOT_READ, H3Wire};
 use h3wire::{Config, Connection, H3Code, Role, StreamId as Q};
-use mq_transport_api::{ConnId, ConnProto, Event, StreamError, StreamId, Time, TransportOps};
+use mq_transport_api::{
+    ConnId, ConnProto, Event, H3ReqId, StreamError, StreamId, Time, TransportOps,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Equals `mq_transport::H3_FIELD_SECTION_MAX`; mq-h3 does not depend on mq-transport.
@@ -34,6 +36,11 @@ pub(crate) struct H3Conn {
     /// Request streams whose `FinishStream` write was `Blocked`: retried by `service`
     /// (adoption spec §4.5). At most one per stream.
     pub(crate) fins: HashSet<StreamId>,
+    /// The transport conn is gone; the conn stays only for its retained requests
+    /// (adoption spec §4.3 "Connection close").
+    pub(crate) gone: bool,
+    /// h3wire emitted `Event::Closed`.
+    pub(crate) h3_closed: bool,
 }
 
 impl H3Conn {
@@ -51,6 +58,8 @@ impl<T: TransportOps> H3Wire<T> {
             uni_done: HashSet::new(),
             closing: false,
             fins: HashSet::new(),
+            gone: false,
+            h3_closed: false,
         };
         self.conns.insert(c, conn);
         self.service(now, c);
@@ -66,14 +75,8 @@ impl<T: TransportOps> H3Wire<T> {
                     self.add_conn(now, c, Role::Server);
                 }
             }
-            // ponytail: C2 drops the conn outright; Task C5 adds the request fan-out.
-            Event::ConnClosed(c, _) => {
-                if let Some(conn) = self.conns.remove(&c) {
-                    for s in conn.mq.values() {
-                        self.streams.remove(s);
-                    }
-                }
-            }
+            // The fan-out comes before ConnClosed passes through (adoption spec §4.1).
+            Event::ConnClosed(c, _) => self.conn_closed(c),
             Event::NewStream(c, s, info) => {
                 let Some(conn) = self.conns.get_mut(&c) else {
                     return Some(e);
@@ -104,6 +107,45 @@ impl<T: TransportOps> H3Wire<T> {
             _ => {}
         }
         Some(e)
+    }
+
+    /// adoption spec §4.3 "Connection close", steps 1, 3 and 5. A client request whose
+    /// response is complete but undelivered is retained while h3wire is open; every other
+    /// request the gateway knows is closed now.
+    fn conn_closed(&mut self, c: ConnId) {
+        let Some(conn) = self.conns.get_mut(&c) else {
+            return;
+        };
+        conn.gone = true;
+        conn.closing = true; // h3wire parses on; its actions are dropped
+        conn.fins.clear();
+        let retain = conn.client && !conn.h3_closed;
+        // ponytail: O(streams + reqs of the shard) per conn close; index them by conn if
+        // shards grow large.
+        self.streams.retain(|_, (x, _)| *x != c);
+        let ids: Vec<H3ReqId> = self
+            .reqs
+            .iter()
+            .filter(|(_, r)| r.conn == c)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            let r = self.reqs.get_mut(&id).expect("listed above");
+            r.stream_closed = true;
+            let complete = r.carry_fin || r.terminal == Some(Terminal::Finished);
+            if !(retain && r.known && !r.handed && complete) {
+                self.close_req(id);
+            }
+        }
+        self.settle_conn(c);
+    }
+
+    /// Drops a gone conn once no retained request is left (adoption spec §4.3 step 5).
+    pub(crate) fn settle_conn(&mut self, c: ConnId) {
+        if self.conns.get(&c).is_some_and(|x| x.gone) && !self.reqs.values().any(|r| r.conn == c) {
+            let mut conn = self.conns.remove(&c).expect("checked");
+            conn.h3.transport_closed();
+        }
     }
 
     fn on_stream_event(&mut self, now: Time, c: ConnId, s: StreamId, q: Q, e: Event) {

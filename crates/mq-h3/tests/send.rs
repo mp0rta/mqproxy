@@ -475,6 +475,20 @@ fn going_away_maps_to_conn() {
         r.h.log()[calls..].contains(&Call::StreamReset(s)),
         "no h3wire state: the raw stream is reset (adoption spec §4.3)"
     );
+    r.w.h3_reset(r.now, id);
+    assert_eq!(
+        aborts(&r, s),
+        [Call::StreamReset(s)],
+        "h3_reset is idempotent"
+    );
+    r.events();
+    r.h.push_event(Event::StreamClosed(s));
+    r.w.drive(r.now);
+    let ev = r.events();
+    assert!(
+        matches!(ev[..], [Event::H3Closed(x, _)] if x == id),
+        "closure follows StreamClosed: {ev:?}"
+    );
 }
 
 #[test]
