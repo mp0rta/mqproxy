@@ -92,6 +92,29 @@ fn assert_req(line: &str, want: &str) {
     }
 }
 
+/// adoption spec §6.2: the response header list is `want`, in order; the volatile `date`
+/// value is normalised to `T`.
+fn assert_headers(got: &[(String, String)], want: &[(&str, &str)]) {
+    let got: Vec<(&str, &str)> = got
+        .iter()
+        .map(|(n, v)| (n.as_str(), if n == "date" { "T" } else { v.as_str() }))
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// The gateway server's H3 response to a direct request an h1 origin answered `ok`.
+const H3_OK: [(&str, &str); 3] = [
+    (":status", "200"),
+    ("x-mq-origin-protocol", "http/1.1"),
+    ("content-length", "2"),
+];
+
+/// The H3 response header list of an `H3Client`.
+fn h3_headers(r: &H3Recorded) -> Vec<(String, String)> {
+    let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    r.headers.iter().map(|(n, v)| (s(n), s(v))).collect()
+}
+
 /// The `mq.req` line of the request to `path` (at most `T`).
 fn req_line(path: &str) -> String {
     wait_log(&["mq.req", &format!("path=\"{path}\"")])
@@ -304,11 +327,6 @@ fn wait_h3(h: &H3Handle, cond: impl Fn(&H3Recorded) -> bool) {
     wait_until("the H3 client", || cond(&h.lock()));
 }
 
-fn h3_header(r: &H3Recorded, name: &str) -> Option<String> {
-    let h = r.headers.iter().find(|(n, _)| n == name.as_bytes());
-    h.map(|(_, v)| String::from_utf8_lossy(v).into_owned())
-}
-
 // ---- a capturing h1 origin ----
 
 /// What `Capture` read on one connection.
@@ -468,6 +486,13 @@ matrix!(
         wait_up(&p, tag);
         let url = format!("https://127.0.0.1:{}/dl-{tag}", o.addr.port());
         let r = parse(&fetch(&p, &url, &[], b"").expect("download"));
+        let want = [
+            ("x-mq-origin-protocol", "h2"),
+            ("date", "T"),
+            ("content-length", "8388608"),
+            ("connection", "close"),
+        ];
+        assert_headers(&r.headers, &want);
         assert_eq!(r.status, 200);
         assert_eq!(r.header("content-length"), Some("8388608"));
         assert!(
@@ -495,6 +520,13 @@ matrix!(
         let body = pattern(8 * MIB);
         let url = format!("http://{}/up-{tag}", o.addr);
         let r = parse(&fetch(&p, &url, &[("X-Mq-Method", "PUT")], &body).expect("upload"));
+        let want = [
+            ("x-mq-origin-protocol", "http/1.1"),
+            ("content-length", "8388608"),
+            ("date", "T"),
+            ("connection", "close"),
+        ];
+        assert_headers(&r.headers, &want);
         assert_eq!(r.status, 200);
         assert_eq!(r.header("content-length"), Some("8388608"));
         assert!(r.body == body, "echo differs ({} bytes)", r.body.len());
@@ -609,6 +641,12 @@ matrix!(
             b"",
         );
         let r = parse(&r.expect("HEAD finishes cleanly"));
+        let want = [
+            ("x-mq-origin-protocol", "http/1.1"),
+            ("content-length", "0"),
+            ("connection", "close"),
+        ];
+        assert_headers(&r.headers, &want);
         assert_eq!((r.status, r.header("content-length")), (200, Some("0")));
         assert!(r.body.is_empty());
         let r = parse(
@@ -616,6 +654,12 @@ matrix!(
                 .expect("304 finishes cleanly"),
         );
         assert_eq!((r.status, r.header("content-length")), (304, Some("100")));
+        let want = [
+            ("x-mq-origin-protocol", "http/1.1"),
+            ("content-length", "100"),
+            ("connection", "close"),
+        ];
+        assert_headers(&r.headers, &want);
         assert!(r.body.is_empty());
         for (sid, method, status, addr, path) in [
             (4, "HEAD", 200, head.addr, format!("/h-{tag}")),
@@ -650,6 +694,14 @@ matrix!(
         wait_up(&p, tag);
         let raw = fetch(&p, &format!("http://{}/big-{tag}", origin.addr), &[], b"");
         let r = parse(&raw.expect("fetch"));
+        let names: Vec<String> = (0..5).map(|i| format!("x-big-{i}")).collect();
+        let mut want = vec![
+            ("x-mq-origin-protocol", "http/1.1"),
+            ("content-length", "2"),
+        ];
+        want.extend(names.iter().map(|n| (n.as_str(), value.as_str())));
+        want.push(("connection", "close"));
+        assert_headers(&r.headers, &want);
         assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
         for i in 0..5 {
             assert_eq!(r.header(&format!("x-big-{i}")), Some(value.as_str()), "{i}");
@@ -673,6 +725,12 @@ matrix!(
         wait_up(&p, tag);
         let url = o.url(&format!("/a/../b-{tag}?q=/../x"));
         let r = parse(&fetch(&p, &url, &[], b"").expect("fetch"));
+        let want = [
+            ("x-mq-origin-protocol", "http/1.1"),
+            ("content-length", "2"),
+            ("connection", "close"),
+        ];
+        assert_headers(&r.headers, &want);
         assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
         let head = o.one().head;
         let want = format!("get /b-{tag}?q=/../x http/1.1\r\n");
@@ -698,6 +756,12 @@ matrix!(
         wait_up(&p, tag);
         let extra = [("X-Test", ""), ("Accept", ""), ("X-Kept", "yes")];
         let r = parse(&fetch(&p, &o.url(&format!("/empty-{tag}")), &extra, b"").expect("fetch"));
+        let want = [
+            ("x-mq-origin-protocol", "http/1.1"),
+            ("content-length", "2"),
+            ("connection", "close"),
+        ];
+        assert_headers(&r.headers, &want);
         assert_eq!(r.status, 200);
         let head = o.one().head;
         assert!(head.contains("\r\nx-kept: yes\r\n"), "{head}");
@@ -733,9 +797,17 @@ matrix!(
         wait_up(&p, tag);
         let url = format!("https://127.0.0.1:{}/c13-{tag}", o.addr.port());
         let r = parse(&fetch(&p, &url, &[], b"").expect("default request"));
+        let want = [
+            ("x-mq-origin-protocol", "http/1.1"),
+            ("content-length", "2"),
+            ("date", "T"),
+            ("connection", "close"),
+        ];
+        assert_headers(&r.headers, &want);
         assert_eq!((r.status, r.body.len()), (200, 2));
         let r = fetch(&p, &url, &[("X-Mq-Origin-Protocol", "h1")], b"");
         let r = parse(&r.expect("h1-forced request"));
+        assert_headers(&r.headers, &want);
         assert_eq!((r.status, r.body.len()), (200, 2));
         assert_eq!(o.accepted(), 1);
         let path = format!("/c13-{tag}");
@@ -818,8 +890,12 @@ matrix!(
         wait_h3(&c.handle, |r| r.fin);
         {
             let r = c.handle.lock();
-            assert_eq!(h3_header(&r, ":status").as_deref(), Some("400"));
-            assert_eq!(h3_header(&r, "x-mq-error").as_deref(), Some("bad-request"));
+            let want = [
+                (":status", "400"),
+                ("x-mq-error", "bad-request"),
+                ("content-length", "0"),
+            ];
+            assert_headers(&h3_headers(&r), &want);
         }
         let line = wait_log(&["mq.req", "status=400", &format!("req_bytes={n} ")]);
         let want = format!(
@@ -848,7 +924,12 @@ matrix!(
         wait_h3(&c.handle, |r| !r.closed.is_empty());
         {
             let r = c.handle.lock();
-            assert_eq!(h3_header(&r, ":status").as_deref(), Some("403"));
+            let want = [
+                (":status", "403"),
+                ("x-mq-error", "auth-failed"),
+                ("content-length", "0"),
+            ];
+            assert_headers(&h3_headers(&r), &want);
             assert_eq!(r.closed[0].0.stats.stream_err, 0, "{:?}", r.closed);
             assert_eq!(r.closed[0].0.stats.send_body, body_len as u64);
         }
@@ -890,10 +971,7 @@ matrix!(
             return;
         }
         wait_h3(&c.handle, |r| r.fin);
-        assert_eq!(
-            h3_header(&c.handle.lock(), ":status").as_deref(),
-            Some("200")
-        );
+        assert_headers(&h3_headers(&c.handle.lock()), &H3_OK);
         let seen = o.one();
         assert!(seen.complete && seen.body.is_empty(), "{seen:?}");
         assert!(!seen.head.contains("transfer-encoding"), "{}", seen.head);
@@ -925,10 +1003,7 @@ matrix!(
         let s = script("GET", &o.authority(), &path, &extra, b"hello body".to_vec());
         let c = h3_client(p.server.udp_addr, s, cells.0);
         wait_h3(&c.handle, |r| r.fin);
-        assert_eq!(
-            h3_header(&c.handle.lock(), ":status").as_deref(),
-            Some("200")
-        );
+        assert_headers(&h3_headers(&c.handle.lock()), &H3_OK);
         let seen = o.one();
         assert!(
             seen.head.contains("\r\ntransfer-encoding: chunked\r\n"),
@@ -965,6 +1040,7 @@ fn upload_reset(cells: (Backend, Backend), path: &str, cl: &str, body: Vec<u8>) 
         let code = r.closed[0].0.stats.stream_err;
         assert!(if wire { code == 0x10e } else { code != 0 }, "{r:?}");
         assert!(!r.fin, "{r:?}");
+        assert_headers(&h3_headers(&r), &[]);
     }
     let want = format!(
         "sid=0 method=POST status=0 authority=\"{}\" path=\"{path}\" req_bytes={} resp_bytes=0 ttfb_ms=-1 duration_ms=-1 origin_protocol=none origin_tls=na content_encoding=none cache=bypass origin_reuse=0 origin_connect_ms=-1 mp_state=0 completion_ms=-1 reset=\"local reset\"",

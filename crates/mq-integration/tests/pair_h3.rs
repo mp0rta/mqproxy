@@ -131,14 +131,24 @@ fn section(hs: &[(Vec<u8>, Vec<u8>)]) -> usize {
     hs.iter().map(|(n, v)| n.len() + v.len() + 32).sum()
 }
 
+/// `hs` as the apps record a header list.
+fn bytes(hs: &[(String, String)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let b = |s: &String| s.as_bytes().to_vec();
+    hs.iter().map(|(n, v)| (b(n), b(v))).collect()
+}
+
 // SP4 spec §5: both engines accept a 40 KiB field section (xquic's default limit was 32 KiB;
 // `H3_FIELD_SECTION_MAX` is 64 KiB): a request section reaches the server and a response
-// section comes back. Matrixed over (client, server) backends (adoption spec §6.2).
+// section comes back, each exactly as sent. Matrixed over (client, server) backends
+// (adoption spec §6.2).
 matrix!(
     h3_40k_section_both_ways,
     |cells: (Backend, Backend), _tag: &str| {
         let mut script = post(Vec::new(), None);
         script.headers.extend(fields(6, 7000));
+        let want_req = bytes(&script.headers);
+        let mut want_resp = vec![(b":status".to_vec(), b"200".to_vec())];
+        want_resp.extend(bytes(&fields(6, 7000)));
         let lo = Ipv4Addr::LOCALHOST.into();
         let p = LoopbackPair::spawn(
             (lo, lo),
@@ -162,16 +172,13 @@ matrix!(
         wait(&p.client.handle, |r| r.fin);
         {
             let s = p.server.handle.lock();
-            assert!(
-                section(&s.request_headers) >= 40 * 1024,
-                "{}",
-                section(&s.request_headers)
-            );
+            assert!(section(&want_req) >= 40 * 1024, "{}", section(&want_req));
+            assert!(s.request_headers == want_req, "request headers differ");
         }
         {
             let c = p.client.handle.lock();
-            assert_eq!(c.headers[0].0, b":status");
-            assert!(section(&c.headers) >= 40 * 1024, "{}", section(&c.headers));
+            assert!(section(&want_resp) >= 40 * 1024, "{}", section(&want_resp));
+            assert!(c.headers == want_resp, "response headers differ");
         }
         p.join_both();
     }
