@@ -978,6 +978,8 @@ matrix!(
             return;
         }
         wait_h3(&c.handle, |r| r.fin);
+        // The control of `assert_not_seen`: a request the gateway took is counted.
+        assert_eq!(p.server_h3_requests.load(Ordering::SeqCst), 1);
         assert_headers(&h3_headers(&c.handle.lock()), &H3_OK);
         let seen = o.one();
         assert!(seen.complete && seen.body.is_empty(), "{seen:?}");
@@ -1089,15 +1091,18 @@ fn raw_headers(fields: &[(&str, &str)]) -> Vec<u8> {
 }
 
 /// `RawH3Peer`'s HEADERS was malformed (adoption spec §5.3 (6)): h3wire resets the stream with
-/// `H3_MESSAGE_ERROR` and the gateway never sees the request, so no `mq.req` line carries
-/// `marker` for 500 ms after the reset.
-fn assert_message_error(c: &DriverThread<RawH3Handle>, marker: &str) {
+/// `H3_MESSAGE_ERROR` and the gateway never sees the request.
+fn assert_message_error(p: &LoopbackProxy, c: &DriverThread<RawH3Handle>) {
     wait_until("the peer's reset", || !c.handle.lock().resets.is_empty());
-    assert_eq!(c.handle.lock().resets[0].1, 0x10e, "{:?}", c.handle.lock());
-    assert_no_req(marker);
+    {
+        let g = c.handle.lock();
+        assert_eq!(g.resets[0].1, 0x10e, "{g:?}");
+    }
+    assert_not_seen(p);
 }
 
-/// No `mq.req` line carries `marker` for 500 ms.
+/// No `mq.req` line carries `marker` for 500 ms (the xqc_h3 receiver: it can log the
+/// request as `path="-"` before decoding, so only the submitted path is searched for).
 fn assert_no_req(marker: &str) {
     let end = Instant::now() + Duration::from_millis(500);
     while Instant::now() < end {
@@ -1106,6 +1111,18 @@ fn assert_no_req(marker: &str) {
             .iter()
             .find(|l| l.contains("mq.req") && l.contains(marker));
         assert!(hit.is_none(), "{hit:?}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The server never handed the gateway a request (`H3Request`) for 500 ms. Counted at the
+/// server app of this test's own pair, so neither a `path="-"` log line (the gateway's name
+/// for a request it has not accepted) nor another test's lines can hide a leak.
+fn assert_not_seen(p: &LoopbackProxy) {
+    let end = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < end {
+        let n = p.server_h3_requests.load(Ordering::SeqCst);
+        assert_eq!(n, 0, "the gateway was handed a request");
         thread::sleep(Duration::from_millis(5));
     }
 }
@@ -1206,10 +1223,10 @@ receivers!(nul_in_auth_path_class_direct_h3, |b: Backend, tag: &str| {
             ("200", None),
         ),
     ];
-    for (stream, path, (status, xmq)) in cases {
+    for (stream, _, (status, xmq)) in cases {
         let c = raw_client(p.server.udp_addr, stream);
         if b == Backend::Wire {
-            assert_message_error(&c, &format!("path=\"{path}\""));
+            assert_message_error(&p, &c);
         } else {
             wait_until("the response", || c.handle.lock().fin);
             assert_eq!(raw_field(&c, ":status").as_deref(), Some(status));
@@ -1241,7 +1258,7 @@ receivers!(connect_malformed_direct_h3, |b: Backend, tag: &str| {
     ]);
     let c = raw_client(p.server.udp_addr, stream);
     if b == Backend::Wire {
-        assert_message_error(&c, &format!("path=\"{path}\""));
+        assert_message_error(&p, &c);
     } else {
         wait_until("the response", || c.handle.lock().fin);
         assert_eq!(raw_field(&c, ":status").as_deref(), Some("400"));
@@ -1277,13 +1294,27 @@ receivers!(
                 !c.handle.lock().closed.is_empty()
             });
             assert_eq!(c.handle.lock().closed, [EXCESSIVE_LOAD]);
-            assert!(c.handle.lock().resets.is_empty(), "{:?}", c.handle.lock());
+            {
+                let g = c.handle.lock();
+                assert!(g.resets.is_empty(), "{g:?}");
+            }
         } else {
             wait_until("the peer's reset", || !c.handle.lock().resets.is_empty());
-            assert_eq!(c.handle.lock().resets[0].1, 0x10e, "{:?}", c.handle.lock());
-            assert!(c.handle.lock().closed.is_empty(), "{:?}", c.handle.lock());
+            {
+                let g = c.handle.lock();
+                assert_eq!(g.resets[0].1, 0x10e, "{g:?}");
+            }
+            {
+                let g = c.handle.lock();
+                assert!(g.closed.is_empty(), "{g:?}");
+            }
         }
-        assert_no_req(&format!("path=\"{path}\""));
+        if b == Backend::Wire {
+            assert_not_seen(&p);
+        } else {
+            // xqc_h3 hands the gateway the stream before it decodes (and rejects) the block.
+            assert_no_req(&format!("path=\"{path}\""));
+        }
         stop(c);
         assert_eq!(p.join_both(), (0, 0));
     }
@@ -1297,12 +1328,21 @@ receivers!(direct_h3_fin_without_headers, |b: Backend, _tag: &str| {
     let c = raw_client(p.server.udp_addr, Vec::new());
     if b == Backend::Wire {
         wait_until("the peer's reset", || !c.handle.lock().resets.is_empty());
-        assert_eq!(c.handle.lock().resets[0].1, 0x10d, "{:?}", c.handle.lock());
+        {
+            let g = c.handle.lock();
+            assert_eq!(g.resets[0].1, 0x10d, "{g:?}");
+        }
     } else {
         thread::sleep(Duration::from_millis(500));
-        assert!(c.handle.lock().resets.is_empty(), "{:?}", c.handle.lock());
+        {
+            let g = c.handle.lock();
+            assert!(g.resets.is_empty(), "{g:?}");
+        }
     }
-    assert!(c.handle.lock().closed.is_empty(), "{:?}", c.handle.lock());
+    {
+        let g = c.handle.lock();
+        assert!(g.closed.is_empty(), "{g:?}");
+    }
     stop(c);
     assert_eq!(p.join_both(), (0, 0));
 });

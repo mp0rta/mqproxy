@@ -10,14 +10,19 @@ use mq_proxy::config::{ClientConfig, GatewayConfig, MitmConfig, ServerConfig};
 use mq_proxy::server::Server;
 use mq_proxy::server::origin::build_client_config;
 use mq_runtime::driver::{DriverConfig, StdResolver};
-use mq_runtime::{App, ListenKind, ListenerTag, Shard};
+use mq_runtime::{
+    AcceptMeta, App, Cx, DialError, DialOpId, ListenKind, ListenerTag, Shard, SocketOpId, TcpEnd,
+    TcpId, TimerId, UdpSocketId,
+};
 use mq_transport::Transport;
 use mq_transport_api::{
-    CongestionControl, H3Backend, Role, Scheduler, TransportConfig, TransportOps,
+    CongestionControl, Event, H3Backend, Role, Scheduler, TransportConfig, TransportOps,
 };
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Builds and starts a server driver bound to the given UDP address.
@@ -29,6 +34,67 @@ pub struct LoopbackPair<S, C> {
     pub client: DriverThread<C>,
     /// `restart_server`'s factory (pairs built by `spawn_mitm`).
     respawn: Option<Respawn<S>>,
+    /// `H3Request`s the server app was handed (`spawn_gateway_on` pairs; 0 elsewhere): what
+    /// the gateway saw of the requests, whatever it logged.
+    pub server_h3_requests: Arc<AtomicUsize>,
+}
+
+/// Counts the `H3Request` events its app is handed.
+struct CountH3Requests<A> {
+    app: A,
+    n: Arc<AtomicUsize>,
+}
+
+impl<A: App> App for CountH3Requests<A> {
+    fn on_start(&mut self, cx: &mut Cx<'_>) {
+        self.app.on_start(cx)
+    }
+    fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
+        if matches!(ev, Event::H3Request(..)) {
+            self.n.fetch_add(1, Ordering::SeqCst);
+        }
+        self.app.on_transport_event(cx, ev)
+    }
+    fn on_accepted(&mut self, cx: &mut Cx<'_>, l: ListenerTag, tcp: TcpId, meta: AcceptMeta) {
+        self.app.on_accepted(cx, l, tcp, meta)
+    }
+    fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        self.app.on_tcp_data(cx, tcp)
+    }
+    fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
+        self.app.on_tcp_end(cx, tcp, end)
+    }
+    fn on_tcp_writable(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        self.app.on_tcp_writable(cx, tcp)
+    }
+    fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>) {
+        self.app.on_dial_result(cx, op, r)
+    }
+    fn on_resolve_result(
+        &mut self,
+        cx: &mut Cx<'_>,
+        op: DialOpId,
+        r: Result<SocketAddr, DialError>,
+    ) {
+        self.app.on_resolve_result(cx, op, r)
+    }
+    fn on_udp_socket(
+        &mut self,
+        cx: &mut Cx<'_>,
+        op: SocketOpId,
+        r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
+    ) {
+        self.app.on_udp_socket(cx, op, r)
+    }
+    fn on_udp_rx(&mut self, cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {
+        self.app.on_udp_rx(cx, sock, peer, data)
+    }
+    fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
+        self.app.on_timer(cx, id)
+    }
+    fn on_shutdown(&mut self, cx: &mut Cx<'_>) {
+        self.app.on_shutdown(cx)
+    }
 }
 
 fn driver_config() -> DriverConfig {
@@ -83,6 +149,7 @@ impl<S: Send + 'static, C: Send + 'static> LoopbackPair<S, C> {
             server,
             client,
             respawn: None,
+            server_h3_requests: Arc::default(),
         }
     }
 
@@ -277,7 +344,15 @@ impl LoopbackProxy {
         server.gateway.get_or_insert_with(GatewayConfig::default);
         let tls = build_client_config(Some(origin_ca), &Vec::new).expect("origin CA");
         // `Server` holds `Rc`s: it is built on its driver thread.
-        Self::gateway_pair(client, move || Server::with_gateway(server, tls), backends)
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let app = move || CountH3Requests {
+            app: Server::with_gateway(server, tls),
+            n: n2,
+        };
+        let mut p = Self::gateway_pair(client, app, backends);
+        p.server_h3_requests = n;
+        p
     }
 
     /// The fetch client of `spawn_gateway` against an arbitrary H3 server `App` (a
