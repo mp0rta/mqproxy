@@ -1,6 +1,7 @@
 //! One `h3wire::Connection` per H3 conn, and the raw events it consumes (adoption spec §4.2,
 //! §4.4).
 
+use crate::req::{Req, req_id};
 use crate::{BOOT_READ, H3Wire};
 use h3wire::{Config, Connection, H3Code, Role, StreamId as Q};
 use mq_transport_api::{ConnId, ConnProto, Event, StreamError, StreamId, Time, TransportOps};
@@ -70,6 +71,12 @@ impl<T: TransportOps> H3Wire<T> {
                 };
                 conn.mq.insert(info.quic_id, s);
                 self.streams.insert(s, (c, Q(info.quic_id)));
+                // A peer request stream (server): h3wire holds its state from the first
+                // sight; the gateway learns of it at its HEADERS (adoption spec §4.3).
+                if Q(info.quic_id).is_request() && !conn.client {
+                    let req = Req::new(c, s, info.quic_id, false);
+                    self.reqs.insert(req_id(s), req);
+                }
                 return None;
             }
             Event::StreamReadable(s)
@@ -91,6 +98,9 @@ impl<T: TransportOps> H3Wire<T> {
     }
 
     fn on_stream_event(&mut self, now: Time, c: ConnId, s: StreamId, q: Q, e: Event) {
+        if q.is_request() && self.on_req_event(now, c, s, q, &e) {
+            return;
+        }
         let conn = self
             .conns
             .get_mut(&c)
@@ -102,7 +112,7 @@ impl<T: TransportOps> H3Wire<T> {
                 if peer_uni && conn.uni_done.insert(s) {
                     log_closed(conn.h3.stream_reset_received(q, H3Code(code)));
                 }
-                // Retirement probe (adoption spec §3); request streams: Task C3/C5.
+                // Retirement probe (adoption spec §3).
                 if peer_uni {
                     self.read_uni(now, c, s, q);
                 }
@@ -160,7 +170,7 @@ impl<T: TransportOps> H3Wire<T> {
 
 /// `ConnectionError` is a state notification; the wire effect is a queued action
 /// (adoption spec §5.1).
-fn log_closed(r: Result<(), h3wire::ConnectionError>) {
+pub(crate) fn log_closed(r: Result<(), h3wire::ConnectionError>) {
     if let Err(e) = r {
         log::debug!("h3wire: {e}");
     }

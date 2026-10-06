@@ -1,11 +1,13 @@
 //! `H3Wire<T>`: a `TransportOps` decorator serving HTTP/3 from h3wire (adoption spec §4.1).
 //!
-//! Active mode (`H3Wire::new`) runs one h3wire `Connection` per H3 conn; requests are served
-//! from it by the later tasks (C3–C5).
+//! Active mode (`H3Wire::new`) runs one h3wire `Connection` per H3 conn and serves the
+//! requests from it.
 #![forbid(unsafe_code)]
 
 mod conn;
 mod queue;
+mod recv;
+mod req;
 mod send;
 
 use conn::H3Conn;
@@ -15,7 +17,8 @@ use mq_transport_api::{
     TransportOps, TxKey,
 };
 use queue::OutQueue;
-use std::collections::{HashMap, HashSet};
+use req::Req;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 /// Bootstrap read size for a request stream (adoption spec §4.4).
@@ -26,8 +29,8 @@ pub struct H3Wire<T> {
     /// `false`: create no H3 state; every op and event passes through (adoption spec §4.1).
     active: bool,
     queue: OutQueue,
-    /// Requests this wrapper holds; always empty until request state lands (later tasks).
-    reqs: HashSet<H3ReqId>,
+    /// Request streams of H3 conns, by request id (adoption spec §4.3).
+    reqs: HashMap<H3ReqId, Req>,
     conns: HashMap<ConnId, H3Conn>,
     /// Every stream of an H3 conn: its conn and quic id.
     streams: HashMap<StreamId, (ConnId, h3wire::StreamId)>,
@@ -49,7 +52,7 @@ impl<T: TransportOps> H3Wire<T> {
             inner,
             active,
             queue: OutQueue::default(),
-            reqs: HashSet::new(),
+            reqs: HashMap::new(),
             conns: HashMap::new(),
             streams: HashMap::new(),
         }
@@ -142,10 +145,10 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
             | Event::StreamWritable(s)
             | Event::StreamPeerReset(s, _)
             | Event::StreamStopSending(s, _) => inner.stream_info(*s).is_ok(),
-            // The inner transport already filtered passthrough H3 events.
-            Event::H3Request(_, r) | Event::H3Readable(r) | Event::H3Writable(r) => {
-                !*active || reqs.contains(r)
-            }
+            // The inner transport already filtered passthrough H3 events. An H3Readable
+            // after the receive end was handed over has nothing to deliver.
+            Event::H3Readable(r) => !*active || reqs.get(r).is_some_and(|q| !q.handed),
+            Event::H3Request(_, r) | Event::H3Writable(r) => !*active || reqs.contains_key(r),
             _ => true,
         })
     }
@@ -238,11 +241,11 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         self.inner.datagram_recv(conn, buf)
     }
 
-    // H3 ops. Active: never forwarded; no request is held yet, so every id is stale
-    // (adoption spec §4.1). Tasks C3–C5 serve them from h3wire.
+    // H3 ops. Active: served from h3wire, never forwarded; an id not held is stale
+    // (adoption spec §4.1).
     fn open_h3_request(&mut self, now: Time, conn: ConnId) -> Result<H3ReqId, Error> {
         if self.active {
-            return Err(Error::Other); // Task C4
+            return self.open_req(now, conn);
         }
         fwd!(self, now, self.inner.open_h3_request(now, conn))
     }
@@ -255,7 +258,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         fin: bool,
     ) -> Result<(), StreamError> {
         if self.active {
-            return Err(StreamError::Stale);
+            return self.send_headers(now, r, hs, fin);
         }
         fwd!(self, now, self.inner.h3_send_headers(now, r, hs, fin))
     }
@@ -268,14 +271,14 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         fin: bool,
     ) -> Result<usize, StreamError> {
         if self.active {
-            return Err(StreamError::Stale);
+            return Err(StreamError::Stale); // Task C4
         }
         fwd!(self, now, self.inner.h3_send_body(now, r, data, fin))
     }
 
     fn h3_finish(&mut self, now: Time, r: H3ReqId) -> Result<(), StreamError> {
         if self.active {
-            return Err(StreamError::Stale);
+            return Err(StreamError::Stale); // Task C4
         }
         fwd!(self, now, self.inner.h3_finish(now, r))
     }
@@ -287,7 +290,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         each: &mut dyn FnMut(&[u8], &[u8]),
     ) -> Result<bool, StreamError> {
         if self.active {
-            return Err(StreamError::Stale);
+            return self.recv_headers(now, r, each);
         }
         fwd!(self, now, self.inner.h3_recv_headers(now, r, each))
     }
@@ -299,21 +302,28 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         buf: &mut [u8],
     ) -> Result<(usize, bool), StreamError> {
         if self.active {
-            return Err(StreamError::Stale);
+            return self.recv_body(now, r, buf);
         }
         fwd!(self, now, self.inner.h3_recv_body(now, r, buf))
     }
 
     fn h3_reset(&mut self, now: Time, r: H3ReqId) {
         if self.active {
-            return;
+            return; // Task C5
         }
         fwd!(self, now, self.inner.h3_reset(now, r))
     }
 
     fn h3_req_info(&self, r: H3ReqId) -> Result<H3ReqInfo, Error> {
         if self.active {
-            return Err(Error::Stale);
+            // Cached at request start: the inner slot is gone before StreamClosed.
+            return match self.reqs.get(&r) {
+                Some(q) if q.known => Ok(H3ReqInfo {
+                    conn: q.conn,
+                    quic_id: q.quic_id,
+                }),
+                _ => Err(Error::Stale),
+            };
         }
         self.inner.h3_req_info(r)
     }
