@@ -86,9 +86,7 @@ impl<T: TransportOps> H3Wire<T> {
                 }
                 // adoption spec §4.5: the client discards later body, the server resets.
                 H3Event::SendStopped { .. } => {
-                    req.send_stopped = true;
-                    req.frame = None;
-                    req.finish_latched = false;
+                    req.stop_send();
                     if req.known {
                         self.queue.push(Event::H3Writable(id)); // a blocked pump learns it
                     }
@@ -336,6 +334,14 @@ impl<T: TransportOps> H3Wire<T> {
                     req.reset_code_pending = false;
                     if let Some(conn) = self.conns.get_mut(&c) {
                         log_closed(conn.h3.stream_reset_received(q, H3Code(*code)));
+                    }
+                    // After `Finished` h3wire resets our send side with no event: as
+                    // `SendStopped`.
+                    if req.terminal == Some(Terminal::Finished) {
+                        req.stop_send();
+                        if req.known {
+                            self.queue.push(Event::H3Writable(id));
+                        }
                     }
                 }
                 // The probe always runs (spec §3), before the events are dispatched by

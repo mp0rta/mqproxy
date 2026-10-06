@@ -98,6 +98,13 @@ impl Req {
     pub(crate) fn aborted(&self) -> bool {
         matches!(self.terminal, Some(Terminal::Aborted { .. }))
     }
+
+    /// h3wire ended our send side without a `StreamAborted` (adoption spec §4.5).
+    pub(crate) fn stop_send(&mut self) {
+        self.send_stopped = true;
+        self.frame = None;
+        self.finish_latched = false;
+    }
 }
 
 /// The request id is the request stream's slot (adoption spec §4.1).
