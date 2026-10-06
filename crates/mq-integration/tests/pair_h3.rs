@@ -9,7 +9,8 @@ use mq_integration::loopback::{
 use mq_integration::matrix;
 use mq_integration::raw_h3::{RawH3Handle, RawH3Peer, RawH3Script, field, headers_frame};
 use mq_runtime::Shard;
-use mq_transport_api::Role;
+use mq_runtime::testing::{RecordHandle, Recorded, RecordingApp};
+use mq_transport_api::{ConnConfig, ConnProto, Event, H3Header, Role};
 use std::net::Ipv4Addr;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -274,4 +275,199 @@ fn raw_peer_smoke() {
         assert_eq!(p.server.handle.lock().requests, 1, "{b:?}");
         p.join_both();
     }
+}
+
+/// Two live H3Wire requests: an unread partial response and an unfinished request.
+fn live_wire_pair(
+    idle: Option<Duration>,
+    close_on_response: bool,
+) -> LoopbackPair<RecordHandle, RecordHandle> {
+    let lo = Ipv4Addr::LOCALHOST.into();
+    LoopbackPair::spawn(
+        (lo, lo),
+        Vec::new(),
+        move |local| {
+            let (app, rec) = RecordingApp::new();
+            rec.on(|r, cx| match r {
+                Recorded::TransportEvent(Event::H3Readable(req)) => {
+                    let fin = cx.h3_recv_headers(*req, &mut |_, _| {});
+                    if fin == Ok(true) {
+                        let headers = [H3Header {
+                            name: b":status",
+                            value: b"200",
+                        }];
+                        assert_eq!(cx.h3_send_headers(*req, &headers, false), Ok(()));
+                        assert_eq!(cx.h3_send_body(*req, b"partial", false), Ok(7));
+                    }
+                }
+                Recorded::Shutdown => cx.request_exit(0),
+                _ => {}
+            });
+            (
+                Shard::new(h3_transport(server_role(), Backend::Wire), app, local, 1),
+                rec,
+            )
+        },
+        move |local, server| {
+            let (app, rec) = RecordingApp::new();
+            let mut close_on_response = close_on_response;
+            rec.on(move |r, cx| match r {
+                Recorded::Start => {
+                    cx.connect(&ConnConfig {
+                        peer: server,
+                        sni: "mqproxy",
+                        idle_timeout: idle,
+                        proto: ConnProto::H3,
+                    })
+                    .expect("connect");
+                }
+                Recorded::TransportEvent(Event::ConnEstablished(conn)) => {
+                    let headers = [
+                        H3Header {
+                            name: b":method",
+                            value: b"POST",
+                        },
+                        H3Header {
+                            name: b":scheme",
+                            value: b"https",
+                        },
+                        H3Header {
+                            name: b":authority",
+                            value: b"x",
+                        },
+                        H3Header {
+                            name: b":path",
+                            value: b"/",
+                        },
+                    ];
+                    for fin in [true, false] {
+                        let req = cx.open_h3_request(*conn).expect("open request");
+                        assert_eq!(cx.h3_send_headers(req, &headers, fin), Ok(()));
+                    }
+                }
+                Recorded::TransportEvent(Event::H3Readable(req)) if close_on_response => {
+                    close_on_response = false;
+                    let conn = cx.h3_req_info(*req).expect("live request").conn;
+                    cx.close_conn(conn);
+                }
+                Recorded::Shutdown => cx.request_exit(0),
+                _ => {}
+            });
+            (
+                Shard::new(h3_transport(Role::Client, Backend::Wire), app, local, 2),
+                rec,
+            )
+        },
+    )
+}
+
+fn wait_records(rec: &RecordHandle, pred: impl Fn(&[Recorded]) -> bool) {
+    let end = Instant::now() + Duration::from_secs(10);
+    while !pred(&rec.records()) {
+        assert!(Instant::now() < end, "timed out: {:?}", rec.records());
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The peer disappears mid-response: the real engine's idle timeout closes live requests.
+#[test]
+fn wire_idle_timeout_mid_response_aborts() {
+    let idle = Duration::from_secs(1);
+    let mut p = live_wire_pair(Some(idle), false);
+    wait_records(&p.client.handle, |records| {
+        records
+            .iter()
+            .any(|r| matches!(r, Recorded::TransportEvent(Event::H3Readable(_))))
+    });
+    let start = Instant::now();
+    // The server exits without sending CONNECTION_CLOSE, so only idle expiry can close it.
+    p.server.shutdown.trigger();
+    assert_eq!(p.server.join_timeout(Duration::from_secs(10)), Some(0));
+    wait_records(&p.client.handle, |records| {
+        records
+            .iter()
+            .any(|r| matches!(r, Recorded::TransportEvent(Event::ConnClosed(..))))
+    });
+    assert!(start.elapsed() <= 2 * idle, "after {:?}", start.elapsed());
+    let records = p.client.handle.records();
+    let closed: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            Recorded::TransportEvent(Event::H3Closed(_, close)) => Some(close),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed.len(), 2, "{records:?}");
+    for close in closed {
+        assert_eq!(close.unread, None, "{close:?}");
+    }
+    p.client.shutdown.trigger();
+    assert_eq!(p.client.join(), 0);
+}
+
+/// Local close reports every live request before ConnClosed and rescues no partial body.
+#[test]
+fn wire_local_close_with_live_requests_is_clean() {
+    let p = live_wire_pair(None, true);
+    wait_records(&p.client.handle, |records| {
+        records
+            .iter()
+            .any(|r| matches!(r, Recorded::TransportEvent(Event::ConnClosed(..))))
+    });
+    let records = p.client.handle.records();
+    let conn = records
+        .iter()
+        .position(|r| matches!(r, Recorded::TransportEvent(Event::ConnClosed(..))))
+        .expect("ConnClosed");
+    let closed: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            Recorded::TransportEvent(Event::H3Closed(_, close)) => Some((i, close)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed.len(), 2, "{records:?}");
+    for (i, close) in closed {
+        assert!(i < conn, "{records:?}");
+        assert_eq!(close.unread, None, "{close:?}");
+    }
+    assert_eq!(p.join_both(), (0, 0));
+}
+
+/// Engine teardown with open requests on both sides, including an unread partial response.
+#[test]
+fn wire_drop_transport_with_live_requests_is_clean() {
+    let p = live_wire_pair(None, false);
+    wait_records(&p.client.handle, |records| {
+        records
+            .iter()
+            .any(|r| matches!(r, Recorded::TransportEvent(Event::H3Readable(_))))
+    });
+    wait_records(&p.server.handle, |records| {
+        records
+            .iter()
+            .filter(|r| matches!(r, Recorded::TransportEvent(Event::H3Request(..))))
+            .count()
+            == 2
+    });
+    let server = p.server.handle.records();
+    assert_eq!(
+        server
+            .iter()
+            .filter(|r| matches!(r, Recorded::TransportEvent(Event::H3Request(..))))
+            .count(),
+        2,
+        "{server:?}"
+    );
+    for rec in [&p.client.handle, &p.server.handle] {
+        assert!(
+            !rec.records().iter().any(|r| matches!(
+                r,
+                Recorded::TransportEvent(Event::H3Closed(..) | Event::ConnClosed(..))
+            )),
+            "requests still live"
+        );
+    }
+    assert_eq!(p.join_both(), (0, 0));
 }

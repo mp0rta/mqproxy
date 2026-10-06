@@ -1,12 +1,19 @@
 //! adoption spec §3 "Raw-H3 backend": ALPN `h3` over raw xquic streams.
 mod common;
 
-use common::lockstep::{self, Peer, cfg, server_role};
-use common::pair::{MS, Opts, Pair, new_streams, read_all, recv, send, stream_count};
+use common::initial::{client_hello_fragment, initial};
+use common::lockstep::{self, Peer, cfg, exchange_many, server_role};
+use common::pair::{
+    MS, Opts, Pair, T0, cli_addr, conn_cfg, new_streams, read_all, recv, send, srv_addr,
+    stream_count,
+};
 use mq_transport_api::{
     ConnId, ConnProto, ErrType, Error, Event, H3Backend, Role, StreamCloseStats, StreamError,
     StreamId, StreamKind, Time, TransportConfig, TransportOps,
 };
+
+use std::net::SocketAddr;
+use std::time::Duration;
 
 fn raw_h3_cfg(role: Role) -> TransportConfig {
     TransportConfig {
@@ -622,4 +629,175 @@ fn no_close_stats_on_raw_conns() {
             .count()
     };
     assert_eq!((n(&p.cev), n(&p.sev)), (0, 0));
+}
+
+fn new_conns(ev: &[Event]) -> Vec<(ConnId, ConnProto)> {
+    ev.iter()
+        .filter_map(|e| match e {
+            Event::NewConn(c, p) => Some((*c, *p)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn raw_h3_conn_counts_toward_max_conns() {
+    let mut scfg = raw_h3_cfg(server_role());
+    scfg.max_conns = 1;
+    let server = Peer::spawn(scfg, vec![srv_addr()]);
+    let mut now = T0;
+    let client = |k: usize, now: Time| {
+        let c = Peer::spawn(raw_h3_cfg(Role::Client), vec![cli_addr(k)]);
+        let mut cc = conn_cfg(None);
+        cc.proto = ConnProto::H3;
+        let id = c.call(now, move |t, now| t.connect(now, &cc)).unwrap();
+        (c, id)
+    };
+    let run = |peers: &[&Peer], now: &mut Time, steps: usize| {
+        for _ in 0..steps {
+            *now = *now + MS;
+            for p in peers {
+                p.drive(*now);
+            }
+            exchange_many(*now, peers);
+        }
+    };
+    let count = |s: &Peer| s.call(T0, |t, _| (t.conn_count(), t.n_provisional()));
+
+    let (c0, id0) = client(3, now);
+    run(&[&c0, &server], &mut now, 5);
+    assert!(c0.drain_events().contains(&Event::ConnEstablished(id0)));
+    let news = new_conns(&server.drain_events());
+    assert!(matches!(news[..], [(_, ConnProto::H3)]), "{news:?}");
+    assert_eq!(count(&server), (1, 0));
+
+    // spec §4.7: an unauthenticated H3 conn (no request yet) is evicted by a newcomer.
+    let (c1, id1) = client(0, now);
+    let (mut sev, mut c0ev) = (Vec::new(), Vec::new());
+    for _ in 0..1000 {
+        run(&[&c0, &c1, &server], &mut now, 10);
+        sev.extend(server.drain_events());
+        c0ev.extend(c0.drain_events());
+        if c0ev.iter().any(|e| matches!(e, Event::ConnClosed(..))) {
+            break;
+        }
+    }
+    assert!(c1.drain_events().contains(&Event::ConnEstablished(id1)));
+    assert!(
+        c0ev.iter()
+            .any(|e| matches!(e, Event::ConnClosed(c, r) if *c == id0 && r.code == 0x1002)),
+        "{c0ev:?}"
+    );
+    let news = new_conns(&sev);
+    assert!(matches!(news[..], [(_, ConnProto::H3)]), "{news:?}");
+    assert_eq!(count(&server), (1, 0));
+    let s1 = news[0].0;
+    server.call(now, move |t, _| t.mark_conn_authed(s1));
+
+    // The second H3 client is refused at the shared cap, before any slot: s1 is authed.
+    let (c2, id2) = client(1, now);
+    run(&[&c1, &c2, &server], &mut now, 50);
+    assert!(!c2.drain_events().contains(&Event::ConnEstablished(id2)));
+    assert!(new_conns(&server.drain_events()).is_empty());
+    assert_eq!(count(&server), (1, 0));
+
+    // Closing the first H3 connection releases its unit.
+    c1.call(now, move |t, now| t.close_conn(now, id1));
+    let mut sev = Vec::new();
+    for _ in 0..1000 {
+        run(&[&c1, &c2, &server], &mut now, 10);
+        sev.extend(server.drain_events());
+        if sev.iter().any(|e| matches!(e, Event::ConnClosed(..))) {
+            break;
+        }
+    }
+    assert!(
+        sev.iter().any(|e| matches!(e, Event::ConnClosed(..))),
+        "{sev:?}"
+    );
+    assert_eq!(count(&server), (0, 0));
+}
+
+/// Raw-H3 uses the same server_accept backlog cap and 10 s provisional deadline.
+#[test]
+fn raw_h3_provisional_cap_and_expiry() {
+    let mut scfg = raw_h3_cfg(server_role());
+    scfg.max_conns = 1;
+    let server = Peer::spawn(scfg, vec![srv_addr()]);
+    for i in 0..65u8 {
+        let from = SocketAddr::from(([10, 2, 0, i], 40000));
+        let pkt = initial(
+            &[0xd0, i, 1, 1, 2, 3, 4, 5],
+            &[0x5c, i, 1, 5, 4, 3, 2, 1],
+            0,
+            0,
+            &client_hello_fragment(0, 300),
+        );
+        server.deliver(T0, srv_addr(), from, pkt);
+        assert_eq!(
+            server.call(Time::ZERO, |t, _| t.n_provisional()),
+            u32::from(i + 1).min(64),
+            "refused beyond the cap in server_accept"
+        );
+    }
+    server.drive(T0);
+    server.pump_out(T0);
+    assert_eq!(server.call(T0, |t, _| t.conn_count()), 0);
+    let mut now = T0;
+    while server.call(Time::ZERO, |t, _| t.n_provisional()) > 0 {
+        let d = server.next_timeout().expect("provisional deadline");
+        now = now.max(d);
+        server.drive(now);
+        server.pump_out(now);
+        assert!(now < T0 + Duration::from_secs(60), "never released");
+    }
+    assert!(
+        now >= T0 + Duration::from_secs(10),
+        "not before the 10 s deadline"
+    );
+    assert_eq!(server.call(now, |t, _| t.conn_count()), 0);
+    assert_eq!(server.drain_events(), vec![], "never admitted: no events");
+}
+
+/// Bidi and uni streams on raw-H3 share the 8192-slot ceiling.
+#[test]
+fn raw_h3_streams_share_8192_ceiling() {
+    const CEILING: u32 = 8192;
+    let mut p = Pair::with(h3raw_opts());
+    let uni = open_uni(&p.client, p.now, p.conn).expect("first uni");
+    assert_eq!(send(&p.client, p.now, uni, vec![1], false), Ok(1));
+    p.exchange();
+    for _ in 1..CEILING {
+        let c = p.conn;
+        let s = (0..100)
+            .find_map(
+                |_| match p.client.call(p.now, move |t, now| t.open_stream(now, c)) {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        p.tick(MS);
+                        None
+                    }
+                },
+            )
+            .expect("bidi credit");
+        assert_eq!(send(&p.client, p.now, s, vec![1], false), Ok(1));
+        p.exchange();
+        p.cev.clear();
+    }
+    assert_eq!(stream_count(&p.client, p.conn), CEILING);
+    p.tick(MS);
+    assert_eq!(stream_count(&p.server, p.srv_conn), CEILING);
+    assert_eq!(new_streams(&p.sev).len(), CEILING as usize);
+    let c = p.conn;
+    assert_eq!(
+        p.client.call(p.now, move |t, now| t.open_stream(now, c)),
+        Err(Error::Ceiling)
+    );
+    assert_eq!(open_uni(&p.client, p.now, c), Err(Error::Ceiling));
+    assert_eq!(stream_count(&p.client, c), CEILING, "no refused slot");
+    for _ in 0..100 {
+        p.tick(10 * MS);
+    }
+    assert_eq!(p.client_closed(), None);
+    assert_eq!(p.server_closed(), None);
 }
