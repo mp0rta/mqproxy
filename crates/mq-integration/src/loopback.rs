@@ -4,6 +4,7 @@
 //! the local application and the origin with plain `std::net` sockets.
 
 use crate::driver_harness::DriverThread;
+use mq_h3::H3Wire;
 use mq_proxy::client::{Client, FETCH, HTTP_CONNECT, SOCKS5, TRANSPARENT};
 use mq_proxy::config::{ClientConfig, GatewayConfig, MitmConfig, ServerConfig};
 use mq_proxy::server::Server;
@@ -11,7 +12,9 @@ use mq_proxy::server::origin::build_client_config;
 use mq_runtime::driver::{DriverConfig, StdResolver};
 use mq_runtime::{App, ListenKind, ListenerTag, Shard};
 use mq_transport::Transport;
-use mq_transport_api::{CongestionControl, Role, Scheduler, TransportConfig, TransportOps};
+use mq_transport_api::{
+    CongestionControl, H3Backend, Role, Scheduler, TransportConfig, TransportOps,
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -101,6 +104,33 @@ pub type LoopbackProxy = LoopbackPair<(), ()>;
 /// A real transport as the proxy runs it (test cert, ALPN "mqproxy-tcp/1", BBR/MinRtt); `h3`
 /// registers the H3 ctx.
 pub fn transport(role: Role, h3: bool) -> Transport {
+    transport_on(role, h3, H3Backend::XqcH3)
+}
+
+/// `transport(role, true)` on `h3_backend: Raw`: H3 conns get raw streams and no H3 stack
+/// (adoption spec §3).
+pub fn raw_h3_transport(role: Role) -> Transport {
+    transport_on(role, true, H3Backend::Raw)
+}
+
+/// Which H3 stack serves one endpoint (adoption spec §6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// xquic's xqc_h3, behind a passthrough `H3Wire`.
+    XqcH3,
+    /// h3wire, in an active `H3Wire` over `h3_backend: Raw`.
+    Wire,
+}
+
+/// An H3 transport on backend `b` (adoption spec §6.2).
+pub fn h3_transport(role: Role, b: Backend) -> H3Wire<Transport> {
+    match b {
+        Backend::XqcH3 => H3Wire::passthrough(transport(role, true)),
+        Backend::Wire => H3Wire::new(raw_h3_transport(role)),
+    }
+}
+
+fn transport_on(role: Role, h3: bool, h3_backend: H3Backend) -> Transport {
     Transport::new(TransportConfig {
         role,
         alpn: "mqproxy-tcp/1",
@@ -109,7 +139,7 @@ pub fn transport(role: Role, h3: bool) -> Transport {
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
         h3,
-        h3_backend: mq_transport_api::H3Backend::XqcH3,
+        h3_backend,
         qlog: None,
     })
     .expect("transport")
@@ -172,13 +202,23 @@ impl LoopbackProxy {
     /// either config is filled with a placeholder / `GatewayConfig::default()`.
     pub fn spawn_gateway(
         client: ClientConfig,
+        server: ServerConfig,
+        origin_ca: &Path,
+    ) -> LoopbackProxy {
+        Self::spawn_gateway_on(client, server, origin_ca, (Backend::XqcH3, Backend::XqcH3))
+    }
+
+    /// `spawn_gateway` with the (client, server) H3 backends (adoption spec §6.2).
+    pub fn spawn_gateway_on(
+        client: ClientConfig,
         mut server: ServerConfig,
         origin_ca: &Path,
+        backends: (Backend, Backend),
     ) -> LoopbackProxy {
         server.gateway.get_or_insert_with(GatewayConfig::default);
         let tls = build_client_config(Some(origin_ca), &Vec::new).expect("origin CA");
         // `Server` holds `Rc`s: it is built on its driver thread.
-        Self::gateway_pair(client, move || Server::with_gateway(server, tls))
+        Self::gateway_pair(client, move || Server::with_gateway(server, tls), backends)
     }
 
     /// The fetch client of `spawn_gateway` against an arbitrary H3 server `App` (a
@@ -187,12 +227,22 @@ impl LoopbackProxy {
         client: ClientConfig,
         server_app: A,
     ) -> LoopbackProxy {
-        Self::gateway_pair(client, move || server_app)
+        Self::spawn_gateway_against_on(client, server_app, (Backend::XqcH3, Backend::XqcH3))
+    }
+
+    /// `spawn_gateway_against` with the (client, server) H3 backends (adoption spec §6.2).
+    pub fn spawn_gateway_against_on<A: App + Send + 'static>(
+        client: ClientConfig,
+        server_app: A,
+        backends: (Backend, Backend),
+    ) -> LoopbackProxy {
+        Self::gateway_pair(client, move || server_app, backends)
     }
 
     fn gateway_pair<A: App + 'static>(
         mut client: ClientConfig,
         server_app: impl FnOnce() -> A + Send + 'static,
+        (client_b, server_b): (Backend, Backend),
     ) -> LoopbackProxy {
         // The bound address is what `fetch_addr` reports; `Client::new` only needs `Some`.
         client
@@ -204,18 +254,18 @@ impl LoopbackProxy {
             (lo, lo),
             vec![(ListenKind::Plain, FETCH)],
             move |local| {
-                let t = transport(
+                let t = h3_transport(
                     Role::Server {
                         cert: cert("test.crt"),
                         key: cert("test.key"),
                     },
-                    true,
+                    server_b,
                 );
                 (Shard::new(t, server_app(), local, 1), ())
             },
             move |local, server_udp| {
                 client.server = server_udp;
-                let t = transport(Role::Client, true);
+                let t = h3_transport(Role::Client, client_b);
                 (Shard::new(t, Client::new(client), local, 2), ())
             },
         )

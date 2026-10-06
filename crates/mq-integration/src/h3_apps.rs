@@ -116,6 +116,7 @@ macro_rules! no_io {
         }
     };
 }
+pub(crate) use no_io;
 
 /// How `H3EchoServer` answers a fully read request (every answer has `:status 200`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

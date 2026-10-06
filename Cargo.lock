@@ -553,8 +553,10 @@ name = "mq-integration"
 version = "0.0.4"
 dependencies = [
  "h2",
+ "h3wire",
  "hyper",
  "log",
+ "mq-h3",
  "mq-http",
  "mq-integration",
  "mq-linux",

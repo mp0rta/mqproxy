@@ -16,4 +16,6 @@ pub mod origin_loop;
 #[cfg(feature = "harness")]
 pub mod origin_server;
 #[cfg(feature = "harness")]
+pub mod raw_h3;
+#[cfg(feature = "harness")]
 pub mod shard_pair;
