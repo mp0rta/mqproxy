@@ -1,23 +1,23 @@
 //! spec §10.3 (H3 pair, gateway items): the fetch client and the gateway server on two
 //! production drivers over loopback UDP, real xquic, against real origins. The test thread
 //! plays the local fetch caller (HTTP/1.1 over `std::net`) and, for the direct-H3 cases, an
-//! `H3Client` on a third driver.
+//! `H3Client` or a `RawH3Peer` on a third driver.
 #![forbid(unsafe_code)]
 
 use mq_integration::driver_harness::DriverThread;
-use mq_integration::h3_apps::{
-    CUT_BODY, EchoMode, H3Client, H3EchoServer, H3Handle, H3Recorded, H3Script,
-};
+use mq_integration::h3_apps::{EchoMode, H3Client, H3EchoServer, H3Handle, H3Recorded, H3Script};
 use mq_integration::log_tap;
 use mq_integration::loopback::{Backend, LoopbackProxy, h3_transport};
-use mq_integration::matrix;
 use mq_integration::origin_server::{Handler, ORIGIN_CA, OriginServer, OriginServerMode, Proto};
-use mq_integration::raw_h3::{RawH3Peer, RawH3Script, data_frame, headers_frame};
+use mq_integration::raw_h3::{
+    RawH3Handle, RawH3Peer, RawH3Script, data_frame, field, headers_frame,
+};
+use mq_integration::{matrix, receivers};
 use mq_proxy::config::{ClientConfig, GatewayConfig, ServerConfig};
 use mq_proxy::server::origin::host::upload_byte;
-use mq_runtime::Shard;
 use mq_runtime::driver::{DriverConfig, StdResolver};
-use mq_transport_api::Role;
+use mq_runtime::{App, Shard};
+use mq_transport_api::{CloseReason, ErrType, Role};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -40,9 +40,6 @@ fn server_cfg() -> ServerConfig {
         ..ServerConfig::default()
     }
 }
-
-/// Both endpoints on xqc_h3: the tests outside the matrix.
-const XX: (Backend, Backend) = (Backend::XqcH3, Backend::XqcH3);
 
 /// The gateway pair on the (client, server) backends `cells` (adoption spec §6.2).
 fn gateway_with(server: ServerConfig, cells: (Backend, Backend)) -> LoopbackProxy {
@@ -208,8 +205,11 @@ fn pattern(len: usize) -> Vec<u8> {
 
 // ---- direct H3 ----
 
-/// An `H3Client` on its own driver, on backend `b`, against the gateway server.
-fn h3_client(server: SocketAddr, s: H3Script, b: Backend) -> DriverThread<H3Handle> {
+/// The client app `make()` builds, on its own driver on backend `b`.
+fn client_on<A: App + 'static, H: Send + 'static>(
+    b: Backend,
+    make: impl FnOnce() -> (A, H) + Send + 'static,
+) -> DriverThread<H> {
     let cfg = DriverConfig {
         resolver: Arc::new(StdResolver),
         install_signal_handlers: false,
@@ -217,14 +217,26 @@ fn h3_client(server: SocketAddr, s: H3Script, b: Backend) -> DriverThread<H3Hand
     };
     let lo = Ipv4Addr::LOCALHOST.into();
     let mut d = DriverThread::spawn_on(lo, cfg, Vec::new(), move |local| {
-        let (app, h) = H3Client::new(server, s);
+        let (app, h) = make();
         (Shard::new(h3_transport(Role::Client, b), app, local, 3), h)
     });
     d.start();
     d
 }
 
-fn stop(d: DriverThread<H3Handle>) {
+/// An `H3Client` on backend `b` against the gateway server.
+fn h3_client(server: SocketAddr, s: H3Script, b: Backend) -> DriverThread<H3Handle> {
+    client_on(b, move || H3Client::new(server, s))
+}
+
+/// A `RawH3Peer` client writing `stream` + FIN to the gateway server.
+fn raw_client(server: SocketAddr, stream: Vec<u8>) -> DriverThread<RawH3Handle> {
+    client_on(Backend::Raw, move || {
+        RawH3Peer::client(server, RawH3Script { stream, fin: true })
+    })
+}
+
+fn stop<H>(d: DriverThread<H>) {
     d.shutdown.trigger();
     assert_eq!(d.join(), 0);
 }
@@ -454,32 +466,59 @@ matrix!(
     }
 );
 
-/// spec §5.4, §5.5, §10.3: `content-length: 100` over a complete 50-byte DATA frame + FIN
-/// from a peer: the client's own body check aborts the local socket.
-#[test]
-fn fetch_short_cl_response_aborts_client() {
-    let (app, h) = H3EchoServer::new(EchoMode::ShortCl { cl: 100, sent: 50 });
-    let p = LoopbackProxy::spawn_gateway_against(ClientConfig::default(), app);
-    let r = fetch_when_up(p.fetch_addr(), &auth("http://x/short", "any"));
-    assert!(is_reset(&r), "{r:?}");
-    assert!(h.lock().requests >= 1);
-    assert_eq!(p.join_both(), (0, 0));
-}
+// spec §5.4, §5.5, §10.3: `content-length: 100` over a complete 50-byte DATA frame + FIN
+// from a peer: the local socket is aborted. On an xqc_h3 client its own body check does it; a
+// `Wire` client's h3wire finds the malformed response (RFC 9114 §4.1.2) and aborts the
+// stream, which reaches the client as `Err(Reset)`.
+matrix!(
+    fetch_short_cl_response_aborts_client,
+    |cells: (Backend, Backend), tag: &str| {
+        let (app, h) = H3EchoServer::new(EchoMode::ShortCl { cl: 100, sent: 50 });
+        let p = LoopbackProxy::spawn_gateway_against_on(ClientConfig::default(), app, cells);
+        let target = format!("http://x/short-{tag}");
+        let r = fetch_when_up(p.fetch_addr(), &auth(&target, "any"));
+        assert!(is_reset(&r), "{r:?}");
+        assert!(h.lock().requests >= 1);
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
 
-/// spec §3.7 (3), §5.4, Review Focus 5: the response's DATA frame is cut by FIN inside its
-/// declared length (xquic reads it as a clean EOF). The local fetch socket is reset — by the
-/// body check at fin or through the `H3Closed.unread` path, whichever the reader's speed
-/// selects; neither is asserted.
-#[test]
-fn fetch_response_cut_inside_frame_aborts() {
-    let (app, h) = H3EchoServer::new(EchoMode::CutResponseFrame);
-    let p = LoopbackProxy::spawn_gateway_against(ClientConfig::default(), app);
-    let r = fetch_when_up(p.fetch_addr(), &auth("http://x/cut", "any"));
-    assert!(is_reset(&r), "{:?}", r.as_ref().map(|b| b.len()));
-    let accepted = h.lock().accepted.expect("the peer sent the cut frame");
-    assert!(0 < accepted && accepted < CUT_BODY, "accepted {accepted}");
-    assert_eq!(p.join_both(), (0, 0));
-}
+/// The declared length of a cut DATA frame, and what the raw peer sends of it.
+const CUT_DECLARED: u64 = 32 << 20;
+const CUT_SENT: usize = 32 * 1024;
+
+/// adoption spec §5.3 (1).
+const FRAME_ERROR: CloseReason = CloseReason {
+    err_type: ErrType::Application,
+    code: 0x106,
+};
+
+// spec §3.7 (3), §5.4, Review Focus 5: the response's DATA frame is cut by FIN inside its
+// declared length; the local fetch socket is reset in both cells. An xqc_h3 client reads the
+// cut as a clean EOF and its body check (or the `H3Closed.unread` path) resets; h3wire closes
+// the connection with `H3_FRAME_ERROR` (adoption spec §5.3 (1)).
+receivers!(
+    fetch_response_cut_inside_frame_aborts,
+    |b: Backend, tag: &str| {
+        let cl = CUT_DECLARED.to_string();
+        let mut stream = headers_frame(&[(b":status", b"200"), (b"content-length", cl.as_bytes())]);
+        stream.extend(data_frame(CUT_DECLARED, &[0; CUT_SENT]));
+        let (app, h) = RawH3Peer::server(RawH3Script { stream, fin: true });
+        let p = LoopbackProxy::spawn_gateway_against_on(
+            ClientConfig::default(),
+            app,
+            (b, Backend::Raw),
+        );
+        let target = format!("http://x/cut-{tag}");
+        let r = fetch_when_up(p.fetch_addr(), &auth(&target, "any"));
+        assert!(is_reset(&r), "{:?}", r.as_ref().map(|b| b.len()));
+        if b == Backend::Wire {
+            wait_until("the peer's ConnClosed", || !h.lock().closed.is_empty());
+            assert_eq!(h.lock().closed, [FRAME_ERROR]);
+        }
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
 
 /// adoption spec §6.2: a `RawH3Peer::server` hosts the server side of the gateway pair
 /// (`Backend::Raw`); its fixed 200 reaches the fetch socket through each client backend.
@@ -799,19 +838,12 @@ matrix!(
 /// logs the request, and the origin never received a complete body. On a `Wire` server the
 /// reset is h3wire's (`H3_MESSAGE_ERROR`, adoption spec §5.3 (6)), and the gateway still logs
 /// it as `local reset`.
-fn upload_reset(
-    cells: (Backend, Backend),
-    path: &str,
-    cl: &str,
-    body: Vec<u8>,
-    truncate: bool,
-) -> H3Handle {
+fn upload_reset(cells: (Backend, Backend), path: &str, cl: &str, body: Vec<u8>) {
     let o = Capture::spawn();
     let p = gateway(cells);
     let auth = bearer();
     let extra = [("x-mq-auth", auth.as_str()), ("content-length", cl)];
-    let mut s = script("POST", &o.authority(), path, &extra, body);
-    s.truncate_after_partial = truncate;
+    let s = script("POST", &o.authority(), path, &extra, body);
     let c = h3_client(p.server.udp_addr, s, cells.0);
     wait_h3(&c.handle, |r| !r.closed.is_empty());
     {
@@ -823,23 +855,15 @@ fn upload_reset(
     assert!(line.contains("reset=\"local reset\""), "{line}");
     let seen = o.settled();
     assert!(seen.iter().all(|s| !s.complete), "{seen:?}");
-    let h = c.handle.clone();
     stop(c);
     assert_eq!(p.join_both(), (0, 0));
-    h
 }
 
 // spec §6.3, §10.3: 50 bytes + FIN (a complete frame) under `content-length: 100`.
 matrix!(
     direct_h3_short_request_body_resets,
     |cells: (Backend, Backend), tag: &str| {
-        upload_reset(
-            cells,
-            &format!("/short-req-{tag}"),
-            "100",
-            vec![1; 50],
-            false,
-        );
+        upload_reset(cells, &format!("/short-req-{tag}"), "100", vec![1; 50]);
     }
 );
 
@@ -847,72 +871,175 @@ matrix!(
 matrix!(
     direct_h3_excess_request_body_resets,
     |cells: (Backend, Backend), tag: &str| {
-        upload_reset(
-            cells,
-            &format!("/excess-req-{tag}"),
-            "10",
-            vec![1; 50],
-            false,
-        );
+        upload_reset(cells, &format!("/excess-req-{tag}"), "10", vec![1; 50]);
     }
 );
 
-/// spec §3.7 (3), §6.3, Review Focus 5: the request's DATA frame is cut by FIN inside its
-/// declared length (`CUT_BODY` under `content-length: 33554432`, partial acceptance then
-/// `h3_finish`); the server's upload check resets the request.
-#[test]
-fn direct_h3_request_body_cut_inside_frame_resets() {
-    let cl = CUT_BODY.to_string();
-    let h = upload_reset(XX, "/cut-req", &cl, vec![2; CUT_BODY], true);
-    let accepted = h.lock().accepted.expect("partial acceptance");
-    assert!(0 < accepted && accepted < CUT_BODY, "accepted {accepted}");
+// ---- malformed input against each receiver (adoption spec §6.2) ----
+
+/// A HEADERS frame of `fields`, as the raw peer writes it (unvalidated).
+fn raw_headers(fields: &[(&str, &str)]) -> Vec<u8> {
+    let fs: Vec<(&[u8], &[u8])> = fields
+        .iter()
+        .map(|(n, v)| (n.as_bytes(), v.as_bytes()))
+        .collect();
+    headers_frame(&fs)
 }
 
-/// spec §6.2, §12, §10.3: an embedded NUL in `x-mq-auth`, `:path` and `x-mq-class` gives
-/// 403 / 400 / `?` in the log.
-#[test]
-fn nul_in_auth_path_class_direct_h3() {
+/// `RawH3Peer`'s HEADERS was malformed (adoption spec §5.3 (6)): h3wire resets the stream with
+/// `H3_MESSAGE_ERROR` and the gateway never sees the request, so no `mq.req` line carries
+/// `marker` for 500 ms after the reset.
+fn assert_message_error(c: &DriverThread<RawH3Handle>, marker: &str) {
+    wait_until("the peer's reset", || !c.handle.lock().resets.is_empty());
+    assert_eq!(c.handle.lock().resets[0].1, 0x10e, "{:?}", c.handle.lock());
+    let end = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < end {
+        let lines = log_tap::lines();
+        let hit = lines
+            .iter()
+            .find(|l| l.contains("mq.req") && l.contains(marker));
+        assert!(hit.is_none(), "{hit:?}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The raw response's `name` field.
+fn raw_field(c: &DriverThread<RawH3Handle>, name: &str) -> Option<String> {
+    let v = field(&c.handle.lock().read, name.as_bytes());
+    v.map(|v| String::from_utf8_lossy(&v).into_owned())
+}
+
+// spec §3.7 (3), §6.3, Review Focus 5: the request's DATA frame is cut by FIN inside its
+// declared length. An xqc_h3 server reads the cut as a clean EOF and its upload check resets
+// the request. h3wire closes the connection with `H3_FRAME_ERROR` (adoption spec §5.3 (1));
+// the valid HEADERS reached the gateway first, so the connection-close fan-out (§4.3) logs
+// the request once, reset.
+receivers!(
+    direct_h3_request_body_cut_inside_frame_resets,
+    |b: Backend, tag: &str| {
+        let o = Capture::spawn();
+        let p = gateway((Backend::XqcH3, b));
+        let (auth, cl, path) = (
+            bearer(),
+            CUT_DECLARED.to_string(),
+            format!("/cut-req-{tag}"),
+        );
+        let mut stream = raw_headers(&[
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":authority", &o.authority()),
+            (":path", &path),
+            ("x-mq-auth", &auth),
+            ("content-length", &cl),
+        ]);
+        stream.extend(data_frame(CUT_DECLARED, &[2; CUT_SENT]));
+        let c = raw_client(p.server.udp_addr, stream);
+        let marker = format!("path=\"{path}\"");
+        let line = wait_log(&["mq.req", &marker]);
+        if b == Backend::Wire {
+            wait_until("the peer's ConnClosed", || {
+                !c.handle.lock().closed.is_empty()
+            });
+            assert_eq!(c.handle.lock().closed, [FRAME_ERROR]);
+            assert!(!line.contains("reset=\"\""), "{line}");
+            let n = log_tap::lines()
+                .iter()
+                .filter(|l| l.contains("mq.req") && l.contains(&marker))
+                .count();
+            assert_eq!(n, 1);
+        } else {
+            assert!(line.contains("reset=\"local reset\""), "{line}");
+        }
+        let seen = o.settled();
+        assert!(seen.iter().all(|s| !s.complete), "{seen:?}");
+        stop(c);
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
+
+// spec §6.2, §12, §10.3: an embedded NUL in `x-mq-auth`, `:path` and `x-mq-class`. An
+// xqc_h3 server passes them to the gateway: 403 / 400 / `?` in the log. RFC 9114 §4.2 makes
+// such a request malformed, and h3wire resets it (adoption spec §5.3 (6)).
+receivers!(nul_in_auth_path_class_direct_h3, |b: Backend, tag: &str| {
     let o = Capture::spawn();
-    let p = gateway(XX);
+    let p = gateway((Backend::XqcH3, b));
     let auth = bearer();
     let nul_auth = format!("{auth}\0junk");
+    let class = format!("nul\0class-marker-{tag}");
     let a = o.authority();
+    let get = |path: &str, extra: &[(&str, &str)]| {
+        let mut fs = vec![
+            (":method", "GET"),
+            (":scheme", "http"),
+            (":authority", a.as_str()),
+            (":path", path),
+        ];
+        fs.extend_from_slice(extra);
+        raw_headers(&fs)
+    };
+    let (p_auth, p_path, p_class) = (
+        format!("/nul-auth-{tag}"),
+        format!("/ok\0junk-{tag}"),
+        format!("/nul-class-{tag}"),
+    );
     let cases = [
         (
-            script(
-                "GET",
-                &a,
-                "/nul-auth",
-                &[("x-mq-auth", &nul_auth)],
-                Vec::new(),
-            ),
+            get(&p_auth, &[("x-mq-auth", &nul_auth)]),
+            &p_auth,
             ("403", Some("auth-failed")),
         ),
         (
-            script("GET", &a, "/ok\0junk", &[("x-mq-auth", &auth)], Vec::new()),
+            get(&p_path, &[("x-mq-auth", &auth)]),
+            &p_path,
             ("400", Some("bad-target")),
         ),
         (
-            script(
-                "GET",
-                &a,
-                "/nul-class",
-                &[("x-mq-auth", &auth), ("x-mq-class", "nul\0class-marker")],
-                Vec::new(),
-            ),
+            get(&p_class, &[("x-mq-auth", &auth), ("x-mq-class", &class)]),
+            &p_class,
             ("200", None),
         ),
     ];
-    for (s, (status, xmq)) in cases {
-        let c = h3_client(p.server.udp_addr, s, Backend::XqcH3);
-        wait_h3(&c.handle, |r| r.fin);
-        {
-            let r = c.handle.lock();
-            assert_eq!(h3_header(&r, ":status").as_deref(), Some(status));
-            assert_eq!(h3_header(&r, "x-mq-error").as_deref(), xmq);
+    for (stream, path, (status, xmq)) in cases {
+        let c = raw_client(p.server.udp_addr, stream);
+        if b == Backend::Wire {
+            assert_message_error(&c, &format!("path=\"{path}\""));
+        } else {
+            wait_until("the response", || c.handle.lock().fin);
+            assert_eq!(raw_field(&c, ":status").as_deref(), Some(status));
+            assert_eq!(raw_field(&c, "x-mq-error").as_deref(), xmq);
         }
         stop(c);
     }
-    wait_log(&["x-mq-class='nul?class-marker'"]);
+    let class_line = format!("x-mq-class='nul?class-marker-{tag}'");
+    if b == Backend::Wire {
+        assert!(!log_tap::lines().iter().any(|l| l.contains(&class_line)));
+    } else {
+        wait_log(&[&class_line]);
+    }
     assert_eq!(p.join_both(), (0, 0));
-}
+});
+
+// spec §5.2, §6.2: CONNECT with `:scheme` and `:path` (RFC 9114 §4.4 forbids both). An
+// xqc_h3 server passes it to the gateway, which answers 400 `bad-request`; h3wire resets it
+// as malformed (adoption spec §5.3 (6)).
+receivers!(connect_malformed_direct_h3, |b: Backend, tag: &str| {
+    let p = gateway((Backend::XqcH3, b));
+    let (auth, path) = (bearer(), format!("/connect-{tag}"));
+    let stream = raw_headers(&[
+        (":method", "CONNECT"),
+        (":scheme", "http"),
+        (":authority", "127.0.0.1:1"),
+        (":path", &path),
+        ("x-mq-auth", &auth),
+    ]);
+    let c = raw_client(p.server.udp_addr, stream);
+    if b == Backend::Wire {
+        assert_message_error(&c, &format!("path=\"{path}\""));
+    } else {
+        wait_until("the response", || c.handle.lock().fin);
+        assert_eq!(raw_field(&c, ":status").as_deref(), Some("400"));
+        assert_eq!(raw_field(&c, "x-mq-error").as_deref(), Some("bad-request"));
+    }
+    stop(c);
+    assert_eq!(p.join_both(), (0, 0));
+});

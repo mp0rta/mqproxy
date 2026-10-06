@@ -7,7 +7,7 @@ use mq_integration::loopback::{
     Backend, LoopbackPair, cert, h3_transport, raw_h3_transport, transport,
 };
 use mq_integration::matrix;
-use mq_integration::raw_h3::{RawH3Handle, RawH3Peer, RawH3Script, headers_frame};
+use mq_integration::raw_h3::{RawH3Handle, RawH3Peer, RawH3Script, field, headers_frame};
 use mq_runtime::Shard;
 use mq_transport_api::Role;
 use std::net::Ipv4Addr;
@@ -50,7 +50,6 @@ fn post(body: Vec<u8>, pause_reads: Option<Duration>) -> H3Script {
         .to_vec(),
         body,
         pause_reads,
-        truncate_after_partial: false,
     }
 }
 
@@ -216,32 +215,6 @@ fn wire_pair_smoke() {
     p.join_both();
 }
 
-/// The `:status` of the first HEADERS frame in `bytes` (a request stream as read raw).
-fn status(bytes: &[u8]) -> Option<Vec<u8>> {
-    use h3wire::qpack::decoder::{Span, decode_field_section};
-    let mut b = bytes;
-    while !b.is_empty() {
-        let (ty, n) = h3wire::varint::decode(b)?;
-        let (len, m) = h3wire::varint::decode(&b[n..])?;
-        let payload = b.get(n + m..n + m + len as usize)?;
-        b = &b[n + m + len as usize..];
-        if ty != 0x01 {
-            continue; // DATA or a reserved frame
-        }
-        let (mut arena, mut fields) = (Vec::new(), Vec::new());
-        decode_field_section(payload, &mut arena, &mut fields).ok()?;
-        let get = |s: Span| match s {
-            Span::Static(v) => v.to_vec(),
-            Span::Arena(a, z) => arena[a as usize..z as usize].to_vec(),
-        };
-        return fields
-            .iter()
-            .find(|f| get(f.name) == b":status")
-            .map(|f| get(f.value));
-    }
-    None
-}
-
 /// adoption spec §6.2: the raw-H3 peer's valid GET (fixed bytes) gets a 200 from an
 /// `H3EchoServer` on each backend.
 #[test]
@@ -282,7 +255,7 @@ fn raw_peer_smoke() {
         {
             let seen = p.client.handle.lock();
             assert_eq!(
-                status(&seen.read).as_deref(),
+                field(&seen.read, b":status").as_deref(),
                 Some(&b"200"[..]),
                 "{b:?}: {seen:?}"
             );

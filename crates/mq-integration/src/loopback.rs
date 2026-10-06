@@ -157,6 +157,29 @@ macro_rules! matrix {
     };
 }
 
+/// Malformed input against each receiver (adoption spec §6.2): `receivers!(name, |b: Backend,
+/// tag: &str| body)` runs `body` as the tests `name::{x, w}`, with `b` the receiving side's
+/// backend (`XqcH3`, `Wire`) and `tag` the cell's name; a `RawH3Peer` is the other side.
+#[macro_export]
+macro_rules! receivers {
+    ($name:ident, |$b:ident: Backend, $tag:ident: &str| $body:block $(,)?) => {
+        mod $name {
+            use super::*;
+
+            fn body($b: $crate::loopback::Backend, $tag: &str) $body
+
+            #[test]
+            fn x() {
+                body($crate::loopback::Backend::XqcH3, "x")
+            }
+            #[test]
+            fn w() {
+                body($crate::loopback::Backend::Wire, "w")
+            }
+        }
+    };
+}
+
 /// An H3 transport on backend `b` (adoption spec §6.2).
 pub fn h3_transport(role: Role, b: Backend) -> H3Wire<Transport> {
     match b {

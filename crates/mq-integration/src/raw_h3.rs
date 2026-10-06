@@ -195,3 +195,30 @@ pub fn data_frame(declared: u64, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(payload);
     out
 }
+
+/// The value of `name` in the first HEADERS frame of `bytes` (a request stream as read raw);
+/// on h3wire's hidden `varint` and `qpack::decoder`.
+pub fn field(bytes: &[u8], name: &[u8]) -> Option<Vec<u8>> {
+    use h3wire::qpack::decoder::{Span, decode_field_section};
+    let mut b = bytes;
+    while !b.is_empty() {
+        let (ty, n) = h3wire::varint::decode(b)?;
+        let (len, m) = h3wire::varint::decode(&b[n..])?;
+        let payload = b.get(n + m..n + m + len as usize)?;
+        b = &b[n + m + len as usize..];
+        if ty != 0x01 {
+            continue; // DATA or a reserved frame
+        }
+        let (mut arena, mut fields) = (Vec::new(), Vec::new());
+        decode_field_section(payload, &mut arena, &mut fields).ok()?;
+        let get = |s: Span| match s {
+            Span::Static(v) => v.to_vec(),
+            Span::Arena(a, z) => arena[a as usize..z as usize].to_vec(),
+        };
+        return fields
+            .iter()
+            .find(|f| get(f.name) == name)
+            .map(|f| get(f.value));
+    }
+    None
+}
