@@ -4,6 +4,7 @@
 
 use crate::cli::{self, Client as ClientArgs, Mode, Resolved, Server as ServerArgs};
 use crate::setup_redirect;
+use mq_h3::H3Wire;
 use mq_proxy::server::origin::{build_client_config, native_roots};
 use mq_proxy::{client, client::Client, server::Server};
 use mq_runtime::driver::{Driver, DriverConfig, StdResolver};
@@ -67,7 +68,12 @@ fn seed() -> u64 {
 }
 
 /// The transport (cert/key loaded here, H3 per `cli::wants_h3`), then `--qlog`.
-fn transport(r: &Resolved, role: Role, max_conns: u32, err: String) -> Result<Transport, String> {
+fn transport(
+    r: &Resolved,
+    role: Role,
+    max_conns: u32,
+    err: String,
+) -> Result<H3Wire<Transport>, String> {
     let name = if matches!(role, Role::Client) {
         "client"
     } else {
@@ -81,7 +87,7 @@ fn transport(r: &Resolved, role: Role, max_conns: u32, err: String) -> Result<Tr
         cc: r.cc,
         realtime_offset_us: realtime_offset_us(),
         h3: cli::wants_h3(r),
-        h3_backend: mq_transport_api::H3Backend::XqcH3,
+        h3_backend: mq_transport_api::H3Backend::Raw,
         qlog: r.qlog.clone(),
     })
     .map_err(|e| match (&e, &r.qlog) {
@@ -96,7 +102,7 @@ fn transport(r: &Resolved, role: Role, max_conns: u32, err: String) -> Result<Tr
             dir.join(format!("{name}.qlog")).display()
         );
     }
-    Ok(t)
+    Ok(H3Wire::new(t))
 }
 
 fn driver() -> Result<Driver, String> {
@@ -118,9 +124,9 @@ fn ready(r: &Resolved, line: String) {
 }
 
 /// spec §5.3: `run` → `into_transport` → `Transport::close` with the last `now`.
-fn finish<A: App>(d: Driver, shard: Shard<Transport, A>) -> i32 {
+fn finish<A: App>(d: Driver, shard: Shard<H3Wire<Transport>, A>) -> i32 {
     let (code, shard) = d.run(shard);
-    shard.into_transport().close(now());
+    shard.into_transport().into_inner().close(now());
     code
 }
 
