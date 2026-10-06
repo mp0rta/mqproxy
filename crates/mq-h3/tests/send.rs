@@ -242,6 +242,55 @@ fn headers_fin_survives_partial_write_once() {
 }
 
 #[test]
+fn headers_fin_retries_after_blocked_write_once() {
+    let mut r = client();
+    let (id, s) = open(&mut r);
+    r.limit(s, Some(0));
+    assert_eq!(
+        r.w.h3_send_headers(r.now, id, &request("GET"), true),
+        Ok(())
+    );
+    assert!(r.h.sent_bytes(s).is_empty());
+    assert_eq!(r.fins(s), 0, "a blocked write cannot commit FIN");
+    let blocked: Vec<_> =
+        r.h.log()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::StreamSend {
+                    s: sent,
+                    bytes,
+                    fin: true,
+                } if sent == s => Some(bytes),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(blocked.len(), 1);
+    assert!(!blocked[0].is_empty(), "the blocked call carries HEADERS");
+
+    r.limit(s, None);
+    r.h.push_event(Event::StreamWritable(s));
+    r.w.drive(r.now);
+    assert_eq!(r.fins(s), 1);
+    let fin_calls: Vec<_> =
+        r.h.log()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::StreamSend {
+                    s: sent,
+                    bytes,
+                    fin: true,
+                } if sent == s => Some(bytes),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(fin_calls.len(), 2, "one blocked attempt, one retry");
+    assert!(fin_calls.iter().all(|bytes| !bytes.is_empty()));
+    r.pump();
+    assert_peer_finished(&r, Q(0));
+    assert_eq!(r.fins(s), 1, "the retry commits exactly one FIN");
+}
+
+#[test]
 fn send_body_partial_payload() {
     let (mut r, id, s, head) = posting();
     let body = body_of(1000);
