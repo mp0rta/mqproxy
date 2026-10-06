@@ -300,6 +300,9 @@ impl<T: TransportOps> H3Wire<T> {
             }
         } else if !req.aborted() {
             self.inner.stream_reset(now, req.stream);
+        }
+        // Set here, not only by `StreamAborted`: h3wire emits none after `Finished`.
+        if !req.aborted() {
             req.terminal = Some(Terminal::Aborted {
                 code: H3Code::REQUEST_CANCELLED,
                 source: AbortSource::Local,

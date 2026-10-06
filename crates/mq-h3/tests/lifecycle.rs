@@ -465,3 +465,37 @@ fn stale_after_close() {
     r.w.drive(now);
     assert_eq!(closed(&r.events()), []);
 }
+
+/// h3wire emits no `StreamAborted` after `Finished`: `h3_reset` must still end the send
+/// side, with a DATA frame in flight (found by the property test).
+#[test]
+fn h3_reset_after_finished_ends_send() {
+    let mut r = server();
+    r.peer.send_headers(Q(0), &request("GET"), true).unwrap();
+    r.pump();
+    let id = started(&mut r);
+    assert_eq!(recv_headers(&mut r, id), Ok(true));
+    assert_eq!(
+        r.w.h3_send_headers(r.now, id, &[h(":status", "200")], false),
+        Ok(())
+    );
+    r.pump();
+    let s = r.peer_stream(Q(0));
+    r.limit(s, Some(0));
+    assert_eq!(
+        r.w.h3_send_body(r.now, id, b"x", false),
+        Err(StreamError::Blocked),
+        "the frame is in flight"
+    );
+    r.w.h3_reset(r.now, id);
+    let n = sends(&r, s);
+    assert_eq!(
+        r.w.h3_send_body(r.now, id, b"x", false),
+        Err(StreamError::Reset)
+    );
+    assert_eq!(r.w.h3_finish(r.now, id), Err(StreamError::Reset));
+    assert_eq!(sends(&r, s), n, "nothing written after the reset");
+    r.h.push_event(Event::StreamClosed(s));
+    r.w.drive(r.now);
+    assert_eq!(closed(&r.events()), [id]);
+}
