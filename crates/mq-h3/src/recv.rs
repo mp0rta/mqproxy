@@ -2,7 +2,7 @@
 //! transport events (adoption spec §4.3, §4.4).
 
 use crate::conn::log_closed;
-use crate::req::{Terminal, no_stats, req_id};
+use crate::req::{Terminal, req_id};
 use crate::{BOOT_READ, H3Wire};
 use h3wire::{Event as H3Event, H3Code, HeadersKind, Recv, StreamId as Q};
 use mq_transport_api::{
@@ -292,6 +292,9 @@ impl<T: TransportOps> H3Wire<T> {
             Ok(n) => Ok((n, false)),
             Err(e) => Err(e),
         };
+        if let Ok((n, _)) = out {
+            req.recv_body += n as u64;
+        }
         req.handed |= matches!(out, Ok((_, true)) | Err(StreamError::Reset));
         self.maybe_close(id);
         self.drive_inner(now);
@@ -309,7 +312,7 @@ impl<T: TransportOps> H3Wire<T> {
         e: &Event,
     ) -> bool {
         let id = req_id(s);
-        match *e {
+        match e {
             Event::StreamReadable(_) => {
                 let Some(req) = self.reqs.get(&id) else {
                     return true;
@@ -332,7 +335,7 @@ impl<T: TransportOps> H3Wire<T> {
                 {
                     req.reset_code_pending = false;
                     if let Some(conn) = self.conns.get_mut(&c) {
-                        log_closed(conn.h3.stream_reset_received(q, H3Code(code)));
+                        log_closed(conn.h3.stream_reset_received(q, H3Code(*code)));
                     }
                 }
                 // The probe always runs (spec §3), before the events are dispatched by
@@ -342,6 +345,12 @@ impl<T: TransportOps> H3Wire<T> {
             Event::StreamWritable(_) => {
                 if self.reqs.get(&id).is_some_and(|r| r.known) {
                     self.queue.push(Event::H3Writable(id)); // adoption spec §4.5
+                }
+            }
+            Event::StreamCloseStats(_, st) => {
+                // Only a known request's snapshot is kept (adoption spec §4.4).
+                if let Some(req) = self.reqs.get_mut(&id).filter(|r| r.known) {
+                    req.snapshot = Some(st.clone());
                 }
             }
             Event::StreamClosed(_) => {
@@ -385,12 +394,14 @@ impl<T: TransportOps> H3Wire<T> {
     }
 
     /// Removes request `id`, with one `H3Closed` if the gateway knows it: the single place
-    /// that builds the `H3Close` (Task C6 fills its stats).
+    /// that builds the `H3Close` (adoption spec §4.6).
     pub(crate) fn close_req(&mut self, id: H3ReqId) {
         let Some(req) = self.reqs.remove(&id) else {
             return;
         };
+        let mut conn_err = None;
         if let Some(conn) = self.conns.get_mut(&req.conn) {
+            conn_err = conn.conn_err;
             conn.mq.remove(&req.quic_id);
             if let Some(b) = req.pending_block {
                 conn.h3.release(b);
@@ -398,7 +409,7 @@ impl<T: TransportOps> H3Wire<T> {
         }
         if req.known {
             let close = H3Close {
-                stats: no_stats(),
+                stats: req.stats(conn_err),
                 unread: None,
             };
             self.queue.push(Event::H3Closed(id, Box::new(close)));

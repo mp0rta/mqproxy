@@ -2,7 +2,7 @@
 
 use crate::send::InFlight;
 use h3wire::{AbortSource, H3Code, HeaderBlockId};
-use mq_transport_api::{ConnId, H3ReqId, H3ReqStats, StreamId, Time};
+use mq_transport_api::{ConnId, H3ReqId, H3ReqStats, StreamCloseStats, StreamId, Time};
 
 /// The h3wire terminal event of a request's receive side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,11 +51,23 @@ pub(crate) struct Req {
     pub(crate) send_stopped: bool,
     /// `now` when the first HEADERS byte was accepted (adoption spec §4.6).
     pub(crate) headers_sent_at: Option<Time>,
-    // stats: Task C6
+    /// `now` when the request started (adoption spec §4.6).
+    pub(crate) begin: Time,
+    /// Body payload bytes delivered by `h3_recv_body` / accepted by `h3_send_body`.
+    pub(crate) recv_body: u64,
+    pub(crate) send_body: u64,
+    /// The transport's snapshot, kept for a known request only (adoption spec §4.4).
+    pub(crate) snapshot: Option<Box<StreamCloseStats>>,
 }
 
 impl Req {
-    pub(crate) fn new(conn: ConnId, stream: StreamId, quic_id: u64, client: bool) -> Req {
+    pub(crate) fn new(
+        now: Time,
+        conn: ConnId,
+        stream: StreamId,
+        quic_id: u64,
+        client: bool,
+    ) -> Req {
         Req {
             conn,
             stream,
@@ -76,6 +88,10 @@ impl Req {
             writable_wanted: false,
             send_stopped: false,
             headers_sent_at: None,
+            begin: now,
+            recv_body: 0,
+            send_body: 0,
+            snapshot: None,
         }
     }
 
@@ -89,17 +105,33 @@ pub(crate) fn req_id(s: StreamId) -> H3ReqId {
     H3ReqId::from_slot(s.slot()).expect("a live slot has a nonzero generation")
 }
 
-/// Task C6 fills these from `StreamCloseStats`.
-pub(crate) fn no_stats() -> H3ReqStats {
-    H3ReqStats {
-        send_body: 0,
-        recv_body: 0,
-        begin_us: 0,
-        header_send_us: 0,
-        fin_send_us: 0,
-        fin_ack_us: 0,
-        mp_state: 0,
-        stream_err: 0,
-        close_msg: None,
+impl Req {
+    /// adoption spec §4.6. Without a snapshot, `conn_err` is the `ConnClosed` code of a
+    /// request closed by the fan-out.
+    pub(crate) fn stats(&self, conn_err: Option<i32>) -> H3ReqStats {
+        let (fin_send_us, fin_ack_us, mp_state, stream_err, close_msg) = match &self.snapshot {
+            Some(s) => (
+                s.fin_send_us,
+                s.fin_ack_us,
+                s.mp_state,
+                s.stream_err,
+                s.close_msg.clone(),
+            ),
+            None => match conn_err {
+                Some(e) => (0, 0, 0, e, Some("conn closed".to_string())),
+                None => (0, 0, 0, 0, None),
+            },
+        };
+        H3ReqStats {
+            send_body: self.send_body,
+            recv_body: self.recv_body,
+            begin_us: self.begin.as_micros(),
+            header_send_us: self.headers_sent_at.map_or(0, Time::as_micros),
+            fin_send_us,
+            fin_ack_us,
+            mp_state,
+            stream_err,
+            close_msg,
+        }
     }
 }

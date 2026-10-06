@@ -106,7 +106,7 @@ impl<T: TransportOps> H3Wire<T> {
                 conn.mq.insert(q, s);
                 self.streams.insert(s, (c, Q(q)));
                 let id = req_id(s);
-                self.reqs.insert(id, Req::new(c, s, q, true));
+                self.reqs.insert(id, Req::new(now, c, s, q, true));
                 Ok(id)
             }),
         };
@@ -158,6 +158,9 @@ impl<T: TransportOps> H3Wire<T> {
     ) -> Result<usize, StreamError> {
         let client = self.client_of(id)?;
         let r = self.body(now, id, data, fin, client);
+        if let (Ok(n), Some(req)) = (&r, self.reqs.get_mut(&id)) {
+            req.send_body += *n as u64;
+        }
         self.drive_inner(now);
         r
     }

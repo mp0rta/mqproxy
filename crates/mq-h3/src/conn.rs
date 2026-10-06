@@ -41,6 +41,9 @@ pub(crate) struct H3Conn {
     pub(crate) gone: bool,
     /// h3wire emitted `Event::Closed`.
     pub(crate) h3_closed: bool,
+    /// The `ConnClosed` code (xquic's `i32`): the stats of a request closed without a
+    /// snapshot (adoption spec §4.6).
+    pub(crate) conn_err: Option<i32>,
 }
 
 impl H3Conn {
@@ -60,6 +63,7 @@ impl<T: TransportOps> H3Wire<T> {
             fins: HashSet::new(),
             gone: false,
             h3_closed: false,
+            conn_err: None,
         };
         self.conns.insert(c, conn);
         self.service(now, c);
@@ -76,7 +80,7 @@ impl<T: TransportOps> H3Wire<T> {
                 }
             }
             // The fan-out comes before ConnClosed passes through (adoption spec §4.1).
-            Event::ConnClosed(c, _) => self.conn_closed(c),
+            Event::ConnClosed(c, reason) => self.conn_closed(c, reason.code as i32),
             Event::NewStream(c, s, info) => {
                 let Some(conn) = self.conns.get_mut(&c) else {
                     return Some(e);
@@ -86,7 +90,7 @@ impl<T: TransportOps> H3Wire<T> {
                 // A peer request stream (server): h3wire holds its state from the first
                 // sight; the gateway learns of it at its HEADERS (adoption spec §4.3).
                 if Q(info.quic_id).is_request() && !conn.client {
-                    let req = Req::new(c, s, info.quic_id, false);
+                    let req = Req::new(now, c, s, info.quic_id, false);
                     self.reqs.insert(req_id(s), req);
                 }
                 return None;
@@ -112,11 +116,12 @@ impl<T: TransportOps> H3Wire<T> {
     /// adoption spec §4.3 "Connection close", steps 1, 3 and 5. A client request whose
     /// response is complete but undelivered is retained while h3wire is open; every other
     /// request the gateway knows is closed now.
-    fn conn_closed(&mut self, c: ConnId) {
+    fn conn_closed(&mut self, c: ConnId, code: i32) {
         let Some(conn) = self.conns.get_mut(&c) else {
             return;
         };
         conn.gone = true;
+        conn.conn_err = Some(code);
         conn.closing = true; // h3wire parses on; its actions are dropped
         conn.fins.clear();
         let retain = conn.client && !conn.h3_closed;
