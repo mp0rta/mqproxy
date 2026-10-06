@@ -2,6 +2,3 @@
 	path = third_party/xquic
 	url = https://github.com/mp0rta/xquic.git
 	branch = mqvpn-main
-[submodule "third_party/h3wire"]
-	path = third_party/h3wire
-	url = https://github.com/mp0rta/h3wire.git
