@@ -13,11 +13,6 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Above `XQC_MAX_RECV_WINDOW` (16 MiB, xqc_conn.h:40), which the Rust conn settings never
-/// lower (`init_recv_window = 0`): one `h3_send_body` of it is accepted only partially, and
-/// the DATA frame header already declared the whole length (xqc_h3_stream.c:455).
-pub const CUT_BODY: usize = 32 << 20;
-
 /// What an app observed.
 #[derive(Debug, Default)]
 pub struct H3Recorded {
@@ -31,9 +26,6 @@ pub struct H3Recorded {
     pub request_headers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Every `H3Closed`, with its arrival time.
     pub closed: Vec<(H3Close, Instant)>,
-    /// `CutResponseFrame` / `truncate_after_partial`: what the oversized `h3_send_body`
-    /// accepted (0 when `Blocked`).
-    pub accepted: Option<usize>,
     /// `ResetBeforeFin` / `CloseConnMidResponse`: when the server cut the response, and the
     /// connection's srtt then.
     pub cut_at: Option<Instant>,
@@ -116,6 +108,7 @@ macro_rules! no_io {
         }
     };
 }
+pub(crate) use no_io;
 
 /// How `H3EchoServer` answers a fully read request (every answer has `:status 200`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -129,10 +122,6 @@ pub enum EchoMode {
     CloseConnMidResponse,
     /// `content-length: cl` over a complete `sent`-byte DATA frame + FIN.
     ShortCl { cl: u64, sent: usize },
-    /// `content-length: CUT_BODY`, one `h3_send_body` of `CUT_BODY` bytes, then `h3_finish`
-    /// on the partial acceptance (xqc_h3_stream.c:579 attaches the FIN without checking the
-    /// incomplete frame): spec §3.7 (3)'s malformed peer.
-    CutResponseFrame,
 }
 
 const CUT_DELAY: Duration = Duration::from_millis(100);
@@ -193,14 +182,6 @@ impl H3EchoServer {
             EchoMode::ShortCl { cl: n, sent } => {
                 hs.push(cl(n));
                 (q.resp, q.fin) = (vec![b'x'; sent], true);
-            }
-            EchoMode::CutResponseFrame => {
-                hs.push(cl(CUT_BODY as u64));
-                let _ = cx.h3_send_headers(r, &hdrs(&hs), false);
-                let n = cx.h3_send_body(r, &vec![0; CUT_BODY], false).unwrap_or(0);
-                self.h.lock().accepted = Some(n);
-                let _ = cx.h3_finish(r);
-                return;
             }
         }
         let _ = cx.h3_send_headers(r, &hdrs(&hs), q.fin && q.resp.is_empty());
@@ -287,9 +268,6 @@ pub struct H3Script {
     /// On the first `H3Readable`, read nothing for this long (reading the FIN would set
     /// `fin_consumed` and nothing would be rescued, spec §3.3), then read everything.
     pub pause_reads: Option<Duration>,
-    /// The request-side twin of `EchoMode::CutResponseFrame`: on a partial acceptance of
-    /// `body`, `h3_finish` instead of waiting for `H3Writable`.
-    pub truncate_after_partial: bool,
 }
 
 /// An `App` that connects (H3) to `peer` on start, sends its one scripted request once the
@@ -322,11 +300,6 @@ impl H3Client {
             return;
         }
         push(cx, r, &self.s.body, &mut self.sent, true);
-        if self.s.truncate_after_partial && self.sent < self.s.body.len() {
-            self.h.lock().accepted = Some(self.sent);
-            self.sent = self.s.body.len();
-            let _ = cx.h3_finish(r);
-        }
     }
 
     fn read(&mut self, cx: &mut Cx<'_>, r: H3ReqId) {

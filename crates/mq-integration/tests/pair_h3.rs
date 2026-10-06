@@ -3,22 +3,19 @@
 #![forbid(unsafe_code)]
 
 use mq_integration::h3_apps::{EchoMode, H3Client, H3EchoServer, H3Handle, H3Script};
-use mq_integration::loopback::{LoopbackPair, cert, transport};
+use mq_integration::loopback::{
+    Backend, LoopbackPair, cert, h3_transport, raw_h3_transport, transport,
+};
+use mq_integration::matrix;
+use mq_integration::raw_h3::{RawH3Handle, RawH3Peer, RawH3Script, field, headers_frame};
 use mq_runtime::Shard;
 use mq_transport_api::Role;
 use std::net::Ipv4Addr;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Bare xqc_h3 on both sides (the rescue tests).
 fn pair(mode: EchoMode, script: H3Script) -> LoopbackPair<H3Handle, H3Handle> {
-    pair_with(mode, Vec::new(), script)
-}
-
-fn pair_with(
-    mode: EchoMode,
-    resp_headers: Vec<(String, String)>,
-    script: H3Script,
-) -> LoopbackPair<H3Handle, H3Handle> {
     let lo = Ipv4Addr::LOCALHOST.into();
     LoopbackPair::spawn(
         (lo, lo),
@@ -32,7 +29,6 @@ fn pair_with(
                 true,
             );
             let (app, h) = H3EchoServer::new(mode);
-            let app = app.with_response_headers(resp_headers.clone());
             (Shard::new(t, app, local, 1), h)
         },
         move |local, server| {
@@ -54,7 +50,6 @@ fn post(body: Vec<u8>, pause_reads: Option<Duration>) -> H3Script {
         .to_vec(),
         body,
         pause_reads,
-        truncate_after_partial: false,
     }
 }
 
@@ -66,6 +61,9 @@ fn wait(h: &H3Handle, cond: impl Fn(&mq_integration::h3_apps::H3Recorded) -> boo
         thread::sleep(Duration::from_millis(5));
     }
 }
+
+// The rescue tests below read `H3Closed.unread`, which only xqc_h3 fills: they stay on the
+// xqc_h3 backend, outside the differential matrix (adoption spec §6.2).
 
 /// spec §3.7 (2): the client stops reading for longer than 3 PTO after the server's FIN; every
 /// byte still arrives, through `H3Closed.unread`.
@@ -133,27 +131,147 @@ fn section(hs: &[(Vec<u8>, Vec<u8>)]) -> usize {
     hs.iter().map(|(n, v)| n.len() + v.len() + 32).sum()
 }
 
-/// SP4 spec §5: both engines accept a 40 KiB field section (xquic's default limit was 32 KiB;
-/// `H3_FIELD_SECTION_MAX` is 64 KiB): a request section reaches the server and a response
-/// section comes back.
-#[test]
-fn h3_40k_section_both_ways() {
-    let mut script = post(Vec::new(), None);
-    script.headers.extend(fields(6, 7000));
-    let p = pair_with(EchoMode::Echo, fields(6, 7000), script);
-    wait(&p.client.handle, |r| r.fin);
-    {
-        let s = p.server.handle.lock();
-        assert!(
-            section(&s.request_headers) >= 40 * 1024,
-            "{}",
-            section(&s.request_headers)
+/// `hs` as the apps record a header list.
+fn bytes(hs: &[(String, String)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let b = |s: &String| s.as_bytes().to_vec();
+    hs.iter().map(|(n, v)| (b(n), b(v))).collect()
+}
+
+// SP4 spec §5: both engines accept a 40 KiB field section (xquic's default limit was 32 KiB;
+// `H3_FIELD_SECTION_MAX` is 64 KiB): a request section reaches the server and a response
+// section comes back, each exactly as sent. Matrixed over (client, server) backends
+// (adoption spec §6.2).
+matrix!(
+    h3_40k_section_both_ways,
+    |cells: (Backend, Backend), _tag: &str| {
+        let mut script = post(Vec::new(), None);
+        script.headers.extend(fields(6, 7000));
+        let want_req = bytes(&script.headers);
+        let mut want_resp = vec![(b":status".to_vec(), b"200".to_vec())];
+        want_resp.extend(bytes(&fields(6, 7000)));
+        let lo = Ipv4Addr::LOCALHOST.into();
+        let p = LoopbackPair::spawn(
+            (lo, lo),
+            Vec::new(),
+            move |local| {
+                let (app, h) = H3EchoServer::new(EchoMode::Echo);
+                let app = app.with_response_headers(fields(6, 7000));
+                (
+                    Shard::new(h3_transport(server_role(), cells.1), app, local, 1),
+                    h,
+                )
+            },
+            move |local, server| {
+                let (app, h) = H3Client::new(server, script);
+                (
+                    Shard::new(h3_transport(Role::Client, cells.0), app, local, 2),
+                    h,
+                )
+            },
         );
+        wait(&p.client.handle, |r| r.fin);
+        {
+            let s = p.server.handle.lock();
+            assert!(section(&want_req) >= 40 * 1024, "{}", section(&want_req));
+            assert!(s.request_headers == want_req, "request headers differ");
+        }
+        {
+            let c = p.client.handle.lock();
+            assert!(section(&want_resp) >= 40 * 1024, "{}", section(&want_resp));
+            assert!(c.headers == want_resp, "response headers differ");
+        }
+        p.join_both();
     }
+);
+
+fn server_role() -> Role {
+    Role::Server {
+        cert: cert("test.crt"),
+        key: cert("test.key"),
+    }
+}
+
+/// adoption spec §6.2: an `H3Client` and an `H3EchoServer`, both on h3wire over real xquic; a
+/// 1 MiB POST is echoed.
+#[test]
+fn wire_pair_smoke() {
+    let body: Vec<u8> = (0..1u32 << 20).map(|k| (k % 251) as u8).collect();
+    let lo = Ipv4Addr::LOCALHOST.into();
+    let script = post(body.clone(), None);
+    let p = LoopbackPair::spawn(
+        (lo, lo),
+        Vec::new(),
+        move |local| {
+            let (app, h) = H3EchoServer::new(EchoMode::Echo);
+            let t = h3_transport(server_role(), Backend::Wire);
+            (Shard::new(t, app, local, 1), h)
+        },
+        move |local, server| {
+            let (app, h) = H3Client::new(server, script);
+            let t = h3_transport(Role::Client, Backend::Wire);
+            (Shard::new(t, app, local, 2), h)
+        },
+    );
+    wait(&p.client.handle, |r| r.fin && !r.closed.is_empty());
     {
         let c = p.client.handle.lock();
-        assert_eq!(c.headers[0].0, b":status");
-        assert!(section(&c.headers) >= 40 * 1024, "{}", section(&c.headers));
+        assert_eq!(c.headers[0], (b":status".to_vec(), b"200".to_vec()));
+        assert!(c.body == body, "echo differs: {} bytes", c.body.len());
+        assert_eq!(c.closed[0].0.stats.stream_err, 0, "{:?}", c.closed[0].0);
     }
     p.join_both();
+}
+
+/// adoption spec §6.2: the raw-H3 peer's valid GET (fixed bytes) gets a 200 from an
+/// `H3EchoServer` on each backend.
+#[test]
+fn raw_peer_smoke() {
+    for b in [Backend::XqcH3, Backend::Wire] {
+        let get = headers_frame(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", b"x"),
+            (b":path", b"/"),
+        ]);
+        let lo = Ipv4Addr::LOCALHOST.into();
+        let p: LoopbackPair<H3Handle, RawH3Handle> = LoopbackPair::spawn(
+            (lo, lo),
+            Vec::new(),
+            move |local| {
+                let (app, h) = H3EchoServer::new(EchoMode::Echo);
+                (Shard::new(h3_transport(server_role(), b), app, local, 1), h)
+            },
+            move |local, server| {
+                let s = RawH3Script {
+                    stream: get,
+                    fin: true,
+                };
+                let (app, h) = RawH3Peer::client(server, s);
+                (Shard::new(raw_h3_transport(Role::Client), app, local, 2), h)
+            },
+        );
+        let end = Instant::now() + Duration::from_secs(10);
+        while !p.client.handle.lock().fin {
+            assert!(
+                Instant::now() < end,
+                "{b:?}: timed out: {:?}",
+                p.client.handle.lock()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let seen = p.client.handle.lock();
+            assert_eq!(
+                field(&seen.read, b":status").as_deref(),
+                Some(&b"200"[..]),
+                "{b:?}: {seen:?}"
+            );
+            assert!(
+                seen.resets.is_empty() && seen.closed.is_empty(),
+                "{b:?}: {seen:?}"
+            );
+        }
+        assert_eq!(p.server.handle.lock().requests, 1, "{b:?}");
+        p.join_both();
+    }
 }

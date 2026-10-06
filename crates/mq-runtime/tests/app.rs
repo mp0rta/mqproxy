@@ -67,6 +67,9 @@ impl TransportOps for Null {
     fn conn_stats(&self, _: ConnId) -> Result<ConnStats, Error> {
         Err(Error::Stale)
     }
+    fn conn_live(&self, _: ConnId) -> bool {
+        false
+    }
     fn stream_info(&self, _: StreamId) -> Result<StreamInfo, Error> {
         Err(Error::Stale)
     }

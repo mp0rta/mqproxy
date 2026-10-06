@@ -135,6 +135,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny,cargo-audit
@@ -186,7 +188,9 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Compute xquic SHA
         id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD:third_party/xquic)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Cache xquic + BoringSSL (build-xquic.sh)
         uses: actions/cache@v5
         with:
@@ -194,7 +198,7 @@ jobs:
             third_party/xquic/build
             third_party/xquic/third_party/boringssl/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-build-xquic-sh-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-build-xquic-sh-v2
       - name: Build the C mqproxy (interop peer)
         run: |
           scripts/build-xquic.sh
@@ -274,7 +278,9 @@ jobs:
       - name: Compute xquic SHA
         if: github.event_name != 'push'
         id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD:third_party/xquic)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Cache xquic + BoringSSL (build-xquic.sh)
         if: github.event_name != 'push'
         uses: actions/cache@v5
@@ -283,7 +289,7 @@ jobs:
             third_party/xquic/build
             third_party/xquic/third_party/boringssl/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-build-xquic-sh-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-build-xquic-sh-v2
       - name: Build the C mqproxy (baseline)
         if: github.event_name != 'push'
         run: |

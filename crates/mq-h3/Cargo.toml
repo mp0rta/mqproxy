@@ -1,0 +1,18 @@
+[package]
+name = "mq-h3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+h3wire = { path = "../../third_party/h3wire/h3wire" }
+mq-transport-api = { path = "../mq-transport-api" }
+log = { workspace = true }
+
+[features]
+test-support = []
+
+[dev-dependencies]
+mq-runtime = { path = "../mq-runtime", features = ["test-support"] }
+proptest = { workspace = true }

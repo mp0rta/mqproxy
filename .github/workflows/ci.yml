@@ -43,7 +43,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libevent-dev libcurl4-openssl-dev libnghttp2-dev golang
       - name: Compute xquic SHA
         id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD:third_party/xquic)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Cache BoringSSL (gcc fPIC)
         id: bssl-cache
@@ -68,7 +70,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v3
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
@@ -105,7 +107,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libevent-dev libcurl4-openssl-dev libnghttp2-dev golang
       - name: Compute xquic SHA
         id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD:third_party/xquic)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Cache BoringSSL (gcc fPIC)
         id: bssl-cache
@@ -128,7 +132,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v3
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
@@ -201,7 +205,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libevent-dev libcurl4-openssl-dev libnghttp2-dev golang
       - name: Compute xquic SHA
         id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD:third_party/xquic)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Cache BoringSSL (gcc fPIC)
         id: bssl-cache
@@ -224,7 +230,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v3
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
@@ -278,7 +284,9 @@ jobs:
             ca-certificates
       - name: Compute xquic SHA
         id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD:third_party/xquic)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Cache BoringSSL (gcc fPIC)
         id: bssl-cache
@@ -301,7 +309,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v3
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
@@ -352,7 +360,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libevent-dev libnghttp2-dev golang pkg-config
       - name: Compute xquic SHA
         id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD:third_party/xquic)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Cache BoringSSL (gcc fPIC)
         id: bssl-cache
@@ -375,7 +385,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v2
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v3
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |

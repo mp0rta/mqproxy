@@ -4,17 +4,25 @@
 //! the local application and the origin with plain `std::net` sockets.
 
 use crate::driver_harness::DriverThread;
+use mq_h3::H3Wire;
 use mq_proxy::client::{Client, FETCH, HTTP_CONNECT, SOCKS5, TRANSPARENT};
 use mq_proxy::config::{ClientConfig, GatewayConfig, MitmConfig, ServerConfig};
 use mq_proxy::server::Server;
 use mq_proxy::server::origin::build_client_config;
 use mq_runtime::driver::{DriverConfig, StdResolver};
-use mq_runtime::{App, ListenKind, ListenerTag, Shard};
+use mq_runtime::{
+    AcceptMeta, App, Cx, DialError, DialOpId, ListenKind, ListenerTag, Shard, SocketOpId, TcpEnd,
+    TcpId, TimerId, UdpSocketId,
+};
 use mq_transport::Transport;
-use mq_transport_api::{CongestionControl, Role, Scheduler, TransportConfig, TransportOps};
+use mq_transport_api::{
+    CongestionControl, Event, H3Backend, Role, Scheduler, TransportConfig, TransportOps,
+};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Builds and starts a server driver bound to the given UDP address.
@@ -26,6 +34,67 @@ pub struct LoopbackPair<S, C> {
     pub client: DriverThread<C>,
     /// `restart_server`'s factory (pairs built by `spawn_mitm`).
     respawn: Option<Respawn<S>>,
+    /// `H3Request`s the server app was handed (`spawn_gateway_on` pairs; 0 elsewhere): what
+    /// the gateway saw of the requests, whatever it logged.
+    pub server_h3_requests: Arc<AtomicUsize>,
+}
+
+/// Counts the `H3Request` events its app is handed.
+struct CountH3Requests<A> {
+    app: A,
+    n: Arc<AtomicUsize>,
+}
+
+impl<A: App> App for CountH3Requests<A> {
+    fn on_start(&mut self, cx: &mut Cx<'_>) {
+        self.app.on_start(cx)
+    }
+    fn on_transport_event(&mut self, cx: &mut Cx<'_>, ev: Event) {
+        if matches!(ev, Event::H3Request(..)) {
+            self.n.fetch_add(1, Ordering::SeqCst);
+        }
+        self.app.on_transport_event(cx, ev)
+    }
+    fn on_accepted(&mut self, cx: &mut Cx<'_>, l: ListenerTag, tcp: TcpId, meta: AcceptMeta) {
+        self.app.on_accepted(cx, l, tcp, meta)
+    }
+    fn on_tcp_data(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        self.app.on_tcp_data(cx, tcp)
+    }
+    fn on_tcp_end(&mut self, cx: &mut Cx<'_>, tcp: TcpId, end: TcpEnd) {
+        self.app.on_tcp_end(cx, tcp, end)
+    }
+    fn on_tcp_writable(&mut self, cx: &mut Cx<'_>, tcp: TcpId) {
+        self.app.on_tcp_writable(cx, tcp)
+    }
+    fn on_dial_result(&mut self, cx: &mut Cx<'_>, op: DialOpId, r: Result<TcpId, DialError>) {
+        self.app.on_dial_result(cx, op, r)
+    }
+    fn on_resolve_result(
+        &mut self,
+        cx: &mut Cx<'_>,
+        op: DialOpId,
+        r: Result<SocketAddr, DialError>,
+    ) {
+        self.app.on_resolve_result(cx, op, r)
+    }
+    fn on_udp_socket(
+        &mut self,
+        cx: &mut Cx<'_>,
+        op: SocketOpId,
+        r: Result<(UdpSocketId, SocketAddr), io::ErrorKind>,
+    ) {
+        self.app.on_udp_socket(cx, op, r)
+    }
+    fn on_udp_rx(&mut self, cx: &mut Cx<'_>, sock: UdpSocketId, peer: SocketAddr, data: &[u8]) {
+        self.app.on_udp_rx(cx, sock, peer, data)
+    }
+    fn on_timer(&mut self, cx: &mut Cx<'_>, id: TimerId) {
+        self.app.on_timer(cx, id)
+    }
+    fn on_shutdown(&mut self, cx: &mut Cx<'_>) {
+        self.app.on_shutdown(cx)
+    }
 }
 
 fn driver_config() -> DriverConfig {
@@ -80,6 +149,7 @@ impl<S: Send + 'static, C: Send + 'static> LoopbackPair<S, C> {
             server,
             client,
             respawn: None,
+            server_h3_requests: Arc::default(),
         }
     }
 
@@ -101,6 +171,92 @@ pub type LoopbackProxy = LoopbackPair<(), ()>;
 /// A real transport as the proxy runs it (test cert, ALPN "mqproxy-tcp/1", BBR/MinRtt); `h3`
 /// registers the H3 ctx.
 pub fn transport(role: Role, h3: bool) -> Transport {
+    transport_on(role, h3, H3Backend::XqcH3)
+}
+
+/// `transport(role, true)` on `h3_backend: Raw`: H3 conns get raw streams and no H3 stack
+/// (adoption spec §3).
+pub fn raw_h3_transport(role: Role) -> Transport {
+    transport_on(role, true, H3Backend::Raw)
+}
+
+/// Which H3 stack serves one endpoint (adoption spec §6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// xquic's xqc_h3, behind a passthrough `H3Wire`.
+    XqcH3,
+    /// h3wire, in an active `H3Wire` over `h3_backend: Raw`.
+    Wire,
+    /// No H3 stack: a passthrough `H3Wire` over `h3_backend: Raw`, for a `RawH3Peer` side.
+    Raw,
+}
+
+/// The differential matrix (adoption spec §6.2): `matrix!(name, |cells: (Backend, Backend),
+/// tag: &str| body)` runs `body` once per (client, server) backend cell, as the tests
+/// `name::{xx, xw, wx, ww}`; `tag` is the cell's name.
+#[macro_export]
+macro_rules! matrix {
+    ($name:ident, |$cells:ident: (Backend, Backend), $tag:ident: &str| $body:block $(,)?) => {
+        mod $name {
+            use super::*;
+            use $crate::loopback::Backend::{Wire, XqcH3};
+
+            fn body($cells: ($crate::loopback::Backend, $crate::loopback::Backend), $tag: &str)
+                $body
+
+            #[test]
+            fn xx() {
+                body((XqcH3, XqcH3), "xx")
+            }
+            #[test]
+            fn xw() {
+                body((XqcH3, Wire), "xw")
+            }
+            #[test]
+            fn wx() {
+                body((Wire, XqcH3), "wx")
+            }
+            #[test]
+            fn ww() {
+                body((Wire, Wire), "ww")
+            }
+        }
+    };
+}
+
+/// Malformed input against each receiver (adoption spec §6.2): `receivers!(name, |b: Backend,
+/// tag: &str| body)` runs `body` as the tests `name::{x, w}`, with `b` the receiving side's
+/// backend (`XqcH3`, `Wire`) and `tag` the cell's name; a `RawH3Peer` is the other side.
+#[macro_export]
+macro_rules! receivers {
+    ($name:ident, |$b:ident: Backend, $tag:ident: &str| $body:block $(,)?) => {
+        mod $name {
+            use super::*;
+
+            fn body($b: $crate::loopback::Backend, $tag: &str) $body
+
+            #[test]
+            fn x() {
+                body($crate::loopback::Backend::XqcH3, "x")
+            }
+            #[test]
+            fn w() {
+                body($crate::loopback::Backend::Wire, "w")
+            }
+        }
+    };
+}
+
+/// An H3 transport on backend `b` (adoption spec §6.2).
+pub fn h3_transport(role: Role, b: Backend) -> H3Wire<Transport> {
+    match b {
+        Backend::XqcH3 => H3Wire::passthrough(transport(role, true)),
+        Backend::Wire => H3Wire::new(raw_h3_transport(role)),
+        Backend::Raw => H3Wire::passthrough(raw_h3_transport(role)),
+    }
+}
+
+fn transport_on(role: Role, h3: bool, h3_backend: H3Backend) -> Transport {
     Transport::new(TransportConfig {
         role,
         alpn: "mqproxy-tcp/1",
@@ -109,7 +265,7 @@ pub fn transport(role: Role, h3: bool) -> Transport {
         cc: CongestionControl::Bbr,
         realtime_offset_us: 0,
         h3,
-        h3_backend: mq_transport_api::H3Backend::XqcH3,
+        h3_backend,
         qlog: None,
     })
     .expect("transport")
@@ -172,13 +328,31 @@ impl LoopbackProxy {
     /// either config is filled with a placeholder / `GatewayConfig::default()`.
     pub fn spawn_gateway(
         client: ClientConfig,
+        server: ServerConfig,
+        origin_ca: &Path,
+    ) -> LoopbackProxy {
+        Self::spawn_gateway_on(client, server, origin_ca, (Backend::XqcH3, Backend::XqcH3))
+    }
+
+    /// `spawn_gateway` with the (client, server) H3 backends (adoption spec §6.2).
+    pub fn spawn_gateway_on(
+        client: ClientConfig,
         mut server: ServerConfig,
         origin_ca: &Path,
+        backends: (Backend, Backend),
     ) -> LoopbackProxy {
         server.gateway.get_or_insert_with(GatewayConfig::default);
         let tls = build_client_config(Some(origin_ca), &Vec::new).expect("origin CA");
         // `Server` holds `Rc`s: it is built on its driver thread.
-        Self::gateway_pair(client, move || Server::with_gateway(server, tls))
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let app = move || CountH3Requests {
+            app: Server::with_gateway(server, tls),
+            n: n2,
+        };
+        let mut p = Self::gateway_pair(client, app, backends);
+        p.server_h3_requests = n;
+        p
     }
 
     /// The fetch client of `spawn_gateway` against an arbitrary H3 server `App` (a
@@ -187,12 +361,22 @@ impl LoopbackProxy {
         client: ClientConfig,
         server_app: A,
     ) -> LoopbackProxy {
-        Self::gateway_pair(client, move || server_app)
+        Self::spawn_gateway_against_on(client, server_app, (Backend::XqcH3, Backend::XqcH3))
+    }
+
+    /// `spawn_gateway_against` with the (client, server) H3 backends (adoption spec §6.2).
+    pub fn spawn_gateway_against_on<A: App + Send + 'static>(
+        client: ClientConfig,
+        server_app: A,
+        backends: (Backend, Backend),
+    ) -> LoopbackProxy {
+        Self::gateway_pair(client, move || server_app, backends)
     }
 
     fn gateway_pair<A: App + 'static>(
         mut client: ClientConfig,
         server_app: impl FnOnce() -> A + Send + 'static,
+        (client_b, server_b): (Backend, Backend),
     ) -> LoopbackProxy {
         // The bound address is what `fetch_addr` reports; `Client::new` only needs `Some`.
         client
@@ -204,18 +388,18 @@ impl LoopbackProxy {
             (lo, lo),
             vec![(ListenKind::Plain, FETCH)],
             move |local| {
-                let t = transport(
+                let t = h3_transport(
                     Role::Server {
                         cert: cert("test.crt"),
                         key: cert("test.key"),
                     },
-                    true,
+                    server_b,
                 );
                 (Shard::new(t, server_app(), local, 1), ())
             },
             move |local, server_udp| {
                 client.server = server_udp;
-                let t = transport(Role::Client, true);
+                let t = h3_transport(Role::Client, client_b);
                 (Shard::new(t, Client::new(client), local, 2), ())
             },
         )
@@ -230,23 +414,36 @@ impl LoopbackProxy {
     /// against `Server::with_gateway` (`origin_ca` its only trust root); H3 on both
     /// transports. The client keeps its raw tunnel for the opaque relay.
     pub fn spawn_mitm(
+        client: ClientConfig,
+        server: ServerConfig,
+        origin_ca: &Path,
+        mitm: MitmConfig,
+        fixed_dst: SocketAddr,
+    ) -> LoopbackProxy {
+        let cells = (Backend::XqcH3, Backend::XqcH3);
+        Self::spawn_mitm_on(client, server, origin_ca, mitm, fixed_dst, cells)
+    }
+
+    /// `spawn_mitm` with the (client, server) H3 backends (adoption spec §6.2).
+    pub fn spawn_mitm_on(
         mut client: ClientConfig,
         mut server: ServerConfig,
         origin_ca: &Path,
         mitm: MitmConfig,
         fixed_dst: SocketAddr,
+        (client_b, server_b): (Backend, Backend),
     ) -> LoopbackProxy {
         server.gateway.get_or_insert_with(GatewayConfig::default);
         let tls = build_client_config(Some(origin_ca), &Vec::new).expect("origin CA");
         let respawn = move |udp: SocketAddr| {
             let (server, tls) = (server.clone(), tls.clone());
             DriverThread::spawn_on_addr(udp, driver_config(), Vec::new(), move |local| {
-                let t = transport(
+                let t = h3_transport(
                     Role::Server {
                         cert: cert("test.crt"),
                         key: cert("test.key"),
                     },
-                    true,
+                    server_b,
                 );
                 let app = Server::with_gateway(server, tls);
                 (Shard::new(t, app, local, 1), ())
@@ -260,7 +457,7 @@ impl LoopbackProxy {
             vec![(ListenKind::Fixed(fixed_dst), TRANSPARENT)],
             move |local, server_udp| {
                 client.server = server_udp;
-                let t = transport(Role::Client, true);
+                let t = h3_transport(Role::Client, client_b);
                 (Shard::new(t, Client::new(client), local, 2), ())
             },
         );

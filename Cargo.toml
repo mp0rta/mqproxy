@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "crates/xquic-sys", "crates/mq-linux", "crates/mq-wire", "crates/mq-http", "crates/mq-wire-difftest",
   "crates/mq-transport-api", "crates/mq-transport", "crates/mq-runtime",
-  "crates/mq-proxy", "crates/mqproxy", "crates/mq-integration",
+  "crates/mq-h3", "crates/mq-proxy", "crates/mqproxy", "crates/mq-integration",
 ]
 exclude = ["crates/mq-wire/fuzz", "crates/mq-proxy/fuzz", "crates/mq-http/fuzz"]   # cargo-fuzz crates are their own workspaces
 

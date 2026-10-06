@@ -270,6 +270,13 @@ impl<'a> Cx<'a> {
         let now = self.now;
         self.tm().stream_reset(now, s)
     }
+    /// Tests only: a local unidirectional stream, for the raw-H3 peer's control stream
+    /// (adoption spec §3, §6.2).
+    #[cfg(feature = "test-support")]
+    pub fn open_uni(&mut self, conn: ConnId) -> Result<StreamId, Error> {
+        let now = self.now;
+        self.tm().open_uni(now, conn)
+    }
     /// spec §5.4.
     pub fn stream_info(&self, s: StreamId) -> Result<StreamInfo, Error> {
         self.t.stream_info(s)

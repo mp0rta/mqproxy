@@ -96,6 +96,8 @@ fn stale_conn_id_never_reaches_the_reused_slot() {
             .contains(&mq_transport_api::Event::ConnEstablished(new))
     );
     assert!(p.client.call(p.now, move |t, _| t.conn_stats(new)).is_ok());
+    assert!(p.client.call(p.now, move |t, _| t.conn_live(new)));
+    assert!(!p.client.call(p.now, move |t, _| t.conn_live(old)));
     assert_eq!(
         p.client
             .call(p.now, move |t, _| t.conn_stats(old).map(|_| ())),

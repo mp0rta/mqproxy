@@ -153,6 +153,7 @@ struct ScriptState {
     recv: HashMap<StreamId, VecDeque<RecvChunk>>,
     stream_info: HashMap<StreamId, StreamInfo>,
     conn_stats: HashMap<ConnId, ConnStats>,
+    conn_stats_calls: usize,
     transmits: HashMap<TxKey, (SocketAddr, VecDeque<Vec<u8>>)>,
     resume_pending: bool,
     next_timeout: Option<Time>,
@@ -288,6 +289,10 @@ impl ScriptedHandle {
     pub fn expect_stream_recv(&self, s: StreamId, r: Result<(Vec<u8>, bool), StreamError>) {
         self.st().recv.entry(s).or_default().push_back(r);
     }
+    /// Scripted `stream_recv` results on `s` not yet fully returned.
+    pub fn recv_pending(&self, s: StreamId) -> usize {
+        self.st().recv.get(&s).map_or(0, VecDeque::len)
+    }
     pub fn expect_add_path(&self, r: Result<PathId, PathError>) {
         self.st().add_path.push_back(r);
     }
@@ -333,6 +338,10 @@ impl ScriptedHandle {
     /// How often `datagram_mss(c)` was queried.
     pub fn datagram_mss_calls(&self, c: ConnId) -> usize {
         self.st().dgram_mss_calls.get(&c).copied().unwrap_or(0)
+    }
+    /// How often `conn_stats` was called (the expensive liveness probe `conn_live` replaces).
+    pub fn conn_stats_calls(&self) -> usize {
+        self.st().conn_stats_calls
     }
     pub fn set_conn_stats(&self, c: ConnId, st: ConnStats) {
         self.st().conn_stats.insert(c, st);
@@ -721,7 +730,13 @@ impl TransportOps for ScriptedTransport {
     }
 
     fn conn_stats(&self, conn: ConnId) -> Result<ConnStats, Error> {
-        self.st().conn_stats.get(&conn).cloned().ok_or(Error::Stale)
+        let mut st = self.st();
+        st.conn_stats_calls += 1;
+        st.conn_stats.get(&conn).cloned().ok_or(Error::Stale)
+    }
+
+    fn conn_live(&self, conn: ConnId) -> bool {
+        self.st().conn_stats.contains_key(&conn)
     }
 
     fn stream_info(&self, s: StreamId) -> Result<StreamInfo, Error> {
