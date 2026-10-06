@@ -19,8 +19,8 @@ const CONTROL: [u8; 3] = [0x00, 0x04, 0x00];
 pub struct RawH3Seen {
     /// Every `ConnClosed` reason.
     pub closed: Vec<CloseReason>,
-    /// Every `StreamPeerReset` code.
-    pub resets: Vec<u64>,
+    /// Every `StreamPeerReset`: the stream and its code.
+    pub resets: Vec<(StreamId, u64)>,
     /// The bytes read on request streams (the one a client opened, every one opened to a
     /// server), and whether a FIN ended one.
     pub read: Vec<u8>,
@@ -54,8 +54,8 @@ pub struct RawH3Peer {
     h: RawH3Handle,
     /// Request streams.
     reqs: HashSet<StreamId>,
-    /// Request streams with script bytes (or the FIN) still unsent: how much was sent.
-    out: HashMap<StreamId, usize>,
+    /// Streams with bytes (or the FIN) still unsent: the bytes, how many were sent, the FIN.
+    out: HashMap<StreamId, (Vec<u8>, usize, bool)>,
 }
 
 impl RawH3Peer {
@@ -81,22 +81,27 @@ impl RawH3Peer {
 
     fn control(&mut self, cx: &mut Cx<'_>, c: ConnId) {
         let s = cx.open_uni(c).expect("open_uni");
-        assert_eq!(cx.stream_send(s, &CONTROL, false), Ok(CONTROL.len()));
+        self.write(cx, s, CONTROL.to_vec(), false);
     }
 
     /// Starts writing the script on request stream `s`.
     fn respond(&mut self, cx: &mut Cx<'_>, s: StreamId) {
         self.reqs.insert(s);
-        self.out.insert(s, 0);
+        self.write(cx, s, self.s.stream.clone(), self.s.fin);
+    }
+
+    /// Writes `bytes` (+ `fin`) on `s`; what is not accepted follows on `StreamWritable`.
+    fn write(&mut self, cx: &mut Cx<'_>, s: StreamId, bytes: Vec<u8>, fin: bool) {
+        self.out.insert(s, (bytes, 0, fin));
         self.push(cx, s);
     }
 
     fn push(&mut self, cx: &mut Cx<'_>, s: StreamId) {
-        let Some(sent) = self.out.get_mut(&s) else {
+        let Some((bytes, sent, fin)) = self.out.get_mut(&s) else {
             return;
         };
-        let rest = &self.s.stream[*sent..];
-        let done = match cx.stream_send(s, rest, self.s.fin) {
+        let rest = &bytes[*sent..];
+        let done = match cx.stream_send(s, rest, *fin) {
             Ok(n) => {
                 *sent += n;
                 n == rest.len()
@@ -155,7 +160,7 @@ impl App for RawH3Peer {
             Event::StreamReadable(s) => self.read(cx, s),
             Event::StreamWritable(s) => self.push(cx, s),
             Event::StreamPeerReset(s, code) => {
-                self.h.lock().resets.push(code);
+                self.h.lock().resets.push((s, code));
                 self.read(cx, s); // the retirement probe (adoption spec §3)
             }
             Event::ConnClosed(_, why) => self.h.lock().closed.push(why),

@@ -120,6 +120,8 @@ pub enum Backend {
     XqcH3,
     /// h3wire, in an active `H3Wire` over `h3_backend: Raw`.
     Wire,
+    /// No H3 stack: a passthrough `H3Wire` over `h3_backend: Raw`, for a `RawH3Peer` side.
+    Raw,
 }
 
 /// An H3 transport on backend `b` (adoption spec §6.2).
@@ -127,6 +129,7 @@ pub fn h3_transport(role: Role, b: Backend) -> H3Wire<Transport> {
     match b {
         Backend::XqcH3 => H3Wire::passthrough(transport(role, true)),
         Backend::Wire => H3Wire::new(raw_h3_transport(role)),
+        Backend::Raw => H3Wire::passthrough(raw_h3_transport(role)),
     }
 }
 

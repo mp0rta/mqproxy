@@ -9,8 +9,9 @@ use mq_integration::h3_apps::{
     CUT_BODY, EchoMode, H3Client, H3EchoServer, H3Handle, H3Recorded, H3Script,
 };
 use mq_integration::log_tap;
-use mq_integration::loopback::{LoopbackProxy, transport};
+use mq_integration::loopback::{Backend, LoopbackProxy, transport};
 use mq_integration::origin_server::{Handler, ORIGIN_CA, OriginServer, OriginServerMode, Proto};
+use mq_integration::raw_h3::{RawH3Peer, RawH3Script, data_frame, headers_frame};
 use mq_proxy::config::{ClientConfig, GatewayConfig, ServerConfig};
 use mq_proxy::server::origin::host::upload_byte;
 use mq_runtime::Shard;
@@ -467,6 +468,30 @@ fn fetch_response_cut_inside_frame_aborts() {
     let accepted = h.lock().accepted.expect("the peer sent the cut frame");
     assert!(0 < accepted && accepted < CUT_BODY, "accepted {accepted}");
     assert_eq!(p.join_both(), (0, 0));
+}
+
+/// adoption spec §6.2: a `RawH3Peer::server` hosts the server side of the gateway pair
+/// (`Backend::Raw`); its fixed 200 reaches the fetch socket through each client backend.
+#[test]
+fn raw_server_smoke() {
+    for b in [Backend::XqcH3, Backend::Wire] {
+        let mut stream = headers_frame(&[(b":status", b"200"), (b"content-length", b"2")]);
+        stream.extend(data_frame(2, b"ok"));
+        let (app, h) = RawH3Peer::server(RawH3Script { stream, fin: true });
+        let p = LoopbackProxy::spawn_gateway_against_on(
+            ClientConfig::default(),
+            app,
+            (b, Backend::Raw),
+        );
+        let r = fetch_when_up(p.fetch_addr(), &auth("http://x/raw", "any"));
+        let r = parse(&r.unwrap_or_else(|e| panic!("{b:?}: {e}")));
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]), "{b:?}");
+        assert!(
+            !h.lock().read.is_empty(),
+            "{b:?}: the peer read the request"
+        );
+        assert_eq!(p.join_both(), (0, 0), "{b:?}");
+    }
 }
 
 /// spec §5.4, §6.4, §10.3: a HEAD response and a 304, each carrying `content-length`,
