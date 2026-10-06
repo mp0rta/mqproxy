@@ -37,13 +37,7 @@ impl<T: TransportOps> H3Wire<T> {
                 H3Event::Closed { .. } => {
                     conn.h3_closed = true;
                     if conn.gone {
-                        let ids: Vec<H3ReqId> = self
-                            .reqs
-                            .iter()
-                            .filter(|(_, r)| r.conn == c)
-                            .map(|(&id, _)| id)
-                            .collect();
-                        for id in ids {
+                        for id in self.reqs_of(c) {
                             self.close_req(id);
                         }
                         self.settle_conn(c);
@@ -86,10 +80,7 @@ impl<T: TransportOps> H3Wire<T> {
                 }
                 // adoption spec §4.5: the client discards later body, the server resets.
                 H3Event::SendStopped { .. } => {
-                    req.stop_send();
-                    if req.known {
-                        self.queue.push(Event::H3Writable(id)); // a blocked pump learns it
-                    }
+                    req.stop_send(&mut self.queue);
                     continue;
                 }
                 H3Event::Finished(_) => req.terminal = Some(Terminal::Finished),
@@ -393,11 +384,15 @@ impl<T: TransportOps> H3Wire<T> {
             log_closed(conn.h3.stream_reset_received(Q(req.quic_id), H3Code(code)));
         }
         if req.terminal == Some(Terminal::Finished) {
-            req.stop_send();
-            if req.known {
-                self.queue.push(Event::H3Writable(id));
-            }
+            req.stop_send(&mut self.queue);
         }
+    }
+
+    /// The requests of conn `c`. ponytail: O(reqs of the shard); index them by conn if
+    /// shards grow large.
+    pub(crate) fn reqs_of(&self, c: ConnId) -> Vec<H3ReqId> {
+        let of_c = self.reqs.iter().filter(|(_, r)| r.conn == c);
+        of_c.map(|(&id, _)| id).collect()
     }
 
     /// Closure (adoption spec §4.3): once the transport closed the stream (1) and the

@@ -4,9 +4,7 @@
 use crate::req::{Req, Terminal, req_id};
 use crate::{BOOT_READ, H3Wire};
 use h3wire::{Config, Connection, H3Code, Role, StreamId as Q};
-use mq_transport_api::{
-    ConnId, ConnProto, Event, H3ReqId, StreamError, StreamId, Time, TransportOps,
-};
+use mq_transport_api::{ConnId, ConnProto, Event, StreamError, StreamId, Time, TransportOps};
 use std::collections::{HashMap, HashSet};
 
 /// Equals `mq_transport::H3_FIELD_SECTION_MAX`; mq-h3 does not depend on mq-transport.
@@ -134,13 +132,7 @@ impl<T: TransportOps> H3Wire<T> {
         // ponytail: O(streams + reqs of the shard) per conn close; index them by conn if
         // shards grow large.
         self.streams.retain(|_, (x, _)| *x != c);
-        let ids: Vec<H3ReqId> = self
-            .reqs
-            .iter()
-            .filter(|(_, r)| r.conn == c)
-            .map(|(&id, _)| id)
-            .collect();
-        for id in ids {
+        for id in self.reqs_of(c) {
             let r = self.reqs.get_mut(&id).expect("listed above");
             r.stream_closed = true;
             let complete = r.carry_fin || r.terminal == Some(Terminal::Finished);

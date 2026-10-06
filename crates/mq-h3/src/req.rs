@@ -1,8 +1,9 @@
 //! Per-request state (adoption spec §4.3).
 
+use crate::queue::OutQueue;
 use crate::send::InFlight;
 use h3wire::{AbortSource, H3Code, HeaderBlockId};
-use mq_transport_api::{ConnId, H3ReqId, H3ReqStats, StreamCloseStats, StreamId, Time};
+use mq_transport_api::{ConnId, Event, H3ReqId, H3ReqStats, StreamCloseStats, StreamId, Time};
 
 /// The h3wire terminal event of a request's receive side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,20 +104,17 @@ impl Req {
         matches!(self.terminal, Some(Terminal::Aborted { .. }))
     }
 
-    /// h3wire ended our send side without a `StreamAborted` (adoption spec §4.5).
-    pub(crate) fn stop_send(&mut self) {
+    /// h3wire ended our send side without a `StreamAborted` (adoption spec §4.5); a
+    /// blocked pump learns it from `H3Writable`.
+    pub(crate) fn stop_send(&mut self, queue: &mut OutQueue) {
         self.send_stopped = true;
         self.frame = None;
         self.finish_latched = false;
+        if self.known {
+            queue.push(Event::H3Writable(req_id(self.stream)));
+        }
     }
-}
 
-/// The request id is the request stream's slot (adoption spec §4.1).
-pub(crate) fn req_id(s: StreamId) -> H3ReqId {
-    H3ReqId::from_slot(s.slot()).expect("a live slot has a nonzero generation")
-}
-
-impl Req {
     /// adoption spec §4.6. Without a snapshot, `conn_err` is the `ConnClosed` code of a
     /// request closed by the fan-out.
     pub(crate) fn stats(&self, conn_err: Option<i32>) -> H3ReqStats {
@@ -145,4 +143,9 @@ impl Req {
             close_msg,
         }
     }
+}
+
+/// The request id is the request stream's slot (adoption spec §4.1).
+pub(crate) fn req_id(s: StreamId) -> H3ReqId {
+    H3ReqId::from_slot(s.slot()).expect("a live slot has a nonzero generation")
 }

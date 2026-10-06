@@ -469,7 +469,9 @@ impl<T: TransportOps> H3Wire<T> {
                 }
             }
             if let Some(req) = req.filter(|_| conn.h3.poll_send(q).is_none()) {
-                let _ = try_finish(&mut conn.h3, req); // refused: logged by usage_err
+                // An error drops the latched finish: `Closed` / `GoingAway` (the conn is
+                // ending, silently), else a refusal `usage_err` logged.
+                let _ = try_finish(&mut conn.h3, req);
                 if std::mem::take(&mut req.writable_wanted) && req.known {
                     queue.push(Event::H3Writable(req_id(s)));
                 }
