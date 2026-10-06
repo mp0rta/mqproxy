@@ -160,7 +160,8 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
     }
 
     /// Pops our own queue; stale readiness/creation events are dropped, close events never
-    /// (adoption spec §4.1).
+    /// (adoption spec §4.1). The inner transport filtered at drain time; an object can go
+    /// stale between that drain and this pop, so the same checks run again here.
     fn poll_event(&mut self) -> Option<Event> {
         let Self {
             inner,
@@ -170,16 +171,28 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
             ..
         } = self;
         queue.pop(|e| match e {
+            // ponytail: `conn_stats` is the only conn probe `TransportOps` has, and on xquic
+            // it collects path stats; add a cheap `conn_live` op if these pops show up.
+            Event::ConnEstablished(c)
+            | Event::NewConn(c, _)
+            | Event::MpReady(c)
+            | Event::DatagramReadable(c)
+            | Event::PathRemoved(c, _) => inner.conn_stats(*c).is_ok(),
             Event::NewStream(_, s, _)
             | Event::StreamReadable(s)
             | Event::StreamWritable(s)
             | Event::StreamPeerReset(s, _)
             | Event::StreamStopSending(s, _) => inner.stream_info(*s).is_ok(),
-            // The inner transport already filtered passthrough H3 events. An H3Readable
-            // after the receive end was handed over has nothing to deliver.
-            Event::H3Readable(r) => !*active || reqs.get(r).is_some_and(|q| !q.handed),
-            Event::H3Request(_, r) | Event::H3Writable(r) => !*active || reqs.contains_key(r),
-            _ => true,
+            Event::H3Request(_, r) | Event::H3Readable(r) | Event::H3Writable(r) if !*active => {
+                inner.h3_req_info(*r).is_ok()
+            }
+            // An H3Readable after the receive end was handed over has nothing to deliver.
+            Event::H3Readable(r) => reqs.get(r).is_some_and(|q| !q.handed),
+            Event::H3Request(_, r) | Event::H3Writable(r) => reqs.contains_key(r),
+            Event::ConnClosed(..)
+            | Event::StreamClosed(_)
+            | Event::StreamCloseStats(..)
+            | Event::H3Closed(..) => true,
         })
     }
 

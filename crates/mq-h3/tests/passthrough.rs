@@ -97,6 +97,7 @@ fn raw_events(active: bool) {
         kind: StreamKind::Bidi,
     };
     h.set_stream_info(s, info);
+    h.set_conn_stats(c, Default::default()); // the conn is live
     let reason = CloseReason {
         err_type: ErrType::Unknown,
         code: 0,
@@ -214,4 +215,46 @@ fn active_unknown_id_is_stale_and_not_forwarded() {
         )),
         "forwarded: {log:?}"
     );
+}
+
+/// Pops are filtered as the bare transport filters them (adoption spec §4.1): in passthrough,
+/// an H3 event whose request the inner transport no longer knows is dropped; in both modes a
+/// readiness or creation event of a gone conn is dropped. Close events always pop.
+#[test]
+fn stale_on_pop_dropped_like_bare_transport() {
+    for active in [false, true] {
+        let (mut w, h) = mk(active);
+        let (live, gone) = (h.new_conn_id(), h.new_conn_id());
+        h.set_conn_stats(live, Default::default());
+        let r = h.new_h3_request(live);
+        h.inject_h3_headers(r, vec![(b":method".to_vec(), b"GET".to_vec())], true);
+        h.push_event(Event::MpReady(gone));
+        h.push_event(Event::DatagramReadable(gone));
+        h.push_event(Event::MpReady(live));
+        w.drive(NOW); // drained while everything was still live in the inner queue
+        let close = H3Close {
+            stats: H3ReqStats {
+                send_body: 0,
+                recv_body: 0,
+                begin_us: 0,
+                header_send_us: 0,
+                fin_send_us: 0,
+                fin_ack_us: 0,
+                mp_state: 0,
+                stream_err: 0,
+                close_msg: None,
+            },
+            unread: None,
+        };
+        h.close_h3(r, close.clone()); // the request goes stale between drain and pop
+        let got: Vec<_> = std::iter::from_fn(|| w.poll_event()).collect();
+        assert_eq!(got, vec![Event::MpReady(live)], "active={active}");
+        w.drive(NOW);
+        let got: Vec<_> = std::iter::from_fn(|| w.poll_event()).collect();
+        assert_eq!(
+            got,
+            vec![Event::H3Closed(r, Box::new(close))],
+            "active={active}"
+        );
+    }
 }

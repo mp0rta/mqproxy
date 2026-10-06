@@ -102,6 +102,7 @@ impl Rig {
     fn new(peer_role: Role, local_uni: [u64; 3]) -> Rig {
         let (t, h) = ScriptedTransport::new();
         let conn = h.new_conn_id();
+        h.set_conn_stats(conn, Default::default()); // live: its conn events pop
         let wire = Arc::new(Mutex::new(Wire::default()));
         for q in local_uni {
             let s = h.new_stream_id();
