@@ -129,6 +129,9 @@ impl Events {
             | Event::NewConn(..)
             | Event::NewStream(..)
             | Event::StreamClosed(_)
+            | Event::StreamPeerReset(..)
+            | Event::StreamStopSending(..)
+            | Event::StreamCloseStats(..)
             | Event::PathRemoved(..)
             | Event::H3Request(..)
             | Event::H3Closed(..) => {}
@@ -162,6 +165,8 @@ mod tests {
             writable_queued: false,
             fin_seen: false,
             abandoned,
+            peer_reset_reported: false,
+            stop_sending_reported: false,
         }
     }
 

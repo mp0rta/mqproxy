@@ -56,10 +56,13 @@ impl TransportOps for Null {
         Err(StreamError::Blocked)
     }
     fn stream_reset(&mut self, _: Time, _: StreamId) {}
+    fn stream_reset_send(&mut self, _: Time, _: StreamId, _: u64) {}
+    fn stream_stop_sending(&mut self, _: Time, _: StreamId, _: u64) {}
     fn add_path(&mut self, _: Time, _: ConnId, _: bool) -> Result<PathId, PathError> {
         Ok(PathId(7))
     }
     fn close_conn(&mut self, _: Time, _: ConnId) {}
+    fn close_conn_with(&mut self, _: Time, _: ConnId, _: u64) {}
     fn mark_conn_authed(&mut self, _: ConnId) {}
     fn conn_stats(&self, _: ConnId) -> Result<ConnStats, Error> {
         Err(Error::Stale)
@@ -75,6 +78,9 @@ impl TransportOps for Null {
     }
     fn datagram_recv(&mut self, _: ConnId, _: &mut [u8]) -> Option<usize> {
         None
+    }
+    fn open_uni(&mut self, _: Time, _: ConnId) -> Result<StreamId, Error> {
+        Err(Error::Role)
     }
     fn open_h3_request(&mut self, _: Time, _: ConnId) -> Result<H3ReqId, Error> {
         Err(Error::Role)

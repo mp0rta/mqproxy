@@ -50,8 +50,20 @@ pub trait TransportOps {
         buf: &mut [u8],
     ) -> Result<(usize, bool), StreamError>;
     fn stream_reset(&mut self, now: Time, s: StreamId);
+    /// A local unidirectional stream, either role (adoption spec §3). `Err(Stale)` for a dead
+    /// conn, `Err(Other)` on an xqc_h3 conn or when the peer's uni credit is exhausted,
+    /// `Err(Ceiling)` at 8192 streams.
+    fn open_uni(&mut self, now: Time, conn: ConnId) -> Result<StreamId, Error>;
+    /// RESET_STREAM only; the receive side keeps reporting. Stale id: no-op (adoption spec §3).
+    fn stream_reset_send(&mut self, now: Time, s: StreamId, code: u64);
+    /// STOP_SENDING only; the receive side keeps reporting until FIN or reset is read.
+    /// Stale id: no-op (adoption spec §3).
+    fn stream_stop_sending(&mut self, now: Time, s: StreamId, code: u64);
     fn add_path(&mut self, now: Time, conn: ConnId, standby: bool) -> Result<PathId, PathError>;
     fn close_conn(&mut self, now: Time, conn: ConnId);
+    /// CONNECTION_CLOSE carrying the HTTP/3 application code `code` (>= 0x100; xquic frames a
+    /// lower code as a transport error, xqc_packet_out.c:799). Stale id: no-op (adoption spec §3).
+    fn close_conn_with(&mut self, now: Time, conn: ConnId, code: u64);
     /// The app authenticated the peer: at `max_conns` the server evicts only
     /// connections never marked (spec §4.7). A no-op on a stale id.
     fn mark_conn_authed(&mut self, conn: ConnId);

@@ -1,9 +1,12 @@
 # xquic pin
 
-`third_party/xquic` is pinned to **`4aa5b1fe993e1f5dc7e3e24c8e9d8585752cb14b`**,
-the head of the fork branch `feat/max-implicit-streams` (mp0rta/xquic), based on
-`a5fbdc3` (`mqvpn-main`). `mqvpn-dev` does not contain `a5fbdc3`, so the branch
-starts from `a5fbdc3` rather than from `mqvpn-dev`.
+`third_party/xquic` is pinned to **`f88832d02fd8677b4708d5f4f36f580251fb4bc9`**,
+the head of the fork branch `feat/h3wire-raw-streams` (mp0rta/xquic), based on
+`4aa5b1fe993e1f5dc7e3e24c8e9d8585752cb14b`, the head of
+`feat/max-implicit-streams` (which is based on `a5fbdc3`, `mqvpn-main`).
+`mqvpn-dev` does not contain `a5fbdc3`, so the branches start from `a5fbdc3`
+rather than from `mqvpn-dev`. The `max_implicit_streams` commit is still in the
+series; the four h3wire commits sit on top of it.
 
 ## Why a branch head, not a merged revision
 
@@ -12,13 +15,8 @@ now. mqvpn shares this fork and has not validated the patch; merging into
 `mqvpn-dev` / `mqvpn-main` is deferred until mqvpn has run with it. Until the
 merge, mqproxy pins the branch head directly.
 
-The branch must still be pushed to the fork remote: until it is, the pin is a
-commit that exists only in a local clone, and a fresh `git submodule update`
-(and CI) cannot fetch it. The fork owner must push the branch first:
-
-```
-git -C third_party/xquic push origin 4aa5b1fe993e1f5dc7e3e24c8e9d8585752cb14b:refs/heads/feat/max-implicit-streams
-```
+The pin is pushed: `origin/feat/h3wire-raw-streams` (mp0rta/xquic) is at the
+pinned commit, so a fresh `git submodule update` and CI can fetch it.
 
 Effect on mqvpn: none until mqvpn bumps its own pin. The cap only triggers for
 a peer that leaves more than 16384 stream ids unopened at once; sequential
@@ -27,7 +25,37 @@ creations, no error, count back to 0). If mqvpn wants the old behaviour even
 after bumping, the default can be changed to "0 = disabled" with mqproxy
 setting 16384 explicitly (mq-transport already does).
 
-## What the patch does (spec §7, implicit streams)
+The new `stream_peer_abort_notify` is the trailing member of
+`xqc_stream_callbacks_t` and NULL by default. With no callback and no
+`xqc_conn_set_no_reset_echo`, behaviour is unchanged.
+
+## What the patch does
+
+### Raw streams for h3wire (adoption spec §2)
+
+All opt-in: with no new callback registered and the setter not called, xquic
+behaves as at `4aa5b1f`.
+
+1. `xqc_stream_reset(stream, code)` sends RESET_STREAM only, with a 62-bit code.
+   It drops queued stream frames and resets at the current send offset; a no-op
+   once the send side has reached DATA_RECVD (RFC 9000 section 3.1) or when
+   the conn is closing.
+2. `xqc_stream_stop_sending(stream, code)` sends STOP_SENDING only, while the
+   receive side is in Recv or Size Known. What arrives afterwards is still read.
+3. `stream_peer_abort_notify(stream, kind, code, user_data)`, a new optional
+   member of `xqc_stream_callbacks_t` (`kind` is RESET_STREAM or STOP_SENDING).
+   Both frame handlers call it with the full code, including on the passive
+   stream-creation path.
+4. `xqc_conn_set_no_reset_echo(conn, on)` (default off) stops a received
+   RESET_STREAM from being echoed; the application resets its own send side via
+   item 1. The automatic RESET_STREAM in reply to STOP_SENDING is unchanged
+   (RFC 9000 section 3.5).
+5. `xqc_stream_get_close_stats(stream, out)` fills `xqc_stream_close_stats_t`
+   `{fin_send_time, fin_ack_time, mp_state, err, close_msg}` the way
+   `xqc_h3_request_get_stats` does, with connection-error precedence for `err`.
+   Callable from `stream_close_notify`.
+
+### Implicit streams (spec §7)
 
 - `xqc_conn_settings_t.max_implicit_streams` (0 = default 16384): a peer stream
   id inserts a `passive_streams_hash` entry for every skipped id; the

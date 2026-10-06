@@ -5,6 +5,7 @@ pub(crate) mod trampolines;
 
 use core::ffi::{c_char, c_int, c_uchar, c_void};
 use libc::{sa_family_t, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t};
+use mq_transport_api::ConnProto;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use trampolines::*;
@@ -49,12 +50,15 @@ pub(crate) fn transport_callbacks() -> xqc_transport_callbacks_t {
     }
 }
 
-/// ALPN callbacks (`"mqproxy-tcp/1"`). Of the datagram callbacks only read and write are
-/// registered (SP2 spec §3.3).
-pub(crate) fn app_proto_callbacks() -> xqc_app_proto_callbacks_t {
+/// ALPN callbacks (`"mqproxy-tcp/1"`, or `"h3"` on the raw-H3 backend; adoption spec §3). Of
+/// the datagram callbacks only read and write are registered (SP2 spec §3.3).
+pub(crate) fn app_proto_callbacks(proto: ConnProto) -> xqc_app_proto_callbacks_t {
     xqc_app_proto_callbacks_t {
         conn_cbs: xqc_conn_callbacks_t {
-            conn_create_notify: Some(conn_create_notify),
+            conn_create_notify: Some(match proto {
+                ConnProto::Raw => conn_create_notify,
+                ConnProto::H3 => h3raw_conn_create_notify,
+            }),
             conn_close_notify: Some(conn_close_notify),
             conn_handshake_finished: Some(conn_handshake_finished),
             conn_ping_acked: None,
@@ -65,6 +69,11 @@ pub(crate) fn app_proto_callbacks() -> xqc_app_proto_callbacks_t {
             stream_create_notify: Some(stream_create_notify),
             stream_close_notify: Some(stream_close_notify),
             stream_closing_notify: None,
+            // adoption spec §3: raw-H3 conns only; raw conns never report peer aborts.
+            stream_peer_abort_notify: match proto {
+                ConnProto::Raw => None,
+                ConnProto::H3 => Some(stream_peer_abort_notify),
+            },
         },
         dgram_cbs: xqc_datagram_callbacks_t {
             datagram_read_notify: Some(datagram_read_notify),

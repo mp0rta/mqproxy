@@ -30,6 +30,7 @@ pub enum Call {
     },
     Connect(ConnConfig),
     OpenStream(ConnId),
+    OpenUni(ConnId),
     /// `bytes` is everything offered, not just the accepted prefix.
     StreamSend {
         s: StreamId,
@@ -41,11 +42,23 @@ pub enum Call {
         cap: usize,
     },
     StreamReset(StreamId),
+    StreamResetSend {
+        s: StreamId,
+        code: u64,
+    },
+    StreamStopSending {
+        s: StreamId,
+        code: u64,
+    },
     AddPath {
         conn: ConnId,
         standby: bool,
     },
     CloseConn(ConnId),
+    CloseConnWith {
+        conn: ConnId,
+        code: u64,
+    },
     MarkConnAuthed(ConnId),
     /// `bytes` is what was offered, whether or not the call succeeded.
     DatagramSend {
@@ -134,6 +147,7 @@ struct ScriptState {
     next_path: u64,
     connect: VecDeque<Result<ConnId, ConnectError>>,
     open_stream: VecDeque<Result<StreamId, Error>>,
+    open_uni: VecDeque<Result<StreamId, Error>>,
     add_path: VecDeque<Result<PathId, PathError>>,
     send: HashMap<StreamId, VecDeque<Result<usize, StreamError>>>,
     recv: HashMap<StreamId, VecDeque<RecvChunk>>,
@@ -232,6 +246,21 @@ impl ScriptedTransport {
     fn st(&self) -> MutexGuard<'_, ScriptState> {
         self.h.st()
     }
+
+    /// The `ConnClosed` a close op produces, unless `hold_close`.
+    fn close_event(&mut self, conn: ConnId) {
+        let mut st = self.st();
+        if st.hold_close {
+            return;
+        }
+        st.events.push_back(Event::ConnClosed(
+            conn,
+            CloseReason {
+                err_type: ErrType::Unknown,
+                code: 0,
+            },
+        ));
+    }
 }
 
 impl ScriptedHandle {
@@ -245,6 +274,10 @@ impl ScriptedHandle {
     }
     pub fn expect_open_stream(&self, r: Result<StreamId, Error>) {
         self.st().open_stream.push_back(r);
+    }
+    /// Queued results for `open_uni`; the default is a fresh id.
+    pub fn expect_open_uni(&self, r: Result<StreamId, Error>) {
+        self.st().open_uni.push_back(r);
     }
     /// `Ok(n)` with `n` below the offered length accepts only that prefix.
     pub fn expect_stream_send(&self, s: StreamId, r: Result<usize, StreamError>) {
@@ -569,6 +602,16 @@ impl TransportOps for ScriptedTransport {
             .unwrap_or_else(|| Ok(self.h.new_stream_id()))
     }
 
+    fn open_uni(&mut self, now: Time, conn: ConnId) -> Result<StreamId, Error> {
+        self.last_now = now;
+        let scripted = {
+            let mut st = self.st();
+            st.log.push(Call::OpenUni(conn));
+            st.open_uni.pop_front()
+        };
+        scripted.unwrap_or_else(|| Ok(self.h.new_stream_id()))
+    }
+
     fn stream_send(
         &mut self,
         now: Time,
@@ -641,6 +684,16 @@ impl TransportOps for ScriptedTransport {
         self.st().log.push(Call::StreamReset(s));
     }
 
+    fn stream_reset_send(&mut self, now: Time, s: StreamId, code: u64) {
+        self.last_now = now;
+        self.st().log.push(Call::StreamResetSend { s, code });
+    }
+
+    fn stream_stop_sending(&mut self, now: Time, s: StreamId, code: u64) {
+        self.last_now = now;
+        self.st().log.push(Call::StreamStopSending { s, code });
+    }
+
     fn add_path(&mut self, now: Time, conn: ConnId, standby: bool) -> Result<PathId, PathError> {
         self.last_now = now;
         let mut st = self.st();
@@ -653,18 +706,14 @@ impl TransportOps for ScriptedTransport {
 
     fn close_conn(&mut self, now: Time, conn: ConnId) {
         self.last_now = now;
-        let mut st = self.st();
-        st.log.push(Call::CloseConn(conn));
-        if st.hold_close {
-            return;
-        }
-        st.events.push_back(Event::ConnClosed(
-            conn,
-            CloseReason {
-                err_type: ErrType::Unknown,
-                code: 0,
-            },
-        ));
+        self.st().log.push(Call::CloseConn(conn));
+        self.close_event(conn);
+    }
+
+    fn close_conn_with(&mut self, now: Time, conn: ConnId, code: u64) {
+        self.last_now = now;
+        self.st().log.push(Call::CloseConnWith { conn, code });
+        self.close_event(conn);
     }
 
     fn mark_conn_authed(&mut self, conn: ConnId) {
@@ -841,5 +890,28 @@ impl TransportOps for ScriptedTransport {
             Some(q) if !q.closed => q.info.ok_or(Error::Stale),
             _ => Err(Error::Stale),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_directional_aborts_are_logged() {
+        let (mut t, h) = ScriptedTransport::new();
+        let s = h.new_stream_id();
+        t.stream_reset_send(Time::ZERO, s, 0x10c);
+        t.stream_stop_sending(Time::ZERO, s, (1 << 62) - 1);
+        assert_eq!(
+            h.log(),
+            vec![
+                Call::StreamResetSend { s, code: 0x10c },
+                Call::StreamStopSending {
+                    s,
+                    code: (1 << 62) - 1
+                },
+            ]
+        );
     }
 }

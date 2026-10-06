@@ -14,7 +14,7 @@ use core::ffi::{c_int, c_uchar, c_void};
 use libc::{sockaddr, socklen_t};
 use mq_transport_api::{
     CloseReason, ConnId, ConnProto, ErrType, Event, H3Close, H3ReqId, H3ReqStats, PathId, Role,
-    SlotId, StreamId, StreamInfo, StreamKind, Time, Unread,
+    SlotId, StreamCloseStats, StreamId, StreamInfo, StreamKind, Time, Unread,
 };
 use std::time::Duration;
 use xquic_sys::*;
@@ -283,14 +283,49 @@ pub(crate) fn on_local_stream_bind(
 }
 
 /// Stream close notification: every stream slot is released here (spec §4.8).
-pub(crate) fn on_stream_close(inner: &mut Inner, s: SlotId) {
+///
+/// adoption spec §3: `stats` (read by the trampoline before this runs) are queued first when
+/// the stream's connection is raw-H3.
+pub(crate) fn on_stream_close(inner: &mut Inner, s: SlotId, stats: StreamCloseStats) {
     let Some(slot) = inner.streams.remove(s) else {
         return;
     };
     if let Some(c) = inner.conns.get_mut(slot.conn) {
         c.streams -= 1;
+        if c.proto == ConnProto::H3 {
+            inner
+                .events
+                .push(Event::StreamCloseStats(stream_id(s), Box::new(stats)));
+        }
     }
     inner.events.push(Event::StreamClosed(stream_id(s)));
+}
+
+/// adoption spec §3: the peer's RESET_STREAM / STOP_SENDING code, queued while the stream's
+/// slot is live (when the frame is processed, before any readable it causes). One-shot per
+/// kind: xquic notifies again for a retransmitted frame.
+pub(crate) fn on_peer_abort(
+    inner: &mut Inner,
+    s: SlotId,
+    kind: xqc_stream_peer_abort_t,
+    code: u64,
+) {
+    let Some(slot) = inner.streams.get_mut(s) else {
+        return;
+    };
+    let (reported, e) = match kind {
+        XQC_STREAM_PEER_STOP_SENDING => (
+            &mut slot.stop_sending_reported,
+            Event::StreamStopSending(stream_id(s), code),
+        ),
+        _ => (
+            &mut slot.peer_reset_reported,
+            Event::StreamPeerReset(stream_id(s), code),
+        ),
+    };
+    if !std::mem::replace(reported, true) {
+        inner.events.push(e);
+    }
 }
 
 /// Server: the peer opened a request (spec §3.3). `None` = refused: the request keeps NULL
@@ -398,20 +433,29 @@ unsafe fn drain_unread(h3r: *mut xqc_h3_request_t, header: bool) -> Option<Unrea
     }
 }
 
-/// spec §3.1: the fields C's call site reads; `close_msg` copied up to 64 bytes.
+/// `msg` is null or a NUL-terminated string; at most 64 bytes are copied.
 ///
 /// # Safety
-/// `st.stream_close_msg` is null or a NUL-terminated string (xquic's static messages).
-pub(crate) unsafe fn h3_stats(st: &xqc_request_stats_t) -> H3ReqStats {
-    let msg = st.stream_close_msg.cast::<u8>();
-    let close_msg = (!msg.is_null()).then(|| {
+/// `msg` is null or points to a NUL-terminated string (xquic's static messages).
+unsafe fn close_msg(msg: *const core::ffi::c_char) -> Option<String> {
+    let msg = msg.cast::<u8>();
+    (!msg.is_null()).then(|| {
         // SAFETY: guaranteed by the caller; reading stops at the NUL (or after 64 bytes).
         let bytes: Vec<u8> = (0..64)
             .map(|k| unsafe { *msg.add(k) })
             .take_while(|&b| b != 0)
             .collect();
         String::from_utf8_lossy(&bytes).into_owned()
-    });
+    })
+}
+
+/// spec §3.1: the fields C's call site reads; `close_msg` copied up to 64 bytes.
+///
+/// # Safety
+/// `st.stream_close_msg` is null or a NUL-terminated string (xquic's static messages).
+pub(crate) unsafe fn h3_stats(st: &xqc_request_stats_t) -> H3ReqStats {
+    // SAFETY: guaranteed by the caller.
+    let close_msg = unsafe { close_msg(st.stream_close_msg) };
     H3ReqStats {
         send_body: st.send_body_size as u64,
         recv_body: st.recv_body_size as u64,
@@ -624,10 +668,39 @@ pub(super) unsafe extern "C" fn conn_create_notify(
     ud: *mut c_void,
     _proto: *mut c_void,
 ) -> c_int {
+    // SAFETY: forwarded from xquic unchanged.
+    unsafe { conn_create(conn, cid, ud, ConnProto::Raw) }
+}
+
+/// adoption spec §3: a raw conn on ALPN `h3`; `no_reset_echo` is set per conn.
+pub(super) unsafe extern "C" fn h3raw_conn_create_notify(
+    conn: *mut xqc_connection_t,
+    cid: *const xqc_cid_t,
+    ud: *mut c_void,
+    _proto: *mut c_void,
+) -> c_int {
+    // SAFETY: forwarded from xquic unchanged; the setter is plain on the conn being created.
+    unsafe {
+        if conn_create(conn, cid, ud, ConnProto::H3) != 0 {
+            return -1;
+        }
+        xqc_conn_set_no_reset_echo(conn, 1);
+    }
+    0
+}
+
+/// # Safety
+/// The arguments of an xquic `conn_create_notify`.
+unsafe fn conn_create(
+    conn: *mut xqc_connection_t,
+    cid: *const xqc_cid_t,
+    ud: *mut c_void,
+    proto: ConnProto,
+) -> c_int {
     // SAFETY: `cid` is null or valid for this call; copied.
     let cid = (!cid.is_null()).then(|| unsafe { cid.read_unaligned() });
     let s = slot_of(ud);
-    if !with_inner(false, |i| on_conn_create(i, conn, cid, s, ConnProto::Raw)) {
+    if !with_inner(false, |i| on_conn_create(i, conn, cid, s, proto)) {
         return -1;
     }
     // SAFETY: plain setters on the connection being created.
@@ -873,13 +946,57 @@ pub(super) unsafe extern "C" fn stream_write_notify(
     0
 }
 
-pub(super) unsafe extern "C" fn stream_close_notify(
+/// adoption spec §3: registered for raw-H3 conns only.
+pub(super) unsafe extern "C" fn stream_peer_abort_notify(
     _xs: *mut xqc_stream_t,
+    kind: xqc_stream_peer_abort_t,
+    code: u64,
+    ud: *mut c_void,
+) {
+    let s = slot_of(ud);
+    if !s.is_none() {
+        // A null user data is a stream we refused (DISCARDED): not ours.
+        with_inner((), |i| on_peer_abort(i, s, kind, code));
+    }
+}
+
+pub(super) unsafe extern "C" fn stream_close_notify(
+    xs: *mut xqc_stream_t,
     ud: *mut c_void,
 ) -> xqc_int_t {
     let s = slot_of(ud);
     if !s.is_none() {
-        with_inner((), |i| on_stream_close(i, s));
+        // Only H3-proto conns queue the stats (`on_stream_close`): skip the read otherwise.
+        let h3 = with_inner(false, |i| {
+            i.streams
+                .get(s)
+                .and_then(|st| i.conns.get(st.conn))
+                .is_some_and(|c| c.proto == ConnProto::H3)
+        });
+        let mut stats = StreamCloseStats {
+            fin_send_us: 0,
+            fin_ack_us: 0,
+            mp_state: 0,
+            stream_err: 0,
+            close_msg: None,
+        };
+        if h3 {
+            // adoption spec §3: a plain read, before `with_inner` (no re-entrancy).
+            // SAFETY: `xs` is the stream being closed, valid inside its close callback; `st` is
+            // a plain C struct, all-zero valid; `close_msg` is null or a static string.
+            unsafe {
+                let mut st: xqc_stream_close_stats_t = core::mem::zeroed();
+                xqc_stream_get_close_stats(xs, &mut st);
+                stats = StreamCloseStats {
+                    fin_send_us: st.fin_send_time,
+                    fin_ack_us: st.fin_ack_time,
+                    mp_state: st.mp_state,
+                    stream_err: st.err,
+                    close_msg: close_msg(st.close_msg),
+                };
+            }
+        }
+        with_inner((), |i| on_stream_close(i, s, stats));
     }
     0
 }
@@ -924,6 +1041,7 @@ mod tests {
                 cc: CongestionControl::Bbr,
                 realtime_offset_us: 0,
                 h3: false,
+                h3_backend: mq_transport_api::H3Backend::XqcH3,
                 qlog: None,
             },
             CString::new("mqproxy-tcp/1").unwrap(),
@@ -1210,6 +1328,16 @@ mod tests {
         }
     }
 
+    fn no_stats() -> StreamCloseStats {
+        StreamCloseStats {
+            fin_send_us: 0,
+            fin_ack_us: 0,
+            mp_state: 0,
+            stream_err: 0,
+            close_msg: None,
+        }
+    }
+
     #[test]
     fn stream_close_releases_and_reports() {
         let mut i = inner(0);
@@ -1217,14 +1345,60 @@ mod tests {
         assert!(create(&mut i, c, ConnProto::Raw));
         let s =
             on_peer_stream_create(&mut i, c, core::ptr::null_mut(), 0, StreamKind::Uni).unwrap();
-        on_stream_close(&mut i, s);
-        on_stream_close(&mut i, s);
+        on_stream_close(&mut i, s, no_stats());
+        on_stream_close(&mut i, s, no_stats());
         assert_eq!(i.conns.get(c).unwrap().streams, 0);
         let evs: Vec<_> =
             std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
                 .collect();
         assert_eq!(evs.last(), Some(&Event::StreamClosed(stream_id(s))));
         assert_eq!(evs.len(), 3); // NewConn, NewStream, StreamClosed
+    }
+
+    #[test]
+    fn peer_abort_reported_once_per_kind() {
+        let mut i = inner(0);
+        let c = accept(&mut i);
+        assert!(create(&mut i, c, ConnProto::H3));
+        let s =
+            on_peer_stream_create(&mut i, c, core::ptr::null_mut(), 0, StreamKind::Bidi).unwrap();
+        for code in [5, 6] {
+            on_peer_abort(&mut i, s, XQC_STREAM_PEER_RESET_STREAM, code);
+            on_peer_abort(&mut i, s, XQC_STREAM_PEER_STOP_SENDING, code);
+        }
+        let evs: Vec<_> =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
+        assert_eq!(
+            evs[2..],
+            [
+                Event::StreamPeerReset(stream_id(s), 5),
+                Event::StreamStopSending(stream_id(s), 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_abort_for_released_slot_is_dropped() {
+        let mut i = inner(0);
+        let c = accept(&mut i);
+        assert!(create(&mut i, c, ConnProto::H3));
+        let s =
+            on_peer_stream_create(&mut i, c, core::ptr::null_mut(), 0, StreamKind::Bidi).unwrap();
+        on_peer_abort(&mut i, s, XQC_STREAM_PEER_STOP_SENDING, 7);
+        on_stream_close(&mut i, s, no_stats());
+        on_peer_abort(&mut i, s, XQC_STREAM_PEER_RESET_STREAM, 8);
+        let evs: Vec<_> =
+            std::iter::from_fn(|| i.events.pop(&mut i.streams, &mut i.conns, &mut i.h3reqs))
+                .collect();
+        assert_eq!(
+            evs[2..],
+            [
+                Event::StreamStopSending(stream_id(s), 7),
+                Event::StreamCloseStats(stream_id(s), Box::new(no_stats())),
+                Event::StreamClosed(stream_id(s)),
+            ]
+        );
     }
 
     #[test]

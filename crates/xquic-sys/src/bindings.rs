@@ -1138,6 +1138,18 @@ pub type xqc_stream_closing_notify_pt = ::core::option::Option<
         strm_user_data: *mut ::core::ffi::c_void,
     ),
 >;
+pub const XQC_STREAM_PEER_RESET_STREAM: xqc_stream_peer_abort_t = 0;
+pub const XQC_STREAM_PEER_STOP_SENDING: xqc_stream_peer_abort_t = 1;
+#[doc = " @brief which peer frame an xqc_stream_peer_abort_notify_pt reports"]
+pub type xqc_stream_peer_abort_t = ::core::ffi::c_uint;
+pub type xqc_stream_peer_abort_notify_pt = ::core::option::Option<
+    unsafe extern "C" fn(
+        stream: *mut xqc_stream_t,
+        kind: xqc_stream_peer_abort_t,
+        err_code: u64,
+        strm_user_data: *mut ::core::ffi::c_void,
+    ),
+>;
 #[doc = " @brief the callback API to notify application that there is a datagram to be read\n\n @param conn the connection handle\n @param user_data the dgram_data set by xqc_datagram_set_user_data\n @param data the data delivered by this callback\n @param data_len the length of the delivered data\n @param dgram_recv_ts the unix timestamp when the datagram is received from socket"]
 pub type xqc_datagram_read_notify_pt = ::core::option::Option<
     unsafe extern "C" fn(
@@ -1325,10 +1337,12 @@ pub struct xqc_stream_callbacks_s {
     pub stream_close_notify: xqc_stream_notify_pt,
     #[doc = " @brief stream reset callback function. OPTIONAL for both server and client\n\n this function will be triggered when a RESET_STREAM frame is received."]
     pub stream_closing_notify: xqc_stream_closing_notify_pt,
+    #[doc = " @brief peer abort callback function. OPTIONAL for both server and client\n\n this function will be triggered when a RESET_STREAM or STOP_SENDING frame is\n received, with the full 62-bit error code. It is also triggered for a stream\n the frame creates passively. It must stay the last member."]
+    pub stream_peer_abort_notify: xqc_stream_peer_abort_notify_pt,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of xqc_stream_callbacks_s"][::core::mem::size_of::<xqc_stream_callbacks_s>() - 40usize];
+    ["Size of xqc_stream_callbacks_s"][::core::mem::size_of::<xqc_stream_callbacks_s>() - 48usize];
     ["Alignment of xqc_stream_callbacks_s"]
         [::core::mem::align_of::<xqc_stream_callbacks_s>() - 8usize];
     ["Offset of field: xqc_stream_callbacks_s::stream_read_notify"]
@@ -1341,6 +1355,8 @@ const _: () = {
         [::core::mem::offset_of!(xqc_stream_callbacks_s, stream_close_notify) - 24usize];
     ["Offset of field: xqc_stream_callbacks_s::stream_closing_notify"]
         [::core::mem::offset_of!(xqc_stream_callbacks_s, stream_closing_notify) - 32usize];
+    ["Offset of field: xqc_stream_callbacks_s::stream_peer_abort_notify"]
+        [::core::mem::offset_of!(xqc_stream_callbacks_s, stream_peer_abort_notify) - 40usize];
 };
 #[doc = " @brief QUIC layer stream callback functions"]
 pub type xqc_stream_callbacks_t = xqc_stream_callbacks_s;
@@ -1391,7 +1407,7 @@ pub struct xqc_app_proto_callbacks_s {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of xqc_app_proto_callbacks_s"]
-        [::core::mem::size_of::<xqc_app_proto_callbacks_s>() - 112usize];
+        [::core::mem::size_of::<xqc_app_proto_callbacks_s>() - 120usize];
     ["Alignment of xqc_app_proto_callbacks_s"]
         [::core::mem::align_of::<xqc_app_proto_callbacks_s>() - 8usize];
     ["Offset of field: xqc_app_proto_callbacks_s::conn_cbs"]
@@ -1399,7 +1415,7 @@ const _: () = {
     ["Offset of field: xqc_app_proto_callbacks_s::stream_cbs"]
         [::core::mem::offset_of!(xqc_app_proto_callbacks_s, stream_cbs) - 32usize];
     ["Offset of field: xqc_app_proto_callbacks_s::dgram_cbs"]
-        [::core::mem::offset_of!(xqc_app_proto_callbacks_s, dgram_cbs) - 72usize];
+        [::core::mem::offset_of!(xqc_app_proto_callbacks_s, dgram_cbs) - 80usize];
 };
 #[doc = " @brief connection and stream callbacks for QUIC level, Application-Layer-Protocol shall\n implement these callback functions and register ALP with xqc_engine_register_alpn"]
 pub type xqc_app_proto_callbacks_t = xqc_app_proto_callbacks_s;
@@ -2783,6 +2799,10 @@ unsafe extern "C" {
     pub fn xqc_conn_close_with_error(conn: *mut xqc_connection_t, err_code: u64) -> xqc_int_t;
 }
 unsafe extern "C" {
+    #[doc = " @brief stop echoing a received RESET_STREAM on the send side of the stream. Default\n off. The reply to STOP_SENDING is not affected (RFC 9000 Section 3.5)."]
+    pub fn xqc_conn_set_no_reset_echo(conn: *mut xqc_connection_t, on: ::core::ffi::c_int);
+}
+unsafe extern "C" {
     #[doc = " Get errno when conn_close_notify, 0 For no-error"]
     pub fn xqc_conn_get_errno(conn: *mut xqc_connection_t) -> xqc_int_t;
 }
@@ -2927,6 +2947,49 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Send RESET_STREAM to peer, stream_close_notify will callback when stream destroyed\n @retval XQC_OK for success, others for failure"]
     pub fn xqc_stream_close(stream: *mut xqc_stream_t) -> xqc_int_t;
+}
+unsafe extern "C" {
+    #[doc = " Send RESET_STREAM only, with the application error code err_code (up to 62\n bits), at the current send offset. Queued stream data is dropped. The receive\n side is untouched. No-op once the send side is Data Recvd or later (including\n an earlier reset), or when the connection is closing.\n @retval XQC_OK for success or no-op, negative errno if a frame write failed"]
+    pub fn xqc_stream_reset(stream: *mut xqc_stream_t, err_code: u64) -> xqc_int_t;
+}
+unsafe extern "C" {
+    #[doc = " Send STOP_SENDING only, with err_code (up to 62 bits). Acts only while the\n receive side is in Recv or Size Known; data arriving later is still readable.\n The send side is untouched. No-op otherwise or when the connection is\n closing.\n @retval XQC_OK for success or no-op, negative errno if a frame write failed"]
+    pub fn xqc_stream_stop_sending(stream: *mut xqc_stream_t, err_code: u64) -> xqc_int_t;
+}
+#[doc = " Close statistics of a stream, computed as xqc_h3_request_get_stats does for\n a request. Callable from stream_close_notify."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct xqc_stream_close_stats_s {
+    pub fin_send_time: xqc_usec_t,
+    pub fin_ack_time: xqc_usec_t,
+    pub mp_state: ::core::ffi::c_int,
+    pub err: ::core::ffi::c_int,
+    pub close_msg: *const ::core::ffi::c_char,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of xqc_stream_close_stats_s"]
+        [::core::mem::size_of::<xqc_stream_close_stats_s>() - 32usize];
+    ["Alignment of xqc_stream_close_stats_s"]
+        [::core::mem::align_of::<xqc_stream_close_stats_s>() - 8usize];
+    ["Offset of field: xqc_stream_close_stats_s::fin_send_time"]
+        [::core::mem::offset_of!(xqc_stream_close_stats_s, fin_send_time) - 0usize];
+    ["Offset of field: xqc_stream_close_stats_s::fin_ack_time"]
+        [::core::mem::offset_of!(xqc_stream_close_stats_s, fin_ack_time) - 8usize];
+    ["Offset of field: xqc_stream_close_stats_s::mp_state"]
+        [::core::mem::offset_of!(xqc_stream_close_stats_s, mp_state) - 16usize];
+    ["Offset of field: xqc_stream_close_stats_s::err"]
+        [::core::mem::offset_of!(xqc_stream_close_stats_s, err) - 20usize];
+    ["Offset of field: xqc_stream_close_stats_s::close_msg"]
+        [::core::mem::offset_of!(xqc_stream_close_stats_s, close_msg) - 24usize];
+};
+#[doc = " Close statistics of a stream, computed as xqc_h3_request_get_stats does for\n a request. Callable from stream_close_notify."]
+pub type xqc_stream_close_stats_t = xqc_stream_close_stats_s;
+unsafe extern "C" {
+    pub fn xqc_stream_get_close_stats(
+        stream: *mut xqc_stream_t,
+        out: *mut xqc_stream_close_stats_t,
+    );
 }
 unsafe extern "C" {
     #[doc = " Recv data in stream.\n @return bytes read, -XQC_EAGAIN try next time, <0 for error"]

@@ -153,13 +153,18 @@ impl TransportOps for Transport {
                 | Event::MpReady(c)
                 | Event::DatagramReadable(c)
                 | Event::PathRemoved(c, _) => conns.is_live(c.slot()),
-                Event::NewStream(_, s, _) | Event::StreamReadable(s) | Event::StreamWritable(s) => {
-                    streams.is_live(s.slot())
-                }
+                Event::NewStream(_, s, _)
+                | Event::StreamReadable(s)
+                | Event::StreamWritable(s)
+                | Event::StreamPeerReset(s, _)
+                | Event::StreamStopSending(s, _) => streams.is_live(s.slot()),
                 Event::H3Request(_, r) | Event::H3Readable(r) | Event::H3Writable(r) => {
                     h3reqs.is_live(r.slot())
                 }
-                Event::ConnClosed(..) | Event::StreamClosed(_) | Event::H3Closed(..) => true,
+                Event::ConnClosed(..)
+                | Event::StreamClosed(_)
+                | Event::StreamCloseStats(..)
+                | Event::H3Closed(..) => true,
             };
             if live {
                 return Some(e);
@@ -177,6 +182,10 @@ impl TransportOps for Transport {
 
     fn open_stream(&mut self, now: Time, c: ConnId) -> Result<StreamId, mq_transport_api::Error> {
         stream::open_stream(self, now, c)
+    }
+
+    fn open_uni(&mut self, now: Time, c: ConnId) -> Result<StreamId, mq_transport_api::Error> {
+        stream::open_uni(self, now, c)
     }
 
     fn stream_send(
@@ -202,12 +211,24 @@ impl TransportOps for Transport {
         stream::stream_reset(self, now, s)
     }
 
+    fn stream_reset_send(&mut self, now: Time, s: StreamId, code: u64) {
+        stream::stream_reset_send(self, now, s, code)
+    }
+
+    fn stream_stop_sending(&mut self, now: Time, s: StreamId, code: u64) {
+        stream::stream_stop_sending(self, now, s, code)
+    }
+
     fn add_path(&mut self, now: Time, c: ConnId, standby: bool) -> Result<PathId, PathError> {
         conn::add_path(self, now, c, standby)
     }
 
     fn close_conn(&mut self, now: Time, c: ConnId) {
         conn::close_conn(self, now, c)
+    }
+
+    fn close_conn_with(&mut self, now: Time, c: ConnId, code: u64) {
+        conn::close_conn_with(self, now, c, code)
     }
 
     fn mark_conn_authed(&mut self, c: ConnId) {

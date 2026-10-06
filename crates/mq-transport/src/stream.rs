@@ -21,9 +21,29 @@ pub(crate) fn stream_err(r: isize) -> StreamError {
 /// before `xqc_stream_create` and released if it fails (spec §4.8).
 pub(crate) fn open_stream(t: &mut Transport, now: Time, c: ConnId) -> Result<StreamId, Error> {
     // SAFETY (closure): the engine is live; the cid outlives the call.
-    open_with(t, now, c, |engine, cid, ud| unsafe {
-        xqc_stream_create(engine, cid, ptr::null_mut(), ud)
-    })
+    open_with(
+        t,
+        now,
+        c,
+        StreamKind::Bidi,
+        |i, c| reserve_local(i, c, false),
+        |engine, cid, ud| unsafe { xqc_stream_create(engine, cid, ptr::null_mut(), ud) },
+    )
+}
+
+/// adoption spec §3: a local unidirectional stream, either role. Does not rely on
+/// `stream_create_notify` for local uni streams: `open_with` binds from the return value.
+pub(crate) fn open_uni(t: &mut Transport, now: Time, c: ConnId) -> Result<StreamId, Error> {
+    // SAFETY (closure): the connection pointer is live (reserved just above, no xquic call
+    // in between).
+    open_with(
+        t,
+        now,
+        c,
+        StreamKind::Uni,
+        reserve_uni,
+        |_, conn, ud| unsafe { xqc_stream_create_with_direction(*conn, XQC_STREAM_UNI, ud) },
+    )
 }
 
 /// `open_stream` with a caller-chosen QUIC id (spec §7, §8.4 sparse ids): tests only.
@@ -35,25 +55,31 @@ pub(crate) fn open_stream_with_id(
     quic_id: u64,
 ) -> Result<StreamId, Error> {
     // SAFETY (closure): as in `open_stream`.
-    open_with(t, now, c, |engine, cid, ud| unsafe {
-        xqc_stream_create_with_id(engine, cid, quic_id, ud)
-    })
+    open_with(
+        t,
+        now,
+        c,
+        StreamKind::Bidi,
+        |i, c| reserve_local(i, c, false),
+        |engine, cid, ud| unsafe { xqc_stream_create_with_id(engine, cid, quic_id, ud) },
+    )
 }
 
-fn open_with(
+/// `reserve` admits and counts the stream, returning what `create` needs.
+fn open_with<R>(
     t: &mut Transport,
     now: Time,
     c: ConnId,
-    create: impl FnOnce(*mut xqc_engine_t, &xqc_cid_t, *mut core::ffi::c_void) -> *mut xqc_stream_t,
+    kind: StreamKind,
+    reserve: impl FnOnce(&mut Inner, ConnId) -> Result<R, Error>,
+    create: impl FnOnce(*mut xqc_engine_t, &R, *mut core::ffi::c_void) -> *mut xqc_stream_t,
 ) -> Result<StreamId, Error> {
     t.inner.last_now = now;
-    let cid = reserve_local(&mut t.inner, c, false)?;
-    let s = t.inner.streams.insert(StreamSlot::new(
-        c.slot(),
-        ptr::null_mut(),
-        0,
-        StreamKind::Bidi,
-    ));
+    let cid = reserve(&mut t.inner, c)?;
+    let s = t
+        .inner
+        .streams
+        .insert(StreamSlot::new(c.slot(), ptr::null_mut(), 0, kind));
     let created = t.with_engine(now, |_, engine| {
         // The create notification binds the slot; the id is read before any other xquic call.
         let xs = create(engine, &cid, ud_of(s));
@@ -97,6 +123,20 @@ pub(crate) fn reserve_local(inner: &mut Inner, c: ConnId, h3: bool) -> Result<xq
     }
     conn.streams += 1;
     Ok(conn.cid)
+}
+
+/// adoption spec §3: both roles may open uni streams; raw conns only (an xqc_h3 conn's stream
+/// callbacks would take our slot id for their own state). Counts the stream.
+pub(crate) fn reserve_uni(inner: &mut Inner, c: ConnId) -> Result<*mut xqc_connection_t, Error> {
+    let conn = inner.conns.get_mut(c.slot()).ok_or(Error::Stale)?;
+    if !conn.h3c.is_null() {
+        return Err(Error::Other);
+    }
+    if conn.streams >= STREAM_CEILING {
+        return Err(Error::Ceiling);
+    }
+    conn.streams += 1;
+    Ok(conn.xqc)
 }
 
 /// The stream's xquic pointer and its connection's slot.
@@ -201,6 +241,35 @@ pub(crate) fn stream_reset(t: &mut Transport, now: Time, s: StreamId) {
     })
 }
 
+/// adoption spec §3: RESET_STREAM only. No `abandoned` flag and no drain: the receive side
+/// keeps reporting. A no-op on a stale id.
+pub(crate) fn stream_reset_send(t: &mut Transport, now: Time, s: StreamId, code: u64) {
+    abort_one_side(t, now, s, code, xqc_stream_reset)
+}
+
+/// adoption spec §3: STOP_SENDING only; the receive side keeps reporting until FIN or reset
+/// is read. A no-op on a stale id.
+pub(crate) fn stream_stop_sending(t: &mut Transport, now: Time, s: StreamId, code: u64) {
+    abort_one_side(t, now, s, code, xqc_stream_stop_sending)
+}
+
+fn abort_one_side(
+    t: &mut Transport,
+    now: Time,
+    s: StreamId,
+    code: u64,
+    op: unsafe extern "C" fn(*mut xqc_stream_t, u64) -> xqc_int_t,
+) {
+    t.inner.last_now = now;
+    let Ok((xs, _)) = xqc_of(t, s) else {
+        return;
+    };
+    // SAFETY: `xs` is valid (live slot). The call runs connection logic, which can close
+    // streams (this one too) or the conn: no reference into Inner is held across it. A failed
+    // frame write is already a connection error inside xquic.
+    t.with_engine(now, |_, _| unsafe { op(xs, code) });
+}
+
 /// spec §4.8 "Abandoned streams": read into scratch until xquic reports nothing more (≤ 0) or
 /// FIN. Runs even after FIN: a RESET_STREAM after FIN is made terminal only by this call.
 /// Must run inside `clock::enter`; holds no reference into `Inner` across `xqc_stream_recv`.
@@ -237,4 +306,40 @@ pub(crate) fn stream_info(t: &Transport, s: StreamId) -> Result<StreamInfo, Erro
         quic_id: slot.quic_id,
         kind: slot.kind,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mq_transport_api::{
+        CongestionControl, ConnConfig, ConnProto, Scheduler, TransportConfig, TransportOps,
+    };
+
+    /// adoption spec §3: local uni streams share the per-connection ceiling.
+    #[test]
+    fn open_uni_counts_against_ceiling() {
+        let mut t = Transport::new(TransportConfig {
+            role: Role::Client,
+            alpn: "mqproxy-tcp/1",
+            max_conns: 0,
+            scheduler: Scheduler::MinRtt,
+            cc: CongestionControl::Bbr,
+            realtime_offset_us: 0,
+            h3: false,
+            h3_backend: mq_transport_api::H3Backend::XqcH3,
+            qlog: None,
+        })
+        .expect("transport");
+        let cc = ConnConfig {
+            peer: "10.0.0.1:4433".parse().unwrap(),
+            sni: "mqproxy",
+            idle_timeout: None,
+            proto: ConnProto::Raw,
+        };
+        let c = t.connect(Time(1), &cc).expect("connect");
+        t.inner.conns.get_mut(c.slot()).unwrap().streams = STREAM_CEILING;
+        assert_eq!(reserve_uni(&mut t.inner, c).err(), Some(Error::Ceiling));
+        assert_eq!(t.open_uni(Time(1), c), Err(Error::Ceiling));
+        assert_eq!(t.inner.conns.get(c.slot()).unwrap().streams, STREAM_CEILING);
+    }
 }

@@ -727,6 +727,10 @@ impl App for Server {
             }
             // Client-only events.
             Event::ConnEstablished(_) | Event::MpReady(_) | Event::PathRemoved(..) => {}
+            // raw-H3 conns only; H3Wire consumes them (adoption spec §4.1).
+            Event::StreamPeerReset(..)
+            | Event::StreamStopSending(..)
+            | Event::StreamCloseStats(..) => {}
             Event::DatagramReadable(c) => self.udp_inbound(cx, c),
             // SP3 spec §6.7: always the gateway's.
             Event::H3Request(..)

@@ -12,6 +12,7 @@ unsafe extern "C" {
     static xqc_sys_sizeof_cid: usize;
     static xqc_sys_sizeof_conn_stats: usize;
     static xqc_sys_sizeof_path_metrics: usize;
+    static xqc_sys_sizeof_stream_close_stats: usize;
 }
 
 #[test]
@@ -44,5 +45,9 @@ fn sizes_match_c() {
         assert_eq!(size_of::<xqc_cid_t>(), xqc_sys_sizeof_cid);
         assert_eq!(size_of::<xqc_conn_stats_t>(), xqc_sys_sizeof_conn_stats);
         assert_eq!(size_of::<xqc_path_metrics_t>(), xqc_sys_sizeof_path_metrics);
+        assert_eq!(
+            size_of::<xqc_stream_close_stats_t>(),
+            xqc_sys_sizeof_stream_close_stats
+        );
     }
 }
