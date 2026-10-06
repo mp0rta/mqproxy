@@ -579,3 +579,15 @@ fn empty_probe_framing_before_fin() {
     );
     assert_eq!(r.w.h3_recv_body(r.now, id, &mut buf), Ok((0, true)));
 }
+
+/// A server-initiated bidirectional stream is a connection error on the client
+/// (`H3_STREAM_CREATION_ERROR`, RFC 9114 §6.1).
+#[test]
+fn server_initiated_bidi_closes() {
+    let mut r = Rig::client();
+    r.pump();
+    r.events();
+    r.deliver(Q(1), b"x", false);
+    r.pump();
+    assert_eq!(close_codes(&r), [0x103]);
+}

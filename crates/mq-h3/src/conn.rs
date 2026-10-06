@@ -89,9 +89,15 @@ impl<T: TransportOps> H3Wire<T> {
                 self.streams.insert(s, (c, Q(info.quic_id)));
                 // A peer request stream (server): h3wire holds its state from the first
                 // sight; the gateway learns of it at its HEADERS (adoption spec §4.3).
-                if Q(info.quic_id).is_request() && !conn.client {
+                let q = Q(info.quic_id);
+                if q.is_request() && !conn.client {
                     let req = Req::new(now, c, s, info.quic_id, false);
                     self.reqs.insert(req_id(s), req);
+                } else if !q.is_uni() && !conn.is_local(q) {
+                    // A server-initiated bidi stream: h3wire closes the conn with
+                    // H3_STREAM_CREATION_ERROR (RFC 9114 §6.1).
+                    log_closed(conn.h3.recv(q, &[], false).map(drop));
+                    self.service(now, c);
                 }
                 return None;
             }
