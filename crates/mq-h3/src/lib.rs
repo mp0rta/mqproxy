@@ -34,6 +34,9 @@ pub struct H3Wire<T> {
     conns: HashMap<ConnId, H3Conn>,
     /// Every stream of an H3 conn: its conn and quic id.
     streams: HashMap<StreamId, (ConnId, h3wire::StreamId)>,
+    /// A `NewConn` was seen: the inner transport is a server. ponytail: learned, not
+    /// configured; before its first conn a server reports an unknown conn as `Stale`.
+    server: bool,
 }
 
 impl<T: TransportOps> H3Wire<T> {
@@ -55,6 +58,7 @@ impl<T: TransportOps> H3Wire<T> {
             reqs: HashMap::new(),
             conns: HashMap::new(),
             streams: HashMap::new(),
+            server: false,
         }
     }
 

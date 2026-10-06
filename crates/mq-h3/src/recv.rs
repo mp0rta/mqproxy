@@ -70,6 +70,8 @@ impl<T: TransportOps> H3Wire<T> {
                     }
                     req.carry = Vec::new();
                     req.carry_fin = false;
+                    // Aborted: a later StreamClosed is not a peer reset to pass on.
+                    req.reset_code_pending = false;
                 }
                 _ => unreachable!("filtered above"),
             }
@@ -125,6 +127,7 @@ impl<T: TransportOps> H3Wire<T> {
             let (consumed, body) = match conn.h3.recv(Q(req.quic_id), &req.carry[..len], fin) {
                 Err(e) => {
                     log::debug!("h3wire: {e}");
+                    req.carry = Vec::new(); // never fed again
                     return Err(StreamError::Conn);
                 }
                 Ok(Recv::Paused) => return Ok(0),
@@ -147,10 +150,18 @@ impl<T: TransportOps> H3Wire<T> {
                 }
             }
             let fin_fed = fin && consumed == len;
+            let fin_read = req.carry_fin;
             req.carry.drain(..consumed);
             req.carry_fin &= !fin_fed;
-            let c = req.conn;
+            let (c, s) = (req.conn, req.stream);
             self.dispatch(c);
+            // Aborted by this feed (malformed, content-length, no final response): read the
+            // rest to FIN or the reset so the stream retires; raw xquic does not re-notify
+            // for bytes it already holds, and later StreamReadables continue it (spec §3).
+            if !fin_read && self.reqs.get(&id).is_some_and(|r| r.aborted()) {
+                self.retire_read(now, s);
+                return Ok(0);
+            }
             if n > 0 || (consumed == 0 && !fin_fed) {
                 return Ok(n);
             }

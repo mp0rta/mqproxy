@@ -30,9 +30,11 @@ impl<T: TransportOps> H3Wire<T> {
     /// Client request start (adoption spec §4.3): the request exists from `open_stream`;
     /// h3wire holds state for it once `send_headers` succeeds.
     pub(crate) fn open_req(&mut self, now: Time, c: ConnId) -> Result<H3ReqId, Error> {
+        // The xqc_h3 backend's order (`reserve_local`): role, conn, protocol.
         let r = match self.conns.get(&c) {
+            _ if self.server => Err(Error::Role),
+            None if self.inner.conn_stats(c).is_ok() => Err(Error::Other), // a raw conn
             None => Err(Error::Stale),
-            Some(conn) if !conn.client => Err(Error::Role),
             Some(_) => self.inner.open_stream(now, c).and_then(|s| {
                 let q = self.inner.stream_info(s)?.quic_id;
                 let conn = self.conns.get_mut(&c).expect("checked above");

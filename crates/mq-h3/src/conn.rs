@@ -56,7 +56,12 @@ impl<T: TransportOps> H3Wire<T> {
     /// of H3 conns are consumed here (adoption spec §4.1).
     pub(crate) fn on_event(&mut self, now: Time, e: Event) -> Option<Event> {
         match e {
-            Event::NewConn(c, ConnProto::H3) => self.add_conn(now, c, Role::Server),
+            Event::NewConn(c, proto) => {
+                self.server = true;
+                if proto == ConnProto::H3 {
+                    self.add_conn(now, c, Role::Server);
+                }
+            }
             // ponytail: C2 drops the conn outright; Task C5 adds the request fan-out.
             Event::ConnClosed(c, _) => {
                 if let Some(conn) = self.conns.remove(&c) {

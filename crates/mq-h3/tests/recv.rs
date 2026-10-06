@@ -116,7 +116,10 @@ fn assert_body(got: &[Result<(Vec<u8>, bool), StreamError>], body: &[u8], cap: u
     for (i, g) in got.iter().enumerate() {
         let (bytes, fin) = g.as_ref().expect("no error");
         assert!(bytes.len() <= cap, "slice {i} is {} > {cap}", bytes.len());
-        assert!(!bytes.is_empty() || *fin, "Ok((0, false)) at call {i}");
+        assert!(
+            !bytes.is_empty(),
+            "an empty result at call {i} (fin comes with the last byte)"
+        );
         all.extend_from_slice(bytes);
         assert_eq!(*fin, i == got.len() - 1, "fin only on the last call");
     }
@@ -449,6 +452,50 @@ fn malformed_headers_never_reach_gateway() {
     );
 }
 
+/// A stream h3wire aborts during a feed is read to its FIN, so it can retire
+/// (adoption spec §3, §4.4).
+#[test]
+fn abort_in_feed_retires() {
+    let mut r = server();
+    let mut fields = get_request();
+    fields.push(f("X-Upper", "1"));
+    let mut bytes = raw_headers(&fields);
+    let mut data = Vec::new();
+    h3wire::frame::encode_header(0x00, 10_000, &mut data);
+    bytes.extend_from_slice(&data);
+    bytes.extend_from_slice(&body_of(10_000));
+    assert!(bytes.len() > 4096);
+    r.deliver(Q(0), &bytes, true);
+    r.pump();
+    assert_eq!(r.events(), []);
+    let s = r.peer_stream(Q(0));
+    assert_eq!(r.h.recv_pending(s), 0, "read to the FIN");
+    assert_eq!(
+        aborts(&r, s),
+        [
+            Call::StreamResetSend { s, code: 0x10e },
+            Call::StreamStopSending { s, code: 0x10e }
+        ]
+    );
+}
+
+/// The xqc_h3 backend's order (`reserve_local`): role, then conn, then protocol.
+#[test]
+fn open_h3_request_errors() {
+    let mut r = Rig::client();
+    r.pump();
+    let unknown = r.h.new_conn_id();
+    assert_eq!(r.w.open_h3_request(r.now, unknown), Err(Error::Stale));
+    let raw = r.h.new_conn_id();
+    r.h.set_conn_stats(raw, Default::default());
+    assert_eq!(r.w.open_h3_request(r.now, raw), Err(Error::Other));
+    let mut r = server();
+    assert_eq!(r.w.open_h3_request(r.now, r.conn), Err(Error::Role));
+    let unknown = r.h.new_conn_id();
+    assert_eq!(r.w.open_h3_request(r.now, unknown), Err(Error::Role));
+    assert!(!r.h.log().iter().any(|c| matches!(c, Call::OpenStream(_))));
+}
+
 /// adoption spec §5.3 (2), server.
 #[test]
 fn fin_without_headers() {
@@ -485,11 +532,20 @@ fn no_final_response() {
 #[test]
 fn oversized_headers_closes() {
     let mut r = server();
-    let mut hdr = Vec::new();
-    h3wire::frame::encode_header(0x01, 65537, &mut hdr);
-    r.deliver(Q(0), &hdr, false); // the frame header alone: no payload to buffer
+    let mut bytes = Vec::new();
+    h3wire::frame::encode_header(0x01, 65537, &mut bytes);
+    bytes.extend_from_slice(&body_of(10_000)); // payload follows the frame header
+    r.deliver(Q(0), &bytes, false);
     r.pump();
     assert_eq!(close_codes(&r), [0x107]);
+    // Closed at the frame header: the first read is dropped and nothing more is read.
+    let s = r.peer_stream(Q(0));
+    assert_eq!(recvs(&r, s), 1);
+    assert_eq!(
+        r.h.recv_pending(s),
+        1,
+        "the rest of the payload is never read"
+    );
     assert!(
         !r.events()
             .iter()
