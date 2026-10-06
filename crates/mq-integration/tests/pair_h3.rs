@@ -10,8 +10,9 @@ use mq_integration::matrix;
 use mq_integration::raw_h3::{RawH3Handle, RawH3Peer, RawH3Script, field, headers_frame};
 use mq_runtime::Shard;
 use mq_runtime::testing::{RecordHandle, Recorded, RecordingApp};
-use mq_transport_api::{ConnConfig, ConnProto, Event, H3Header, Role};
+use mq_transport_api::{ConnConfig, ConnProto, Event, H3Header, Role, StreamError};
 use std::net::Ipv4Addr;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -281,9 +282,10 @@ fn raw_peer_smoke() {
 fn live_wire_pair(
     idle: Option<Duration>,
     close_on_response: bool,
-) -> LoopbackPair<RecordHandle, RecordHandle> {
+) -> (LoopbackPair<RecordHandle, RecordHandle>, mpsc::Receiver<()>) {
+    let (ready_tx, ready_rx) = mpsc::channel();
     let lo = Ipv4Addr::LOCALHOST.into();
-    LoopbackPair::spawn(
+    let p = LoopbackPair::spawn(
         (lo, lo),
         Vec::new(),
         move |local| {
@@ -310,7 +312,7 @@ fn live_wire_pair(
         },
         move |local, server| {
             let (app, rec) = RecordingApp::new();
-            let mut close_on_response = close_on_response;
+            let mut prefix_read = false;
             rec.on(move |r, cx| match r {
                 Recorded::Start => {
                     cx.connect(&ConnConfig {
@@ -345,10 +347,24 @@ fn live_wire_pair(
                         assert_eq!(cx.h3_send_headers(req, &headers, fin), Ok(()));
                     }
                 }
-                Recorded::TransportEvent(Event::H3Readable(req)) if close_on_response => {
-                    close_on_response = false;
-                    let conn = cx.h3_req_info(*req).expect("live request").conn;
-                    cx.close_conn(conn);
+                Recorded::TransportEvent(Event::H3Readable(req)) if !prefix_read => {
+                    let _ = cx.h3_recv_headers(*req, &mut |_, _| {});
+                    let mut prefix = [0; 1];
+                    match cx.h3_recv_body(*req, &mut prefix) {
+                        Ok((n, fin)) => {
+                            assert_eq!((n, fin), (1, false), "positive body prefix, no FIN");
+                            assert_eq!(&prefix, b"p");
+                            // Only one of the seven sent bytes is consumed; six stay unread.
+                            prefix_read = true;
+                            ready_tx.send(()).expect("test awaiting body prefix");
+                            if close_on_response {
+                                let conn = cx.h3_req_info(*req).expect("live request").conn;
+                                cx.close_conn(conn);
+                            }
+                        }
+                        Err(StreamError::Blocked) => {} // HEADERS may precede DATA.
+                        Err(e) => panic!("body prefix: {e:?}"),
+                    }
                 }
                 Recorded::Shutdown => cx.request_exit(0),
                 _ => {}
@@ -358,7 +374,8 @@ fn live_wire_pair(
                 rec,
             )
         },
-    )
+    );
+    (p, ready_rx)
 }
 
 fn wait_records(rec: &RecordHandle, pred: impl Fn(&[Recorded]) -> bool) {
@@ -373,12 +390,10 @@ fn wait_records(rec: &RecordHandle, pred: impl Fn(&[Recorded]) -> bool) {
 #[test]
 fn wire_idle_timeout_mid_response_aborts() {
     let idle = Duration::from_secs(1);
-    let mut p = live_wire_pair(Some(idle), false);
-    wait_records(&p.client.handle, |records| {
-        records
-            .iter()
-            .any(|r| matches!(r, Recorded::TransportEvent(Event::H3Readable(_))))
-    });
+    let (mut p, ready) = live_wire_pair(Some(idle), false);
+    ready
+        .recv_timeout(Duration::from_secs(10))
+        .expect("unfinished body prefix received");
     let start = Instant::now();
     // The server exits without sending CONNECTION_CLOSE, so only idle expiry can close it.
     p.server.shutdown.trigger();
@@ -408,7 +423,10 @@ fn wire_idle_timeout_mid_response_aborts() {
 /// Local close reports every live request before ConnClosed and rescues no partial body.
 #[test]
 fn wire_local_close_with_live_requests_is_clean() {
-    let p = live_wire_pair(None, true);
+    let (p, ready) = live_wire_pair(None, true);
+    ready
+        .recv_timeout(Duration::from_secs(10))
+        .expect("unfinished body prefix received before local close");
     wait_records(&p.client.handle, |records| {
         records
             .iter()
@@ -438,12 +456,10 @@ fn wire_local_close_with_live_requests_is_clean() {
 /// Engine teardown with open requests on both sides, including an unread partial response.
 #[test]
 fn wire_drop_transport_with_live_requests_is_clean() {
-    let p = live_wire_pair(None, false);
-    wait_records(&p.client.handle, |records| {
-        records
-            .iter()
-            .any(|r| matches!(r, Recorded::TransportEvent(Event::H3Readable(_))))
-    });
+    let (p, ready) = live_wire_pair(None, false);
+    ready
+        .recv_timeout(Duration::from_secs(10))
+        .expect("unfinished body prefix received");
     wait_records(&p.server.handle, |records| {
         records
             .iter()
