@@ -54,7 +54,9 @@ jobs:
 
       - name: Compute xquic SHA
         id: xqsha
-        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD:third_party/xquic)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       # Cache keys are arch-qualified: the matrix runs amd64 + arm64, and a
       # non-arch key would let arm64 restore an amd64 BoringSSL/xquic build.
@@ -79,7 +81,7 @@ jobs:
           path: |
             third_party/xquic/build
             third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-${{ matrix.arch }}-gcc-release-bssl-0ce57bb-v1
+          key: xquic-${{ steps.xqsha.outputs.sha }}-${{ matrix.arch }}-gcc-release-bssl-0ce57bb-v2
       - name: Build xquic
         if: steps.xquic-cache.outputs.cache-hit != 'true'
         run: |
