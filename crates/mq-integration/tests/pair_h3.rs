@@ -6,6 +6,7 @@ use mq_integration::h3_apps::{EchoMode, H3Client, H3EchoServer, H3Handle, H3Scri
 use mq_integration::loopback::{
     Backend, LoopbackPair, cert, h3_transport, raw_h3_transport, transport,
 };
+use mq_integration::matrix;
 use mq_integration::raw_h3::{RawH3Handle, RawH3Peer, RawH3Script, headers_frame};
 use mq_runtime::Shard;
 use mq_transport_api::Role;
@@ -13,15 +14,8 @@ use std::net::Ipv4Addr;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Bare xqc_h3 on both sides (the rescue tests).
 fn pair(mode: EchoMode, script: H3Script) -> LoopbackPair<H3Handle, H3Handle> {
-    pair_with(mode, Vec::new(), script)
-}
-
-fn pair_with(
-    mode: EchoMode,
-    resp_headers: Vec<(String, String)>,
-    script: H3Script,
-) -> LoopbackPair<H3Handle, H3Handle> {
     let lo = Ipv4Addr::LOCALHOST.into();
     LoopbackPair::spawn(
         (lo, lo),
@@ -35,7 +29,6 @@ fn pair_with(
                 true,
             );
             let (app, h) = H3EchoServer::new(mode);
-            let app = app.with_response_headers(resp_headers.clone());
             (Shard::new(t, app, local, 1), h)
         },
         move |local, server| {
@@ -139,30 +132,51 @@ fn section(hs: &[(Vec<u8>, Vec<u8>)]) -> usize {
     hs.iter().map(|(n, v)| n.len() + v.len() + 32).sum()
 }
 
-/// SP4 spec §5: both engines accept a 40 KiB field section (xquic's default limit was 32 KiB;
-/// `H3_FIELD_SECTION_MAX` is 64 KiB): a request section reaches the server and a response
-/// section comes back.
-#[test]
-fn h3_40k_section_both_ways() {
-    let mut script = post(Vec::new(), None);
-    script.headers.extend(fields(6, 7000));
-    let p = pair_with(EchoMode::Echo, fields(6, 7000), script);
-    wait(&p.client.handle, |r| r.fin);
-    {
-        let s = p.server.handle.lock();
-        assert!(
-            section(&s.request_headers) >= 40 * 1024,
-            "{}",
-            section(&s.request_headers)
+// SP4 spec §5: both engines accept a 40 KiB field section (xquic's default limit was 32 KiB;
+// `H3_FIELD_SECTION_MAX` is 64 KiB): a request section reaches the server and a response
+// section comes back. Matrixed over (client, server) backends (adoption spec §6.2).
+matrix!(
+    h3_40k_section_both_ways,
+    |cells: (Backend, Backend), _tag: &str| {
+        let mut script = post(Vec::new(), None);
+        script.headers.extend(fields(6, 7000));
+        let lo = Ipv4Addr::LOCALHOST.into();
+        let p = LoopbackPair::spawn(
+            (lo, lo),
+            Vec::new(),
+            move |local| {
+                let (app, h) = H3EchoServer::new(EchoMode::Echo);
+                let app = app.with_response_headers(fields(6, 7000));
+                (
+                    Shard::new(h3_transport(server_role(), cells.1), app, local, 1),
+                    h,
+                )
+            },
+            move |local, server| {
+                let (app, h) = H3Client::new(server, script);
+                (
+                    Shard::new(h3_transport(Role::Client, cells.0), app, local, 2),
+                    h,
+                )
+            },
         );
+        wait(&p.client.handle, |r| r.fin);
+        {
+            let s = p.server.handle.lock();
+            assert!(
+                section(&s.request_headers) >= 40 * 1024,
+                "{}",
+                section(&s.request_headers)
+            );
+        }
+        {
+            let c = p.client.handle.lock();
+            assert_eq!(c.headers[0].0, b":status");
+            assert!(section(&c.headers) >= 40 * 1024, "{}", section(&c.headers));
+        }
+        p.join_both();
     }
-    {
-        let c = p.client.handle.lock();
-        assert_eq!(c.headers[0].0, b":status");
-        assert!(section(&c.headers) >= 40 * 1024, "{}", section(&c.headers));
-    }
-    p.join_both();
-}
+);
 
 fn server_role() -> Role {
     Role::Server {

@@ -9,7 +9,8 @@ use mq_integration::h3_apps::{
     CUT_BODY, EchoMode, H3Client, H3EchoServer, H3Handle, H3Recorded, H3Script,
 };
 use mq_integration::log_tap;
-use mq_integration::loopback::{Backend, LoopbackProxy, transport};
+use mq_integration::loopback::{Backend, LoopbackProxy, h3_transport};
+use mq_integration::matrix;
 use mq_integration::origin_server::{Handler, ORIGIN_CA, OriginServer, OriginServerMode, Proto};
 use mq_integration::raw_h3::{RawH3Peer, RawH3Script, data_frame, headers_frame};
 use mq_proxy::config::{ClientConfig, GatewayConfig, ServerConfig};
@@ -40,13 +41,18 @@ fn server_cfg() -> ServerConfig {
     }
 }
 
-fn gateway_with(server: ServerConfig) -> LoopbackProxy {
+/// Both endpoints on xqc_h3: the tests outside the matrix.
+const XX: (Backend, Backend) = (Backend::XqcH3, Backend::XqcH3);
+
+/// The gateway pair on the (client, server) backends `cells` (adoption spec §6.2).
+fn gateway_with(server: ServerConfig, cells: (Backend, Backend)) -> LoopbackProxy {
     log_tap::install();
-    LoopbackProxy::spawn_gateway(ClientConfig::default(), server, Path::new(ORIGIN_CA))
+    let client = ClientConfig::default();
+    LoopbackProxy::spawn_gateway_on(client, server, Path::new(ORIGIN_CA), cells)
 }
 
-fn gateway() -> LoopbackProxy {
-    gateway_with(server_cfg())
+fn gateway(cells: (Backend, Backend)) -> LoopbackProxy {
+    gateway_with(server_cfg(), cells)
 }
 
 /// Polls `cond` every 5 ms until it holds (at most `T`).
@@ -172,8 +178,9 @@ fn fetch_when_up(addr: SocketAddr, headers: &[(String, String)]) -> io::Result<V
 }
 
 /// Waits for the tunnel with a wrong-token probe (the server answers 403, nothing else).
-fn wait_up(p: &LoopbackProxy) {
-    let r = fetch_when_up(p.fetch_addr(), &auth("http://127.0.0.1:1/probe", "nope"));
+fn wait_up(p: &LoopbackProxy, tag: &str) {
+    let target = format!("http://127.0.0.1:1/probe-{tag}");
+    let r = fetch_when_up(p.fetch_addr(), &auth(&target, "nope"));
     assert_eq!(parse(&r.expect("probe")).status, 403);
 }
 
@@ -201,8 +208,8 @@ fn pattern(len: usize) -> Vec<u8> {
 
 // ---- direct H3 ----
 
-/// An `H3Client` on its own driver against the gateway server.
-fn h3_client(server: SocketAddr, s: H3Script) -> DriverThread<H3Handle> {
+/// An `H3Client` on its own driver, on backend `b`, against the gateway server.
+fn h3_client(server: SocketAddr, s: H3Script, b: Backend) -> DriverThread<H3Handle> {
     let cfg = DriverConfig {
         resolver: Arc::new(StdResolver),
         install_signal_handlers: false,
@@ -211,7 +218,7 @@ fn h3_client(server: SocketAddr, s: H3Script) -> DriverThread<H3Handle> {
     let lo = Ipv4Addr::LOCALHOST.into();
     let mut d = DriverThread::spawn_on(lo, cfg, Vec::new(), move |local| {
         let (app, h) = H3Client::new(server, s);
-        (Shard::new(transport(Role::Client, true), app, local, 3), h)
+        (Shard::new(h3_transport(Role::Client, b), app, local, 3), h)
     });
     d.start();
     d
@@ -406,42 +413,46 @@ fn capture_one(mut tcp: TcpStream) -> Seen {
 
 // ---- fetch API end to end ----
 
-/// spec §5.4, §6.4, §10.3: an 8 MiB download with `content-length` over an h2 TLS origin.
-#[test]
-fn fetch_download_8mib_cl() {
-    let len = 8 * MIB;
-    let o = OriginServer::spawn(OriginServerMode::new(
-        Proto::H2Tls,
-        Handler::FileBytes(len as u64),
-    ));
-    let p = gateway();
-    wait_up(&p);
-    let url = format!("https://127.0.0.1:{}/dl", o.addr.port());
-    let r = parse(&fetch(&p, &url, &[], b"").expect("download"));
-    assert_eq!(r.status, 200);
-    assert_eq!(r.header("content-length"), Some("8388608"));
-    assert!(
-        r.body == pattern(len),
-        "body differs ({} bytes)",
-        r.body.len()
-    );
-    assert_eq!(p.join_both(), (0, 0));
-}
+// spec §5.4, §6.4, §10.3: an 8 MiB download with `content-length` over an h2 TLS origin.
+matrix!(
+    fetch_download_8mib_cl,
+    |cells: (Backend, Backend), tag: &str| {
+        let len = 8 * MIB;
+        let o = OriginServer::spawn(OriginServerMode::new(
+            Proto::H2Tls,
+            Handler::FileBytes(len as u64),
+        ));
+        let p = gateway(cells);
+        wait_up(&p, tag);
+        let url = format!("https://127.0.0.1:{}/dl-{tag}", o.addr.port());
+        let r = parse(&fetch(&p, &url, &[], b"").expect("download"));
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header("content-length"), Some("8388608"));
+        assert!(
+            r.body == pattern(len),
+            "body differs ({} bytes)",
+            r.body.len()
+        );
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
 
-/// spec §5.3, §6.3, §10.3: an 8 MiB `PUT` upload, streamed back by an h1 echo origin.
-#[test]
-fn fetch_upload_8mib_put() {
-    let o = OriginServer::spawn(OriginServerMode::new(Proto::H1Plain, Handler::Echo));
-    let p = gateway();
-    wait_up(&p);
-    let body = pattern(8 * MIB);
-    let url = format!("http://{}/up", o.addr);
-    let r = parse(&fetch(&p, &url, &[("X-Mq-Method", "PUT")], &body).expect("upload"));
-    assert_eq!(r.status, 200);
-    assert_eq!(r.header("content-length"), Some("8388608"));
-    assert!(r.body == body, "echo differs ({} bytes)", r.body.len());
-    assert_eq!(p.join_both(), (0, 0));
-}
+// spec §5.3, §6.3, §10.3: an 8 MiB `PUT` upload, streamed back by an h1 echo origin.
+matrix!(
+    fetch_upload_8mib_put,
+    |cells: (Backend, Backend), tag: &str| {
+        let o = OriginServer::spawn(OriginServerMode::new(Proto::H1Plain, Handler::Echo));
+        let p = gateway(cells);
+        wait_up(&p, tag);
+        let body = pattern(8 * MIB);
+        let url = format!("http://{}/up-{tag}", o.addr);
+        let r = parse(&fetch(&p, &url, &[("X-Mq-Method", "PUT")], &body).expect("upload"));
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header("content-length"), Some("8388608"));
+        assert!(r.body == body, "echo differs ({} bytes)", r.body.len());
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
 
 /// spec §5.4, §5.5, §10.3: `content-length: 100` over a complete 50-byte DATA frame + FIN
 /// from a peer: the client's own body check aborts the local socket.
@@ -494,275 +505,314 @@ fn raw_server_smoke() {
     }
 }
 
-/// spec §5.4, §6.4, §10.3: a HEAD response and a 304, each carrying `content-length`,
-/// finish cleanly (the HEAD reply's length is rewritten to 0, §12).
-#[test]
-fn head_and_304_with_cl_finish_cleanly() {
-    let raw = |reply: &[u8]| {
+// spec §5.4, §6.4, §10.3: a HEAD response and a 304, each carrying `content-length`,
+// finish cleanly (the HEAD reply's length is rewritten to 0, §12).
+matrix!(
+    head_and_304_with_cl_finish_cleanly,
+    |cells: (Backend, Backend), tag: &str| {
+        let raw = |reply: &[u8]| {
+            let proto = Proto::RawH1 {
+                tls: false,
+                reply: reply.to_vec(),
+            };
+            OriginServer::spawn(OriginServerMode::new(proto, Handler::Echo))
+        };
+        let head = raw(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n");
+        let nm = raw(b"HTTP/1.1 304 Not Modified\r\ncontent-length: 100\r\n\r\n");
+        let p = gateway(cells);
+        wait_up(&p, tag);
+        let r = fetch(
+            &p,
+            &format!("http://{}/h-{tag}", head.addr),
+            &[("X-Mq-Method", "HEAD")],
+            b"",
+        );
+        let r = parse(&r.expect("HEAD finishes cleanly"));
+        assert_eq!((r.status, r.header("content-length")), (200, Some("0")));
+        assert!(r.body.is_empty());
+        let r = parse(
+            &fetch(&p, &format!("http://{}/n-{tag}", nm.addr), &[], b"")
+                .expect("304 finishes cleanly"),
+        );
+        assert_eq!((r.status, r.header("content-length")), (304, Some("100")));
+        assert!(r.body.is_empty());
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
+
+// SP4 spec §5: an origin answering with about 30 KiB of headers (five 6 KiB values, under
+// `SECTION_MAX`) is relayed to the local caller; the fetch request itself stays small.
+matrix!(
+    fetch_30k_response_head_relayed,
+    |cells: (Backend, Backend), tag: &str| {
+        let value = "v".repeat(6 * 1024);
+        let mut reply = String::from("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n");
+        for i in 0..5 {
+            reply += &format!("x-big-{i}: {value}\r\n");
+        }
+        reply += "\r\nok";
         let proto = Proto::RawH1 {
             tls: false,
-            reply: reply.to_vec(),
+            reply: reply.into_bytes(),
         };
-        OriginServer::spawn(OriginServerMode::new(proto, Handler::Echo))
-    };
-    let head = raw(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n");
-    let nm = raw(b"HTTP/1.1 304 Not Modified\r\ncontent-length: 100\r\n\r\n");
-    let p = gateway();
-    wait_up(&p);
-    let r = fetch(
-        &p,
-        &format!("http://{}/h", head.addr),
-        &[("X-Mq-Method", "HEAD")],
-        b"",
-    );
-    let r = parse(&r.expect("HEAD finishes cleanly"));
-    assert_eq!((r.status, r.header("content-length")), (200, Some("0")));
-    assert!(r.body.is_empty());
-    let r = parse(
-        &fetch(&p, &format!("http://{}/n", nm.addr), &[], b"").expect("304 finishes cleanly"),
-    );
-    assert_eq!((r.status, r.header("content-length")), (304, Some("100")));
-    assert!(r.body.is_empty());
-    assert_eq!(p.join_both(), (0, 0));
-}
-
-/// SP4 spec §5: an origin answering with about 30 KiB of headers (five 6 KiB values, under
-/// `SECTION_MAX`) is relayed to the local caller; the fetch request itself stays small.
-#[test]
-fn fetch_30k_response_head_relayed() {
-    let value = "v".repeat(6 * 1024);
-    let mut reply = String::from("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n");
-    for i in 0..5 {
-        reply += &format!("x-big-{i}: {value}\r\n");
+        let origin = OriginServer::spawn(OriginServerMode::new(proto, Handler::Echo));
+        let p = gateway(cells);
+        wait_up(&p, tag);
+        let raw = fetch(&p, &format!("http://{}/big-{tag}", origin.addr), &[], b"");
+        let r = parse(&raw.expect("fetch"));
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
+        for i in 0..5 {
+            assert_eq!(r.header(&format!("x-big-{i}")), Some(value.as_str()), "{i}");
+        }
+        assert_eq!(p.join_both(), (0, 0));
     }
-    reply += "\r\nok";
-    let proto = Proto::RawH1 {
-        tls: false,
-        reply: reply.into_bytes(),
-    };
-    let origin = OriginServer::spawn(OriginServerMode::new(proto, Handler::Echo));
-    let p = gateway();
-    wait_up(&p);
-    let raw = fetch(&p, &format!("http://{}/big", origin.addr), &[], b"");
-    let r = parse(&raw.expect("fetch"));
-    assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
-    for i in 0..5 {
-        assert_eq!(r.header(&format!("x-big-{i}")), Some(value.as_str()), "{i}");
+);
+
+// spec §7.4, §10.3: `/a/../b` reaches the origin as `/b` (the query untouched).
+matrix!(
+    dot_segments_normalised_at_origin,
+    |cells: (Backend, Backend), tag: &str| {
+        let o = Capture::spawn();
+        let p = gateway(cells);
+        wait_up(&p, tag);
+        let url = o.url(&format!("/a/../b-{tag}?q=/../x"));
+        let r = parse(&fetch(&p, &url, &[], b"").expect("fetch"));
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
+        let head = o.one().head;
+        let want = format!("get /b-{tag}?q=/../x http/1.1\r\n");
+        assert!(head.starts_with(&want), "{head}");
+        assert_eq!(p.join_both(), (0, 0));
     }
-    assert_eq!(p.join_both(), (0, 0));
-}
+);
 
-/// spec §7.4, §10.3: `/a/../b` reaches the origin as `/b` (the query untouched).
-#[test]
-fn dot_segments_normalised_at_origin() {
-    let o = Capture::spawn();
-    let p = gateway();
-    wait_up(&p);
-    let r = parse(&fetch(&p, &o.url("/a/../b?q=/../x"), &[], b"").expect("fetch"));
-    assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
-    let head = o.one().head;
-    assert!(head.starts_with("get /b?q=/../x http/1.1\r\n"), "{head}");
-    assert_eq!(p.join_both(), (0, 0));
-}
-
-/// SP4 spec §5: an empty forwarded `x-test:` is sent, and an empty `accept:`
-/// is sent and suppresses the default `accept: */*`.
-#[test]
-fn empty_header_sent_empty_accept_suppresses_default() {
-    let o = Capture::spawn();
-    let p = gateway();
-    wait_up(&p);
-    let extra = [("X-Test", ""), ("Accept", ""), ("X-Kept", "yes")];
-    let r = parse(&fetch(&p, &o.url("/empty"), &extra, b"").expect("fetch"));
-    assert_eq!(r.status, 200);
-    let head = o.one().head;
-    assert!(head.contains("\r\nx-kept: yes\r\n"), "{head}");
-    assert!(head.contains("\r\nx-test:"), "{head}");
-    assert!(head.contains("\r\naccept:"), "{head}");
-    assert!(!head.contains("*/*"), "{head}");
-    assert_eq!(p.join_both(), (0, 0));
-}
-
-/// spec §7.2, §7.7, §10.3 (e2e case 13): an h1-forced request reuses the idle h1 conn a
-/// default request left in the pool — against an origin that serves one conn at a time, a
-/// second dial would hang until `curl:28`.
-#[test]
-fn h1_forced_reuses_idle_default_conn() {
-    let mode = OriginServerMode {
-        single_conn: true,
-        ..OriginServerMode::new(Proto::H1Tls, Handler::FileBytes(2))
-    };
-    let o = OriginServer::spawn(mode);
-    let mut cfg = server_cfg();
-    if let Some(g) = cfg.gateway.as_mut() {
-        g.origin_connect_timeout = Duration::from_secs(2);
+// SP4 spec §5: an empty forwarded `x-test:` is sent, and an empty `accept:`
+// is sent and suppresses the default `accept: */*`.
+matrix!(
+    empty_header_sent_empty_accept_suppresses_default,
+    |cells: (Backend, Backend), tag: &str| {
+        let o = Capture::spawn();
+        let p = gateway(cells);
+        wait_up(&p, tag);
+        let extra = [("X-Test", ""), ("Accept", ""), ("X-Kept", "yes")];
+        let r = parse(&fetch(&p, &o.url(&format!("/empty-{tag}")), &extra, b"").expect("fetch"));
+        assert_eq!(r.status, 200);
+        let head = o.one().head;
+        assert!(head.contains("\r\nx-kept: yes\r\n"), "{head}");
+        assert!(head.contains("\r\nx-test:"), "{head}");
+        assert!(head.contains("\r\naccept:"), "{head}");
+        assert!(!head.contains("*/*"), "{head}");
+        assert_eq!(p.join_both(), (0, 0));
     }
-    let p = gateway_with(cfg);
-    wait_up(&p);
-    let url = format!("https://127.0.0.1:{}/c13", o.addr.port());
-    let r = parse(&fetch(&p, &url, &[], b"").expect("default request"));
-    assert_eq!((r.status, r.body.len()), (200, 2));
-    let r = fetch(&p, &url, &[("X-Mq-Origin-Protocol", "h1")], b"");
-    let r = parse(&r.expect("h1-forced request"));
-    assert_eq!((r.status, r.body.len()), (200, 2));
-    assert_eq!(o.accepted(), 1);
-    assert_eq!(p.join_both(), (0, 0));
-}
+);
 
-/// spec §6.4, §10.3: an h2 origin declares `content-length: 100`, sends 50 bytes and then
-/// RST_STREAM(NO_ERROR): the server's body check resets the H3 response (pinned by its
-/// `mq.req`). The Rust client's local reply is an abort, or 502 `upstream-reset` when its
-/// xquic processes HEADERS and RESET_STREAM in one pass (the reset discards the unread
-/// head; `ClTooShort` leaves only 10 ms between them, too little on a slow CI).
-#[test]
-fn h2_cl_100_then_rst_resets_h3_end_to_end() {
-    let h = Handler::ClTooShort { cl: 100, send: 50 };
-    let o = OriginServer::spawn(OriginServerMode::new(Proto::H2Tls, h));
-    let p = gateway();
-    wait_up(&p);
-    let url = format!("https://127.0.0.1:{}/h2-short", o.addr.port());
-    let r = fetch(&p, &url, &[], b"");
-    let upstream_reset = b"HTTP/1.1 502 \r\nX-Mq-Error: upstream-reset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    assert!(
-        is_reset(&r) || matches!(&r, Ok(b) if b == upstream_reset),
-        "{:?}",
-        r.as_ref().map(|b| String::from_utf8_lossy(b).into_owned())
-    );
-    // The reset is the server's (its check), not only the client's own body check.
-    let line = wait_log(&["mq.req", "path=\"/h2-short\""]);
-    assert!(line.contains("reset=\"local reset\""), "{line}");
-    assert_eq!(p.join_both(), (0, 0));
-}
-
-/// spec §5.2, §6.2, §10.3: CONNECT is refused by the fetch listener (400 `bad-method`) and
-/// by the server intake (400 `bad-request`).
-#[test]
-fn connect_rejected_both_intakes() {
-    let p = gateway();
-    let r = fetch(
-        &p,
-        "http://127.0.0.1:1/",
-        &[("X-Mq-Method", "CONNECT")],
-        b"",
-    );
-    let want = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\nX-Mq-Error: bad-method\r\n\r\n";
-    assert_eq!(
-        String::from_utf8_lossy(&r.expect("reply")),
-        String::from_utf8_lossy(want)
-    );
-    let auth = bearer();
-    let s = script(
-        "CONNECT",
-        "127.0.0.1:1",
-        "/",
-        &[("x-mq-auth", &auth)],
-        Vec::new(),
-    );
-    let c = h3_client(p.server.udp_addr, s);
-    wait_h3(&c.handle, |r| r.fin);
-    {
-        let r = c.handle.lock();
-        assert_eq!(h3_header(&r, ":status").as_deref(), Some("400"));
-        assert_eq!(h3_header(&r, "x-mq-error").as_deref(), Some("bad-request"));
+// spec §7.2, §7.7, §10.3 (e2e case 13): an h1-forced request reuses the idle h1 conn a
+// default request left in the pool — against an origin that serves one conn at a time, a
+// second dial would hang until `curl:28`.
+matrix!(
+    h1_forced_reuses_idle_default_conn,
+    |cells: (Backend, Backend), tag: &str| {
+        let mode = OriginServerMode {
+            single_conn: true,
+            ..OriginServerMode::new(Proto::H1Tls, Handler::FileBytes(2))
+        };
+        let o = OriginServer::spawn(mode);
+        let mut cfg = server_cfg();
+        if let Some(g) = cfg.gateway.as_mut() {
+            g.origin_connect_timeout = Duration::from_secs(2);
+        }
+        let p = gateway_with(cfg, cells);
+        wait_up(&p, tag);
+        let url = format!("https://127.0.0.1:{}/c13-{tag}", o.addr.port());
+        let r = parse(&fetch(&p, &url, &[], b"").expect("default request"));
+        assert_eq!((r.status, r.body.len()), (200, 2));
+        let r = fetch(&p, &url, &[("X-Mq-Origin-Protocol", "h1")], b"");
+        let r = parse(&r.expect("h1-forced request"));
+        assert_eq!((r.status, r.body.len()), (200, 2));
+        assert_eq!(o.accepted(), 1);
+        assert_eq!(p.join_both(), (0, 0));
     }
-    stop(c);
-    assert_eq!(p.join_both(), (0, 0));
-}
+);
+
+// spec §6.4, §10.3: an h2 origin declares `content-length: 100`, sends 50 bytes and then
+// RST_STREAM(NO_ERROR): the server's body check resets the H3 response (pinned by its
+// `mq.req`). The Rust client's local reply is an abort, or 502 `upstream-reset` when its
+// xquic processes HEADERS and RESET_STREAM in one pass (the reset discards the unread
+// head; `ClTooShort` leaves only 10 ms between them, too little on a slow CI).
+matrix!(
+    h2_cl_100_then_rst_resets_h3_end_to_end,
+    |cells: (Backend, Backend), tag: &str| {
+        let h = Handler::ClTooShort { cl: 100, send: 50 };
+        let o = OriginServer::spawn(OriginServerMode::new(Proto::H2Tls, h));
+        let p = gateway(cells);
+        wait_up(&p, tag);
+        let url = format!("https://127.0.0.1:{}/h2-short-{tag}", o.addr.port());
+        let r = fetch(&p, &url, &[], b"");
+        let upstream_reset = b"HTTP/1.1 502 \r\nX-Mq-Error: upstream-reset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        assert!(
+            is_reset(&r) || matches!(&r, Ok(b) if b == upstream_reset),
+            "{:?}",
+            r.as_ref().map(|b| String::from_utf8_lossy(b).into_owned())
+        );
+        // The reset is the server's (its check), not only the client's own body check.
+        let line = wait_log(&["mq.req", &format!("path=\"/h2-short-{tag}\"")]);
+        assert!(line.contains("reset=\"local reset\""), "{line}");
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
+
+// spec §5.2, §6.2, §10.3: CONNECT is refused by the fetch listener (400 `bad-method`) and
+// by the server intake (400 `bad-request`). The direct-H3 CONNECT is the valid authority
+// form (RFC 9114 §4.4), so it reaches the gateway on both server backends (adoption spec
+// §6.2; the malformed form is a raw-peer case).
+matrix!(
+    connect_rejected_both_intakes,
+    |cells: (Backend, Backend), tag: &str| {
+        let p = gateway(cells);
+        let target = format!("http://127.0.0.1:1/connect-{tag}");
+        let r = fetch(&p, &target, &[("X-Mq-Method", "CONNECT")], b"");
+        let want = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\nX-Mq-Error: bad-method\r\n\r\n";
+        assert_eq!(
+            String::from_utf8_lossy(&r.expect("reply")),
+            String::from_utf8_lossy(want)
+        );
+        let auth = bearer();
+        let headers = [
+            (":method", "CONNECT"),
+            (":authority", "127.0.0.1:1"),
+            ("x-mq-auth", &auth),
+        ];
+        let s = H3Script {
+            headers: headers.map(|(n, v)| (n.into(), v.into())).to_vec(),
+            ..H3Script::default()
+        };
+        let c = h3_client(p.server.udp_addr, s, cells.0);
+        wait_h3(&c.handle, |r| r.fin);
+        {
+            let r = c.handle.lock();
+            assert_eq!(h3_header(&r, ":status").as_deref(), Some("400"));
+            assert_eq!(h3_header(&r, "x-mq-error").as_deref(), Some("bad-request"));
+        }
+        stop(c);
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
 
 // ---- direct H3 against the gateway server ----
 
-/// spec §3.7 (1), §6.3, Review Focus 3: a 4 MiB body sent after a 403 is drained, so the
-/// server's `recv_body_size` (`req_bytes`) reports the whole body.
-#[test]
-fn drain_after_403_counts_whole_body() {
-    let p = gateway();
-    let body_len = 4 * MIB;
-    let extra = [("x-mq-auth", "Bearer wrong")];
-    let s = script("POST", "127.0.0.1:1", "/drain", &extra, vec![7; body_len]);
-    let c = h3_client(p.server.udp_addr, s);
-    wait_h3(&c.handle, |r| !r.closed.is_empty());
-    {
-        let r = c.handle.lock();
-        assert_eq!(h3_header(&r, ":status").as_deref(), Some("403"));
-        assert_eq!(r.closed[0].0.stats.stream_err, 0, "{:?}", r.closed);
-        assert_eq!(r.closed[0].0.stats.send_body, body_len as u64);
+// spec §3.7 (1), §6.3, Review Focus 3: a 4 MiB body sent after a 403 is drained, so the
+// server's `recv_body_size` (`req_bytes`) reports the whole body.
+// A 403 line has `path="-"`, so the cell's marker is its body length.
+matrix!(
+    drain_after_403_counts_whole_body,
+    |cells: (Backend, Backend), tag: &str| {
+        let p = gateway(cells);
+        let cell = ["xx", "xw", "wx", "ww"].iter().position(|t| *t == tag);
+        let body_len = 4 * MIB + cell.unwrap();
+        let extra = [("x-mq-auth", "Bearer wrong")];
+        let path = format!("/drain-{tag}");
+        let s = script("POST", "127.0.0.1:1", &path, &extra, vec![7; body_len]);
+        let c = h3_client(p.server.udp_addr, s, cells.0);
+        wait_h3(&c.handle, |r| !r.closed.is_empty());
+        {
+            let r = c.handle.lock();
+            assert_eq!(h3_header(&r, ":status").as_deref(), Some("403"));
+            assert_eq!(r.closed[0].0.stats.stream_err, 0, "{:?}", r.closed);
+            assert_eq!(r.closed[0].0.stats.send_body, body_len as u64);
+        }
+        wait_log(&["mq.req", "status=403", &format!("req_bytes={body_len} ")]);
+        stop(c);
+        assert_eq!(p.join_both(), (0, 0));
     }
-    wait_log(&["mq.req", "status=403", &format!("req_bytes={body_len} ")]);
-    stop(c);
-    assert_eq!(p.join_both(), (0, 0));
-}
+);
 
-/// spec §6.2 step 8, §10.3: `content-length: 10` with FIN on HEADERS reaches the origin
-/// bodiless (no chunked framing, no positive length).
-#[test]
-fn direct_h3_cl_with_fin_on_headers_is_bodiless() {
-    let o = Capture::spawn();
-    let p = gateway();
-    let auth = bearer();
-    let extra = [("x-mq-auth", auth.as_str()), ("content-length", "10")];
-    let c = h3_client(
-        p.server.udp_addr,
-        script("POST", &o.authority(), "/fin", &extra, Vec::new()),
-    );
-    wait_h3(&c.handle, |r| r.fin);
-    assert_eq!(
-        h3_header(&c.handle.lock(), ":status").as_deref(),
-        Some("200")
-    );
-    let seen = o.one();
-    assert!(seen.complete && seen.body.is_empty(), "{seen:?}");
-    assert!(!seen.head.contains("transfer-encoding"), "{}", seen.head);
-    let cl = seen
-        .head
-        .lines()
-        .find_map(|l| l.strip_prefix("content-length:"));
-    assert!(cl.is_none_or(|v| v.trim() == "0"), "{}", seen.head);
-    stop(c);
-    assert_eq!(p.join_both(), (0, 0));
-}
+// spec §6.2 step 8, §10.3: `content-length: 10` with FIN on HEADERS reaches the origin
+// bodiless (no chunked framing, no positive length). adoption spec §5.3 (6): a `Wire` server
+// finds the mismatch in the read that delivers the HEADERS, so the gateway's intake read
+// fails (its line has `path="-"`, which no cell can match) and the origin sees nothing.
+matrix!(
+    direct_h3_cl_with_fin_on_headers_is_bodiless,
+    |cells: (Backend, Backend), tag: &str| {
+        let o = Capture::spawn();
+        let p = gateway(cells);
+        let auth = bearer();
+        let extra = [("x-mq-auth", auth.as_str()), ("content-length", "10")];
+        let path = format!("/fin-{tag}");
+        let s = script("POST", &o.authority(), &path, &extra, Vec::new());
+        let c = h3_client(p.server.udp_addr, s, cells.0);
+        if cells.1 == Backend::Wire {
+            wait_h3(&c.handle, |r| !r.closed.is_empty());
+            let stats = c.handle.lock().closed[0].0.stats.clone();
+            assert_ne!(stats.stream_err, 0, "{stats:?}");
+            stop(c);
+            assert_eq!(p.join_both(), (0, 0));
+            assert!(o.settled().is_empty(), "the origin saw a request");
+            return;
+        }
+        wait_h3(&c.handle, |r| r.fin);
+        assert_eq!(
+            h3_header(&c.handle.lock(), ":status").as_deref(),
+            Some("200")
+        );
+        let seen = o.one();
+        assert!(seen.complete && seen.body.is_empty(), "{seen:?}");
+        assert!(!seen.head.contains("transfer-encoding"), "{}", seen.head);
+        let cl = seen
+            .head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"));
+        assert!(cl.is_none_or(|v| v.trim() == "0"), "{}", seen.head);
+        stop(c);
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
 
-/// spec §7.4, §10.3: a GET with an unknown-length DATA body reaches an h1 origin chunked and
-/// complete.
-#[test]
-fn direct_h3_get_with_body_is_chunked_on_h1() {
-    let o = Capture::spawn();
-    let p = gateway();
-    let auth = bearer();
-    let extra = [("x-mq-auth", auth.as_str())];
-    let s = script(
-        "GET",
-        &o.authority(),
-        "/chunked",
-        &extra,
-        b"hello body".to_vec(),
-    );
-    let c = h3_client(p.server.udp_addr, s);
-    wait_h3(&c.handle, |r| r.fin);
-    assert_eq!(
-        h3_header(&c.handle.lock(), ":status").as_deref(),
-        Some("200")
-    );
-    let seen = o.one();
-    assert!(
-        seen.head.contains("\r\ntransfer-encoding: chunked\r\n"),
-        "{}",
-        seen.head
-    );
-    assert_eq!(dechunk(&seen.body).as_deref(), Some(&b"hello body"[..]));
-    stop(c);
-    assert_eq!(p.join_both(), (0, 0));
-}
+// spec §7.4, §10.3: a GET with an unknown-length DATA body reaches an h1 origin chunked and
+// complete.
+matrix!(
+    direct_h3_get_with_body_is_chunked_on_h1,
+    |cells: (Backend, Backend), tag: &str| {
+        let o = Capture::spawn();
+        let p = gateway(cells);
+        let auth = bearer();
+        let extra = [("x-mq-auth", auth.as_str())];
+        let path = format!("/chunked-{tag}");
+        let s = script("GET", &o.authority(), &path, &extra, b"hello body".to_vec());
+        let c = h3_client(p.server.udp_addr, s, cells.0);
+        wait_h3(&c.handle, |r| r.fin);
+        assert_eq!(
+            h3_header(&c.handle.lock(), ":status").as_deref(),
+            Some("200")
+        );
+        let seen = o.one();
+        assert!(
+            seen.head.contains("\r\ntransfer-encoding: chunked\r\n"),
+            "{}",
+            seen.head
+        );
+        assert_eq!(dechunk(&seen.body).as_deref(), Some(&b"hello body"[..]));
+        stop(c);
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
 
 /// A direct-H3 upload the server must reset (§6.3): the client sees the reset, the server
-/// logs the request, and the origin never received a complete body.
-fn upload_reset(path: &str, cl: &str, body: Vec<u8>, truncate: bool) -> H3Handle {
+/// logs the request, and the origin never received a complete body. On a `Wire` server the
+/// reset is h3wire's (`H3_MESSAGE_ERROR`, adoption spec §5.3 (6)), and the gateway still logs
+/// it as `local reset`.
+fn upload_reset(
+    cells: (Backend, Backend),
+    path: &str,
+    cl: &str,
+    body: Vec<u8>,
+    truncate: bool,
+) -> H3Handle {
     let o = Capture::spawn();
-    let p = gateway();
+    let p = gateway(cells);
     let auth = bearer();
     let extra = [("x-mq-auth", auth.as_str()), ("content-length", cl)];
     let mut s = script("POST", &o.authority(), path, &extra, body);
     s.truncate_after_partial = truncate;
-    let c = h3_client(p.server.udp_addr, s);
+    let c = h3_client(p.server.udp_addr, s, cells.0);
     wait_h3(&c.handle, |r| !r.closed.is_empty());
     {
         let r = c.handle.lock();
@@ -779,17 +829,33 @@ fn upload_reset(path: &str, cl: &str, body: Vec<u8>, truncate: bool) -> H3Handle
     h
 }
 
-/// spec §6.3, §10.3: 50 bytes + FIN (a complete frame) under `content-length: 100`.
-#[test]
-fn direct_h3_short_request_body_resets() {
-    upload_reset("/short-req", "100", vec![1; 50], false);
-}
+// spec §6.3, §10.3: 50 bytes + FIN (a complete frame) under `content-length: 100`.
+matrix!(
+    direct_h3_short_request_body_resets,
+    |cells: (Backend, Backend), tag: &str| {
+        upload_reset(
+            cells,
+            &format!("/short-req-{tag}"),
+            "100",
+            vec![1; 50],
+            false,
+        );
+    }
+);
 
-/// spec §6.3, §10.3: 50 bytes under `content-length: 10`.
-#[test]
-fn direct_h3_excess_request_body_resets() {
-    upload_reset("/excess-req", "10", vec![1; 50], false);
-}
+// spec §6.3, §10.3: 50 bytes under `content-length: 10`.
+matrix!(
+    direct_h3_excess_request_body_resets,
+    |cells: (Backend, Backend), tag: &str| {
+        upload_reset(
+            cells,
+            &format!("/excess-req-{tag}"),
+            "10",
+            vec![1; 50],
+            false,
+        );
+    }
+);
 
 /// spec §3.7 (3), §6.3, Review Focus 5: the request's DATA frame is cut by FIN inside its
 /// declared length (`CUT_BODY` under `content-length: 33554432`, partial acceptance then
@@ -797,7 +863,7 @@ fn direct_h3_excess_request_body_resets() {
 #[test]
 fn direct_h3_request_body_cut_inside_frame_resets() {
     let cl = CUT_BODY.to_string();
-    let h = upload_reset("/cut-req", &cl, vec![2; CUT_BODY], true);
+    let h = upload_reset(XX, "/cut-req", &cl, vec![2; CUT_BODY], true);
     let accepted = h.lock().accepted.expect("partial acceptance");
     assert!(0 < accepted && accepted < CUT_BODY, "accepted {accepted}");
 }
@@ -807,7 +873,7 @@ fn direct_h3_request_body_cut_inside_frame_resets() {
 #[test]
 fn nul_in_auth_path_class_direct_h3() {
     let o = Capture::spawn();
-    let p = gateway();
+    let p = gateway(XX);
     let auth = bearer();
     let nul_auth = format!("{auth}\0junk");
     let a = o.authority();
@@ -838,7 +904,7 @@ fn nul_in_auth_path_class_direct_h3() {
         ),
     ];
     for (s, (status, xmq)) in cases {
-        let c = h3_client(p.server.udp_addr, s);
+        let c = h3_client(p.server.udp_addr, s, Backend::XqcH3);
         wait_h3(&c.handle, |r| r.fin);
         {
             let r = c.handle.lock();

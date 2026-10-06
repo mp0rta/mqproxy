@@ -124,6 +124,39 @@ pub enum Backend {
     Raw,
 }
 
+/// The differential matrix (adoption spec §6.2): `matrix!(name, |cells: (Backend, Backend),
+/// tag: &str| body)` runs `body` once per (client, server) backend cell, as the tests
+/// `name::{xx, xw, wx, ww}`; `tag` is the cell's name.
+#[macro_export]
+macro_rules! matrix {
+    ($name:ident, |$cells:ident: (Backend, Backend), $tag:ident: &str| $body:block $(,)?) => {
+        mod $name {
+            use super::*;
+            use $crate::loopback::Backend::{Wire, XqcH3};
+
+            fn body($cells: ($crate::loopback::Backend, $crate::loopback::Backend), $tag: &str)
+                $body
+
+            #[test]
+            fn xx() {
+                body((XqcH3, XqcH3), "xx")
+            }
+            #[test]
+            fn xw() {
+                body((XqcH3, Wire), "xw")
+            }
+            #[test]
+            fn wx() {
+                body((Wire, XqcH3), "wx")
+            }
+            #[test]
+            fn ww() {
+                body((Wire, Wire), "ww")
+            }
+        }
+    };
+}
+
 /// An H3 transport on backend `b` (adoption spec §6.2).
 pub fn h3_transport(role: Role, b: Backend) -> H3Wire<Transport> {
     match b {
