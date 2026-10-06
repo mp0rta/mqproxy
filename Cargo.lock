@@ -380,9 +380,8 @@ dependencies = [
 [[package]]
 name = "h3wire"
 version = "0.1.0"
-dependencies = [
- "proptest",
-]
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "418fdf23e027fd3730c875fcf148fe980c48273c43beeabc9003001372b78fb3"
 
 [[package]]
 name = "hashbrown"

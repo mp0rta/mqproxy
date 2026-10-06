@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-h3wire = { path = "../../third_party/h3wire/h3wire" }
+h3wire = "0.1"
 mq-transport-api = { path = "../mq-transport-api" }
 log = { workspace = true }
 

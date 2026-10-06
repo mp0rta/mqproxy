@@ -38,7 +38,7 @@ mq-linux = { path = "../mq-linux" }
 mq-wire = { path = "../mq-wire", optional = true }
 # The h3wire transport (loopback::h3_transport) and the raw-H3 peer's byte builders (raw_h3.rs).
 mq-h3 = { path = "../mq-h3", optional = true, features = ["test-support"] }
-h3wire = { path = "../../third_party/h3wire/h3wire", optional = true }
+h3wire = { version = "0.1", optional = true }
 log = { workspace = true, optional = true }
 mq-http = { path = "../mq-http", optional = true }
 # The real-origin harness (origin_server.rs): a hyper server on a tokio
