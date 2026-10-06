@@ -137,3 +137,23 @@ fn core_bytes_retried_on_bare_drive() {
     assert!(r.peer_events.contains(&h3wire::Event::PeerSettings));
     assert!(close_codes(&r).is_empty());
 }
+
+/// Raw-conn ops (tunnel streams, the UDP lane) and bare drives do not service an H3 conn
+/// whose h3wire state did not change (adoption spec §4.5 holds through the dirty set).
+#[cfg(feature = "test-support")]
+#[test]
+fn raw_ops_skip_clean_h3_conn() {
+    let mut r = Rig::server();
+    r.pump();
+    r.events();
+    let before = r.w.debug_services();
+    let raw = r.h.new_stream_id(); // a stream of some raw conn
+    assert_eq!(r.w.stream_send(r.now, raw, b"x", false), Ok(1));
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        r.w.stream_recv(r.now, raw, &mut buf),
+        Err(mq_transport_api::StreamError::Blocked)
+    );
+    r.w.drive(r.now);
+    assert_eq!(r.w.debug_services(), before, "a clean H3 conn was serviced");
+}

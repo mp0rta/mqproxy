@@ -1,23 +1,25 @@
 //! Outer event queue (adoption spec §4.1): level events coalesce, stale ones drop on pop.
 
-use mq_transport_api::Event;
-use std::collections::VecDeque;
+use mq_transport_api::{Event, SlotId};
+use std::collections::{HashSet, VecDeque};
+use std::mem::{Discriminant, discriminant};
 
 #[derive(Default)]
 pub(crate) struct OutQueue {
     q: VecDeque<Event>,
+    /// The level events in `q`, as flags (the bare transport's slot flags).
+    level: HashSet<(Discriminant<Event>, SlotId)>,
 }
 
-fn is_level(e: &Event) -> bool {
-    matches!(
-        e,
-        Event::StreamReadable(_)
-            | Event::StreamWritable(_)
-            | Event::DatagramReadable(_)
-            | Event::MpReady(_)
-            | Event::H3Readable(_)
-            | Event::H3Writable(_)
-    )
+/// A level event's flag: its kind and object.
+fn level(e: &Event) -> Option<(Discriminant<Event>, SlotId)> {
+    let slot = match *e {
+        Event::StreamReadable(s) | Event::StreamWritable(s) => s.slot(),
+        Event::DatagramReadable(c) | Event::MpReady(c) => c.slot(),
+        Event::H3Readable(r) | Event::H3Writable(r) => r.slot(),
+        _ => return None,
+    };
+    Some((discriminant(e), slot))
 }
 
 /// Close events are the last word on an id and are never dropped (adoption spec §4.1).
@@ -34,8 +36,9 @@ fn is_close(e: &Event) -> bool {
 impl OutQueue {
     /// A level event already queued is not queued twice.
     pub(crate) fn push(&mut self, e: Event) {
-        // ponytail: linear scan; queues are short per drain. Index by object if profiling says so.
-        if is_level(&e) && self.q.contains(&e) {
+        if let Some(f) = level(&e)
+            && !self.level.insert(f)
+        {
             return;
         }
         self.q.push_back(e);
@@ -44,6 +47,9 @@ impl OutQueue {
     /// The next event that is a close event or that `live` accepts.
     pub(crate) fn pop(&mut self, live: impl Fn(&Event) -> bool) -> Option<Event> {
         while let Some(e) = self.q.pop_front() {
+            if let Some(f) = level(&e) {
+                self.level.remove(&f);
+            }
             if is_close(&e) || live(&e) {
                 return Some(e);
             }

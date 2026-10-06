@@ -18,7 +18,7 @@ use mq_transport_api::{
 };
 use queue::OutQueue;
 use req::Req;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 /// Bootstrap read size for a request stream (adoption spec §4.4).
@@ -32,6 +32,9 @@ pub struct H3Wire<T> {
     /// Request streams of H3 conns, by request id (adoption spec §4.3).
     reqs: HashMap<H3ReqId, Req>,
     conns: HashMap<ConnId, H3Conn>,
+    /// H3 conns whose h3wire state changed since their last `service`, or that still wait
+    /// on the transport (a pending FIN, a short core-bytes write): the only ones swept.
+    dirty: HashSet<ConnId>,
     /// Every stream of an H3 conn: its conn and quic id.
     streams: HashMap<StreamId, (ConnId, h3wire::StreamId)>,
     /// A `NewConn` was seen: the inner transport is a server. ponytail: learned, not
@@ -40,6 +43,9 @@ pub struct H3Wire<T> {
     /// The largest `h3_recv_body` buf so far: the carry bound (adoption spec §5.4).
     #[cfg(feature = "test-support")]
     max_buf: usize,
+    /// `service` runs so far.
+    #[cfg(feature = "test-support")]
+    services: u64,
 }
 
 impl<T: TransportOps> H3Wire<T> {
@@ -60,10 +66,13 @@ impl<T: TransportOps> H3Wire<T> {
             queue: OutQueue::default(),
             reqs: HashMap::new(),
             conns: HashMap::new(),
+            dirty: HashSet::new(),
             streams: HashMap::new(),
             server: false,
             #[cfg(feature = "test-support")]
             max_buf: 0,
+            #[cfg(feature = "test-support")]
+            services: 0,
         }
     }
 
@@ -79,6 +88,13 @@ impl<T: TransportOps> H3Wire<T> {
         self.inner
     }
 
+    /// Request `r`'s h3wire state may change: its conn is swept next (adoption spec §4.5).
+    fn touch(&mut self, r: H3ReqId) {
+        if let Some(q) = self.reqs.get(&r) {
+            self.dirty.insert(q.conn);
+        }
+    }
+
     /// The h3wire abort of request `r` (code, source), if it was aborted.
     #[cfg(feature = "test-support")]
     pub fn debug_abort(&self, r: H3ReqId) -> Option<(h3wire::H3Code, h3wire::AbortSource)> {
@@ -86,6 +102,12 @@ impl<T: TransportOps> H3Wire<T> {
             req::Terminal::Aborted { code, source } => Some((code, source)),
             req::Terminal::Finished => None,
         }
+    }
+
+    /// How many times `service` ran.
+    #[cfg(feature = "test-support")]
+    pub fn debug_services(&self) -> u64 {
+        self.services
     }
 
     /// Every request's carry <= max(BOOT_READ, largest buf passed so far), and every
@@ -100,17 +122,16 @@ impl<T: TransportOps> H3Wire<T> {
                 .all(|c| c.h3.debug_buffered_bytes() <= c.h3.debug_bound())
     }
 
-    /// Services every H3 conn, then moves the inner queue into ours, consuming what belongs
-    /// to H3 conns; runs at the end of every method that takes `now` (adoption spec §4.1).
+    /// Services the dirty H3 conns, then moves the inner queue into ours, consuming what
+    /// belongs to H3 conns; runs at the end of every method that takes `now` (adoption spec
+    /// §4.1).
     fn drive_inner(&mut self, now: Time) {
-        if self.active {
-            // Core bytes and actions after every call that takes `now` (adoption spec §4.5).
-            // Running first covers what this call changed; each event below services its
-            // own conn. ponytail: O(conns) per call; keep a dirty set if shards grow large.
-            let cs: Vec<ConnId> = self.conns.keys().copied().collect();
-            for c in cs {
-                self.service(now, c);
-            }
+        // Core bytes and actions after every call that takes `now` (adoption spec §4.5).
+        // Running first covers what this call changed; each event below services its own
+        // conn. A conn nothing touched has nothing to run, so only dirty ones are swept.
+        let cs: Vec<ConnId> = self.dirty.iter().copied().collect();
+        for c in cs {
+            self.service(now, c);
         }
         while let Some(e) = self.inner.poll_event() {
             let out = if self.active {
@@ -301,6 +322,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         fin: bool,
     ) -> Result<(), StreamError> {
         if self.active {
+            self.touch(r);
             return self.send_headers(now, r, hs, fin);
         }
         fwd!(self, now, self.inner.h3_send_headers(now, r, hs, fin))
@@ -314,6 +336,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         fin: bool,
     ) -> Result<usize, StreamError> {
         if self.active {
+            self.touch(r);
             return self.send_body(now, r, data, fin);
         }
         fwd!(self, now, self.inner.h3_send_body(now, r, data, fin))
@@ -321,6 +344,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
 
     fn h3_finish(&mut self, now: Time, r: H3ReqId) -> Result<(), StreamError> {
         if self.active {
+            self.touch(r);
             return self.finish(now, r);
         }
         fwd!(self, now, self.inner.h3_finish(now, r))
@@ -333,6 +357,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
         each: &mut dyn FnMut(&[u8], &[u8]),
     ) -> Result<bool, StreamError> {
         if self.active {
+            self.touch(r);
             return self.recv_headers(now, r, each);
         }
         fwd!(self, now, self.inner.h3_recv_headers(now, r, each))
@@ -349,6 +374,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
             self.max_buf = self.max_buf.max(buf.len());
         }
         if self.active {
+            self.touch(r);
             return self.recv_body(now, r, buf);
         }
         fwd!(self, now, self.inner.h3_recv_body(now, r, buf))
@@ -356,6 +382,7 @@ impl<T: TransportOps> TransportOps for H3Wire<T> {
 
     fn h3_reset(&mut self, now: Time, r: H3ReqId) {
         if self.active {
+            self.touch(r);
             return self.reset(now, r);
         }
         fwd!(self, now, self.inner.h3_reset(now, r))

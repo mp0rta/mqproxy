@@ -319,12 +319,21 @@ impl<T: TransportOps> H3Wire<T> {
     }
 
     /// Executes `c`'s actions and writes its core bytes; runs whenever `c`'s h3wire state
-    /// may have changed, so also after every call that takes `now`.
+    /// may have changed, and after every call that takes `now` while `c` is dirty.
     pub(crate) fn service(&mut self, now: Time, c: ConnId) {
+        #[cfg(feature = "test-support")]
+        {
+            self.services += 1;
+        }
         self.retry_fins(now, c);
         self.run_actions(now, c);
-        self.flush(now, c);
+        let short = self.flush(now, c);
         self.run_actions(now, c); // `sent` may queue FinishStream
+        // Clean once nothing waits on the transport: no pending FIN, no short write.
+        match self.conns.get(&c) {
+            Some(conn) if short || !conn.fins.is_empty() => self.dirty.insert(c),
+            _ => self.dirty.remove(&c),
+        };
     }
 
     /// Pending FINs (adoption spec §4.5): kept while `Blocked`, dropped on any other
@@ -417,8 +426,9 @@ impl<T: TransportOps> H3Wire<T> {
 
     /// Writes core bytes per stream until the transport accepts less than offered. A
     /// request stream that drains fires its finish latch and wakes a gateway that was
-    /// `Blocked` behind them (adoption spec §4.5).
-    fn flush(&mut self, now: Time, c: ConnId) {
+    /// `Blocked` behind them (adoption spec §4.5). Returns whether a write was short or
+    /// `Blocked`: bytes wait on the transport.
+    fn flush(&mut self, now: Time, c: ConnId) -> bool {
         let Self {
             conns,
             reqs,
@@ -427,11 +437,12 @@ impl<T: TransportOps> H3Wire<T> {
             ..
         } = self;
         let Some(conn) = conns.get_mut(&c) else {
-            return;
+            return false;
         };
         if conn.closing {
-            return;
+            return false;
         }
+        let mut short = false;
         for q in conn.h3.sendable().collect::<Vec<_>>() {
             let Some(&s) = conn.mq.get(&q.0) else {
                 continue;
@@ -439,8 +450,13 @@ impl<T: TransportOps> H3Wire<T> {
             let mut req = reqs.get_mut(&req_id(s)).filter(|_| q.is_request());
             while let Some(bytes) = conn.h3.poll_send(q).filter(|b| !b.is_empty()) {
                 let len = bytes.len();
-                let Ok(n) = inner.stream_send(now, s, bytes, false) else {
-                    break;
+                // Another error is final for the stream: no retry owed.
+                let n = match inner.stream_send(now, s, bytes, false) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        short |= e == StreamError::Blocked;
+                        break;
+                    }
                 };
                 if let Some(req) = req.as_mut().filter(|_| n > 0) {
                     req.headers_sent_at.get_or_insert(now);
@@ -448,6 +464,7 @@ impl<T: TransportOps> H3Wire<T> {
                 let sent = conn.h3.sent(q, n);
                 debug_assert!(sent.is_ok(), "sent({q:?}, {n}): {sent:?}");
                 if n < len {
+                    short = true;
                     break;
                 }
             }
@@ -458,6 +475,7 @@ impl<T: TransportOps> H3Wire<T> {
                 }
             }
         }
+        short
     }
 }
 
