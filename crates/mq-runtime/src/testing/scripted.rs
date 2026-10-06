@@ -288,6 +288,10 @@ impl ScriptedHandle {
     pub fn expect_stream_recv(&self, s: StreamId, r: Result<(Vec<u8>, bool), StreamError>) {
         self.st().recv.entry(s).or_default().push_back(r);
     }
+    /// Scripted `stream_recv` results on `s` not yet fully returned.
+    pub fn recv_pending(&self, s: StreamId) -> usize {
+        self.st().recv.get(&s).map_or(0, VecDeque::len)
+    }
     pub fn expect_add_path(&self, r: Result<PathId, PathError>) {
         self.st().add_path.push_back(r);
     }
