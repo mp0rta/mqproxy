@@ -567,6 +567,12 @@ const FRAME_ERROR: CloseReason = CloseReason {
     code: 0x106,
 };
 
+/// adoption spec §5.3 (3).
+const EXCESSIVE_LOAD: CloseReason = CloseReason {
+    err_type: ErrType::Application,
+    code: 0x107,
+};
+
 // spec §3.7 (3), §5.4, Review Focus 5: the response's DATA frame is cut by FIN inside its
 // declared length; the local fetch socket is reset in both cells. An xqc_h3 client reads the
 // cut as a clean EOF and its body check (or the `H3Closed.unread` path) resets; h3wire closes
@@ -1087,6 +1093,11 @@ fn raw_headers(fields: &[(&str, &str)]) -> Vec<u8> {
 fn assert_message_error(c: &DriverThread<RawH3Handle>, marker: &str) {
     wait_until("the peer's reset", || !c.handle.lock().resets.is_empty());
     assert_eq!(c.handle.lock().resets[0].1, 0x10e, "{:?}", c.handle.lock());
+    assert_no_req(marker);
+}
+
+/// No `mq.req` line carries `marker` for 500 ms.
+fn assert_no_req(marker: &str) {
     let end = Instant::now() + Duration::from_millis(500);
     while Instant::now() < end {
         let lines = log_tap::lines();
@@ -1238,3 +1249,90 @@ receivers!(connect_malformed_direct_h3, |b: Backend, tag: &str| {
     stop(c);
     assert_eq!(p.join_both(), (0, 0));
 });
+
+// adoption spec §5.3 (3): a request HEADERS frame over 64 KiB encoded (`~` has no Huffman
+// gain, so ten 7000-byte values stay raw). h3wire closes the connection with
+// `H3_EXCESSIVE_LOAD` at the frame header. xqc_h3 limits the decoded size instead and resets
+// the stream with `H3_MESSAGE_ERROR`, keeping the connection. Neither reaches the gateway.
+receivers!(
+    direct_h3_oversize_headers_rejected,
+    |b: Backend, tag: &str| {
+        let p = gateway((Backend::XqcH3, b));
+        let (auth, path, pad) = (bearer(), format!("/big-req-{tag}"), "~".repeat(7000));
+        let names: Vec<String> = (0..10).map(|i| format!("x-pad-{i}")).collect();
+        let mut fs = vec![
+            (":method", "GET"),
+            (":scheme", "http"),
+            (":authority", "127.0.0.1:1"),
+            (":path", path.as_str()),
+            ("x-mq-auth", auth.as_str()),
+        ];
+        fs.extend(names.iter().map(|n| (n.as_str(), pad.as_str())));
+        let stream = raw_headers(&fs);
+        assert!(stream.len() > 64 * 1024, "{}", stream.len());
+        let c = raw_client(p.server.udp_addr, stream);
+        if b == Backend::Wire {
+            wait_until("the peer's ConnClosed", || {
+                !c.handle.lock().closed.is_empty()
+            });
+            assert_eq!(c.handle.lock().closed, [EXCESSIVE_LOAD]);
+            assert!(c.handle.lock().resets.is_empty(), "{:?}", c.handle.lock());
+        } else {
+            wait_until("the peer's reset", || !c.handle.lock().resets.is_empty());
+            assert_eq!(c.handle.lock().resets[0].1, 0x10e, "{:?}", c.handle.lock());
+            assert!(c.handle.lock().closed.is_empty(), "{:?}", c.handle.lock());
+        }
+        assert_no_req(&format!("path=\"{path}\""));
+        stop(c);
+        assert_eq!(p.join_both(), (0, 0));
+    }
+);
+
+// adoption spec §5.3 (2), server: a request stream that ends without HEADERS. h3wire resets it
+// with `H3_REQUEST_INCOMPLETE`; xqc_h3 drops it with no reset and no close (none within
+// 500 ms).
+receivers!(direct_h3_fin_without_headers, |b: Backend, _tag: &str| {
+    let p = gateway((Backend::XqcH3, b));
+    let c = raw_client(p.server.udp_addr, Vec::new());
+    if b == Backend::Wire {
+        wait_until("the peer's reset", || !c.handle.lock().resets.is_empty());
+        assert_eq!(c.handle.lock().resets[0].1, 0x10d, "{:?}", c.handle.lock());
+    } else {
+        thread::sleep(Duration::from_millis(500));
+        assert!(c.handle.lock().resets.is_empty(), "{:?}", c.handle.lock());
+    }
+    assert!(c.handle.lock().closed.is_empty(), "{:?}", c.handle.lock());
+    stop(c);
+    assert_eq!(p.join_both(), (0, 0));
+});
+
+// adoption spec §5.3 (2), client: the response stream ends without a final response, after a
+// bare FIN or after a 103. h3wire aborts it with `H3_MESSAGE_ERROR`, which the fetch client
+// answers with 502 `upstream-reset`. xqc_h3 does the same after the bare FIN, but takes the
+// 103 for the final response and relays it with an empty body (RFC 9114 §4.1 makes it
+// interim).
+receivers!(
+    fetch_response_without_final_fails,
+    |b: Backend, tag: &str| {
+        let reset = "HTTP/1.1 502 \r\nX-Mq-Error: upstream-reset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let relayed_103 =
+            "HTTP/1.1 103 \r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n";
+        for (i, stream) in [Vec::new(), headers_frame(&[(b":status", b"103")])]
+            .into_iter()
+            .enumerate()
+        {
+            let (app, _) = RawH3Peer::server(RawH3Script { stream, fin: true });
+            let cells = (b, Backend::Raw);
+            let p = LoopbackProxy::spawn_gateway_against_on(ClientConfig::default(), app, cells);
+            let target = format!("http://x/no-final-{i}-{tag}");
+            let r = fetch_when_up(p.fetch_addr(), &auth(&target, "any")).expect("a reply");
+            let want = if b == Backend::XqcH3 && i == 1 {
+                relayed_103
+            } else {
+                reset
+            };
+            assert_eq!(String::from_utf8_lossy(&r), want, "case {i}");
+            assert_eq!(p.join_both(), (0, 0));
+        }
+    }
+);
