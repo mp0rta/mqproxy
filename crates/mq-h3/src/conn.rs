@@ -143,8 +143,10 @@ impl<T: TransportOps> H3Wire<T> {
                     }
                 }
                 Err(StreamError::Reset) => {
-                    // Reset, code pending (adoption spec §4.4): the code only matters on a
-                    // critical stream, which closes the conn whatever it is.
+                    // adoption spec §4.4: a deliberate uni-only shortcut. The code only matters
+                    // on a critical stream, which closes the conn whatever it is, so the reset
+                    // is passed now with REQUEST_CANCELLED. Request streams instead follow the
+                    // deferred "reset, code pending" rule (Task C3).
                     if conn.uni_done.insert(s) {
                         log_closed(conn.h3.stream_reset_received(q, H3Code::REQUEST_CANCELLED));
                     }

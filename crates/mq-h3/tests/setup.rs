@@ -121,3 +121,19 @@ fn raw_stream_events_of_h3_conns_are_consumed() {
     r.pump();
     assert_eq!(r.events(), [Event::NewConn(r.conn, ConnProto::H3)]);
 }
+
+/// A blocked core-bytes write is retried by any call that takes `now`, without a
+/// `StreamWritable` (adoption spec §4.5).
+#[test]
+fn core_bytes_retried_on_bare_drive() {
+    let mut r = Rig::server();
+    let ctrl = r.peer_stream(Q(3)); // w's control stream
+    r.limit(ctrl, Some(0));
+    r.w.drive(r.now);
+    assert!(r.h.sent_bytes(ctrl).is_empty());
+    r.w.drive(r.now);
+    assert!(!r.h.sent_bytes(ctrl).is_empty());
+    r.pump();
+    assert!(r.peer_events.contains(&h3wire::Event::PeerSettings));
+    assert!(close_codes(&r).is_empty());
+}

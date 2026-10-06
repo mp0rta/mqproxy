@@ -57,14 +57,14 @@ impl<T: TransportOps> H3Wire<T> {
                 }
                 // Direction guard (adoption spec §4.5): the transport ops do not check.
                 Action::ResetStream { stream: q, code } => {
-                    let ok = q.is_request() || conn.is_local(q);
+                    let ok = q.is_request() || (q.is_uni() && conn.is_local(q));
                     debug_assert!(ok, "ResetStream on a stream with no send side");
                     if let (true, Some(s)) = (ok, mq(q)) {
                         self.inner.stream_reset_send(now, s, code.0);
                     }
                 }
                 Action::StopSending { stream: q, code } => {
-                    let ok = q.is_request() || !conn.is_local(q);
+                    let ok = q.is_request() || (q.is_uni() && !conn.is_local(q));
                     debug_assert!(ok, "StopSending on a stream with no receive side");
                     if let (true, Some(s)) = (ok, mq(q)) {
                         self.inner.stream_stop_sending(now, s, code.0);

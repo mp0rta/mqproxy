@@ -67,9 +67,18 @@ impl<T: TransportOps> H3Wire<T> {
         self.inner
     }
 
-    /// Moves the inner queue into ours, consuming what belongs to H3 conns; runs at the end
-    /// of every method that takes `now` (adoption spec §4.1).
+    /// Services every H3 conn, then moves the inner queue into ours, consuming what belongs
+    /// to H3 conns; runs at the end of every method that takes `now` (adoption spec §4.1).
     fn drive_inner(&mut self, now: Time) {
+        if self.active {
+            // Core bytes and actions after every call that takes `now` (adoption spec §4.5).
+            // Running first covers what this call changed; each event below services its
+            // own conn. ponytail: O(conns) per call; keep a dirty set if shards grow large.
+            let cs: Vec<ConnId> = self.conns.keys().copied().collect();
+            for c in cs {
+                self.service(now, c);
+            }
+        }
         while let Some(e) = self.inner.poll_event() {
             let out = if self.active {
                 self.on_event(now, e)
