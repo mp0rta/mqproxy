@@ -48,7 +48,7 @@
 #   closely; see the NOTE comments for each uncertain step.
 #
 # TO VALIDATE AS ROOT (run this on a root-capable machine):
-#   sudo MQPROXY_BIN=/path/to/build/mqproxy \
+#   sudo MQPROXY_BIN=/path/to/target/release/mqproxy \
 #        MQPROXY_CERT=/path/to/tests/certs/test.crt \
 #        MQPROXY_KEY=/path/to/tests/certs/test.key \
 #        MQPROXY_ORIGIN_CERT=/path/to/tests/certs/origin.crt \
@@ -56,10 +56,8 @@
 #        MQPROXY_ORIGIN_CA=/path/to/tests/certs/origin-ca.crt \
 #        bash tests/integration/e2e_tproxy.sh
 #
-#   Or via ctest (registered with SKIP_RETURN_CODE 77):
-#   sudo ctest --test-dir build -R e2e_tproxy --output-on-failure
 #
-# ENV (passed by CMake; overridable):
+# ENV (overridable):
 #   MQPROXY_BIN              the `mqproxy` binary.
 #   MQPROXY_CERT/KEY         tunnel TLS cert/key (CN=mqproxy-test).
 #   MQPROXY_ORIGIN_CERT/KEY  origin TLS leaf cert/key (SAN=IP:127.0.0.1), served
@@ -73,7 +71,7 @@ note() { printf '%s\n' "e2e_tproxy: $*" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/build/mqproxy}"
+MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/target/release/mqproxy}"
 MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 ORIGIN_CERT="${MQPROXY_ORIGIN_CERT:-${REPO_ROOT}/tests/certs/origin.crt}"
@@ -95,7 +93,6 @@ PATH_B_IP="127.0.0.3"
 if [ "$(id -u)" -ne 0 ]; then
     note "SKIP: not root.  Transparent capture needs root for nft + IP_TRANSPARENT."
     note "  Run with: sudo $0"
-    note "  Or via ctest: sudo ctest --test-dir build -R e2e_tproxy --output-on-failure"
     exit "${SKIP}"
 fi
 
@@ -128,7 +125,7 @@ fi
 # ── binary + cert pre-flight (these are real errors, not skips) ──────────────
 if [ ! -x "${MQPROXY_BIN}" ]; then
     note "ERROR: mqproxy binary not found/executable: ${MQPROXY_BIN}"
-    note "  Build first (cmake --build build) or set MQPROXY_BIN."
+    note "  Build first (cargo build --release -p mqproxy --bins --examples) or set MQPROXY_BIN."
     exit 1
 fi
 if ! command -v python3 >/dev/null 2>&1; then
@@ -141,7 +138,7 @@ if ! python3 -c 'import ssl, http.server' 2>/dev/null; then
 fi
 for f in "${ORIGIN_CERT}" "${ORIGIN_KEY}" "${ORIGIN_CA}" "${MQPROXY_CERT}" "${MQPROXY_KEY}"; do
     if [ ! -f "${f}" ]; then
-        note "ERROR: cert/key missing: ${f} (CMake generates it; set MQPROXY_ORIGIN_CERT/KEY/CA)."
+        note "ERROR: cert/key missing: ${f} (restore tests/certs or set MQPROXY_ORIGIN_CERT/KEY/CA)."
         exit 1
     fi
 done

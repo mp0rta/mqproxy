@@ -98,15 +98,13 @@
 #   step. It SKIPs (exit 77) cleanly when prerequisites are absent.
 #
 # TO VALIDATE AS ROOT (run on a NET_ADMIN-capable machine / container):
-#   sudo MQPROXY_BIN=/path/to/build/mqproxy \
+#   sudo MQPROXY_BIN=/path/to/target/release/mqproxy \
 #        MQPROXY_CERT=/path/to/tests/certs/test.crt \
 #        MQPROXY_KEY=/path/to/tests/certs/test.key \
 #        MQ_MITM_CA_CRT=/path/to/tests/certs/mitm-ca.crt \
 #        MQ_MITM_CA_KEY=/path/to/tests/certs/mitm-ca.key \
 #        bash tests/integration/e2e_mitm_h2.sh
 #
-#   Or via ctest (registered with SKIP_RETURN_CODE 77):
-#   sudo ctest --test-dir build -R e2e_mitm_h2 --output-on-failure
 #
 #   Docker-no-sudo NET_ADMIN pattern (per project memory):
 #     docker run --rm --cap-add=NET_ADMIN -v "$PWD":"$PWD" -w "$PWD" \
@@ -115,7 +113,7 @@
 #         MQPROXY_BIN=... bash tests/integration/e2e_mitm_h2.sh'
 #     (NOTE the curl-CLI gotcha: libcurl-dev != the curl binary — install `curl`.)
 #
-# ENV (passed by CMake; overridable):
+# ENV (overridable):
 #   MQPROXY_BIN              the `mqproxy` binary (MUST be MITM-capable; the Rust
 #                            binary or, for interop, tests/integration/
 #                            mqproxy-interop-wrapper.sh).
@@ -132,7 +130,7 @@ note() { printf '%s\n' "e2e_mitm_h2: $*" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/build/mqproxy}"
+MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/target/release/mqproxy}"
 MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 MITM_CA_CRT="${MQ_MITM_CA_CRT:-${REPO_ROOT}/tests/certs/mitm-ca.crt}"
@@ -153,7 +151,6 @@ ORIGIN_PORT=""
 if [ "$(id -u)" -ne 0 ]; then
     note "SKIP: requires NET_ADMIN/root.  Transparent MITM capture needs root for nft."
     note "  Run with: sudo $0"
-    note "  Or via ctest: sudo ctest --test-dir build -R e2e_mitm_h2 --output-on-failure"
     exit "${SKIP}"
 fi
 
@@ -206,7 +203,7 @@ fi
 # ── binary + fixture pre-flight (real errors, not skips) ─────────────────────
 if [ ! -x "${MQPROXY_BIN}" ]; then
     note "ERROR: mqproxy binary not found/executable: ${MQPROXY_BIN}"
-    note "  Build first (cmake --build build) or set MQPROXY_BIN."
+    note "  Build first (cargo build --release -p mqproxy --bins --examples) or set MQPROXY_BIN."
     exit 1
 fi
 # MITM capability is gated at runtime, not here: the Rust binary always has it;
@@ -214,7 +211,7 @@ fi
 # ("--mitm unavailable"), which wait_mitm_ready below turns into a SKIP.
 for f in "${MITM_CA_CRT}" "${MITM_CA_KEY}" "${MQPROXY_CERT}" "${MQPROXY_KEY}"; do
     if [ ! -f "${f}" ]; then
-        note "ERROR: cert/key missing: ${f} (CMake generates the MITM CA; set MQ_MITM_CA_*)."
+        note "ERROR: cert/key missing: ${f} (run bash tests/certs/generate-mitm.sh or set MQ_MITM_CA_*)."
         exit 1
     fi
 done

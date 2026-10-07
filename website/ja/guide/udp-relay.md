@@ -25,11 +25,11 @@ UDP リレーは **同じ `--socks5` リスナー** 上で公開されます —
 
 ```bash
 # サーバー (UDP リレーはデフォルト ON。30 秒アイドルタイムアウトを表示)
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
   --udp-idle-timeout 30
 
 # クライアント — SOCKS5 リスナーが TCP と UDP の両方を処理
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --socks5 127.0.0.1:1080
 ```
@@ -38,5 +38,5 @@ UDP リレーは **同じ `--socks5` リスナー** 上で公開されます —
 
 ```bash
 # クライアントの SOCKS5 リスナー経由で UDP パケットをターゲットへリレー
-./build/udpsocks --proxy 127.0.0.1:1080 --target 8.8.8.8:53 --send 32 --count 1
+./target/release/examples/udpsocks --proxy 127.0.0.1:1080 --target 8.8.8.8:53 --send 32 --count 1
 ```

@@ -648,25 +648,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "mq-wire-difftest"
-version = "0.0.4"
-dependencies = [
- "cc",
- "mq-wire",
-]
-
-[[package]]
 name = "mqproxy"
 version = "0.0.4"
 dependencies = [
  "clap",
  "log",
+ "mio",
  "mq-h3",
  "mq-linux",
  "mq-proxy",
  "mq-runtime",
  "mq-transport",
  "mq-transport-api",
+ "mq-wire",
+ "signal-hook",
 ]
 
 [[package]]

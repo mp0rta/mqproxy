@@ -25,11 +25,11 @@ UDP relay is exposed on the **same `--socks5` listener** — any SOCKS5 client t
 
 ```bash
 # Server (UDP relay on by default; 30s idle timeout shown)
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
   --udp-idle-timeout 30
 
 # Client — the SOCKS5 listener handles both TCP and UDP
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --socks5 127.0.0.1:1080
 ```
@@ -38,5 +38,5 @@ UDP relay is exposed on the **same `--socks5` listener** — any SOCKS5 client t
 
 ```bash
 # Relay a UDP packet to a target through the client's SOCKS5 listener
-./build/udpsocks --proxy 127.0.0.1:1080 --target 8.8.8.8:53 --send 32 --count 1
+./target/release/examples/udpsocks --proxy 127.0.0.1:1080 --target 8.8.8.8:53 --send 32 --count 1
 ```

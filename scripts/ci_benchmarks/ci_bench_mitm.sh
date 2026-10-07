@@ -31,11 +31,11 @@
 #     Output: ci_bench_results/mitm_rust_vs_c_<timestamp>.json
 #
 # Usage: sudo bash scripts/ci_benchmarks/ci_bench_mitm.sh [path/to/mqproxy]
-#        sudo MQPROXY_BIN_C=build/mqproxy MQPROXY_BIN_RUST=target/release/mqproxy \
+#        sudo MQPROXY_BIN_C=/path/to/legacy/mqproxy MQPROXY_BIN_RUST=target/release/mqproxy \
 #            bash scripts/ci_benchmarks/ci_bench_mitm.sh
 #
 # Env:
-#   MQPROXY_BIN       path to mqproxy binary (default: build/mqproxy)
+#   MQPROXY_BIN       path to mqproxy binary (default: target/release/mqproxy)
 #   MQPROXY_BIN_C     the C binary in Rust-vs-C mode (default: MQPROXY_BIN)
 #   MQPROXY_BIN_RUST  the Rust binary; set to enable Rust-vs-C mode
 #   REPEAT            runs per cell in Rust-vs-C mode (default: 3)
@@ -49,7 +49,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 
-MQPROXY_BIN="${1:-${MQPROXY_BIN_C:-${MQPROXY_BIN:-${REPO_ROOT}/build/mqproxy}}}"
+MQPROXY_BIN="${1:-${MQPROXY_BIN_C:-${MQPROXY_BIN:-${REPO_ROOT}/target/release/mqproxy}}}"
 BIN_RUST="${MQPROXY_BIN_RUST:-}"
 MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"

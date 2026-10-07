@@ -26,11 +26,11 @@ The client exposes the TCP proxy through either (or both) of:
 ```bash
 # Server — listens for MPQUIC on UDP :4433. --cert/--key are required;
 # the repo ships a self-signed test cert under tests/certs for local use.
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
   --cert tests/certs/test.crt --key tests/certs/test.key
 
 # Client — connects to the server, exposes a local SOCKS5 listener on :1080.
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 \
   --token  secret123 \
   --socks5 127.0.0.1:1080
@@ -45,7 +45,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 Or expose an HTTP CONNECT ingress and use it as a proxy:
 
 ```bash
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --http-connect 127.0.0.1:3128
 
@@ -57,7 +57,7 @@ curl --proxy http://127.0.0.1:3128 https://example.com/
 Repeat `--path` to bind additional local IPs as MPQUIC paths; each TCP flow's stream is then aggregated across them:
 
 ```bash
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server <server-ip>:4433 --token secret123 \
   --socks5 127.0.0.1:1080 \
   --path 192.168.1.50 \

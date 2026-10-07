@@ -15,10 +15,10 @@ Transparent capture installs kernel firewall rules, so it needs root or `CAP_NET
 
 ```bash
 # Server — no change from the regular config.
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123
 
 # Client — transparent listener on :12443; self-installs nft rules (needs root).
-sudo ./build/mqproxy client \
+sudo ./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --tproxy 127.0.0.1:12443 \
   --setup-redirect
@@ -36,7 +36,7 @@ curl https://example.com/
 When the router stack already owns the firewall and policy-routing rules (any setup that places a `TPROXY` target in `PREROUTING` and marks the packets), leave `--setup-redirect` OFF and let mqproxy just provide the listener — match its `--tproxy-fwmark`/`--tproxy-table` to whatever the rules use:
 
 ```bash
-sudo ./build/mqproxy client \
+sudo ./target/release/mqproxy client \
   --server <server>:4433 --token secret123 \
   --tproxy 0.0.0.0:12443 \
   --tproxy-mode tproxy \

@@ -1117,3 +1117,20 @@ fn listen_addr_in_use_exits_1() {
         p.lines
     );
 }
+
+#[test]
+fn instance_label_is_optional_and_rejects_log_injection() {
+    for base in [SERVER, CLIENT] {
+        assert_eq!(parse(base, &[]).unwrap().instance_id, None);
+        assert_eq!(
+            parse(base, &["--instance-id", "edge-1.a_b"])
+                .unwrap()
+                .instance_id
+                .as_deref(),
+            Some("edge-1.a_b")
+        );
+        for bad in ["", "a b", "x\n[INFO] forged", "a=b", &"x".repeat(65)] {
+            assert!(parse(base, &["--instance-id", bad]).is_err());
+        }
+    }
+}

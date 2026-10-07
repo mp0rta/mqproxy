@@ -66,7 +66,7 @@ Application (curl / SDK)
   │  POST /_mqproxy/fetch  (X-Mq-Auth / X-Mq-Target / X-Mq-Method + raw body)
   ▼
 mqproxy-client ──────── HTTP/3 over MPQUIC (ALPN h3) ────────► mqproxy-server
-     1 HTTP request = 1 H3 request stream = 1 MPQUIC stream       │  libcurl (h2→h1,
+     1 HTTP request = 1 H3 request stream = 1 MPQUIC stream       │  hyper (h2→h1,
      spread across paths                                          │  TLS verify ON)
                                                                   ▼
                                                               Origin server
@@ -74,7 +74,7 @@ mqproxy-client ──────── HTTP/3 over MPQUIC (ALPN h3) ───�
 
 Instead of tunneling opaque bytes, the gateway **executes delegated HTTP requests**: the client validates `X-Mq-*` headers, maps the request onto a standard H3 request stream (QPACK, trailers and stream management come from the H3 stack — no custom HTTP framing on the wire), and the server authenticates each request (`X-Mq-Auth`, per-request), strips the `X-Mq-*` controls, and runs the request against the origin with full TLS verification. Errors map to HTTP statuses (DNS failure → 502, connect timeout → 504, bad token → 403, …) and responses carry an `X-Mq-Origin-Protocol` diagnostic header. Because each request is one MPQUIC stream, large downloads *and uploads* get within-stream multipath aggregation.
 
-Per-request `X-Mq-*` controls let a caller opt into gateway features without changing the API: `X-Mq-Origin-Protocol` pins the upstream HTTP version (`h1`/`h2`/`h3`), `X-Mq-Accept-Encoding` requests download compression, `X-Mq-Forward-Cookie` forwards the `Cookie` header upstream (otherwise withheld), and `X-Mq-Cache` opts the response into the in-memory origin cache (`--cache-max-bytes`). The server also pools and reuses origin connections across requests.
+Per-request `X-Mq-*` controls let a caller opt into gateway features without changing the API: `X-Mq-Origin-Protocol` pins the upstream HTTP version (`h1`/`h2`; `h3` is rejected), `X-Mq-Accept-Encoding` requests download compression, `X-Mq-Forward-Cookie` forwards the `Cookie` header upstream (otherwise withheld), and the legacy `X-Mq-Cache` control is ignored (the origin cache has been removed). The server also pools and reuses origin connections across requests.
 
 ### UDP Relay
 
@@ -93,35 +93,21 @@ UDP relay carries non-QUIC UDP traffic (DNS, NTP, game, VoIP, app-specific UDP) 
 
 ## Building from source
 
-**Requirements:** `cmake`, `make`, a C11 compiler, `git`, the `openssl` CLI (used at configure time to generate the bundled test certificates), `libevent`, `libcurl` dev headers (e.g. `libcurl4-openssl-dev` — the gateway's origin client), `libnghttp2` dev headers (`libnghttp2-dev` — HTTP/2 termination for the TLS MITM L7 path; the static binary additionally needs the bundled `libnghttp2.a`), and `golang` (BoringSSL's build needs Go). Network access is required on first build (BoringSSL is cloned).
-
-On Debian/Ubuntu:
-
-```bash
-sudo apt-get install -y build-essential cmake git openssl \
-  libevent-dev libcurl4-openssl-dev libnghttp2-dev golang-go
-```
-
-> Runtime packaging dependency: the dynamically-linked binary depends on the nghttp2 shared library (Debian/Ubuntu package `libnghttp2-14`). The `-DMQPROXY_STATIC_XQUIC=ON` packaging binary instead statically links `libnghttp2.a` and so carries no runtime nghttp2 dependency.
+Install Rust with rustup; `rust-toolchain.toml` pins the supported toolchain.
+Native dependencies are a C/C++ toolchain, CMake, Go and Git for the vendored
+xquic/BoringSSL build. Cargo builds and statically links them automatically.
 
 ```bash
-# 1. Clone with the xquic submodule
+sudo apt-get install -y build-essential cmake git golang-go
 git clone --recursive https://github.com/mp0rta/mqproxy.git
 cd mqproxy
-# (if you cloned without --recursive: git submodule update --init --recursive)
-
-# 2. Build the in-tree xquic (BoringSSL + xquic, with qlog enabled)
-#    Produces third_party/xquic/build/libxquic.so. Pins BoringSSL to a known commit.
-./scripts/build-xquic.sh
-
-# 3. Configure + build mqproxy against that xquic
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
-cmake --build build -j"$(nproc)"
-
-# The binary is at build/mqproxy
-./build/mqproxy --help
+git submodule update --init --recursive
+cargo build --release --locked -p mqproxy
+./target/release/mqproxy --help
 ```
+
+The application is Rust. HTTP/3 uses h3wire; origin HTTP/1.1 and HTTP/2 use
+hyper and rustls. xquic and its nested BoringSSL remain pinned submodules.
 
 ## Quick Start
 
@@ -130,11 +116,11 @@ Run a server and a client locally, then send TCP traffic through the client's SO
 ```bash
 # Server — listens for MPQUIC on UDP :4433. --cert/--key are required;
 # the repo ships a self-signed test cert under tests/certs for local use.
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
   --cert tests/certs/test.crt --key tests/certs/test.key
 
 # Client — connects to the server, exposes a local SOCKS5 listener on :1080.
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 \
   --token  secret123 \
   --socks5 127.0.0.1:1080
@@ -148,7 +134,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 **Multipath** — bind additional local IPs as MPQUIC paths (e.g. WiFi + LTE) by repeating `--path`; the stream is then aggregated across them:
 
 ```bash
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server <server-ip>:4433 --token secret123 \
   --socks5 127.0.0.1:1080 \
   --path 192.168.1.50 \
@@ -162,7 +148,7 @@ You can also expose an HTTP CONNECT ingress with `--http-connect <ip:port>` (use
 The gateway is enabled on the server by default. On the client, add `--gateway` (works with or without `--socks5`):
 
 ```bash
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --gateway 127.0.0.1:8080
 
@@ -188,11 +174,11 @@ UDP relay is exposed on the **same `--socks5` listener** — any SOCKS5 client t
 
 ```bash
 # Server (UDP relay on by default; 30s idle timeout shown)
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
   --udp-idle-timeout 30
 
 # Client — the SOCKS5 listener handles both TCP and UDP
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --socks5 127.0.0.1:1080
 ```
@@ -201,7 +187,7 @@ UDP relay is exposed on the **same `--socks5` listener** — any SOCKS5 client t
 
 ```bash
 # Relay a UDP packet to a target through the client's SOCKS5 listener
-./build/udpsocks --proxy 127.0.0.1:1080 --target 8.8.8.8:53 --send 32 --count 1
+./target/release/examples/udpsocks --proxy 127.0.0.1:1080 --target 8.8.8.8:53 --send 32 --count 1
 ```
 
 ### Transparent capture quick start
@@ -219,10 +205,10 @@ Two kernel capture mechanisms are supported:
 
 ```bash
 # Server — no change from the regular config.
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123
 
 # Client — transparent listener on :12443; self-installs nft rules (needs root).
-sudo ./build/mqproxy client \
+sudo ./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --tproxy 127.0.0.1:12443 \
   --setup-redirect
@@ -240,7 +226,7 @@ curl https://example.com/
 When the router stack already owns the firewall and policy-routing rules (any setup that places a `TPROXY` target in `PREROUTING` and marks the packets), leave `--setup-redirect` OFF and let mqproxy just provide the listener — match its `--tproxy-fwmark`/`--tproxy-table` to whatever the rules use:
 
 ```bash
-sudo ./build/mqproxy client \
+sudo ./target/release/mqproxy client \
   --server <server>:4433 --token secret123 \
   --tproxy 0.0.0.0:12443 \
   --tproxy-mode tproxy \
@@ -282,11 +268,11 @@ To limit the CA to your own domains, add a `nameConstraints` extension to the co
 
 ```bash
 # Server — unchanged; the gateway origin bridge does the origin fetch.
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
   --cert /etc/mqproxy/tls/server.pem --key /etc/mqproxy/tls/server.key
 
 # Client — transparent capture + MITM. Requires --tproxy and a signing CA.
-sudo ./build/mqproxy client \
+sudo ./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --tproxy 127.0.0.1:12443 --setup-redirect \
   --mitm \
@@ -359,7 +345,7 @@ mq.mitm conns=<live> streams=<open> mitm=<n> opaque_not_tls=<n> opaque_no_sni=<n
 - **Leaf certificates** are forged per SNI, live 24 hours, are signed by your CA and are cached in memory. The CA key stays in memory while mqproxy runs.
 - **HTTP/2 only.** Other protocols are relayed opaquely, not inspected.
 
-> **Known limitation — large downloads to slow devices.** The client's HTTP/3 receive side does not yet apply end-to-end back-pressure: xquic copies response data into client memory as it arrives and returns flow-control credit to the server immediately. If a browser (or the device it runs on) consumes a large download more slowly than the tunnel delivers it, the client buffers the difference in memory. The same applies to the gateway fetch ingress. The fix is tracked upstream ([alibaba/xquic#959](https://github.com/alibaba/xquic/issues/959), [PR #960](https://github.com/alibaba/xquic/pull/960)) and will be picked up when it lands. On memory-constrained routers, watch the client's memory during large downloads to slow clients, or add the affected hosts to the ignore list.
+> HTTP/3 uses h3wire over raw xquic streams. Receive credit follows consumption, with bounded adapter queues for slow consumers.
 
 ### Resilience: reconnect and keepalive
 
@@ -417,35 +403,28 @@ See [`server.conf.example`](server.conf.example) and [`client.conf.example`](cli
 
 ## Install from a `.deb`
 
-Prebuilt `amd64` and `arm64` packages are attached to each [GitHub Release](https://github.com/mp0rta/mqproxy/releases). The binary is self-contained (xquic + BoringSSL + nghttp2 statically linked), so it depends only on the system libevent/libcurl.
+Prebuilt `amd64` and `arm64` packages are attached to each [GitHub Release](https://github.com/mp0rta/mqproxy/releases). Rust packages statically link xquic, BoringSSL and the Rust dependencies. Their system runtime dependencies are recorded in the `.deb` metadata; libevent, libcurl and nghttp2 are no longer required.
 
 ```bash
 # pick the .deb for your architecture from the latest release
-sudo dpkg -i mqproxy_<version>_amd64.deb     # or _arm64.deb
+sudo apt install ./mqproxy_<version>_amd64.deb     # or _arm64.deb
 ```
 
 The package installs `/usr/bin/mqproxy`, the `mqproxy-server@` / `mqproxy-client@` systemd template units, and creates the unprivileged `mqproxy` user plus `/etc/mqproxy` (via the bundled `sysusers.d`/`tmpfiles.d`, applied in the package's `postinst`). Continue from the per-instance config steps in [Install as a systemd service](#install-as-a-systemd-service) below — the configure/enable steps are identical; only the build-from-source steps are skipped.
 
 ## Install as a systemd service
 
-mqproxy ships systemd template units so each instance runs as a hardened, unprivileged service. Build a self-contained binary (xquic + BoringSSL statically linked, so the installed binary has no non-standard runtime deps) and install it:
+mqproxy ships hardened, unprivileged systemd template units. Install a release
+package, or build a native package locally (amd64 or arm64):
 
 ```bash
-# -DMQPROXY_STATIC_XQUIC statically links xquic+BoringSSL; the install prefix is
-# baked into the unit ExecStart at *configure* time, so set it now (not at --install).
-cmake -S . -B build \
-      -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build" \
-      -DMQPROXY_STATIC_XQUIC=ON -DCMAKE_INSTALL_PREFIX=/usr
-cmake --build build --target mqproxy_cli -j
-sudo cmake --install build              # → /usr/bin/mqproxy, units, sysusers.d, tmpfiles.d
+sudo apt-get install -y dpkg-dev python3
+python3 packaging/build.py
+sudo apt install ./target/dist/mqproxy_*.deb
 ```
 
-Create the `mqproxy` system user and its directories (declared by the bundled `sysusers.d`/`tmpfiles.d`):
-
-```bash
-sudo systemd-sysusers
-sudo systemd-tmpfiles --create          # creates /etc/mqproxy (0750 mqproxy:mqproxy)
-```
+The build also creates a tar archive with the same `/usr` layout. `.deb`
+installation applies the bundled sysusers/tmpfiles rules automatically.
 
 Drop a per-instance config and lock it down (the service reads it as user `mqproxy`):
 
@@ -462,7 +441,7 @@ sudo systemctl enable --now mqproxy-server@edge1     # → /etc/mqproxy/edge1.co
 journalctl -u mqproxy-server@edge1 -f                # logs
 ```
 
-The client side uses `mqproxy-client@<name>` the same way (`/etc/mqproxy/<name>.conf`).
+The client side uses `mqproxy-client@<name>` the same way (`/etc/mqproxy/<name>.conf`). Instance names use 1–64 ASCII letters, digits, dots, underscores or dashes; units pass the name as `--instance-id`, which appends `instance_id=<name>` to logs. Use separate QLog directories when running multiple instances; the label does not change filenames.
 
 **Notes:**
 - **qlog:** to capture xquic qlog, set `[Log] QLog = /var/log/mqproxy` in the config. The unit's `LogsDirectory=` creates `/var/log/mqproxy`; `ProtectSystem=strict` blocks writing qlog anywhere else (except `PrivateTmp`). qlog stays off unless `QLog` is set.
@@ -476,6 +455,8 @@ Both binaries take a small set of **common flags** (connection, TLS, paths, metr
 The tables below are split: **common flags first**, then one block per mode. Within each mode, server- and client-side flags are listed separately.
 
 ### Common flags (all modes)
+
+`--instance-id <id>` optionally labels process logs (1–64 ASCII letters, digits, dots, underscores or dashes). It does not change protocol identity or qlog filenames.
 
 **Server** — `mqproxy server …`
 
@@ -532,7 +513,7 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 | `--no-gateway` | **Disables HTTP Gateway mode for this server** (it is enabled by default). The TCP-proxy core keeps running; only the gateway origin bridge is turned off, so a client's `--gateway` ingress has nothing to talk to. |
 | `--origin-ca <pem>` | Extra CA bundle for origin TLS verification (private CAs / tests); verification itself is always on |
 | `--request-metrics` | Emit one `mq.req` logfmt line per gateway request (method/status/target/ttfb/origin_protocol/cache/…). Opt-in; off by default. Independent of `--metrics-interval`. |
-| `--cache-max-bytes <N>` | In-memory origin response cache bounded to `N` bytes (`0` = off = default; e.g. `67108864` = 64 MiB). Opt-in per request via `X-Mq-Cache`. |
+| `--cache-max-bytes <N>` | Accepted with a warning and ignored; the origin response cache has been removed. |
 | `--masquerade` | Answer **unauthenticated** gateway requests with a bare `404` (no `X-Mq-*` headers), so probes/scanners see a generic HTTP/3 server instead of a fingerprintable `403 auth-failed`. Authenticated requests are unaffected. Gateway-only; off by default; recommended for internet-exposed servers. |
 
 **Client**
@@ -599,7 +580,11 @@ The tables below are split: **common flags first**, then one block per mode. Wit
 After building, run the bundled test suite:
 
 ```bash
-ctest --test-dir build --output-on-failure
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --release --locked -p mqproxy --bins --examples
+bash tests/test_cli_help.sh target/release/mqproxy
+bash tests/integration/e2e_udp.sh
 ```
 
 It covers wire framing, the relay/flow state machine, ingress parsing, the gateway request path, and the TLS MITM crypto core, alongside end-to-end scripts for multipath aggregation, the full gateway chain, UDP relay, and transparent capture. Tests that need root or `NET_ADMIN` (the multipath and transparent-capture end-to-end runs) skip automatically when run unprivileged.
@@ -612,7 +597,7 @@ Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts conf
 
 mqproxy uses a **trusted proxy** model: mqproxy-client, mqproxy-server, and the MPQUIC connection between them are trusted. In TCP Proxy Mode and Transparent Capture mode (without `--mitm`), application↔origin TLS is preserved end-to-end (mqproxy never sees plaintext — it relays raw TLS bytes opaquely). Applications with certificate pinning continue to work. The HTTP Request Execution Gateway is an explicit delegation model — the client delegates HTTP request execution to a trusted gateway that establishes (and always verifies) the origin TLS — not a transparent MITM. Gateway requests are authenticated individually (`X-Mq-Auth`, per-request); `Authorization` is reserved for the origin and forwarded, while `Cookie` and `X-Mq-*` never leave the gateway.
 
-**TLS MITM ingress** (`--mitm`, opt-in) is an **operator-controlled / consenting-endpoint** model for managed devices where the operator's CA is installed locally — a corporate-proxy or personal-VPN posture, not a transparent attack on third parties. The client forges per-host leaves from that CA, terminates the browser's TLS as HTTP/2, and maps each request onto the Gateway tunnel. Its trust assumptions: the **CA private key is the anchor** (an unencrypted PKCS#8 file owned by the running user, not group/other accessible, not a symlink; it stays in memory while mqproxy runs); a CA can be limited to your own domains with an X.509 `nameConstraints` extension; browser-supplied `X-Mq-*` headers are **always stripped** (never interpreted as controls — the client injects its own `x-mq-auth`); and the feature is **fail-closed** (misconfiguration is a startup error, never silent passthrough, with a bounded ClientHello read and header, stream and connection limits). Anything that is not positively an HTTP/2 TLS client for a valid host name is relayed opaquely and never inspected. Cert-pinned hosts can be excluded with `--ignore-host(s)`, which relays them opaquely so the origin's real certificate reaches the client. Known limitation: the client's HTTP/3 receive side buffers a large download in memory when the consuming device is slower than the tunnel, until an upstream xquic fix lands (see [TLS MITM mode](#tls-mitm-mode)).
+**TLS MITM ingress** (`--mitm`, opt-in) is an **operator-controlled / consenting-endpoint** model for managed devices where the operator's CA is installed locally — a corporate-proxy or personal-VPN posture, not a transparent attack on third parties. The client forges per-host leaves from that CA, terminates the browser's TLS as HTTP/2, and maps each request onto the Gateway tunnel. Its trust assumptions: the **CA private key is the anchor** (an unencrypted PKCS#8 file owned by the running user, not group/other accessible, not a symlink; it stays in memory while mqproxy runs); a CA can be limited to your own domains with an X.509 `nameConstraints` extension; browser-supplied `X-Mq-*` headers are **always stripped** (never interpreted as controls — the client injects its own `x-mq-auth`); and the feature is **fail-closed** (misconfiguration is a startup error, never silent passthrough, with a bounded ClientHello read and header, stream and connection limits). Anything that is not positively an HTTP/2 TLS client for a valid host name is relayed opaquely and never inspected. Cert-pinned hosts can be excluded with `--ignore-host(s)`, which relays them opaquely so the origin's real certificate reaches the client.
 
 ## License
 
@@ -628,4 +613,6 @@ Use of mqproxy is at your own risk. Users are solely responsible for validating 
 
 - [XQUIC](https://github.com/alibaba/xquic) (Alibaba) — the QUIC/MPQUIC transport, via the [mp0rta fork](https://github.com/mp0rta/xquic).
 - [BoringSSL](https://boringssl.googlesource.com/boringssl) — TLS backend.
-- [nghttp2](https://nghttp2.org/) — HTTP/2 framing for the C build's TLS MITM ingress (the Rust binary uses the `h2` crate and rustls).
+- [h3wire](https://crates.io/crates/h3wire) — HTTP/3 framing and QPACK.
+- [hyper](https://hyper.rs/), h2 and [rustls](https://rustls.dev/) — origin HTTP and MITM TLS/HTTP/2.
+- All bundled dependency licenses are included in release artifacts.

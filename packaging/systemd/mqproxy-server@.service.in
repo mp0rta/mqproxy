@@ -8,7 +8,7 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-ExecStart=@CMAKE_INSTALL_PREFIX@/bin/mqproxy server --config /etc/mqproxy/%i.conf
+ExecStart=/usr/bin/mqproxy server --config /etc/mqproxy/%i.conf --instance-id %i
 Restart=on-failure
 RestartSec=2
 

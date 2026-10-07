@@ -14,3 +14,8 @@ mq-h3 = { path = "../mq-h3" }
 mq-linux = { path = "../mq-linux" }
 clap = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+mq-wire = { path = "../mq-wire" }
+signal-hook = { workspace = true }
+mio = { workspace = true }

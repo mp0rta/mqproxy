@@ -1,35 +1,7 @@
 #!/usr/bin/env bash
-#
-# build-xquic.sh — build mqproxy's in-tree xquic submodule with qlog enabled.
-#
-# WHY THIS EXISTS:
-#   mqproxy currently links the xquic build that lives under the SIBLING mqvpn
-#   checkout (mqvpn/third_party/xquic/build). That coupling is a stopgap. The
-#   clean end-state is for mqproxy to build its OWN submodule
-#   (third_party/xquic, pinned to the same commit as mqvpn) so the two repos
-#   are decoupled. This script is that decoupling: it builds
-#   third_party/xquic into third_party/xquic/build/libxquic.so.
-#
-#   It mirrors mqvpn/build.sh's BoringSSL + xquic steps, with one critical
-#   addition: -DXQC_ENABLE_EVENT_LOG=ON.
-#
-# WHY -DXQC_ENABLE_EVENT_LOG=ON IS REQUIRED:
-#   The qlog-based milestone 1-B benchmark (tests/integration/e2e_multipath.sh)
-#   and the unit test `test_qlog_blocked` both assert on qlog EXTRA-importance
-#   events (frames_processed, xqc_parse_*_blocked_frame). Those events are only
-#   emitted when xquic is compiled with XQC_ENABLE_EVENT_LOG=ON. A stock xquic
-#   build will make those assertions vacuous (empty qlog) or fail outright.
-#   => Any xquic you point mqproxy at for those tests MUST have this flag on.
-#
-# USAGE:
-#   scripts/build-xquic.sh [--clean]
-#   Then configure mqproxy against the produced build:
-#     cmake -S . -B build \
-#       -DXQUIC_BUILD_DIR="$(pwd)/third_party/xquic/build"
-#
-# REQUIREMENTS: cmake, make, cc, git, time + network (submodule init on first
-#   run). Not run by CI automatically — it is the privileged/one-time bootstrap.
-#
+# Build the pinned xquic fork for its standalone CUnit suite and diagnostics.
+# The Rust application builds its own static xquic/BoringSSL through Cargo.
+# Requires cmake, make, C/C++, Go and git. Usage: scripts/build-xquic.sh [--clean]
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -118,6 +90,3 @@ make -C "$XQUIC_BUILD" -j"$NPROC"
 
 echo ""
 echo "Build complete: $XQUIC_BUILD/libxquic.so"
-echo "Configure mqproxy with:"
-echo "  cmake -S \"$REPO_ROOT\" -B \"$REPO_ROOT/build\" \\"
-echo "    -DXQUIC_BUILD_DIR=\"$XQUIC_BUILD\""

@@ -35,7 +35,7 @@ jobs:
         run: |
           apt-get install -y \
             cmake gcc g++ make \
-            libevent-dev libcurl4-openssl-dev libnghttp2-dev golang \
+            golang \
             iproute2 nftables curl python3 openssl sudo \
             iperf3 socat \
             python3-pip pipx \
@@ -43,59 +43,20 @@ jobs:
           pipx install awscli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Compute xquic SHA
-        id: xqsha
+      - name: Install Rust
         run: |
-          sha=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD:third_party/xquic)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
-      - name: Cache BoringSSL (gcc fPIC)
-        id: bssl-cache
-        uses: actions/cache@v5
-        with:
-          path: third_party/xquic/third_party/boringssl/build
-          key: bssl-0ce57bb-linux-v1
-
-      - name: Build BoringSSL (xquic submodule)
-        if: steps.bssl-cache.outputs.cache-hit != 'true'
-        run: |
-          cd third_party/xquic/third_party/boringssl
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
-          make -j"$(nproc)" ssl crypto
-
-      - name: Cache xquic (gcc Release, EVENT_LOG)
-        id: xquic-cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            third_party/xquic/build
-            third_party/xquic/include/xquic/xqc_configure.h
-          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-eventlog-bssl-0ce57bb-v3
-
-      - name: Build xquic
-        if: steps.xquic-cache.outputs.cache-hit != 'true'
-        run: |
-          cd third_party/xquic
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
-                -DXQC_ENABLE_EVENT_LOG=ON \
-                -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_UNLIMITED=ON \
-                -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON \
-                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
-          make -j"$(nproc)"
-
-      - name: Build mqproxy (Release)
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-                -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build"
-          cmake --build build -j"$(nproc)"
+          curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build mqproxy (Rust Release)
+        run: cargo build --release --locked -p mqproxy
+      - name: Generate MITM test certificates
+        run: bash tests/certs/generate-mitm.sh
 
       - name: TCP proxy benchmark
-        run: sudo bash scripts/ci_benchmarks/ci_bench_tcp_proxy.sh build/mqproxy
+        run: sudo bash scripts/ci_benchmarks/ci_bench_tcp_proxy.sh target/release/mqproxy
 
       - name: MITM H2 benchmark
-        run: sudo bash scripts/ci_benchmarks/ci_bench_mitm.sh build/mqproxy
+        run: sudo bash scripts/ci_benchmarks/ci_bench_mitm.sh target/release/mqproxy
 
       - name: Upload results
         if: always()

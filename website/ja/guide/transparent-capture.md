@@ -15,10 +15,10 @@
 
 ```bash
 # サーバー — 通常の設定から変更なし。
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123
 
 # クライアント — :12443 で透過リスナー。nft ルールを自己インストール (root が必要)。
-sudo ./build/mqproxy client \
+sudo ./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --tproxy 127.0.0.1:12443 \
   --setup-redirect
@@ -36,7 +36,7 @@ curl https://example.com/
 ルータスタックが既にファイアウォールとポリシールーティングのルールを所有している場合（`PREROUTING` に `TPROXY` ターゲットを置きパケットをマークする任意のセットアップ）、`--setup-redirect` を OFF のままにし、mqproxy にはリスナーの提供だけをさせます — その `--tproxy-fwmark`/`--tproxy-table` をルールが使う値に合わせてください。
 
 ```bash
-sudo ./build/mqproxy client \
+sudo ./target/release/mqproxy client \
   --server <server>:4433 --token secret123 \
   --tproxy 0.0.0.0:12443 \
   --tproxy-mode tproxy \
