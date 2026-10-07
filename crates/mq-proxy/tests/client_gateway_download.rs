@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §5.4: the fetch download (H3 → local TCP) — the rendered head,
 //! 16 KiB reads written raw or chunk-framed, `SendBufFull` backpressure, the
 //! malformed-head 502, and the abort paths (§5.5). The body check is the

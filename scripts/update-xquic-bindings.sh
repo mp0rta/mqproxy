@@ -11,5 +11,7 @@ bindgen crates/xquic-sys/wrapper.h -o crates/xquic-sys/src/bindings.rs \
   --allowlist-function 'xqc_.*' --allowlist-type 'xqc_.*' \
   --allowlist-var 'XQC_.*' --allowlist-var 'xqc_.*' \
   --blocklist-type 'sockaddr|socklen_t|iovec' \
+  --raw-line '// SPDX-License-Identifier: Apache-2.0' \
+  --raw-line '// Copyright (c) 2026 mp0rta and mqproxy contributors' \
   --raw-line 'use libc::{sockaddr, socklen_t, iovec};' \
   -- -I third_party/xquic/include

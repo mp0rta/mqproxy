@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Driver tests with the real `Server` (spec §8.1, §8.4, §6.3): the dial of a
 //! data stream's `CONNECT_TCP_REQUEST` through the production driver — its
 //! resolver, connect deadline and late answers — with the transport scripted.

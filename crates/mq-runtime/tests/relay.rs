@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §5.6: the flow relay, driven by `ScriptedTransport` on the QUIC side
 //! and `FakeTcp` (which applies commits the way the driver does) on the TCP side.
 //!

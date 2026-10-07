@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.8: the origin client's TLS configuration — ring only, roots
 //! from the native store or, with `--origin-ca`, from that PEM file **only**.
 

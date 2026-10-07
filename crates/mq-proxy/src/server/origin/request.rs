@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.4: the `http::Request` hyper sends, built at assignment time
 //! from the stored request in the conn's URI form.
 

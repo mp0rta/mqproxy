@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §4.6, §4.9: engine creation, threading rule, destroy-once, qlog.
 use mq_transport::{Error, Transport};
 use mq_transport_api::{CongestionControl, Role, Scheduler, Time, TransportConfig};

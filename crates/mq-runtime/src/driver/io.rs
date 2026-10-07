@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The `Io` trait (spec §5.3 "Loop core and `Io`"). Handles are opaque keys
 //! owned by the `Io` implementation.
 

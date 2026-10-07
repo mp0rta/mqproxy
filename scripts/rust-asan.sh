@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # Run the Rust tests under AddressSanitizer.
 # clang: the C side (xquic + BoringSSL) must link the same ASan runtime as Rust.
 # rust-src: -Zbuild-std rebuilds std with ASan (needs the nightly rust-src component).

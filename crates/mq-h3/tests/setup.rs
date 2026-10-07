@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! H3 connection setup over the `Rig` (adoption spec §4.2, §4.4, §4.5).
 
 mod common;

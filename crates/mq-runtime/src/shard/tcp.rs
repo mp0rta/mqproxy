@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The TCP socket table (spec §5.2, §5.4): app-owned sockets and relays.
 
 use super::{RELAY_BUF, Relay, ShardState, TCP_BUF};

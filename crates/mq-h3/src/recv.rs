@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Request receive: HEADERS bootstrap, header delivery, body pull and the request-stream
 //! transport events (adoption spec §4.3, §4.4).
 

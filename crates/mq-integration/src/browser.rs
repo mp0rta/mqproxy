@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `TestBrowser` (SP4 spec §11.3): a browser stand-in for the MITM pair tests. It speaks
 //! rustls (client) + `h2::client` on a tokio current_thread runtime, driven by the calling
 //! thread (`block_on`), over TCP to the proxy's `TRANSPARENT` listener only. TLS uses SNI

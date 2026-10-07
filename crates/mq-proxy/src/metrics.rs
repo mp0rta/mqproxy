@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.5: `mq.conn` / `mq.path` lines.
 
 use mq_transport_api::{ConnStats, PathStats};

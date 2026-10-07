@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Spec §8.1, §6.1: the real `Client`'s SOCKS5 and HTTP CONNECT listeners
 //! under the production driver; the test is the ingress client, and the
 //! scripted transport stands in for the server (AUTH answered by the rig,

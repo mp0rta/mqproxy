@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Shard-pair failure injection (spec §8.4, the "shard pair" rows; §6.3
 //! server streams and auth; §5.6 relay ends).
 #![forbid(unsafe_code)]

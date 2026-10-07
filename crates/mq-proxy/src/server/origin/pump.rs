@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.3–§7.5: the pump — TCP ↔ pipe ↔ rustls, hyper polled with
 //! the `Dirty` waker and `ShardExec`, the `PUMP_CAP` budget, EOF ordering —
 //! request assignment and send, and response delivery to `BridgeEvents`.

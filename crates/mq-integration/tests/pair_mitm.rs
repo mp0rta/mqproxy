@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §11.3: the MITM client and the gateway server on two production drivers over
 //! loopback UDP, real xquic, against real origins. The test thread plays the browser
 //! (`TestBrowser`: rustls + `h2::client`), connecting only to the client's `TRANSPARENT`

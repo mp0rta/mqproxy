@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `FakeIo`: an `Io` on virtual time with scripted sockets, resolutions and
 //! connects (spec §8.1 "Scripted"). Never sleeps: with `auto_advance` on, a
 //! `wait(Until(t))` with nothing pending moves the clock to `t`.

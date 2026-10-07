@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §10.3 (H3 pair, §3.7): the H3 test apps on two production drivers over loopback UDP,
 //! real xquic on both sides.
 #![forbid(unsafe_code)]

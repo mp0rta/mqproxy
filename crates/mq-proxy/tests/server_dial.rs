@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.3 "Data streams": the dial, its result, the response, the relay
 //! hand-off, and the app-owned stream rule (§5.4) while dialling and retiring.
 

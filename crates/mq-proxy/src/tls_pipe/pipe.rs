@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.1: the pipe between an origin socket and hyper. hyper's
 //! `Connection` owns its IO object, so the state is shared: `PipeIo` is
 //! hyper's end, `PipeHandle` (kept in `OriginConn`) the pump's.

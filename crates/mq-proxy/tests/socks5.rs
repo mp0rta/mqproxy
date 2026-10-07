@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.1: SOCKS5 ingress parser.
 
 use mq_proxy::ingress::{Progress, Socks5Parser, socks5_error_reply, socks5_success_reply};

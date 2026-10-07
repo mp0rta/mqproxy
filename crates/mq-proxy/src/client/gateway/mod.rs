@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §5: the client gateway — the fetch listener's requests, composed
 //! into `Client` (§5.8). SP4 spec §6: the fetch front (①) — H1 parse and
 //! render, the TCP side only; the H3 request goes through the exchange core.

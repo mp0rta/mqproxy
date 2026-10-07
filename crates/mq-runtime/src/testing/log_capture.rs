@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! A `log::Log` that appends formatted records to a thread-local buffer, so a
 //! test can assert the log lines its own thread produced (spec §8.1).
 

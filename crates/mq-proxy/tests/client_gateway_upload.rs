@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §5.3: the fetch upload (local TCP → H3) — 16 KiB chunks with the
 //! FIN on the last byte, H3 backpressure, the EOF rule, bytes beyond
 //! `Content-Length`, and the abort paths (§5.5).

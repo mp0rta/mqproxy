@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.4: the command line.
 //! `parse` turns argv into a fully resolved `Resolved` or an `Exit`.
 

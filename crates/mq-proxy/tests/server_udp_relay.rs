@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §7.2: the server's datagram paths — the auth gate, the pre-OPEN
 //! buffer and its flush, client → target with reassembly, target → client
 //! with the peer check and the fragment send policy, the idle timer, and

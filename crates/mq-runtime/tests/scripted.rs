@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §5.1, §8.1: `ScriptedTransport` scripts every `TransportOps` result.
 
 use mq_runtime::testing::{Call, ScriptedTransport};

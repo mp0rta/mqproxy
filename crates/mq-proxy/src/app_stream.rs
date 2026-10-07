@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §5.4 "App-owned streams": every `StreamReadable` on a stream the app holds
 //! is answered with `stream_recv`, in every phase, so xquic can retire a reset
 //! stream (§4.2). Shared by the client (§6.2) and the server (§6.3).

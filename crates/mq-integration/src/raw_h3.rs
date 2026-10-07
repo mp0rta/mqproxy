@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The raw-H3 peer (adoption spec §6.2): HTTP/3 as fixed bytes on raw streams, for the
 //! malformed input a compliant H3 send API cannot produce.
 

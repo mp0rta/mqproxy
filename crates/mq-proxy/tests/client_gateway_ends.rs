@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §5.5 the fetch request's ends (the finish write order with
 //! pending output, `H3Closed` after `ConnClosed`, abort), §5.9 shutdown,
 //! and §5.7 the metrics tick's two blocks. The stale readiness,

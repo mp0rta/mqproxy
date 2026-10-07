@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Per-request state (adoption spec §4.3).
 
 use crate::queue::OutQueue;

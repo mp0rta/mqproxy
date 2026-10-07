@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Single-path cases on the loopback harness (spec §8.1 "Loopback"): the real `Server` and `Client` on real transports,
 //! each on its own production driver thread, over loopback UDP. The test
 //! thread plays the origin (`TcpListener`) and the application (`TcpStream`

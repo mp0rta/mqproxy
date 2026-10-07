@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Lockstep fabric harness (spec §8.1 "Fabric"): one `Transport` per thread (spec §4.6). The
 //! test sends one command at a time and waits for the reply, so only one side runs at a time.
 //! Each command carries `now`; there is no shared clock. Path k sends from `local_addrs[k]`

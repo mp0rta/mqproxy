@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.2: the client — one tunnel connection with its control stream,
 //! ingress glue, data-stream opens, paths, reconnect, metrics and shutdown.
 //!

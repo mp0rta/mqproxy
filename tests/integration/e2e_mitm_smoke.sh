@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # Verify the Rust MITM TLS endpoint against openssl s_client over loopback.
 # Requires root + NET_ADMIN for nft REDIRECT; asserts h2 ALPN and a valid forged chain.
 # ENV (overridable):

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.3: the server — per connection a control stream (auth), then data
 //! streams that each carry one `CONNECT_TCP_REQUEST`, dial the origin and hand
 //! off to a relay. Every stream the app holds follows the app-owned stream

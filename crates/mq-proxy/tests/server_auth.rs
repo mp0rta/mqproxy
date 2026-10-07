@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.3 Auth: the control stream, the token compare, refusal, the auth
 //! deadline, and the streams that are reset before or without auth.
 

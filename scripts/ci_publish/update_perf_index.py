@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 """Read-modify-write the perf-data index.json on R2.
 
 Adds a new entry for newly produced JSON files, caps history to top 100 entries,

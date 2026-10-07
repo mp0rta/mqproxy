@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Outer event queue (adoption spec §4.1): level events coalesce, stale ones drop on pop.
 
 use mq_transport_api::{Event, SlotId};

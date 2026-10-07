@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! A one-way client→server stream transfer stepped from `Pair::pump_until`.
 
 use super::pair::{Pair, new_streams, read_all, send};

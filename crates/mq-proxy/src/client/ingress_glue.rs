@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.1: per accepted socket, feed the listener's parser from `tcp_rx`,
 //! write its replies with `tcp_write`, and turn read interest off once the
 //! request is complete (bytes behind it stay as the prebuffer).

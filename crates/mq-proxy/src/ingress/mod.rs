@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.1: ingress parsers (SOCKS5, HTTP CONNECT) and transparent capture.
 
 mod http_connect;

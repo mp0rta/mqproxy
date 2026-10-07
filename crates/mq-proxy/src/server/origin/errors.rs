@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.6: hyper errors → `curl:<n>`, status and `origin_tls`.
 
 use super::response::HeadError;

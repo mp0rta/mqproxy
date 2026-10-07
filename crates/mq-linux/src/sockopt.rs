@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Socket options and sockaddr conversion. spec §2.2.
 //!
 //! `original_dst` reads the pre-NAT destination of a REDIRECTed TCP flow;

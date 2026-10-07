@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! App timers (spec §5.2 `drive` step 1, §5.4 `set_timer`/`cancel_timer`).
 
 use super::{Shard, ShardState};

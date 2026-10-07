@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Driver tests (spec §8.1 "Driver"): the production driver over real
 //! loopback sockets with a `RecordingApp`.
 

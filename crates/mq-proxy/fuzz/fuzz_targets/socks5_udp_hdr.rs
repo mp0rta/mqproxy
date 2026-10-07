@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 #![no_main]
 //! spec §5: any accepted header rebuilds byte for byte and parses back to itself.
 use libfuzzer_sys::fuzz_target;

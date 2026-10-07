@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The app interface (spec §5.4) and the shard's request/result types (spec §5.2, §5.3).
 
 use crate::ids::{DialOpId, SocketOpId, TcpId, TimerId, UdpSocketId};

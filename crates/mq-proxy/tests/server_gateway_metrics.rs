@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §6.6: `mq.req` per request (formatted by `mq_http::metrics`),
 //! request ends, cancellation and shutdown on the composed server.
 

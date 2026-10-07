@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §10.3 (H3 pair, gateway items): the fetch client and the gateway server on two
 //! production drivers over loopback UDP, real xquic, against real origins. The test thread
 //! plays the local fetch caller (HTTP/1.1 over `std::net`) and, for the direct-H3 cases, an

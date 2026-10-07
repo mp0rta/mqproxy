@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Error types (spec §4.2). Plain enums; this crate has no dependencies.
 
 /// Stream operation failure (spec §4.2).

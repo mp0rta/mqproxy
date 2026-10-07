@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 """Exercise the benchmark's report gate without root, network or a running proxy."""
 from pathlib import Path
 import subprocess

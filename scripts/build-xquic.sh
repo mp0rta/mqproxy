@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # Build the pinned xquic fork for its standalone CUnit suite and diagnostics.
 # The Rust application builds its own static xquic/BoringSSL through Cargo.
 # Requires cmake, make, C/C++, Go and git. Usage: scripts/build-xquic.sh [--clean]

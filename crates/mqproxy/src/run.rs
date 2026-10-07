@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §5.3 "Setup", §6.4, §6.6: `run_server` / `run_client` build the
 //! transport, the driver and the shard, run the loop and return the exit status (1 for cert/bind/qlog/origin-TLS failures).
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The transport seam (spec §5.1): §4.2 minus `new`/`close`.
 //! Object-safe, so `Cx` can hold `&mut dyn TransportOps`.
 

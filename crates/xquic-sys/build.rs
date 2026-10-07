@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 // build.rs — spec §2.1: static build of xquic and its nested BoringSSL.
 use std::{
     env, fs,

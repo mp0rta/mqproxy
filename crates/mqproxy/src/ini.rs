@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.4: the INI scanner — `[Section]` headers,
 //! `Key = Value` lines, `#`/`;` comments, whitespace trimmed. Names are
 //! returned as written (the caller compares them case-insensitively).

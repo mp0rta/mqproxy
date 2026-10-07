@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Cross-safe layout check: bindgen struct sizes against the C compiler's `sizeof`.
 use core::mem::size_of;
 use xquic_sys::*;

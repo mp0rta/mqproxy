@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # Rust HTTP gateway benchmark: download/upload x P={1,4,16}, unshaped two paths.
 # Each cell must complete REPEAT positive-throughput runs with no failed transfers.
 # Reports throughput and bits per CPU-second. C comparison ended with SP5.

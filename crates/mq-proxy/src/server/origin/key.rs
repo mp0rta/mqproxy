@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.2 step 1: the bridge's own authority split (`http::uri::Authority`
 //! accepts `user@host` and answers `None` for `host:99999`), the request's
 //! acceptable protocols and its ALPN list.

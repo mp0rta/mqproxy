@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! H3 test apps (spec §10.3): an echo server with fault modes and a scripted client. Both run
 //! on a `DriverThread`, where an app can be neither commanded nor inspected, so their scripts
 //! are fixed at spawn and their observations come back through an `H3Handle`.

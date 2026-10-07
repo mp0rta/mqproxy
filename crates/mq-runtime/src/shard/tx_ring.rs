@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! An app-owned UDP socket's send ring (SP2 spec §4.1): one record per
 //! datagram, `dst || u16 len || bytes`, in a `RingBuf`.
 

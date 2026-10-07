@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §4.2, §4.8: at most 8192 stream slots per connection. A peer stream over the
 //! ceiling gets no slot and no event, and closes the connection with application error
 //! `0x1001`; the client's own `open_stream` refuses at the ceiling.

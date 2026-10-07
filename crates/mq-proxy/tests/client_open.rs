@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.2 "Open" and §5.4 app-owned streams: CONNECT_TCP on a data stream,
 //! the response phase, its failure paths and server-initiated streams.
 

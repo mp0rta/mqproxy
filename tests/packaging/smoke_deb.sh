@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # Run only on a disposable native systemd CI runner, as root.
 set -euo pipefail
 [[ $EUID == 0 ]] || { echo 'run as root on a disposable runner'; exit 1; }

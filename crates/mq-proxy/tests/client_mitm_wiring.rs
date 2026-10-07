@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §2.2 / §7.9 / §7.10: the MITM front inside `Client` — the shared
 //! H3 tunnel, routing by owner, the opaque hand-off to the raw tunnel, the
 //! `mq.mitm` line and shutdown.

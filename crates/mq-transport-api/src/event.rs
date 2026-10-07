@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Events and transmit view (spec §4.2).
 
 use crate::config::ConnProto;

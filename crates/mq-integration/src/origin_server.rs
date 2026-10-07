@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `OriginServer`: a real origin for the bridge tests (spec §10.3). The hyper
 //! modes run a hyper 1.10 **server** on a tokio current_thread runtime on a
 //! std thread (TLS through tokio-rustls); the raw modes are canned-bytes peers

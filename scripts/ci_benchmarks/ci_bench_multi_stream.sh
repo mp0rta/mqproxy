@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # ci_bench_multi_stream.sh — Weekly multi-stream sweep benchmark.
 #
 # Sources ci_bench_env.sh for netns topology.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §5: SOCKS5 UDP encapsulation header (RFC 1928 §7).
 
 use mq_proxy::udp::socks5udp::{Dst, build, parse, target_of};

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Driver tests with the real `Client` (spec §8.1, §8.4, §6.2): a SOCKS5
 //! request through the production driver, the scripted transport answering
 //! the open, then the relay.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The driver harness (spec §8.1 "Driver"): the production `Driver` on its
 //! own thread over a `ScriptedTransport` and a `RecordingApp`, real loopback
 //! sockets, and a resolver the test answers on command. `DriverThread` is

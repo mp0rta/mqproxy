@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! In-memory fabric tests (spec §8.1).
 use mq_transport_api::Time;
 use mq_transport_api::fabric::{Fabric, Packet, Rule};

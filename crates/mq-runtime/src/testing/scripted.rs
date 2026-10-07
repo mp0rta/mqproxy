@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `ScriptedTransport`: a `TransportOps` without xquic whose every result can
 //! be scripted (spec §5.1, §8.1).
 

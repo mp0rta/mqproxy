@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Client↔server cases on the shard pair (spec §8.1 "Shard pair"):
 //!
 //! | case | test | client side |

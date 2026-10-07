@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.4: the request body hyper polls. The gateway fills the shared
 //! `UploadBuf` from `h3_recv_body` (§6.3); hyper owns the `UploadBody`.
 

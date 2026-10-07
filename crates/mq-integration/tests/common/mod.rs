@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Rigs for the driver tests with the real apps (spec §8.1 "Driver", rerun
 //! with the real `Client`/`Server`): the production `Driver` on its own
 //! thread, a `ScriptedTransport` in polling mode (so events the test injects

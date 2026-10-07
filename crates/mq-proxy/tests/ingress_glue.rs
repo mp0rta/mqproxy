@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.1: the client's ingress glue — parsers fed from `tcp_rx`, replies via
 //! `tcp_write`, read interest off once complete, the 8 KiB cap and the 10 s deadline.
 

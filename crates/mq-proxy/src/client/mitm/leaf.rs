@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §7.2: per-SNI forged leaves and their rustls `ServerConfig`s.
 
 use super::ca::Ca;

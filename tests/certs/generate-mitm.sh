@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # Disposable test CA; never install it into a machine's trust store.
 set -euo pipefail
 cd "$(dirname "$0")"

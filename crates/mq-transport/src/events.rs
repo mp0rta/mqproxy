@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Coalescing event queue (spec §4.2 "Event coalescing").
 //!
 //! `StreamReadable`/`StreamWritable`/`MpReady`/`DatagramReadable` are

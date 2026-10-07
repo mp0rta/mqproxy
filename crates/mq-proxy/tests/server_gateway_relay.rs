@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §6.3–§6.5, §10.2 (server): the relay — upload H3 → origin,
 //! download origin → H3, the body checks — first with `BridgeEvents` driven
 //! directly through `gw_core_mut()`, then on the composed server against a

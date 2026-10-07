@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Harness for the client tests (spec §6.2): `Shard<ScriptedTransport, Client>`,
 //! driven by hand on the socket side as the driver would.
 #![allow(dead_code)]

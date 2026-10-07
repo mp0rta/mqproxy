@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! adoption spec §3 "Raw-H3 backend": ALPN `h3` over raw xquic streams.
 mod common;
 

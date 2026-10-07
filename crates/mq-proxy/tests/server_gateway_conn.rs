@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §6 intro, §6.7: H3 connections in the server's tables, composed
 //! with the gateway.
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §7.1: the server's UDP sessions — the OPEN's admission gates, the
 //! resolve, the app socket and the RESP; spec §7.2 the datagram paths, the
 //! pre-OPEN buffer, the idle timer and `end_session`.

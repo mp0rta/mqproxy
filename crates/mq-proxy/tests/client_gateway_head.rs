@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §5.2: the fetch request head — listener replies, the head deadline,
 //! the reject sequence, steps 9–10 (tunnel, open, send headers) and the hand-off
 //! to the upload.

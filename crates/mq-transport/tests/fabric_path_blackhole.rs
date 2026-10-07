@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! One path of two black-holed in both directions while the other keeps carrying traffic:
 //! xquic closes the dead path after the idle timeout (its path idle timer is the
 //! connection's), raises `PathRemoved`, the connection lives on, and a path added afresh

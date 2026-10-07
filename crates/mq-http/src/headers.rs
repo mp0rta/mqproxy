@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Gateway header rules (spec §2.3).
 
 use crate::h1::is_tchar;

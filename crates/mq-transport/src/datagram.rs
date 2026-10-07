@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! QUIC DATAGRAMs: send, mss and the per-connection receive ring (SP2 spec §3.1–§3.2).
 
 use crate::slots::ConnSlot;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Shard-allocated generational ids (spec §5.2 "Identities").
 //!
 //! Same shape as `mq_transport_api::ConnId`: `{ index, generation }` with a

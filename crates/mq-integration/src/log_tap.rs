@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! A process-global `log::Log`, for shards on other threads (`DriverThread`), where the
 //! thread-local `mq_runtime::testing::log_capture` cannot see them. Lines accumulate across
 //! the tests of one binary: each test filters by its own markers.

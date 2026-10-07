@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # Verify a staged Rust installation (also usable after dpkg-deb --extract).
 set -euo pipefail
 STAGE="${1:?staged installation root}"

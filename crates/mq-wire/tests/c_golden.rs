@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Frozen at SP5 from C/Rust differential comparisons on cd41d699.
 //! Every full row passed field, consumed-length and re-encode parity against C.
 //! Outside C's representable domain only acceptance is frozen (as in the old test).

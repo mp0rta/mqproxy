@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Two paths and their per-path addresses (spec §8.3), plus spec §4.2 "MpReady may repeat".
 mod common;
 

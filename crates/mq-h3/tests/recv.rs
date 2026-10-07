@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Request receive: HEADERS bootstrap, `h3_recv_headers`, body pull, carry and
 //! "reset, code pending" (adoption spec §4.3 "Start", §4.4, §5.3 (2), (3), (6)).
 

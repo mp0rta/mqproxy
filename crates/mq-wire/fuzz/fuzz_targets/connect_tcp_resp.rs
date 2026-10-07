@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use mq_wire::frames::ConnectTcpResp;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §8.4 (end): keepalive in virtual time — an idle tunnel with keepalive on survives
 //! past its idle timeout, and a peer that stops answering is detected and the connection
 //! closes.

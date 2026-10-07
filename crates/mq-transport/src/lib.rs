@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §4
 //!
 //! Rules (spec §4.8): methods copy `inner.engine` before calling xquic and hold no `&`/`&mut` into

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Streams: open, send, recv, reset, info, and the abandoned drain (spec §4.2, §4.8).
 
 use crate::ffi::trampolines::{STREAM_CEILING, ud_of};

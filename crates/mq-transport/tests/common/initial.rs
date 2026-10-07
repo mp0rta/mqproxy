@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Hand-built QUIC v1 client Initial packets (RFC 9001 §5) carrying a ClientHello that never
 //! completes: no real client sends one, so the provisional-connection test builds them.
 //! Crypto comes from the BoringSSL that xquic-sys links statically.

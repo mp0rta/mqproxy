@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The sans-I/O transport contract seen by the shard and apps (spec §4, §5.1).
 #![forbid(unsafe_code)]
 

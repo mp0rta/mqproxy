@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Callback tables (spec §4.8, §4.9). Every xquic user-data slot holds a `SlotId` or 0 ("none").
 //! The bodies that touch transport state live in `trampolines`.
 

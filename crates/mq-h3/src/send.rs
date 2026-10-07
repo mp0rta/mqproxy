@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! h3wire actions and core bytes on the transport (adoption spec §4.5).
 
 use crate::H3Wire;

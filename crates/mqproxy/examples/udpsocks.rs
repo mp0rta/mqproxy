@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SOCKS5 UDP echo client and single-peer benchmark forwarder.
 use clap::Parser;
 use mq_proxy::udp::socks5udp::{self, Dst};

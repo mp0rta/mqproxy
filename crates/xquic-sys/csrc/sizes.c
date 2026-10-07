@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 /* sizeof exports for tests/layout.rs: compares C layouts with the bindgen types. */
 #include <stddef.h>
 #include <xquic/xquic.h>

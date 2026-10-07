@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 #
 # e2e_mitm_h2.sh — Phase 7 MITM Slice 3 Task 16: NET_ADMIN transparent-MITM H2 e2e.
 #

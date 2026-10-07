@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The shard's seeded RNG (spec §5.2), reached by the app via `Cx::rng()`.
 
 /// spec §5.2: xorshift64*; reproducible for a given seed.

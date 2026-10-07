@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.1 / SP4 spec §2.1: hyper (and h2, rustls) is polled from the shard — one `Dirty` waker per
 //! `Origin` and a single-thread executor; no tokio task or channel.
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.2 "Reconnect": exponential backoff, base 250 ms, multiplier 2, jitter into `[d/2, d]`.
 
 use mq_transport_api::Time;

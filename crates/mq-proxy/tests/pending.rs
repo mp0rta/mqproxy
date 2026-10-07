@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.2 "Pending requests (before auth)".
 
 use mq_proxy::client::pending::{Full, IngressKind, MAX_PENDING, Pending, PendingOpen};

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Client reconnect on the shard pair (spec §8.1 "Shard pair", §6.2
 //! reconnect), real `Client` and `Server`. Case 3 covers the TCP half only
 //! (UDP reconnect is SP2).

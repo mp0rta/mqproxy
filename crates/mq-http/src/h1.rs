@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! HTTP/1.1 request head parser (spec §2.1).
 
 pub const HEAD_MAX: usize = 16 * 1024;

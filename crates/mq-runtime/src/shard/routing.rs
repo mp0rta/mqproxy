@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Event routing (spec §5.2 `drive` step 3, §5.4 "Event routing") and UDP
 //! socket selection (spec §5.2 "UDP socket selection").
 

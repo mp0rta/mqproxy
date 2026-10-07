@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The collected H3 response head (SP4 spec §4.2 / §5; moved from the SP3
 //! fetch download). No `fin`: the end is always reported by `read_body`.
 
