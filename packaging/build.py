@@ -17,6 +17,7 @@ def output(*args, **kwargs):
 
 def build():
     os.chdir(ROOT)
+    os.umask(0o022)  # Package permissions must not inherit the builder's umask.
     subprocess.run(["cargo", "build", "--release", "--locked", "-p", "mqproxy"], check=True)
     metadata = json.loads(output("cargo", "metadata", "--locked", "--format-version", "1"))
     package = next(p for p in metadata["packages"] if p["name"] == "mqproxy")
@@ -79,8 +80,13 @@ def build():
         subprocess.run(["bash", str(ROOT / "tests/packaging/verify_install.sh"), str(stage)], check=True)
         # tar carries the same installed tree, without Debian control metadata.
         tar = dist / f"mqproxy_{version}_{arch}.tar.gz"
+        def root_owner(info):
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            return info
+
         with tarfile.open(tar, "w:gz") as archive:
-            archive.add(stage / "usr", arcname="usr")
+            archive.add(stage / "usr", arcname="usr", filter=root_owner)
         (work / "debian").mkdir()
         (work / "debian/control").write_text("Source: mqproxy\nSection: net\nPriority: optional\nMaintainer: mp0rta\n\nPackage: mqproxy\nArchitecture: any\nDescription: Multipath QUIC application proxy\n")
         deps = output("dpkg-shlibdeps", "-O", "-e" + str(stage / "usr/bin/mqproxy"), cwd=work)
@@ -98,6 +104,8 @@ def build():
             install(ROOT / f"packaging/{script}", f"DEBIAN/{script}", 0o755)
         deb = dist / f"mqproxy_{version}_{arch}.deb"
         subprocess.run(["dpkg-deb", "--root-owner-group", "--build", str(stage), str(deb)], check=True)
+        subprocess.run(["python3", str(ROOT / "tests/packaging/verify_archives.py"),
+                        str(tar), str(deb)], check=True)
         print(f"Built {deb}\nBuilt {tar}")
 
 

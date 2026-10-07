@@ -49,6 +49,8 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Build mqproxy (Rust Release)
         run: cargo build --release --locked -p mqproxy
+      - name: Generate MITM test certificates
+        run: bash tests/certs/generate-mitm.sh
 
       - name: TCP proxy benchmark
         run: sudo bash scripts/ci_benchmarks/ci_bench_tcp_proxy.sh target/release/mqproxy

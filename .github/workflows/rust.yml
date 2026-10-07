@@ -236,6 +236,8 @@ jobs:
           curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: cargo build --release --locked -p mqproxy
+      - name: Generate MITM test certificates
+        run: bash tests/certs/generate-mitm.sh
       - name: TCP proxy benchmark (Rust, informational)
         if: github.event_name == 'push'
         continue-on-error: true
