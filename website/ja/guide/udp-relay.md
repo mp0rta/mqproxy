@@ -34,7 +34,7 @@ UDP リレーは **同じ `--socks5` リスナー** 上で公開されます —
   --socks5 127.0.0.1:1080
 ```
 
-`curl` は SOCKS5 UDP ASSOCIATE を話さないため、UDP 対応の SOCKS5 クライアントを使ってください。リポジトリには最小限のテストクライアント `udpsocks`（テストスイートでビルドされます）が同梱されており、手軽な確認に便利です。
+`curl` は SOCKS5 UDP ASSOCIATE を話さないため、UDP 対応の SOCKS5 クライアントを使ってください。リポジトリには最小限のテストクライアント `udpsocks`（`cargo build --release --locked -p mqproxy --examples` でビルドします）が同梱されており、手軽な確認に便利です。
 
 ```bash
 # クライアントの SOCKS5 リスナー経由で UDP パケットをターゲットへリレー

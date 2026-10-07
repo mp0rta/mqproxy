@@ -356,9 +356,7 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
         );
     }
     let startup_lines = match gateway {
-        Some(_) => vec![format!(
-            "mq_origin: hyper {HYPER_VERSION} + rustls (HTTP3=no)"
-        )],
+        Some(_) => vec![format!("mq_origin: hyper {HYPER_VERSION} + rustls")],
         None => Vec::new(),
     };
     let cc = cc(a.cc.or(f.cc).as_deref())?;

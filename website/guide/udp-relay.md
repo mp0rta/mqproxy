@@ -34,7 +34,7 @@ UDP relay is exposed on the **same `--socks5` listener** — any SOCKS5 client t
   --socks5 127.0.0.1:1080
 ```
 
-`curl` does not speak SOCKS5 UDP ASSOCIATE, so use a UDP-capable SOCKS5 client. The repo ships `udpsocks`, a minimal test client (built by the test suite), which is handy for a quick check:
+`curl` does not speak SOCKS5 UDP ASSOCIATE, so use a UDP-capable SOCKS5 client. The repo ships `udpsocks`, a minimal test client (build it with `cargo build --release --locked -p mqproxy --examples`), which is handy for a quick check:
 
 ```bash
 # Relay a UDP packet to a target through the client's SOCKS5 listener

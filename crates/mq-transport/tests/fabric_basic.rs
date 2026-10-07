@@ -55,7 +55,7 @@ fn handshake_completes() {
     assert!(server.call(T0, move |t, _| t.conn_stats(srv_conn)).is_ok());
 }
 
-/// Smoke test of the stream methods and trampolines (the full suite is Task 4.7).
+/// Smoke test of the stream methods and trampolines.
 #[test]
 fn stream_round_trip_and_reset_release_slots() {
     let (client, server, conn, srv_conn) = connected();

@@ -94,7 +94,7 @@ impl ShardExec {
         }
     }
 
-    /// Tasks spawned and not yet finished (test-support accessor, Task 5.1b).
+    /// Tasks spawned and not yet finished (test-support accessor).
     #[cfg(any(test, feature = "test-support"))]
     pub fn len(&self) -> usize {
         self.tasks.len() + self.spawned.borrow().len()

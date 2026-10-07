@@ -174,7 +174,7 @@ fn startup_lines_golden() {
     assert_eq!(
         lines_until(&mut p, "listening on"),
         vec![
-            "[INFO] mq_origin: hyper 1.10 + rustls (HTTP3=no)".to_string(),
+            "[INFO] mq_origin: hyper 1.10 + rustls".to_string(),
             format!(
                 "[INFO] mqproxy server listening on {listen} \
                  (cc=bbr, sched=minrtt, gateway=on, udp=on, udp-idle=60s)"

@@ -2,7 +2,7 @@
 
 The single home for Linux syscalls that need `unsafe` or raw fds (spec §2.2).
 
-## GSO/GRO: hand-written `libc`, not `quinn-udp` (Task 5.1)
+## GSO/GRO: hand-written `libc`, not `quinn-udp`
 
 I evaluated `quinn-udp` 0.5.16 (`UdpSocketState` over a `std::net::UdpSocket`)
 in a throwaway spike on Linux 7.0 loopback. Functionally it works: a GSO send

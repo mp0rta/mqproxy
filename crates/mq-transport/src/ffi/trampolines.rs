@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 mp0rta and mqproxy contributors
-//! Transport and ALPN callbacks (spec §4.4, §4.7, §4.8; plan Task 4.6 table).
+//! Transport and ALPN callbacks (spec §4.4, §4.7, §4.8).
 //!
 //! Every trampoline runs inside `guard` (a panic aborts) and reaches `Inner` only through
 //! `clock::current()`. The bookkeeping lives in plain `fn on_*(inner: &mut Inner, ..)`

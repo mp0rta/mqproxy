@@ -143,6 +143,40 @@ pub enum Why {
     AtCapacity,
 }
 
+impl Why {
+    /// Every variant, in `mq.mitm` line order (`opaque` counters index by `as usize`).
+    pub const ALL: [Why; 11] = [
+        Why::NotTls,
+        Why::NoSni,
+        Why::BadSni,
+        Why::NoH2,
+        Why::Ignored,
+        Why::OutOfCaScope,
+        Why::TlsIncompatible,
+        Why::Timeout,
+        Why::TooLarge,
+        Why::Eof,
+        Why::AtCapacity,
+    ];
+
+    /// The `opaque_<key>` name in the `mq.mitm` line.
+    pub fn key(self) -> &'static str {
+        match self {
+            Why::NotTls => "not_tls",
+            Why::NoSni => "no_sni",
+            Why::BadSni => "bad_sni",
+            Why::NoH2 => "no_h2",
+            Why::Ignored => "ignored",
+            Why::OutOfCaScope => "ca_scope",
+            Why::TlsIncompatible => "tls_incompat",
+            Why::Timeout => "timeout",
+            Why::TooLarge => "too_large",
+            Why::Eof => "eof",
+            Why::AtCapacity => "capacity",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
     Mitm(Sni),
@@ -187,6 +221,13 @@ mod tests {
 
     fn sni(s: &str) -> Sni {
         Sni::canonical(s.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn why_all_is_in_discriminant_order() {
+        for (i, w) in Why::ALL.iter().enumerate() {
+            assert_eq!(*w as usize, i, "{w:?}");
+        }
     }
 
     fn dom(s: &str) -> DnsSubtree {

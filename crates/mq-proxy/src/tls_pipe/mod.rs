@@ -8,6 +8,9 @@ mod exec;
 mod pipe;
 mod tls_io;
 
+/// Pump iterations per callback (SP3 spec §7.3 step 4; SP4 R2 for the MITM front).
+pub const PUMP_CAP: usize = 16;
+
 pub use exec::{Dirty, ShardExec};
 #[cfg(any(test, feature = "test-support"))]
 pub use pipe::pipe_pair;

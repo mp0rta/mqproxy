@@ -144,7 +144,7 @@ nft add rule  inet mqproxy_block forward udp dport 443 reject
 mq.mitm conns=<live> streams=<open> mitm=<n> opaque_not_tls=<n> opaque_no_sni=<n> opaque_bad_sni=<n> opaque_no_h2=<n> opaque_ignored=<n> opaque_ca_scope=<n> opaque_tls_incompat=<n> opaque_timeout=<n> opaque_too_large=<n> opaque_eof=<n> opaque_capacity=<n> tls_fail=<n> h2_fail=<n> dead=<n> leaf_hit=<n> leaf_miss=<n> reqs=<n> rejects=<n>
 ```
 
-`conns` と `streams` は現在開いている MITM コネクションと h2 ストリームの数で、それ以外は累積値です。`mitm` は終端したコネクション数、各 `opaque_*` は [上記](#不透明リレーになるもの) の理由ごとに不透明リレーしたコネクション数です。`tls_fail`、`h2_fail`、`dead` は、TLS エラー、h2 エラー、ピア消失で終了したコネクション数を数えます。`leaf_hit`/`leaf_miss` は偽造証明書キャッシュのヒットとミス、`reqs` は受信したすべての h2 リクエストの数、`rejects` はそのうちトンネルリクエストを開く前に拒否したものの数です（リクエストマッピングによる `x-mq-error` または 421 の応答、トンネルが使えないか開けなかった場合、不正なリクエストへの `RST_STREAM`、コネクションあたりのストリーム上限を超えたときの `REFUSED_STREAM`）。debug ログレベルでは、ルーティングの判断ごとに `mq_mitm: <sni|-> → mitm|opaque(<why>)` が出力されます。ヘッダやボディの値がログに出ることはありません。
+`conns` と `streams` は現在開いている MITM コネクションと h2 ストリームの数で、それ以外は累積値です。`mitm` は終端したコネクション数、各 `opaque_*` は [上記](#不透明リレーになるもの) の理由ごとに不透明リレーしたコネクション数です。`tls_fail`、`h2_fail`、`dead` は、TLS エラー、h2 エラー、ピア消失で終了したコネクション数を数えます。`leaf_hit`/`leaf_miss` は偽造証明書キャッシュのヒットとミス、`reqs` は受信したすべての h2 リクエストの数、`rejects` はそのうちトンネルリクエストを開く前に拒否したものの数です（リクエストマッピングによる `x-mq-error` または 421 の応答、トンネルが使えないか開けなかった場合、不正なリクエストへの `RST_STREAM`、コネクションあたりのストリーム上限を超えたときの `REFUSED_STREAM`）。debug ログレベルでは、ルーティングの判断ごとに `mq_mitm: <sni|-> → mitm|opaque(<why>)` が出力されます。`<why>` は `opaque_*` カウンタ名から接頭辞を除いたものです（例: `opaque(no_h2)`）。ヘッダやボディの値がログに出ることはありません。
 
 ## セキュリティ姿勢
 

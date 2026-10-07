@@ -64,6 +64,8 @@ struct Entry {
 }
 
 impl LeafStore {
+    /// # Panics
+    /// If generating the shard's P-256 leaf key fails.
     pub fn new(ca: Arc<Ca>, clock: fn() -> SystemTime) -> Self {
         Self {
             ca,

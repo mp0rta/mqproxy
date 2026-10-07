@@ -1,6 +1,6 @@
 # Observability
 
-Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts confirm that within-stream multipath is actually splitting a flow across paths — the key signal that aggregation is working. (xquic must be built with `XQC_ENABLE_EVENT_LOG=ON`, which `scripts/build-xquic.sh` does.)
+Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts confirm that within-stream multipath is actually splitting a flow across paths — the key signal that aggregation is working.
 
 ## Metrics
 
@@ -10,10 +10,14 @@ Pass `--qlog <dir>` to either side to emit xquic qlog. Per-path byte counts conf
 
 ## Testing
 
-After building, run the bundled test suite:
+Run the test suite from the repository root:
 
 ```bash
-ctest --test-dir build --output-on-failure
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --release --locked -p mqproxy --bins --examples
+bash tests/test_cli_help.sh target/release/mqproxy
+bash tests/integration/e2e_udp.sh     # also e2e_{gateway,multipath,tproxy,mitm_h2,...}.sh
 ```
 
-It covers wire framing, the relay/flow state machine, ingress parsing, the gateway request path, and the TLS MITM crypto core, alongside end-to-end scripts for multipath aggregation, the full gateway chain, UDP relay, and transparent capture. Tests that need root or `NET_ADMIN` (the multipath and transparent-capture end-to-end runs) skip automatically when run unprivileged.
+The cargo tests cover wire framing, the relay/flow state machine, ingress parsing, the gateway request path, and TLS MITM. The `tests/integration/e2e_*.sh` scripts run end to end: multipath aggregation, the full gateway chain, UDP relay, transparent capture and MITM. Scripts that need root or `NET_ADMIN` skip themselves when run unprivileged.

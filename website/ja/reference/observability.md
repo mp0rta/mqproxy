@@ -1,6 +1,6 @@
 # オブザーバビリティ
 
-どちらの側にも `--qlog <dir>` を渡すと xquic qlog を出力します。パス単位のバイト数は、ストリーム内マルチパスが実際にフローを複数パスへ分割していることを確認できます — アグリゲーションが機能している鍵となる指標です。(xquic は `XQC_ENABLE_EVENT_LOG=ON` でビルドされている必要があり、`scripts/build-xquic.sh` がこれを行います。)
+どちらの側にも `--qlog <dir>` を渡すと xquic qlog を出力します。パス単位のバイト数は、ストリーム内マルチパスが実際にフローを複数パスへ分割していることを確認できます — アグリゲーションが機能している鍵となる指標です。
 
 ## メトリクス
 
@@ -10,10 +10,14 @@
 
 ## テスト
 
-ビルド後、同梱のテストスイートを実行します。
+リポジトリのルートでテストスイートを実行します。
 
 ```bash
-ctest --test-dir build --output-on-failure
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --release --locked -p mqproxy --bins --examples
+bash tests/test_cli_help.sh target/release/mqproxy
+bash tests/integration/e2e_udp.sh     # 他に e2e_{gateway,multipath,tproxy,mitm_h2,...}.sh
 ```
 
-ワイヤフレーミング、リレー／フロー状態機械、イングレスパース、ゲートウェイのリクエスト経路、TLS MITM 暗号コアをカバーし、マルチパスアグリゲーション・完全なゲートウェイチェーン・UDP リレー・透過キャプチャのエンドツーエンドスクリプトも含みます。root または `NET_ADMIN` を必要とするテスト (マルチパスと透過キャプチャのエンドツーエンド実行) は、非特権で実行すると自動的にスキップされます。
+cargo のテストはワイヤフレーミング、リレー／フロー状態機械、イングレスパース、ゲートウェイのリクエスト経路、TLS MITM をカバーします。`tests/integration/e2e_*.sh` のスクリプトは、マルチパスアグリゲーション・完全なゲートウェイチェーン・UDP リレー・透過キャプチャ・MITM をエンドツーエンドで実行します。root または `NET_ADMIN` を必要とするスクリプトは、非特権で実行すると自動的にスキップされます。

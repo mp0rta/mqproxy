@@ -40,7 +40,7 @@ Config keys map to the CLI flags in the [Options Reference](/reference/options):
 | `[Auth]` | `Key` (token) | `Key` (token) |
 | `[Multipath]` | `CC`, `Scheduler` | `CC`, `Scheduler`, `Path` (repeatable) |
 | `[Ingress]` | — | `Socks5`, `HttpConnect`, `Gateway`, `TProxy`, `Mode`, `Fwmark`, `Table`, `Dport`, `SetupRedirect`, `SkipUid` |
-| `[Gateway]` | `Enabled`, `Masquerade`, `OriginCA`, `CacheMaxBytes` | — |
+| `[Gateway]` | `Enabled`, `Masquerade`, `OriginCA` | — |
 | `[Mitm]` | — | `Enabled`, `CACert`, `CAKey`, `IgnoreHosts` (repeatable) |
 | `[UDP]` | `Enabled`, `IdleTimeout` | — |
 | `[Metrics]` | `Interval`, `PerRequest` | `Interval` |
