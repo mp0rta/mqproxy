@@ -75,7 +75,7 @@ Optional request headers:
 | Header | Effect |
 |---|---|
 | `X-Mq-Method` | Method used toward the origin (default `GET`) |
-| `X-Mq-Origin-Protocol` | Pins the origin protocol to `h1` or `h2` |
+| `X-Mq-Origin-Protocol` | `h1` forces HTTP/1.1; `h2` (or no header) negotiates h2 or HTTP/1.1 |
 | `X-Mq-Accept-Encoding` | Asks for compression on the download |
 | `X-Mq-Forward-Cookie` | Forwards `Cookie` to the origin (withheld by default) |
 
