@@ -31,7 +31,7 @@
 #     Output: ci_bench_results/mitm_rust_vs_c_<timestamp>.json
 #
 # Usage: sudo bash scripts/ci_benchmarks/ci_bench_mitm.sh [path/to/mqproxy]
-#        sudo MQPROXY_BIN_C=target/release/mqproxy MQPROXY_BIN_RUST=target/release/mqproxy \
+#        sudo MQPROXY_BIN_C=/path/to/legacy/mqproxy MQPROXY_BIN_RUST=target/release/mqproxy \
 #            bash scripts/ci_benchmarks/ci_bench_mitm.sh
 #
 # Env:

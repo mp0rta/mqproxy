@@ -33,11 +33,14 @@ jobs:
             echo "Tag ${GITHUB_REF_NAME#v} does not match Cargo $VERSION"; exit 1
           fi
       - name: Install build and package tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake golang dpkg-dev python3 curl
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake golang dpkg-dev python3 curl iproute2
       - name: Build and verify Cargo artifacts
         run: python3 packaging/build.py
       - name: Install deb and exercise both systemd units
         run: sudo bash tests/packaging/smoke_deb.sh target/dist/mqproxy_*_${{ matrix.arch }}.deb
+      - name: Rust gateway benchmark smoke (native disposable runner)
+        if: github.event_name == 'push' && matrix.arch == 'amd64'
+        run: sudo env REPEAT=1 DURATION=1 bash scripts/ci_benchmarks/ci_bench_gateway.sh target/release/mqproxy
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.arch }}

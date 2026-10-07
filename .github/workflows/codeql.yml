@@ -4,7 +4,7 @@ on:
   # Scoped to the default branch: CodeQL runs build scripts and uploads to the
   # repo code-scanning store, so run it on main pushes + PRs targeting main +
   # weekly, not on every feature-branch push. (The lightweight fuzz job in
-  # ci.yml still runs on all branches.)
+  # rust.yml still runs on all branches.)
   push:
     branches: [ main ]
   pull_request:

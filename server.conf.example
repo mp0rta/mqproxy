@@ -26,8 +26,7 @@ Scheduler = minrtt
 # Masquerade = true
 # OriginCA: CA bundle (PEM) used to verify origin TLS
 # OriginCA = /etc/ssl/certs/ca-certificates.crt
-# CacheMaxBytes: response cache size in bytes (0 = off)
-# CacheMaxBytes = 0
+# Legacy CacheMaxBytes is accepted with a warning and ignored.
 
 # UDP relay is ENABLED by default. Uncomment Enabled to turn it off.
 [UDP]
