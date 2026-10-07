@@ -61,8 +61,7 @@
 #       offer h2 takes the OPAQUE path (origin cert verifies; the MITM CA is rejected).
 #   (h) a 6 KiB Cookie and a 3 KiB URL succeed.
 #
-# CASE SELECTION: MITM_CASES (default "a b c d e f"); set
-# MITM_CASES="a b c d e f g h" to run all.
+# CASE SELECTION: MITM_CASES (default: all, "a b c d e f g h").
 #
 # HOW HOSTNAMES RESOLVE (both client AND server sides):
 #   The H2 adapter forwards the browser's :authority verbatim; the gateway server
@@ -111,14 +110,12 @@
 #     (NOTE the curl-CLI gotcha: libcurl-dev != the curl binary — install `curl`.)
 #
 # ENV (overridable):
-#   MQPROXY_BIN              the `mqproxy` binary (MUST be MITM-capable; the Rust
-#                            binary or, for interop, tests/integration/
-#                            mqproxy-interop-wrapper.sh).
+#   MQPROXY_BIN              the `mqproxy` binary.
 #   MQPROXY_CERT/KEY         tunnel TLS cert/key (CN=mqproxy-test).
 #   MQ_MITM_CA_CRT/KEY       the MITM signing CA (configure-time fixtures) —
 #                            consumed by --ca-cert/--ca-key; curl trusts the crt.
 #                            The key must be PKCS#8 (the Rust loader's only format).
-#   MITM_CASES               cases to run (default "a b c d e f").
+#   MITM_CASES               cases to run (default "a b c d e f g h").
 #
 set -u
 
@@ -133,7 +130,7 @@ MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 MITM_CA_CRT="${MQ_MITM_CA_CRT:-${REPO_ROOT}/tests/certs/mitm-ca.crt}"
 MITM_CA_KEY="${MQ_MITM_CA_KEY:-${REPO_ROOT}/tests/certs/mitm-ca.key}"
 
-MITM_CASES="${MITM_CASES:-a b c d e f}"
+MITM_CASES="${MITM_CASES:-a b c d e f g h}"
 want() { case " ${MITM_CASES} " in *" $1 "*) return 0 ;; esac; return 1; }
 
 TOKEN="mitm-h2-e2e-token"
@@ -489,7 +486,6 @@ start_server() {
         --cert "${MQPROXY_CERT}" --key "${MQPROXY_KEY}" \
         --origin-ca "${ORIGIN_CA}" \
         --request-metrics \
-        --cache-max-bytes 67108864 \
         >"${WORK}/server.log" 2>&1 &
     SERVER_PID=$!
 }
