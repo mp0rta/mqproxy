@@ -22,7 +22,7 @@ CI_BENCH_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${CI_BENCH_ENV_DIR}/../../" && pwd)"
 
 # ── Binary paths (overridable) ──
-MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/build/mqproxy}"
+MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/target/release/mqproxy}"
 MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 

@@ -22,12 +22,9 @@
 #
 # HOW TO RUN:
 #     sudo tests/integration/e2e_multipath.sh
-#   or via ctest (registered as `e2e_multipath`, skips cleanly without root):
-#     sudo ctest --test-dir build -R e2e_multipath --output-on-failure
 #
 #   Requires NET_ADMIN (tc/netem on `lo`). WITHOUT it the script prints a notice
-#   and exits 77 (the autotools "skip" code) — ctest is configured with
-#   SKIP_RETURN_CODE 77 so it reports SKIPPED, not FAILED.
+#   and exits 77 (skip). CI requires NET_ADMIN and treats this as a failure.
 #
 # TUNABLE ENV VARS (defaults in parens):
 #   RATE   (100mbit)  per-path rate cap, applied with an HTB class (+ a small
@@ -35,7 +32,7 @@
 #   DELAY  (25ms)     per-path netem delay applied to EACH direction
 #                     (upstream + download), so the path RTT ~= 2*DELAY.
 #   SIZE   (128)      bulk file size in MB.
-#   MQPROXY_BIN       path to the `mqproxy` binary (default: ./build/mqproxy).
+#   MQPROXY_BIN       path to the `mqproxy` binary (default: ./target/release/mqproxy).
 #   MQPROXY_CERT/KEY  TLS cert/key for the server (default: tests/certs/test.*).
 #
 # tc SHAPING APPROACH (documented):
@@ -80,7 +77,7 @@ SIZE_MB="${SIZE:-128}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/build/mqproxy}"
+MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/target/release/mqproxy}"
 MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 
@@ -114,7 +111,7 @@ tc qdisc del dev lo root 2>/dev/null || true
 
 if [ ! -x "${MQPROXY_BIN}" ]; then
     note "e2e_multipath: mqproxy binary not found/executable: ${MQPROXY_BIN}"
-    note "  Build first (cmake --build build) or set MQPROXY_BIN."
+    note "  Build first (cargo build --release -p mqproxy --bins --examples) or set MQPROXY_BIN."
     exit 1
 fi
 
@@ -126,10 +123,8 @@ if ldd "${MQPROXY_BIN}" 2>/dev/null | grep -qi 'libasan'; then
     note "e2e_multipath: WARNING: ${MQPROXY_BIN} is AddressSanitizer-instrumented."
     note "  Throughput will be ASan-crippled and the >=1.5x assertion is NOT meaningful."
     note "  Build a release binary + release xquic and re-run, e.g.:"
-    note "    bash scripts/build-xquic.sh   # release xquic (XQC_ENABLE_EVENT_LOG=ON)"
-    note "    cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \\"
-    note "          -DXQUIC_BUILD_DIR=\$PWD/third_party/xquic/build && cmake --build build-release"
-    note "    sudo env MQPROXY_BIN=\$PWD/build-release/mqproxy $0"
+    note "    cargo build --release --locked -p mqproxy"
+    note "    sudo env MQPROXY_BIN=\$PWD/target/release/mqproxy $0"
     note "  Continuing anyway (numbers are diagnostic-only)..."
 fi
 

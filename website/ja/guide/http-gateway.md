@@ -29,7 +29,7 @@ mqproxy-client ──────── MPQUIC 上の HTTP/3 (ALPN h3) ───
 ゲートウェイはサーバー側でデフォルト有効です。クライアント側では `--gateway` を追加します（`--socks5` の有無を問わず動作）。
 
 ```bash
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --gateway 127.0.0.1:8080
 

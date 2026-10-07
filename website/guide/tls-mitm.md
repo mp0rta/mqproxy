@@ -48,11 +48,11 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
 
 ```bash
 # Server — unchanged; the gateway origin bridge does the origin fetch.
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
   --cert /etc/mqproxy/tls/server.pem --key /etc/mqproxy/tls/server.key
 
 # Client — transparent capture + MITM. Requires --tproxy and a signing CA.
-sudo ./build/mqproxy client \
+sudo ./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --tproxy 127.0.0.1:12443 --setup-redirect \
   --mitm \

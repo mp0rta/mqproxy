@@ -5,11 +5,11 @@
 ```bash
 # サーバー — UDP :4433 で MPQUIC を待ち受け。--cert/--key は必須。
 # リポジトリには tests/certs にローカル用の自己署名テスト証明書が同梱されています。
-./build/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
+./target/release/mqproxy server --listen 0.0.0.0:4433 --token secret123 \
   --cert tests/certs/test.crt --key tests/certs/test.key
 
 # クライアント — サーバーへ接続し、ローカルの SOCKS5 リスナーを :1080 で公開。
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 \
   --token  secret123 \
   --socks5 127.0.0.1:1080
@@ -29,7 +29,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com/
 `--path` を繰り返すことで、追加のローカル IP を MPQUIC パスとしてバインドできます（例: WiFi + LTE）。するとストリームがそれらにわたってアグリゲーションされます。
 
 ```bash
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server <server-ip>:4433 --token secret123 \
   --socks5 127.0.0.1:1080 \
   --path 192.168.1.50 \

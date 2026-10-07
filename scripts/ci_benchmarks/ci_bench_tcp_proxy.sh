@@ -14,7 +14,7 @@
 # Usage: sudo bash scripts/ci_benchmarks/ci_bench_tcp_proxy.sh [path/to/mqproxy]
 #
 # Env:
-#   MQPROXY_BIN    path to mqproxy binary (default: build/mqproxy)
+#   MQPROXY_BIN    path to mqproxy binary (default: target/release/mqproxy)
 #   MQPROXY_CERT   TLS cert (default: tests/certs/test.crt)
 #   MQPROXY_KEY    TLS key  (default: tests/certs/test.key)
 #   CI_BENCH_RESULTS  output directory (default: ci_bench_results/)

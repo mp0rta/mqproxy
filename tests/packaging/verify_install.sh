@@ -1,25 +1,7 @@
 #!/usr/bin/env bash
-# Verify packaging install layout + static self-containment.
-# Usage: verify_install.sh <build-dir>
-#
-# Requires the build to have been configured with -DCMAKE_INSTALL_PREFIX=/usr
-# (the @CMAKE_INSTALL_PREFIX@ in the unit ExecStart is baked at *configure* time,
-# so a --prefix at install time would not match). On any other prefix this SKIPs.
+# Verify a staged Rust installation (also usable after dpkg-deb --extract).
 set -euo pipefail
-BUILD="${1:?build dir}"
-[ -x "$BUILD/mqproxy" ] || { echo "SKIP: no mqproxy in $BUILD"; exit 77; }
-
-PREFIX="$(sed -n 's/^CMAKE_INSTALL_PREFIX:[^=]*=//p' "$BUILD/CMakeCache.txt" 2>/dev/null || true)"
-if [ "$PREFIX" != "/usr" ]; then
-  echo "SKIP: packaging CTest expects -DCMAKE_INSTALL_PREFIX=/usr (got '${PREFIX:-unset}')"
-  exit 77
-fi
-
-STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
-# No --prefix: honor the configured /usr so the staged tree matches the baked ExecStart.
-DESTDIR="$STAGE" cmake --install "$BUILD" >/dev/null
-
-fail=0
+STAGE="${1:?staged installation root}"
 for f in \
   usr/bin/mqproxy \
   usr/lib/systemd/system/mqproxy-server@.service \
@@ -29,21 +11,18 @@ for f in \
   usr/share/doc/mqproxy/server.conf.example \
   usr/share/doc/mqproxy/client.conf.example \
   usr/share/doc/mqproxy/LICENSE \
+  usr/share/doc/mqproxy/NOTICE \
   usr/share/doc/mqproxy/third-party/xquic.txt \
   usr/share/doc/mqproxy/third-party/boringssl.txt \
-  usr/share/doc/mqproxy/third-party/nghttp2.txt ; do
-  [ -e "$STAGE/$f" ] || { echo "MISSING: $f"; fail=1; }
+  usr/share/doc/mqproxy/third-party/RUST-DEPENDENCIES.txt; do
+  test -s "$STAGE/$f" || { echo "MISSING: $f"; exit 1; }
 done
-
-# Self-containment: must not need libxquic. (libssl/libcrypto/libcurl/libevent are
-# legitimate distro deps — do NOT broaden this grep to match them.)
-if ldd "$STAGE/usr/bin/mqproxy" | grep -qi xquic; then
-  echo "FAIL: staged binary links libxquic (expected static)"; fail=1
+# These are linked in-process or replaced by Rust libraries.
+if readelf -d "$STAGE/usr/bin/mqproxy" | grep -Ei 'NEEDED.*(xquic|ssl|crypto|curl|event|nghttp2)'; then
+  echo 'FAIL: unexpected shared protocol library'; exit 1
 fi
-
-grep -q '^ExecStart=/usr/bin/mqproxy server ' \
-  "$STAGE/usr/lib/systemd/system/mqproxy-server@.service" \
-  || { echo "FAIL: server ExecStart not substituted to /usr"; fail=1; }
-
-[ "$fail" -eq 0 ] && echo "OK: packaging install verified"
-exit "$fail"
+for mode in server client; do
+  grep -q "^ExecStart=/usr/bin/mqproxy $mode " "$STAGE/usr/lib/systemd/system/mqproxy-$mode@.service"
+done
+bash "$(dirname "$0")/../test_cli_help.sh" "$STAGE/usr/bin/mqproxy"
+echo 'OK: Rust packaging install verified'

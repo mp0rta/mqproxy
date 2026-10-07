@@ -12,6 +12,9 @@ fn main() {
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     match mqproxy::cli::parse(&argv) {
         Ok(mut resolved) => {
+            if let Some(id) = resolved.instance_id.clone() {
+                mqproxy::logger::set_instance_id(id);
+            }
             // spec §8: the test-only connect timeout knob, read once here.
             if let mqproxy::cli::Mode::Server(s) = &mut resolved.mode
                 && let Some(g) = &mut s.config.gateway

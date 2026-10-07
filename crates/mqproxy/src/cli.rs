@@ -30,6 +30,8 @@ pub struct Exit {
 /// spec §6.4: the parsed and validated command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
+    /// Optional process label appended to log lines.
+    pub instance_id: Option<String>,
     pub mode: Mode,
     /// `--config`, already applied (spec §6.4: defaults < file < CLI).
     pub config: Option<PathBuf>,
@@ -87,6 +89,9 @@ pub struct Client {
     arg_required_else_help = true
 )]
 struct Cli {
+    /// Process label appended to logs (1-64 ASCII letters, digits, dot, underscore or dash).
+    #[arg(long, global = true, value_parser = instance_id)]
+    instance_id: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -269,7 +274,7 @@ pub fn parse(argv: &[&str]) -> Result<Resolved, Exit> {
         code: e.exit_code(),
         message: e.render().to_string(),
     })?;
-    match cli.cmd {
+    let mut resolved = match cli.cmd {
         Cmd::Version => Err(Exit {
             code: 0,
             message: format!("mqproxy {}\n", env!("CARGO_PKG_VERSION")),
@@ -282,7 +287,23 @@ pub fn parse(argv: &[&str]) -> Result<Resolved, Exit> {
             let f = config::load(a.config.as_deref(), false)?;
             client(a, f).map_err(|m| usage_error("client", m))
         }
+    }?;
+    resolved.instance_id = cli.instance_id;
+    Ok(resolved)
+}
+
+fn instance_id(s: &str) -> Result<String, String> {
+    if s.is_empty()
+        || s.len() > 64
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(
+            "instance ID must be 1-64 ASCII letters, digits, dot, underscore or dash".into(),
+        );
     }
+    Ok(s.to_owned())
 }
 
 /// Exit 2 with the message and the subcommand's usage, like clap's own errors.
@@ -350,6 +371,7 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
     };
     let listen = ip_port("--listen", &listen)?;
     Ok(Resolved {
+        instance_id: None,
         mode: Mode::Server(Server {
             config: ServerConfig {
                 token,
@@ -450,6 +472,7 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
         })
         .transpose()?;
     Ok(Resolved {
+        instance_id: None,
         mode: Mode::Client(Client {
             config: ClientConfig {
                 server,

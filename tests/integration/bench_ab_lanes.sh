@@ -19,8 +19,8 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/build/mqproxy}"
-UDPSOCKS_BIN="${UDPSOCKS_BIN:-${REPO_ROOT}/build/udpsocks}"
+MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/target/release/mqproxy}"
+UDPSOCKS_BIN="${UDPSOCKS_BIN:-${REPO_ROOT}/target/release/examples/udpsocks}"
 MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 PICOQUICDEMO="${PICOQUICDEMO:-${REPO_ROOT}/../picoquic/build/picoquicdemo}"

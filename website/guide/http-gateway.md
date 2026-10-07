@@ -29,7 +29,7 @@ The server also pools and reuses origin connections across requests.
 The gateway is enabled on the server by default. On the client, add `--gateway` (works with or without `--socks5`):
 
 ```bash
-./build/mqproxy client \
+./target/release/mqproxy client \
   --server 127.0.0.1:4433 --token secret123 \
   --gateway 127.0.0.1:8080
 

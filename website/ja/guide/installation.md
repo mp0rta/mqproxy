@@ -4,11 +4,11 @@ mqproxy は systemd のテンプレートユニットを同梱しており、各
 
 ## `.deb` からインストール
 
-ビルド済みの `amd64` および `arm64` パッケージが各 [GitHub Release](https://github.com/mp0rta/mqproxy/releases) に添付されています。バイナリは自己完結（xquic + BoringSSL + nghttp2 を静的リンク）なので、依存するのはシステムの libevent/libcurl のみです。
+ビルド済みの `amd64` および `arm64` パッケージが各 [GitHub Release](https://github.com/mp0rta/mqproxy/releases) に添付されています。Rust バイナリは xquic・BoringSSL・Rust 依存ライブラリを静的リンクします。システム側の実行時依存はパッケージのメタデータに記録されます。
 
 ```bash
 # 最新リリースから自分のアーキテクチャの .deb を選ぶ
-sudo dpkg -i mqproxy_<version>_amd64.deb     # または _arm64.deb
+sudo apt install ./mqproxy_<version>_amd64.deb     # または _arm64.deb
 ```
 
 パッケージは `/usr/bin/mqproxy`、`mqproxy-server@` / `mqproxy-client@` の systemd テンプレートユニットをインストールし、非特権の `mqproxy` ユーザーと `/etc/mqproxy` を作成します（同梱の `sysusers.d`/`tmpfiles.d` 経由、パッケージの `postinst` で適用）。以下のインスタンスごとの設定手順から続けてください — configure/enable の手順は同一で、ソースからのビルド手順だけが省略されます。
@@ -18,13 +18,9 @@ sudo dpkg -i mqproxy_<version>_amd64.deb     # または _arm64.deb
 自己完結バイナリ（xquic + BoringSSL を静的リンク、インストール後のバイナリは非標準のランタイム依存を持たない）をビルドしてインストールします。
 
 ```bash
-# -DMQPROXY_STATIC_XQUIC は xquic+BoringSSL を静的リンク。インストール接頭辞は
-# *configure* 時にユニットの ExecStart に焼き込まれるため、今ここで設定する (--install 時ではない)。
-cmake -S . -B build \
-      -DXQUIC_BUILD_DIR="$PWD/third_party/xquic/build" \
-      -DMQPROXY_STATIC_XQUIC=ON -DCMAKE_INSTALL_PREFIX=/usr
-cmake --build build --target mqproxy_cli -j
-sudo cmake --install build              # → /usr/bin/mqproxy, ユニット, sysusers.d, tmpfiles.d
+sudo apt-get install -y dpkg-dev python3
+python3 packaging/build.py
+sudo apt install ./target/dist/mqproxy_*.deb
 ```
 
 `mqproxy` システムユーザーとそのディレクトリを作成します（同梱の `sysusers.d`/`tmpfiles.d` で宣言）。

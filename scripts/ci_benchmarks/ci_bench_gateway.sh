@@ -23,11 +23,11 @@
 #         moved nothing, or when any of the 6 cells lacks REPEAT runs of either
 #         binary. bits/CPU-s is reported, not gated.
 #
-# Usage: sudo MQPROXY_BIN_C=build/mqproxy MQPROXY_BIN_RUST=target/release/mqproxy \
+# Usage: sudo MQPROXY_BIN_C=target/release/mqproxy MQPROXY_BIN_RUST=target/release/mqproxy \
 #            bash scripts/ci_benchmarks/ci_bench_gateway.sh
 #
 # Env:
-#   MQPROXY_BIN_C, MQPROXY_BIN_RUST  the two binaries (defaults: build/mqproxy,
+#   MQPROXY_BIN_C, MQPROXY_BIN_RUST  the two binaries (defaults: target/release/mqproxy,
 #                                    target/release/mqproxy)
 #   MQPROXY_CERT/KEY  tunnel TLS cert/key (default: tests/certs/test.*)
 #   REPEAT            runs per cell (default: 3)
@@ -40,7 +40,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/ci_benchmarks/ci_bench_env.sh
 source "${SCRIPT_DIR}/ci_bench_env.sh"
 
-BIN_C="$(realpath -m "${MQPROXY_BIN_C:-${REPO_ROOT}/build/mqproxy}")"
+BIN_C="$(realpath -m "${MQPROXY_BIN_C:-${REPO_ROOT}/target/release/mqproxy}")"
 BIN_RUST="$(realpath -m "${MQPROXY_BIN_RUST:-${REPO_ROOT}/target/release/mqproxy}")"
 ORIGIN_CERT="${REPO_ROOT}/tests/certs/origin.crt"
 ORIGIN_KEY="${REPO_ROOT}/tests/certs/origin.key"

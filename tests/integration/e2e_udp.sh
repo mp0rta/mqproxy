@@ -58,9 +58,8 @@
 # HOW TO RUN:
 #   tests/integration/e2e_udp.sh                  # cases 1-5, 7 (+ cases 6,8 skip)
 #   sudo tests/integration/e2e_udp.sh             # also runs cases 6 and 8
-#   ctest --test-dir build -R e2e_udp --output-on-failure
 #
-# ENV (passed by CMake; overridable):
+# ENV (overridable):
 #   MQPROXY_BIN     the `mqproxy` binary.
 #   UDPSOCKS_BIN    the `udpsocks` binary.
 #   UDPECHO_BIN     the `udp_echo` binary.
@@ -100,9 +99,9 @@ for c in 1 2 3 5 7; do want "$c" && NEED_A=1; done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/build/mqproxy}"
-UDPSOCKS_BIN="${UDPSOCKS_BIN:-${REPO_ROOT}/build/udpsocks}"
-UDPECHO_BIN="${UDPECHO_BIN:-${REPO_ROOT}/build/udp_echo}"
+MQPROXY_BIN="${MQPROXY_BIN:-${REPO_ROOT}/target/release/mqproxy}"
+UDPSOCKS_BIN="${UDPSOCKS_BIN:-${REPO_ROOT}/target/release/examples/udpsocks}"
+UDPECHO_BIN="${UDPECHO_BIN:-${REPO_ROOT}/target/release/examples/udp_echo}"
 MQPROXY_CERT="${MQPROXY_CERT:-${REPO_ROOT}/tests/certs/test.crt}"
 MQPROXY_KEY="${MQPROXY_KEY:-${REPO_ROOT}/tests/certs/test.key}"
 
@@ -114,7 +113,7 @@ PATH_B_IP="127.0.0.3"
 for bin in "${MQPROXY_BIN}" "${UDPSOCKS_BIN}" "${UDPECHO_BIN}"; do
     if [ ! -x "${bin}" ]; then
         note "binary not found/executable: ${bin}"
-        note "  Build first (cmake --build build) or set MQPROXY_BIN/UDPSOCKS_BIN/UDPECHO_BIN."
+        note "  Build first (cargo build --release -p mqproxy --bins --examples) or set MQPROXY_BIN/UDPSOCKS_BIN/UDPECHO_BIN."
         exit "${SKIP}"
     fi
 done

@@ -17,7 +17,7 @@
 # Usage: sudo bash scripts/ci_benchmarks/ci_bench_unshaped.sh [path/to/mqproxy]
 #
 # Env:
-#   MQPROXY_BIN       path to mqproxy binary (default: build/mqproxy)
+#   MQPROXY_BIN       path to mqproxy binary (default: target/release/mqproxy)
 #   MQPROXY_CERT/KEY  TLS cert/key (default: tests/certs/test.*)
 #   BENCH_LABEL       name used in the output file (default: binary's parent dir,
 #                     e.g. "build" for C, "release" for target/release)

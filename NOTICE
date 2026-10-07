@@ -15,7 +15,6 @@ Third-party software included:
     Copyright (c) 1998-2011 The OpenSSL Project. All rights reserved.
     ISC-style license — see third_party/xquic/third_party/boringssl/LICENSE
 
-  * nghttp2 (https://nghttp2.org)
-    Copyright (c) 2012, 2014, 2015, 2016 Tatsuhiro Tsujikawa
-    Copyright (c) 2012, 2014, 2015, 2016 nghttp2 contributors
-    MIT License — see third_party/nghttp2.LICENSE
+  * h3wire and the Rust dependencies listed in Cargo.lock
+    Per-crate license texts and metadata are included in release packages under
+    /usr/share/doc/mqproxy/third-party/ (RUST-DEPENDENCIES.txt is the index).
