@@ -26,7 +26,7 @@ fn open_domain(sid: u32) -> Vec<u8> {
 fn resp_ok(idle_ms: u64) -> Vec<u8> {
     udp_resp(0, 0, idle_ms)
 }
-/// C `srv_open_reject`: an error RESP carries idle 0.
+/// An error RESP carries idle 0.
 fn resp_err(code: u64) -> Vec<u8> {
     udp_resp(1, code, 0)
 }
@@ -160,7 +160,7 @@ fn open_requested_idle_min_with_server() {
     }
 }
 
-/// spec §7.1: `Dns` and `Timeout` are both `DnsFailed` (C has no other code).
+/// spec §7.1: `Dns` and `Timeout` are both `DnsFailed`.
 fn resolve_fails_with(e: DialError) {
     let mut h = H::new(cfg());
     let (c, _) = h.authed();
@@ -280,8 +280,8 @@ fn cap_1025_session_limit_before_resolve() {
 fn undialable_host_dns_failed() {
     let mut h = H::new(cfg());
     let (c, _) = h.authed();
-    // An IPv4 address of 3 bytes and a name that is not UTF-8 (C
-    // `srv_resolve_udp_target`): answered, not reset.
+    // An IPv4 address of 3 bytes and a name that is not UTF-8:
+    // answered, not reset.
     for open in [
         udp_open(7, AddrType::Ipv4, &[10, 0, 0], 53, 0),
         udp_open(8, AddrType::Domain, &[0xFF, 0xFE], 53, 0),

@@ -1,11 +1,11 @@
-//! Gateway header rules (spec §2.3), port of `src/gateway/mq_gw_headers.c`.
+//! Gateway header rules (spec §2.3).
 
 use crate::h1::is_tchar;
 use crate::limits::{METHOD_MAX, TARGET_PATH_MAX};
 
 /// Longest `X-Mq-Cache` TTL in seconds (1 year).
 pub const CACHE_TTL_MAX: u32 = 31_536_000;
-/// Longest target authority, both intakes (C `char authority[256]`).
+/// Longest target authority, both intakes.
 pub const AUTHORITY_MAX: usize = 255;
 
 /// Parsed `X-Mq-Target` (bytes: any non-control, non-DEL, non-space byte round-trips).
@@ -82,7 +82,7 @@ pub fn parse_target(s: &[u8]) -> Option<Target> {
         .map(|p| p + scan_from)
     {
         let port = &auth[pc + 1..];
-        // No numeric range check (as C).
+        // No numeric range check.
         if port.is_empty() || !port.iter().all(u8::is_ascii_digit) || pc == 0 {
             return None;
         }
@@ -328,7 +328,7 @@ mod tests {
         t(s).unwrap_or_else(|| panic!("expected Some for {s:?}"))
     }
 
-    // ---- parse_target (test_gw_headers.c) ----
+    // ---- parse_target ----
     #[test]
     fn target_https_full() {
         let x = ok("https://example.com/foo/bar?x=1&y=2");
@@ -415,7 +415,7 @@ mod tests {
         assert!(t("https://h:/x").is_none());
         assert!(t("https://:80").is_none());
         assert!(t("https://h:80:90").is_none());
-        // no numeric range check, as C
+        // no numeric range check
         assert_eq!(ok("https://h:99999").authority, b"h:99999");
     }
     #[test]

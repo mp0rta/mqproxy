@@ -1,9 +1,6 @@
-//! Ports `test_transport_fabric` and `test_conn_handshake` (spec §8.3): a full handshake and
-//! a stream echo with FIN both ways, entirely in memory; per-connection `MpReady` with two
-//! connections on one client transport, one of which then closes.
-//!
-//! Not ported: the C mp-ready subscriber table (`mq_transport_add/remove_mp_ready_cb`) and its
-//! capacity tests — the facade has no subscriber table; `MpReady` carries the connection id.
+//! Spec §8.3: a full handshake and a stream echo with FIN both ways, entirely in memory;
+//! per-connection `MpReady` with two connections on one client transport, one of which then
+//! closes. There is no mp-ready subscriber table; `MpReady` carries the connection id.
 mod common;
 
 use common::pair::{MS, Pair, conn_cfg, new_streams, recv, send};
@@ -11,7 +8,7 @@ use mq_transport_api::{ConnId, Event, StreamKind, TransportOps};
 
 const PAYLOAD: &[u8] = b"the quick brown fox jumps over the lazy dog";
 
-/// `test_conn_handshake`: handshake, `NewConn`, one client stream seen by the server, close,
+/// Handshake, `NewConn`, one client stream seen by the server, close,
 /// teardown.
 #[test]
 fn conn_handshake() {
@@ -39,7 +36,7 @@ fn conn_handshake() {
     // Teardown: the peers drop their transports on their own threads.
 }
 
-/// `test_transport_fabric`: the server echoes the client's payload with FIN; byte integrity
+/// The server echoes the client's payload with FIN; byte integrity
 /// and a clean FIN in both directions.
 #[test]
 fn stream_echo_round_trip() {
@@ -72,7 +69,7 @@ fn mp_ready(ev: &[Event], c: ConnId) -> bool {
     ev.contains(&Event::MpReady(c))
 }
 
-/// `test_mp_ready_broadcast`: each connection gets its own `MpReady`; closing one leaves the
+/// Each connection gets its own `MpReady`; closing one leaves the
 /// other working.
 #[test]
 fn mp_ready_per_connection_and_close_one_keep_one() {

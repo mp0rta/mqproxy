@@ -56,9 +56,9 @@ pub const TRANSPARENT: ListenerTag = ListenerTag(3);
 /// SP3 spec §5.1: the fetch listener.
 pub const FETCH: ListenerTag = ListenerTag(4);
 
-/// spec §6.2: the TLS server name, as C.
+/// spec §6.2: the TLS server name.
 const SNI: &str = "mqproxy";
-/// spec §6.2: wire limits of `client_id` / `auth_token` (C `char[64]` / `char[256]`).
+/// spec §6.2: wire limits of `client_id` / `auth_token`.
 const MAX_CLIENT_ID: usize = 63;
 const MAX_TOKEN: usize = 255;
 const MAX_HOST: usize = 255;
@@ -153,7 +153,7 @@ pub(crate) enum Owner {
     Mitm(mitm::MStreamKey),
 }
 
-/// spec §6.2: truncate to the wire limit with a warning (C truncates silently).
+/// spec §6.2: truncate to the wire limit with a warning.
 fn truncated(s: &str, max: usize, flag: &str) -> Vec<u8> {
     let b = s.as_bytes();
     if b.len() > max {
@@ -185,7 +185,7 @@ fn discard(cx: &mut Cx<'_>, tcp: TcpId) {
     cx.tcp_consume(tcp, n);
 }
 
-/// spec §6.2: stream type `0x01` then `CONNECT_TCP_REQUEST` (flags 0), as C sends it.
+/// spec §6.2: stream type `0x01` then `CONNECT_TCP_REQUEST` (flags 0).
 fn connect_request(target: &Target) -> Vec<u8> {
     let (address_type, host): (AddrType, Vec<u8>) = match &target.host {
         Host::Ip(IpAddr::V4(a)) => (AddrType::Ipv4, a.octets().to_vec()),
@@ -412,7 +412,7 @@ impl Client {
             }
         };
         let Some(features) = features else {
-            // spec §6.2 "Auth refused": pending requests fail, as in C.
+            // spec §6.2 "Auth refused": pending requests fail.
             self.set_udp(cx, UdpAvail::Unavailable);
             for o in self.pending.drain() {
                 refuse(cx, o.tcp, o.kind, TcpErr::ConnRefused);
@@ -594,7 +594,7 @@ impl Client {
         if let Some(t) = self.conn.take().and_then(|c| c.auth_timer) {
             self.cancel(cx, t);
         }
-        // Relays were closed by the shard's sweep; in-flight opens fail, as in C.
+        // Relays were closed by the shard's sweep; in-flight opens fail.
         for (_, o) in self.opens.drain() {
             refuse(cx, o.tcp, o.kind, TcpErr::ConnRefused);
         }
@@ -732,7 +732,7 @@ impl App for Client {
                 self.end_session(cx, sid, SessionEnd::Closed, false);
             }
             Event::StreamClosed(s) => {
-                // spec §6.2: closed before the response → CONN_REFUSED, as in C.
+                // spec §6.2: closed before the response → CONN_REFUSED.
                 if let Some(o) = self.opens.remove(&s) {
                     refuse(cx, o.tcp, o.kind, TcpErr::ConnRefused);
                     cx.stream_reset(s);
@@ -950,7 +950,7 @@ impl App for Client {
                 if let Some(every) = self.cfg.metrics_interval {
                     self.timer(cx, every, Tm::Metrics);
                 }
-                // spec §6.5: nothing without a connection, as C `cli_metrics_tick`;
+                // spec §6.5: nothing without a connection;
                 // SP3 spec §5.7: then the H3 tunnel's block.
                 self.dump_metrics(cx);
                 if let Some(t) = self.h3.as_ref() {

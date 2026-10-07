@@ -1,8 +1,7 @@
 //! Socket options and sockaddr conversion. spec §2.2.
 //!
-//! `original_dst` reads the pre-NAT destination of a REDIRECTed TCP flow
-//! (port of `src/ingress/mq_listener.c`); `set_linger_zero` makes the next
-//! close abort with RST (spec §5.2).
+//! `original_dst` reads the pre-NAT destination of a REDIRECTed TCP flow;
+//! `set_linger_zero` makes the next close abort with RST (spec §5.2).
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -151,8 +150,7 @@ pub(crate) fn sockaddr_storage(a: SocketAddr) -> (libc::sockaddr_storage, libc::
     (ss, len as _)
 }
 
-/// `AF_INET` or `AF_INET6`; rejects every other family (the
-/// `unsupported_family` case of `tests/test_origdst.c`).
+/// `AF_INET` or `AF_INET6`; rejects every other family.
 pub(crate) fn from_sockaddr_storage(ss: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
     match ss.ss_family as libc::c_int {
         libc::AF_INET => {

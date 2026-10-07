@@ -86,8 +86,8 @@ pub fn server_role() -> Role {
     }
 }
 
-/// The client settings the ports use: token "secret", reconnect off (as the
-/// C fixtures), a 1 s maximum backoff for the reconnect cases.
+/// The client settings the pair tests use: token "secret", reconnect off, a
+/// 1 s maximum backoff for the reconnect cases.
 pub fn client_cfg() -> ClientConfig {
     ClientConfig {
         server: server_addr(),
@@ -720,7 +720,7 @@ impl<S: App + 'static, C: App + 'static> Pair<S, C> {
         self.with_server(|n| n.tap().open_conns())
     }
 
-    /// `Cx::close_conn` on the client side (C `mq_conn_close`).
+    /// `Cx::close_conn` on the client side.
     pub fn close_client_conn(&self, c: ConnId) {
         self.with_client(move |n| n.with_app(|_, cx| cx.close_conn(c)));
     }
@@ -916,8 +916,8 @@ pub struct RawConn {
 
 /// spec §8.1: a client app below the real `Client` — it opens connections
 /// and streams on command, sends and receives raw bytes, and on each
-/// connection's first stream sends the C `AUTH_REQUEST` (or, unauthenticated,
-/// one `0x00` byte, as C's `preauth` case, and never authenticates).
+/// connection's first stream sends the `AUTH_REQUEST` (or, unauthenticated,
+/// one `0x00` byte, and never authenticates).
 /// Received bytes are read on every `StreamReadable` (the app-owned stream
 /// rule, spec §5.4). Commands run through `Node::with_app`.
 ///
@@ -1043,7 +1043,7 @@ impl App for RawClient {
                 let bytes = if k.authenticate {
                     auth_request(&self.token)
                 } else {
-                    vec![0x00] // C `preauth_on_state`'s nudge: never a complete AUTH_REQUEST
+                    vec![0x00] // a nudge that is never a complete AUTH_REQUEST
                 };
                 let s = self.open_stream(cx, c);
                 self.conns.get_mut(&c).expect("known").ctrl = Some(s);
@@ -1107,7 +1107,7 @@ impl App for RawClient {
 
 // --- Wire bytes ---
 
-/// The C `AUTH_REQUEST` (version 1, client id "client-1", features 0).
+/// The `AUTH_REQUEST` (version 1, client id "client-1", features 0).
 pub fn auth_request(token: &[u8]) -> Vec<u8> {
     let mut b = [0u8; 512];
     let n = AuthReq {
@@ -1121,7 +1121,7 @@ pub fn auth_request(token: &[u8]) -> Vec<u8> {
     b[..n].to_vec()
 }
 
-/// Stream type 0x01 then `CONNECT_TCP_REQUEST` to an IPv4 target (C `open_tcp_data_stream`).
+/// Stream type 0x01 then `CONNECT_TCP_REQUEST` to an IPv4 target.
 pub fn connect_request(target: SocketAddr) -> Vec<u8> {
     let SocketAddr::V4(a) = target else {
         panic!("IPv4 target");
@@ -1190,7 +1190,7 @@ pub fn socks_udp(dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
     b
 }
 
-/// Deterministic payload (C bulk origin: byte i is `i & 0xff`).
+/// Deterministic payload (byte i is `i & 0xff`).
 pub fn bulk(n: usize) -> Vec<u8> {
     (0..n).map(|i| i as u8).collect()
 }

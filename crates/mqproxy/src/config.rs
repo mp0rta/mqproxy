@@ -1,5 +1,4 @@
-//! spec §6.4 "Config file": C `mq_config_load` — the typed values an INI file
-//! sets. `cli` layers the command line on top (defaults < file < CLI). Text
+//! spec §6.4 "Config file": the typed values an INI file sets. `cli` layers the command line on top (defaults < file < CLI). Text
 //! values (`CC`, `Scheduler`, addresses, `[Ingress] Mode`, `Path`) are kept as
 //! text and validated by `cli` at startup, exactly like the flag values.
 
@@ -8,7 +7,7 @@ use crate::ini::{self, Line};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-/// C `parse_section` names (compared case-insensitively).
+/// Section names (compared case-insensitively).
 const SECTIONS: &[&str] = &[
     "Interface",
     "Server",
@@ -33,7 +32,7 @@ pub struct FileConfig {
     pub cc: Option<String>,
     pub scheduler: Option<String>,
     pub qlog: Option<PathBuf>,
-    /// 0 = off, as in C.
+    /// 0 = off.
     pub metrics_interval: Option<u64>,
     // server
     pub listen: Option<String>,
@@ -63,7 +62,7 @@ pub struct FileConfig {
     pub tproxy_table: Option<u32>,
     pub tproxy_dport: Option<u16>,
     pub setup_redirect: bool,
-    /// `SkipUid = -1` (C's "use geteuid()") is `None`.
+    /// `SkipUid = -1` ("use geteuid()") is `None`.
     pub tproxy_uid: Option<u32>,
     pub mitm: bool,
     pub ca_cert: Option<String>,
@@ -71,7 +70,7 @@ pub struct FileConfig {
     pub ignore_hosts: Vec<String>,
 }
 
-/// C `parse_bool`: exact `true`, `yes`, `1`.
+/// Exact `true`, `yes`, `1`.
 fn bool_(v: &str) -> bool {
     matches!(v, "true" | "yes" | "1")
 }
@@ -85,7 +84,7 @@ pub fn load(path: Option<&Path>, server: bool) -> Result<FileConfig, Exit> {
         code: 2,
         message: format!("error: config: cannot open '{}': {e}\n", path.display()),
     })?;
-    // C `mq_config_perms_insecure`: any group/other bit.
+    // Insecure: any group/other bit.
     if std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
         f.warnings.push(format!(
             "config {} is group/world-readable; chmod 0600 to protect the token",
@@ -126,7 +125,7 @@ pub fn load(path: Option<&Path>, server: bool) -> Result<FileConfig, Exit> {
 }
 
 impl FileConfig {
-    /// C LONGV: an integer in `lo..=hi`, else warn and keep the previous value.
+    /// An integer in `lo..=hi`, else warn and keep the previous value.
     fn num(&mut self, at: &str, k: &str, v: &str, lo: i64, hi: i64) -> Option<i64> {
         let n = v.parse::<i64>().ok().filter(|n| (lo..=hi).contains(n));
         if n.is_none() {
@@ -137,7 +136,7 @@ impl FileConfig {
         n
     }
 
-    /// C `handle_kv`. `sec` is canonical, `key` lower-cased; `k` is the key as written.
+    /// Applies one key: `sec` is canonical, `key` lower-cased; `k` is the key as written.
     /// Returns false if the key is unknown for this mode.
     fn set(&mut self, at: &str, sec: &str, key: &str, k: &str, v: &str, server: bool) -> bool {
         let (s, c) = (server, !server);

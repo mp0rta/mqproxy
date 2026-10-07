@@ -1,5 +1,5 @@
-//! spec §5: the per-connection datagram MSS cache and the C fragment send policy,
-//! shared by both roles — C `{srv,cli}_get_mss_payload` / `{srv_split,cli}_emit_*`.
+//! spec §5: the per-connection datagram MSS cache and the fragment send policy,
+//! shared by both roles.
 
 use super::{Counters, MSS_REFRESH, UDP_MSG_HDR};
 use mq_runtime::Cx;
@@ -45,7 +45,7 @@ impl MssCache {
 /// Fragments `send_packet` got out and fragments whose `datagram_send` failed.
 /// Both 0 means nothing was attempted (unusable MSS, or too many fragments); otherwise
 /// `frags_ok + failed` is the fragment count, so a caller that advances `packet_id`
-/// only for a split that ran (C) can tell by `frags_ok + failed > 0`.
+/// only for a split that ran can tell by `frags_ok + failed > 0`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SendOutcome {
     pub frags_ok: u8,
@@ -97,7 +97,7 @@ pub fn send_packet(
         }
     });
     match res {
-        // C: a split with at most one surviving fragment adds nothing.
+        // A split with at most one surviving fragment adds nothing.
         Ok(()) if out.frags_ok > 1 => c.frags_sent += u32::from(out.frags_ok),
         Ok(()) => {}
         Err(SplitError::TooManyFrags) => c.drops_oversize += 1,

@@ -354,8 +354,8 @@ stop_client() {
 #   2. The nft table "ip mqproxy" exists (rules are installed).
 #   3. The QUIC tunnel to the server is established (the client logged its
 #      "mqproxy client: server=..." startup line AND the server is alive).
-# The REDIRECT rules are installed during client startup (mq_tproxy_setup_install
-# is called before the event loop).  The QUIC handshake completes asynchronously;
+# The REDIRECT rules are installed during client startup (before the event
+# loop).  The QUIC handshake completes asynchronously;
 # we poll for up to 8s total.
 wait_tproxy_ready() {
     for _ in $(seq 1 80); do

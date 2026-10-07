@@ -100,7 +100,7 @@ fn server_implemented_flags_resolve() {
     assert_eq!(r.cc, CongestionControl::Cubic);
     assert_eq!(r.scheduler, Scheduler::Wlb);
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-    // C parse_ip_port also takes an unbracketed IPv6 literal (split at the last ':').
+    // An unbracketed IPv6 literal is also accepted (split at the last ':').
     let r = cli::parse(&[
         "mqproxy", "server", "--listen", "::1:9443", "--token", "t", "--cert", "c", "--key", "k",
     ])
@@ -216,7 +216,7 @@ fn client_implemented_flags_resolve() {
         ]);
         assert!(r.is_ok(), "{flag}: {r:?}");
     }
-    // More than 8 --path: C warns and ignores the extras.
+    // More than 8 --path: warns and ignores the extras.
     let mut extra = Vec::new();
     for _ in 0..9 {
         extra.extend(["--path", "10.0.0.1"]);
@@ -262,7 +262,7 @@ fn server_gateway_on_by_default() {
 }
 
 /// spec §8: `--no-gateway` → `gateway = None`, no H3, no `mq_origin:` line;
-/// `--masquerade` / `--request-metrics` with it warn and are ignored (C text).
+/// `--masquerade` / `--request-metrics` with it warn and are ignored.
 #[test]
 fn no_gateway_disables_h3_and_warns_masquerade_and_metrics() {
     let r = parse(SERVER, &["--no-gateway", "--origin-ca", "/ca.pem"]).unwrap();
@@ -270,7 +270,7 @@ fn no_gateway_disables_h3_and_warns_masquerade_and_metrics() {
     assert_eq!(server(&r).config.gateway, None);
     assert!(!cli::wants_h3(&r));
     assert!(r.startup_lines.is_empty(), "{:?}", r.startup_lines);
-    // C's order: request-metrics, cache, masquerade.
+    // Warning order: request-metrics, cache, masquerade.
     let r = parse(
         SERVER,
         &[
@@ -327,7 +327,7 @@ fn client_gateway_counts_as_ingress() {
             "{extra:?}"
         );
     }
-    // C's validation order: server, socks5, http-connect, gateway, tproxy.
+    // Validation order: server, socks5, http-connect, gateway, tproxy.
     for (extra, first) in [
         (&["--server", "x", "--socks5", "y"][..], "--server"),
         (&["--socks5", "x", "--gateway", "y"], "--socks5"),
@@ -393,7 +393,7 @@ fn origin_connect_timeout_pure() {
     );
 }
 
-/// spec §8: `--no-udp` and `--udp-idle-timeout` reach `ServerConfig` (C defaults: on, 60 s).
+/// spec §8: `--no-udp` and `--udp-idle-timeout` reach `ServerConfig` (defaults: on, 60 s).
 #[test]
 fn server_udp_flags_change_config() {
     let d = parse(SERVER, &[]).unwrap();
@@ -553,7 +553,7 @@ fn mitm_on_server_exit2() {
 }
 
 /// A good CA + tproxy builds `config.mitm`; repeated and comma-split ignore
-/// flags (empty tokens skipped, as in C) are unioned.
+/// flags (empty tokens skipped) are unioned.
 #[test]
 fn mitm_ok_builds_config() {
     let r = parse_mitm(
@@ -600,8 +600,7 @@ fn ca_flags_without_mitm_no_effect() {
     assert!(client(&r).config.mitm.is_none());
 }
 
-/// The cache was removed: one warning, gateway on or off (it replaces C's
-/// "no effect with --no-gateway" warning for this flag).
+/// The cache was removed: one warning, gateway on or off.
 #[test]
 fn cache_max_bytes_warns() {
     for extra in [&[][..], &["--no-gateway"]] {
@@ -706,7 +705,7 @@ fn no_ingress_rejected() {
         "t",
     ]));
     assert_eq!(e.code, 2);
-    // C text, naming --gateway too (tests/test_cli_help.sh greps for it).
+    // Names --gateway too (tests/test_cli_help.sh greps for it).
     assert!(
         e.message.contains(
             "at least one ingress is required (--socks5, --http-connect, --gateway, or --tproxy)"
@@ -856,13 +855,13 @@ fn help_and_version_exit_0_in_process() {
             (0, concat!("mqproxy ", env!("CARGO_PKG_VERSION")))
         );
     }
-    // -V is top-level only, as in C.
+    // -V is top-level only.
     assert_eq!(exit(parse(SERVER, &["-V"])).code, 2);
 }
 
 // ---- the only tests that spawn the binary ----
 
-/// The C `longopts` tables (cli/main.c `cmd_server` / `cmd_client`).
+/// Every long option `server` / `client` accepts.
 const SERVER_LONGOPTS: &[&str] = &[
     "listen",
     "token",
@@ -932,7 +931,7 @@ fn mitm_help_no_unavailable_marker() {
     assert!(!text.contains("not available"), "{text}");
 }
 
-/// spec §11.5: every C long option is listed, and no flag carries an old SP1 marker.
+/// spec §11.5: every long option is listed, and no flag carries an old SP1 marker.
 #[test]
 fn help_lists_every_longopt() {
     for (sub, opts) in [("server", SERVER_LONGOPTS), ("client", CLIENT_LONGOPTS)] {
@@ -949,7 +948,7 @@ fn help_lists_every_longopt() {
                 "{sub} --help lacks {flag}:\n{text}"
             );
         }
-        // C's wording now that the gateway conn exists.
+        // The wording now that the gateway conn exists.
         let metrics = match sub {
             "server" => "Logs the most-recently-accepted TCP and gateway conn",
             _ => "Logs the proxy conn (and the gateway conn with --gateway)",

@@ -1,4 +1,4 @@
-//! Ports `test_max_conns` (spec §8.3, §4.7): with `max_conns = 1` a second client is refused
+//! Spec §8.3, §4.7: with `max_conns = 1` a second client is refused
 //! in `server_accept`; after the first connection is destroyed a third client connects;
 //! `conn_count()` follows.
 mod common;

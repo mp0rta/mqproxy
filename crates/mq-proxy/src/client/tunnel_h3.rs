@@ -80,7 +80,7 @@ impl H3Tunnel {
         self.reconnect = Some(cx.set_timer(d));
     }
 
-    /// SP3 spec §5.7: eager, as C's constructor; the first failure is fatal.
+    /// SP3 spec §5.7: eager; the first failure is fatal.
     pub fn on_start(&mut self, cx: &mut Cx<'_>) {
         if !self.connect(cx) {
             cx.request_exit(1);

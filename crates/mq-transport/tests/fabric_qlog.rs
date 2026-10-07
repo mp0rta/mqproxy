@@ -1,4 +1,4 @@
-//! Ports `test_qlog_blocked` (spec §8.3, §4.9): a handshake plus an unblocked download;
+//! Spec §8.3, §4.9: a handshake plus an unblocked download;
 //! `<dir>/client.qlog` holds frame events and no DATA_BLOCKED / STREAM_DATA_BLOCKED frames.
 mod common;
 

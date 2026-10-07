@@ -87,7 +87,7 @@ pub(crate) fn app_proto_callbacks(proto: ConnProto) -> xqc_app_proto_callbacks_t
 
 // ── callbacks with no state ─────────────────────────────────────────────
 
-/// spec §4.7: accept any certificate (as the C client does).
+/// spec §4.7: accept any certificate.
 unsafe extern "C" fn cert_verify(
     _certs: *mut *const c_uchar,
     _cert_len: *const usize,
@@ -101,10 +101,10 @@ unsafe extern "C" fn cert_verify(
 /// the facade does not rely on the fork's null check.
 unsafe extern "C" fn datagram_write_notify(_conn: *mut xqc_connection_t, _ud: *mut c_void) {}
 
-/// No resumption store, as in C.
+/// No resumption store.
 unsafe extern "C" fn save_token(_token: *const c_uchar, _len: u32, _ud: *mut c_void) {}
 
-/// `save_session_cb` and `save_tp_cb`: no-ops, as in C.
+/// `save_session_cb` and `save_tp_cb`: no-ops.
 unsafe extern "C" fn save_string(_data: *const c_char, _len: usize, _ud: *mut c_void) {}
 
 // ── socket addresses ────────────────────────────────────────────────────

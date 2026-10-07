@@ -1,5 +1,4 @@
-//! spec §6.5: `mq.conn` / `mq.path` lines, byte-identical to C
-//! `mq_conn_format_conn_line` / `mq_conn_format_path_line` / `mq_conn_dump_stats_cid`.
+//! spec §6.5: `mq.conn` / `mq.path` lines.
 
 use mq_transport_api::{ConnStats, PathStats};
 

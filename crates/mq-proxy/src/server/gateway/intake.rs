@@ -14,11 +14,9 @@ use mq_http::headers::{
 use mq_http::limits::{SectionBudget, TARGET_PATH_MAX};
 use subtle::ConstantTimeEq;
 
-/// C's fixed buffers `char auth[512]` / `char cls[128]`: the only two
-/// values truncated instead of rejected (§9.3).
+/// The only two values truncated instead of rejected (§9.3).
 const AUTH_CAP: usize = 511;
 const CLASS_CAP: usize = 127;
-/// C `sanitize_for_log(cls_safe, 64, …)`.
 const CLASS_LOG: usize = 64;
 
 /// What one header section said, before any judgement.
@@ -45,8 +43,8 @@ pub(super) struct Capture {
 }
 
 impl Capture {
-    /// One header; names compare case-insensitively (C `slice_ieq`), a
-    /// repeated pseudo-header or control header keeps the last value (C).
+    /// One header; names compare case-insensitively, a repeated
+    /// pseudo-header or control header keeps the last value.
     pub(super) fn each(&mut self, n: &[u8], v: &[u8]) {
         let is = |s: &[u8]| n.eq_ignore_ascii_case(s);
         let cut = |cap: usize| Some(v[..v.len().min(cap)].to_vec());
@@ -56,7 +54,7 @@ impl Capture {
                 _ if is(b":scheme") => &mut self.scheme,
                 _ if is(b":authority") => &mut self.authority,
                 _ if is(b":path") => &mut self.path,
-                _ => return, // other pseudo-headers: ignored, as C
+                _ => return, // other pseudo-headers: ignored
             };
             // A pseudo-header is a field too (`:path` at 8188 overflows here).
             self.bad_header |= self.budget.add(n, v).is_err();
@@ -330,13 +328,13 @@ mod tests {
             Err((403, "auth-failed"))
         );
         assert_eq!(outcome(&req(&[], false)), Ok(()));
-        // An empty configured token never matches (C: `al > pl`).
+        // An empty configured token never matches.
         assert!(
             decide(&req(&[("x-mq-auth", Some(b"Bearer "))], false), b"")
                 .outcome
                 .is_err()
         );
-        // C's `char auth[512]`: the value is cut at 511 bytes before the compare.
+        // The value is cut at 511 bytes before the compare.
         let token = vec![b't'; 504];
         let mut v = b"Bearer ".to_vec();
         v.extend_from_slice(&token);
@@ -344,7 +342,7 @@ mod tests {
         let c = req(&[("x-mq-auth", Some(&v))], false);
         assert_eq!(c.auth.as_ref().map(Vec::len), Some(511));
         assert!(decide(&c, &token).authed, "the cut value matches");
-        // Header names match case-insensitively, as C's `slice_ieq`.
+        // Header names match case-insensitively.
         let mut c = req(&[("x-mq-auth", None)], false);
         c.each(b"X-Mq-Auth", b"Bearer secret");
         assert_eq!(outcome(&c), Ok(()));
@@ -391,7 +389,7 @@ mod tests {
             class_line(b"x", b"Bearer nope").is_empty(),
             "step 5 follows auth"
         );
-        // C's `char cls[128]`.
+        // The class is cut at 127 bytes.
         let c = req(&[("x-mq-class", Some(&[b'c'; 200]))], false);
         assert_eq!(c.class.as_ref().map(Vec::len), Some(127));
     }

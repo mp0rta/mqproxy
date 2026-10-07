@@ -52,7 +52,7 @@ struct ReqMeta {
     origin_is_tls: bool,
 }
 
-/// spec §6.6: how the origin transfer ended, committed C-style (`on_done`).
+/// spec §6.6: how the origin transfer ended.
 #[derive(Copy, Clone)]
 struct OriginEnd {
     tls: TlsOutcome,
@@ -347,7 +347,7 @@ impl GwCore {
             hs.push(h("x-mq-error", xmq.as_bytes()));
         }
         hs.push(h("content-length", b"0"));
-        // `Blocked` on this tiny block is treated as sent (as C).
+        // `Blocked` on this tiny block is treated as sent.
         if !matches!(
             cx.h3_send_headers(id, &hs, true),
             Ok(()) | Err(StreamError::Blocked)
@@ -479,7 +479,7 @@ impl GwCore {
     }
 }
 
-/// spec §6.6/§2.4: the request's `mq.req` line, inputs derived as C's call site.
+/// spec §6.6/§2.4: the request's `mq.req` line.
 fn log_req(r: &GwReq, s: &H3ReqStats) {
     let m = r.meta.as_ref();
     let path = m.map_or(&b"-"[..], |m| {

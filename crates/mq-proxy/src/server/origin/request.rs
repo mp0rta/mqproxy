@@ -30,7 +30,7 @@ pub(super) fn build_request(
         .method(req.method.as_bytes())
         .uri(uri)
         .header("host", req.authority.as_slice());
-    // libcurl: `name:` suppresses, so an empty `accept` suppresses the default too.
+    // `name:` suppresses the header, so an empty `accept` suppresses the default too.
     if !req
         .headers
         .iter()

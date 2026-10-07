@@ -1,4 +1,4 @@
-//! spec §2.3: 4-slot LRU datagram defragmenter (C `tests/test_defrag.c` plus the §2.3 additions).
+//! spec §2.3: 4-slot LRU datagram defragmenter.
 
 use mq_proxy::udp::defrag::{Defrag, Feed};
 use mq_wire::udp_msg::UdpMsgHdr;

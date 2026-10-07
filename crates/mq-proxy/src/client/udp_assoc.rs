@@ -66,7 +66,7 @@ impl Assoc {
         now: Time,
     ) -> Option<&mut DstEntry> {
         if self.dsts.len() >= MAX_DST_PER_ASSOC {
-            // C `dst_alloc`: `failed_at == 0 || now - failed_at >= NEGCACHE`.
+            // A free entry: no session and no live negative-cache mark.
             let free = self.dsts.iter().find(|(_, e)| {
                 e.session.is_none() && e.failed_at.is_none_or(|f| now - f >= NEG_CACHE)
             });

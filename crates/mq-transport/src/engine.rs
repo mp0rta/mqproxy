@@ -10,7 +10,7 @@ use std::io::Write;
 use std::time::Duration;
 use xquic_sys::*;
 
-/// Connection settings (spec §4.9), built from a zeroed struct like C's `memset`.
+/// Connection settings (spec §4.9), built from a zeroed struct.
 /// `idle` is the client's `--keepalive-idle`; the server passes `None`.
 /// spec §7: live skipped-id entries a peer may make xquic hold per connection.
 pub(crate) const MAX_IMPLICIT_STREAMS: u64 = 16384;
@@ -21,7 +21,7 @@ pub const H3_FIELD_SECTION_MAX: usize = 64 * 1024;
 pub(crate) fn conn_settings(cfg: &TransportConfig, idle: Option<Duration>) -> xqc_conn_settings_t {
     let server = matches!(cfg.role, Role::Server { .. });
     // SAFETY: a plain C struct of integers, floats, arrays and Option<fn> fields; all-zero is
-    // valid and is exactly what the C version starts from.
+    // valid.
     let mut s: xqc_conn_settings_t = unsafe { core::mem::zeroed() };
     s.proto_version = XQC_VERSION_V1;
     s.pacing_on = 1;
@@ -231,7 +231,7 @@ unsafe extern "C" fn set_event_timer(wake_after: xqc_usec_t, _ud: *mut c_void) {
     })
 }
 
-/// xquic logs → `log` with the C level mapping (`mq_transport_log_write`).
+/// xquic logs → `log`, with xquic's levels mapped onto `log::Level`.
 unsafe extern "C" fn log_write(
     lvl: xqc_log_level_t,
     buf: *const c_void,
@@ -254,7 +254,7 @@ unsafe extern "C" fn log_write(
     })
 }
 
-/// qlog sink (`mq_transport_qlog_write`): the line plus a newline, only while a file is open.
+/// qlog sink: the line plus a newline, only while a file is open.
 unsafe extern "C" fn qlog_write(
     _imp: qlog_event_importance_t,
     buf: *const c_void,
@@ -270,7 +270,7 @@ unsafe extern "C" fn qlog_write(
         unsafe {
             if let Some(f) = (*inner).qlog.as_mut() {
                 let line = core::slice::from_raw_parts(buf.cast::<u8>(), size);
-                // Best effort, as in C.
+                // Best effort.
                 let _ = f.write_all(line).and_then(|()| f.write_all(b"\n"));
             }
         }
@@ -324,15 +324,15 @@ mod tests {
         };
         assert_eq!(bytes(&s.cong_ctrl_callback), bytes(&want_cc));
         assert_eq!(bytes(&s.scheduler_callback), bytes(&want_sched));
-        // Left at the xquic default (zero = "use default"), as in C.
+        // Left at the xquic default (zero = "use default").
         assert_eq!(s.max_streams_bidi, 0);
         assert_eq!(s.init_idle_time_out, 0);
         assert_eq!(s.enable_stream_rate_limit, 0);
         assert_eq!(s.init_recv_window, 0);
-        assert_eq!(s.cc_params.customize_on, 0, "cc_params zeroed, as in C");
+        assert_eq!(s.cc_params.customize_on, 0, "cc_params zeroed");
     }
 
-    /// Ports `test_sched` (spec §8.3): each scheduler selects its own xquic callback table,
+    /// spec §8.3: each scheduler selects its own xquic callback table,
     /// on both roles. (Parsing the `--scheduler` names belongs to the config crate.)
     #[test]
     fn sched_selects_callback() {

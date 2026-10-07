@@ -3,14 +3,14 @@
 use mq_transport_api::Time;
 use std::time::Duration;
 
-/// spec §6.2: C `MQ_CLIENT_RECONNECT_BASE_MS`.
+/// spec §6.2: the reconnect base delay.
 pub const BASE_MS: u64 = 250;
-/// spec §6.2: `--reconnect-max-backoff` is floored to this (C `mq_client_set_reconnect`).
+/// spec §6.2: `--reconnect-max-backoff` is floored to this.
 pub const MIN_CAP: Duration = Duration::from_secs(1);
 /// spec §6.2: being `Serving` this long resets the attempt counter.
 pub const SERVING_RESET: Duration = Duration::from_secs(10);
 
-/// spec §6.2: port of C `mq_backoff_ms`: `min(cap, base << min(attempt, 31))`.
+/// spec §6.2: `min(cap, base << min(attempt, 31))`.
 pub fn backoff_ms(base_ms: u64, cap_ms: u64, attempt: u32) -> u64 {
     (base_ms << attempt.min(31)).min(cap_ms)
 }
@@ -41,8 +41,8 @@ impl Backoff {
 
     /// spec §6.2: the delay before the next attempt, taken on leaving for `Backoff` at
     /// `now`; `rnd` is a random value (the shard's `Cx::rng()`). If the client had been
-    /// `Serving` for 10 s the counter resets first; then, as in C `client_reconnect_arm`,
-    /// it is incremented before the delay is computed (first retry: 250–500 ms).
+    /// `Serving` for 10 s the counter resets first; then it is incremented
+    /// before the delay is computed (first retry: 250–500 ms).
     pub fn next_delay(&mut self, now: Time, rnd: u64) -> Duration {
         if let Some(since) = self.serving_since.take()
             && now - since >= SERVING_RESET

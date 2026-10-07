@@ -1,4 +1,4 @@
-//! spec §7.2: server pre-OPEN datagram buffer (C `srv_preopen_*`).
+//! spec §7.2: server pre-OPEN datagram buffer.
 
 use mq_proxy::udp::preopen::PreOpen;
 use mq_proxy::udp::{PREOPEN_BYTES, PREOPEN_DGRAMS, PREOPEN_TTL};
@@ -14,13 +14,13 @@ fn push_evicts_expired_lazily() {
         assert_eq!(p.push(T0, 1, &[i as u8]), 0);
     }
     // All 16 are past the TTL: the new entry sweeps them instead of evicting
-    // the oldest, and a TTL sweep is not an eviction (C).
+    // the oldest, and a TTL sweep is not an eviction.
     let later = T0 + PREOPEN_TTL + Duration::from_millis(1);
     assert_eq!(p.push(later, 2, &[9]), 0);
     assert!(p.take(later, 1).is_empty());
     assert_eq!(p.take(later, 2), vec![vec![9]]);
 
-    // Exactly the TTL old is not expired (C `<=`).
+    // Exactly the TTL old is not expired.
     p.push(later, 3, &[3]);
     p.push(later + PREOPEN_TTL, 4, &[4]);
     assert_eq!(p.take(later + PREOPEN_TTL, 3), vec![vec![3]]);
@@ -93,7 +93,7 @@ fn take_applies_ttl_without_intervening_push() {
     let mut p = PreOpen::default();
     p.push(T0, 1, &[1]);
     p.push(T0, 2, &[2]);
-    // The TTL is inclusive (C `<=`).
+    // The TTL is inclusive.
     assert_eq!(p.take(T0 + PREOPEN_TTL, 1), vec![vec![1]]);
     let late = T0 + Duration::from_millis(300);
     assert!(p.take(late, 2).is_empty());

@@ -1,4 +1,4 @@
-//! spec §6.1: SOCKS5 ingress parser — port of tests/test_socks5.c (SP2 UDP cases excluded).
+//! spec §6.1: SOCKS5 ingress parser.
 
 use mq_proxy::ingress::{Progress, Socks5Parser, socks5_error_reply, socks5_success_reply};
 use mq_runtime::{Host, Target};
@@ -164,7 +164,7 @@ fn request_need_more_every_prefix() {
 
 #[test]
 fn request_cmd_unsupported() {
-    // C: MQ_SOCKS5_UNSUPPORTED_CMD → mq_listener.c sends REP 0x07 and closes.
+    // An unsupported command: REP 0x07, then close.
     assert_eq!(
         greeted().feed(REQ_CMD_BIND),
         Progress::Reply {
@@ -332,7 +332,7 @@ fn pipelined_bytes_left_unconsumed() {
 
 #[test]
 fn bad_version_closes_without_reply() {
-    // Bad VER in the greeting or in the request: Close, no reply bytes (mq_socks5.c:25,52).
+    // Bad VER in the greeting or in the request: Close, no reply bytes.
     let mut buf = GREETING_BADVER.to_vec();
     buf.extend_from_slice(REQ_IPV4);
     assert_eq!(Socks5Parser::default().feed(&buf), Progress::Close);

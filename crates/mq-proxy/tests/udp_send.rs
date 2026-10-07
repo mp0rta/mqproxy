@@ -1,4 +1,4 @@
-//! spec §5: datagram MSS cache and the C fragment send policy (`send_packet`).
+//! spec §5: datagram MSS cache and the fragment send policy (`send_packet`).
 
 mod common;
 
@@ -177,7 +177,7 @@ fn single_fragment_and_empty_payload() {
         h.t.datagram_sends(h.conn),
         vec![cat(hdr(1, 0, 1), b"abc"), hdr(2, 0, 1)]
     );
-    // unfragmented packets never add to frags_sent (C)
+    // unfragmented packets never add to frags_sent
     assert_eq!(c, Counters::default());
 }
 

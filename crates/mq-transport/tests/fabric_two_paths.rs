@@ -1,5 +1,4 @@
-//! Ports `test_two_paths` and the address assertions of `test_path_bind` (spec §8.3), plus
-//! spec §4.2 "MpReady may repeat".
+//! Two paths and their per-path addresses (spec §8.3), plus spec §4.2 "MpReady may repeat".
 mod common;
 
 use common::pair::{
@@ -69,7 +68,7 @@ fn second_path_comes_up_and_carries_traffic() {
         "sent {sent} recv {recv}"
     );
 
-    // Addresses (test_path_bind): each path keeps its own 4-tuple on both sides.
+    // Addresses: each path keeps its own 4-tuple on both sides.
     let srv_key_path1 = |d: &&common::lockstep::Datagram| d.key.1 == pid && d.from == srv_addr();
     assert!(
         p.wire.iter().any(|d| d.from == cli_addr(1)),

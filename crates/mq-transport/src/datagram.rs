@@ -53,7 +53,7 @@ pub(crate) fn datagram_send(
     if r < 0 { Err(dgram_err(r)) } else { Ok(()) }
 }
 
-/// SP2 spec §3.1: as C `mq_conn_datagram_mss` — the min over active paths, re-read per call.
+/// SP2 spec §3.1: the min over active paths, re-read per call.
 pub(crate) fn datagram_mss(t: &Transport, c: ConnId) -> usize {
     let Some(xqc) = xqc_of(t, c) else {
         return 0;

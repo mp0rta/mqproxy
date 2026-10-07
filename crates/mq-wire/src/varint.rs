@@ -1,4 +1,4 @@
-// spec §2.3; mirrors src/wire/mq_varint.c
+// spec §2.3
 pub const MAX: u64 = 0x3FFF_FFFF_FFFF_FFFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

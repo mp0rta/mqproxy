@@ -1,6 +1,5 @@
 //! spec §5.3 "Setup", §6.4, §6.6: `run_server` / `run_client` build the
-//! transport, the driver and the shard in C `cmd_server` / `cmd_client` order,
-//! run the loop and return the exit status (1 for cert/bind/qlog/origin-TLS failures).
+//! transport, the driver and the shard, run the loop and return the exit status (1 for cert/bind/qlog/origin-TLS failures).
 
 use crate::cli::{self, Client as ClientArgs, Mode, Resolved, Server as ServerArgs};
 use crate::setup_redirect;
@@ -59,7 +58,7 @@ fn realtime_offset_us() -> i64 {
     wall - now().as_micros() as i64
 }
 
-/// C `getpid() ^ time(NULL)`.
+/// Process id XOR Unix time in seconds.
 fn seed() -> u64 {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -114,7 +113,7 @@ fn driver() -> Result<Driver, String> {
     .map_err(|e| format!("failed to create runtime ({e})"))
 }
 
-/// The startup INFO lines, logged once the signal handlers are in (as C).
+/// The startup INFO lines, logged once the signal handlers are in.
 fn ready(r: &Resolved, line: String) {
     for l in &r.startup_lines {
         log::info!("{l}");
@@ -173,7 +172,7 @@ fn run_server(r: &Resolved, s: &ServerArgs) -> Result<i32, String> {
     let app = match &s.config.gateway {
         Some(g) => {
             let tls = build_client_config(g.origin_ca.as_deref(), &native_roots).map_err(|e| {
-                // C's line, plus the cause (as the transport's).
+                // The line plus the cause (as the transport's).
                 let ca = g.origin_ca.as_deref().map_or("(system)".into(), |p| p.display().to_string());
                 format!(
                     "failed to create HTTP gateway server (origin_ca={ca}, connect_timeout={}s) ({e})",
@@ -214,7 +213,7 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
         "failed to create client transport".into(),
     )?;
     let mut d = driver()?;
-    // C: the first --path is the primary bind, else 0.0.0.0 with an ephemeral port.
+    // The first --path is the primary bind, else 0.0.0.0 with an ephemeral port.
     let primary_ip = c
         .config
         .paths
@@ -250,8 +249,8 @@ fn run_client(r: &Resolved, c: &ClientArgs) -> Result<i32, String> {
         d.attach_listener(l, shard.add_listener(tag));
         ingress += &format!(" {key}={addr}");
     }
-    // C binds tproxy (and installs its rules) before the fetch listener, but
-    // logs the ingress list as socks5, http-connect, gateway, tproxy.
+    // Tproxy is bound (and its rules installed) before the fetch listener, but
+    // the ingress list is logged as socks5, http-connect, gateway, tproxy.
     let mut tproxy = String::new();
     if let Some(addr) = c.tproxy {
         let l = d

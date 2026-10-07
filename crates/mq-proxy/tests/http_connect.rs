@@ -1,5 +1,4 @@
-//! spec §6.1: HTTP CONNECT ingress parser — port of tests/test_http_connect.c
-//! (`build_200_too_small` excluded: the Rust reply is a `&'static` slice, no caller buffer).
+//! spec §6.1: HTTP CONNECT ingress parser.
 
 use mq_proxy::ingress::{
     HttpConnectParser, INGRESS_CAP, Progress, http_error_reply, http_success_reply,
@@ -105,7 +104,7 @@ fn overlong_domain() {
         parse(format!("CONNECT {host}:443 HTTP/1.1\r\n\r\n").as_bytes()),
         bad()
     );
-    // 255 is still accepted (MQ_MAX_HOST).
+    // 255 is still accepted.
     let host = "a".repeat(255);
     let req = format!("CONNECT {host}:443 HTTP/1.1\r\n\r\n");
     assert_eq!(
@@ -201,13 +200,13 @@ fn pipelined_bytes_left_unconsumed() {
 
 #[test]
 fn cap_8k_closes_without_reply() {
-    // As mq_listener.c:346: a full 8 KiB buffer with no complete head → close, no reply.
+    // A full 8 KiB buffer with no complete head → close, no reply.
     let mut buf = b"CONNECT example.com:443 HTTP/1.1\r\n".to_vec();
     buf.resize(INGRESS_CAP - 1, b'x');
     assert_eq!(parse(&buf), Progress::Need);
     buf.push(b'x');
     assert_eq!(parse(&buf), Progress::Close);
-    // A terminator past the cap is never seen (C's rxbuf cannot hold it).
+    // A terminator past the cap is never seen.
     buf.extend_from_slice(b"\r\n\r\n");
     assert_eq!(parse(&buf), Progress::Close);
     // A head ending exactly at the cap still parses.

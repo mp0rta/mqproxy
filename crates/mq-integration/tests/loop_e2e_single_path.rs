@@ -1,24 +1,22 @@
-//! Ports `tests/integration/test_e2e_single_path.c` onto the loopback harness
-//! (spec §8.1 "Loopback"): the real `Server` and `Client` on real transports,
+//! Single-path cases on the loopback harness (spec §8.1 "Loopback"): the real `Server` and `Client` on real transports,
 //! each on its own production driver thread, over loopback UDP. The test
 //! thread plays the origin (`TcpListener`) and the application (`TcpStream`
 //! through the client's SOCKS5 / HTTP CONNECT listener).
 //!
-//! | C case                         | here                        | sizes / patterns |
-//! |--------------------------------|-----------------------------|------------------|
-//! | `test_socks5_download`         | `socks5_download`           | 200000 B, `i & 0xff`, then EOF |
-//! | `test_socks5_echo`             | `socks5_echo`               | 4096 B, `i*31+7` |
-//! | `test_http_echo`               | `http_echo`                 | 4096 B, `i*17+3` |
-//! | `test_socks5_pipelined_payload`| `socks5_pipelined_payload`  | `EARLY-PIPELINED-BYTES` in the request write |
-//! | `test_http_pipelined_payload`  | `http_pipelined_payload`    | `EARLY-HTTP-BYTES` in the head write |
-//! | `test_concurrent_ingress`      | `concurrent_ingress`        | 1 SOCKS5 + 1 HTTP, 4096 B each, `i*31+7` / `(i*17+3)^0xa5` |
-//! | `test_socks5_refused`          | `socks5_refused`            | dead port → REP 0x05, then close |
-//! | `test_http_refused`            | `http_refused`              | dead port → `HTTP/1.1 502`, then close |
+//! | test                        | sizes / patterns |
+//! |-----------------------------|------------------|
+//! | `socks5_download`           | 200000 B, `i & 0xff`, then EOF |
+//! | `socks5_echo`               | 4096 B, `i*31+7` |
+//! | `http_echo`                 | 4096 B, `i*17+3` |
+//! | `socks5_pipelined_payload`  | `EARLY-PIPELINED-BYTES` in the request write |
+//! | `http_pipelined_payload`    | `EARLY-HTTP-BYTES` in the head write |
+//! | `concurrent_ingress`        | 1 SOCKS5 + 1 HTTP, 4096 B each, `i*31+7` / `(i*17+3)^0xa5` |
+//! | `socks5_refused`            | dead port → REP 0x05, then close |
+//! | `http_refused`              | dead port → `HTTP/1.1 502`, then close |
 //!
-//! `socks5_echo_ipv6_path` (no C counterpart in this file; C supports
-//! `AF_INET6` QUIC paths) runs the tunnel over `::1` with IPv4 ingress;
+//! `socks5_echo_ipv6_path` runs the tunnel over `::1` with IPv4 ingress;
 //! `socks5_echo_v6_wildcard_path_to_v4_server` runs it from a dual-stack
-//! `[::]` client path to a `127.0.0.1` server (C's `--path ::`).
+//! `[::]` client path (`--path ::`) to a `127.0.0.1` server.
 //!
 //! Each test ends with both drivers stopped through their handles, exit (0, 0).
 #![forbid(unsafe_code)]

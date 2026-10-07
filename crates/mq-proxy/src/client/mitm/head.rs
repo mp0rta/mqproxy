@@ -23,7 +23,7 @@ pub enum MapErr {
     Malformed,
 }
 
-/// `"Bearer " + token`; a token that already has the prefix is used as is (C dedup).
+/// `"Bearer " + token`; a token that already has the prefix is used as is.
 pub fn auth_value(token: &str) -> Vec<u8> {
     if token.starts_with("Bearer ") {
         token.as_bytes().to_vec()

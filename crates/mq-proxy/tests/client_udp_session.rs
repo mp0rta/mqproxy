@@ -18,7 +18,7 @@ use std::time::Duration;
 const ASSOCIATE: &[u8] = &[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 /// Type `0x02` then `UDP_SESSION_OPEN` { sid 1, flags 0, IPv4 10.0.0.9, port 53, idle 0 }.
 const OPEN_SID1_53: &[u8] = &[
-    0x02, // MQ_STREAM_TYPE_UDP_SESSION
+    0x02, // stream type: UDP_SESSION
     0x01, // session_id
     0x00, // flags
     0x01, // address_type = IPv4

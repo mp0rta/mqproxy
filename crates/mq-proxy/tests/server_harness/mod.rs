@@ -18,13 +18,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Stream type 0x01 then C `mq_encode_connect_tcp_req` for example.com:443.
+/// Stream type 0x01 then `CONNECT_TCP_REQUEST` for example.com:443.
 pub const CONNECT_REQ_C: &[u8] = &[
     0x01, 0x00, 0x03, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x01,
     0xBB, 0x00,
 ];
 
-/// C `mq_encode_auth_resp` for OK / ERROR+AUTH_FAILED, server_id "mqproxy-server".
+/// `AUTH_RESPONSE` for OK / ERROR+AUTH_FAILED, server_id "mqproxy-server".
 /// `AUTH_OK_C` carries MQ_FEAT_UDP_RELAY (the default config); `AUTH_OK_NO_UDP_C`
 /// is the `udp_enabled = false` form (features 0).
 pub const AUTH_OK_C: &[u8] = &[

@@ -1,4 +1,4 @@
-//! spec §6.4: the INI scanner of C `mq_config_load` — `[Section]` headers,
+//! spec §6.4: the INI scanner — `[Section]` headers,
 //! `Key = Value` lines, `#`/`;` comments, whitespace trimmed. Names are
 //! returned as written (the caller compares them case-insensitively).
 
@@ -6,7 +6,7 @@
 #[derive(Debug, PartialEq, Eq)]
 pub enum Line<'a> {
     Section(&'a str),
-    /// The value is non-empty: C treats an empty value as not set and skips it.
+    /// The value is non-empty: an empty value counts as not set and is skipped.
     Kv(&'a str, &'a str),
     /// A warning text (malformed header or a line without `=`).
     Malformed(&'static str),
@@ -18,7 +18,7 @@ pub fn lines(text: &str) -> impl Iterator<Item = (usize, Line<'_>)> {
         let line = if t.is_empty() || t.starts_with(['#', ';']) {
             return None;
         } else if let Some(h) = t.strip_prefix('[') {
-            // C: everything after the first ']' is ignored.
+            // Everything after the first ']' is ignored.
             match h.split_once(']') {
                 Some((name, _)) => Line::Section(name),
                 None => Line::Malformed("malformed section header"),

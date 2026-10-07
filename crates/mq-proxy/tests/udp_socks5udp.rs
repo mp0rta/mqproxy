@@ -133,7 +133,7 @@ fn target_of_maps_each_atype() {
 
 #[test]
 fn target_of_empty_domain_is_none() {
-    // parse accepts a zero-length domain (as C); only the Target conversion refuses it.
+    // parse accepts a zero-length domain; only the Target conversion refuses it.
     let (dst, off) = parse(&[0, 0, 0, 0x03, 0, 0x00, 0x50]).unwrap();
     assert_eq!((dst.addr.len(), off), (0, 7));
     assert_eq!(target_of(&dst), None);

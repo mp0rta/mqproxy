@@ -1,9 +1,7 @@
-//! Ports `tests/integration/test_engine_boot.c` onto the loopback harness
-//! (spec §8.1 "Loopback"). The C test boots one client transport + runtime,
-//! opens the primary UDP path on `127.0.0.1:0`, runs the loop and stops it
-//! cleanly. Here both sides boot (real xquic engine, production driver, each
-//! on its own thread), the client completes a handshake with the server, and
-//! each driver is stopped through its `ShutdownHandle` with exit status 0.
+//! Engine boot on the loopback harness (spec §8.1 "Loopback"): both sides
+//! boot (real xquic engine, production driver, each on its own thread) on
+//! `127.0.0.1:0`, the client completes a handshake with the server, and each
+//! driver is stopped through its `ShutdownHandle` with exit status 0.
 
 use mq_integration::loopback::LoopbackPair;
 use mq_runtime::Shard;
@@ -90,7 +88,7 @@ fn loop_engine_boot() {
             (Shard::new(t, app, local, 2), rec)
         },
     );
-    // The C test's `mq_runtime_open_udp_path("127.0.0.1", 0) == 0`.
+    // Both primary UDP paths are bound on loopback with a kernel-chosen port.
     for a in [pair.server.udp_addr, pair.client.udp_addr] {
         assert!(a.ip().is_loopback() && a.port() != 0, "{a}");
     }
@@ -109,6 +107,6 @@ fn loop_engine_boot() {
     );
     assert!(pair.server.stats.iterations() > 0 && pair.client.stats.iterations() > 0);
 
-    // The C test's stop timer: each side stopped through its own handle.
+    // Each side stopped through its own handle.
     assert_eq!(pair.join_both(), (0, 0));
 }
