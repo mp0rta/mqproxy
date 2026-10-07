@@ -1,10 +1,10 @@
 //! spec §5.6: the flow relay, driven by `ScriptedTransport` on the QUIC side
 //! and `FakeTcp` (which applies commits the way the driver does) on the TCP side.
 //!
-//! Mapping of `tests/test_relay.c` (side A = TCP, side B = the QUIC stream):
-//! `happy_both_directions`, `backpressure`, `eof_one_side` (inverted: half-close
-//! keeps the other direction open), `hard_error` (B's writer = `stream_send`),
-//! `read_hard_error`, `read_would_block_chunked`, `data_and_eof_same_read`.
+//! Side A = TCP, side B = the QUIC stream: `happy_both_directions`,
+//! `backpressure`, `eof_one_side` (half-close keeps the other direction open),
+//! `hard_error` (B's writer = `stream_send`), `read_hard_error`,
+//! `read_would_block_chunked`, `data_and_eof_same_read`.
 
 use mq_runtime::testing::{Call, ScriptedHandle, ScriptedTransport};
 use mq_runtime::{
@@ -217,7 +217,7 @@ const NONE: Interest = Interest {
     write: false,
 };
 
-// ---- the seven cases of tests/test_relay.c ----
+// ---- the seven relay cases ----
 
 #[test]
 fn happy_both_directions() {
@@ -260,7 +260,7 @@ fn backpressure() {
 
 #[test]
 fn eof_one_side() {
-    // Inverted from C: TCP EOF sends FIN but the relay stays open.
+    // TCP EOF sends FIN but the relay stays open.
     let (mut t, h, s) = setup();
     let mut r = relay(&h, s);
     let mut tcp = FakeTcp::new(b"hi").eof_after(2);

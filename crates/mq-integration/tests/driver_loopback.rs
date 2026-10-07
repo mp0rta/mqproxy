@@ -390,7 +390,6 @@ fn accept_meta_has_local() {
     stop(h);
 }
 
-/// Port of C `test_path_bind`.
 #[test]
 fn driver_path_bind() {
     let mut d = Driver::new(DriverConfig {

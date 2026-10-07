@@ -1,28 +1,25 @@
-//! Ports `tests/integration/test_client_server.c` onto the shard pair
-//! (spec §8.1 "Shard pair"), one test per C case:
+//! Client↔server cases on the shard pair (spec §8.1 "Shard pair"):
 //!
-//! | C case | test | client side |
+//! | case | test | client side |
 //! |---|---|---|
-//! | `test_auth_wrong_token` (A) | `pair_cs_auth_wrong_token` | real `Client` |
-//! | `test_auth_matching_token` (B) | `pair_cs_auth_matching_token` | `RawClient` |
-//! | `test_data_stream_echo` (C) | `pair_cs_data_stream_echo` | `RawClient` |
-//! | `test_data_stream_refused` (D) | `pair_cs_data_stream_refused` | `RawClient` |
-//! | `test_data_stream_preauth_reset` (E) | `pair_cs_data_stream_preauth_reset` | `RawClient` |
-//! | `test_data_stream_teardown` (F) | `pair_cs_data_stream_teardown` | `RawClient` |
-//! | `test_data_stream_download_completion` (G) | `pair_cs_data_stream_download_completion` | `RawClient` |
-//! | `test_data_stream_halfclose_nospin` (H) | `pair_cs_data_stream_halfclose_nospin` | `RawClient` |
-//! | `test_data_stream_coalesced_payload` (M) | `pair_cs_data_stream_coalesced_payload` | `RawClient` |
-//! | `test_client_open_echo` (I) | `pair_cs_client_open_echo` | real `Client` |
-//! | `test_client_open_download` (J) | `pair_cs_client_open_download` | real `Client` |
-//! | `test_client_open_preauth_queue` (K) | `pair_cs_client_open_preauth_queue` | real `Client` |
-//! | `test_client_open_refused` (L) | `pair_cs_client_open_refused` | real `Client` |
+//! | A | `pair_cs_auth_wrong_token` | real `Client` |
+//! | B | `pair_cs_auth_matching_token` | `RawClient` |
+//! | C | `pair_cs_data_stream_echo` | `RawClient` |
+//! | D | `pair_cs_data_stream_refused` | `RawClient` |
+//! | E | `pair_cs_data_stream_preauth_reset` | `RawClient` |
+//! | F | `pair_cs_data_stream_teardown` | `RawClient` |
+//! | G | `pair_cs_data_stream_download_completion` | `RawClient` |
+//! | H | `pair_cs_data_stream_halfclose_nospin` | `RawClient` |
+//! | M | `pair_cs_data_stream_coalesced_payload` | `RawClient` |
+//! | I | `pair_cs_client_open_echo` | real `Client` |
+//! | J | `pair_cs_client_open_download` | real `Client` |
+//! | K | `pair_cs_client_open_preauth_queue` | real `Client` |
+//! | L | `pair_cs_client_open_refused` | real `Client` |
 //!
-//! No case is excluded. The C test's in-process origins become the server
-//! side's `Origin` (echo / bulk-then-close / refusing); the C
-//! `mq_client_tcp_open` over a socketpair becomes a SOCKS5 request from a
-//! scripted local socket, whose SOCKS5 reply stands for the open callback
-//! (`ok` = success reply, `err` = the reply code). Reconnect is off, as in
-//! the C fixture.
+//! The origins are the server side's `Origin` (echo / bulk-then-close /
+//! refusing); a client open is a SOCKS5 request from a scripted local socket,
+//! whose SOCKS5 reply stands for the open callback (`ok` = success reply,
+//! `err` = the reply code). Reconnect is off.
 #![forbid(unsafe_code)]
 
 use mq_integration::shard_pair::*;

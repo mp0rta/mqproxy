@@ -1,12 +1,12 @@
-//! HTTP/1.1 request head parser (spec §2.1), port of `src/gateway/mq_http1.c`.
+//! HTTP/1.1 request head parser (spec §2.1).
 
 pub const HEAD_MAX: usize = 16 * 1024;
 pub const MAX_HEADERS: usize = 64;
-/// Longest method (bytes) of the fetch listener's own request line only
-/// (C `char[16]` minus NUL); the shared method bound is `limits::METHOD_MAX`.
+/// Longest method (bytes) of the fetch listener's own request line only;
+/// the shared method bound is `limits::METHOD_MAX`.
 pub const METHOD_MAX: usize = 15;
-/// Longest request-target of the fetch listener's own request line only
-/// (C `char[1024]` minus NUL); the shared bound is `limits::TARGET_PATH_MAX`.
+/// Longest request-target of the fetch listener's own request line only;
+/// the shared bound is `limits::TARGET_PATH_MAX`.
 pub const PATH_MAX: usize = 1023;
 
 /// One header line; `value` is OWS-trimmed.
@@ -61,7 +61,7 @@ fn trim_ows(mut v: &[u8]) -> &[u8] {
     v
 }
 
-/// Strict decimal in `0..=i64::MAX` (leading zeros accepted, as C).
+/// Strict decimal in `0..=i64::MAX` (leading zeros accepted).
 pub fn parse_content_length(v: &[u8]) -> Option<u64> {
     if v.is_empty() {
         return None;
@@ -86,7 +86,7 @@ fn te_lists_chunked(v: &[u8]) -> bool {
 }
 
 /// Parse a request head from the start of `buf` (spec §2.1). A head whose
-/// terminator lies beyond `HEAD_MAX` is `TooLarge` (C answered Bad).
+/// terminator lies beyond `HEAD_MAX` is `TooLarge`.
 pub fn parse_head(buf: &[u8]) -> Progress<'_> {
     let Some(p) = find(buf, b"\r\n\r\n") else {
         return if buf.len() >= HEAD_MAX {
@@ -122,7 +122,7 @@ fn parse_complete(head: &[u8]) -> Option<Head<'_>> {
     let rest = &line[m_end + 1..];
     let t_end = rest.iter().position(|&c| c == b' ')?;
     let target = &rest[..t_end];
-    // < 1024 bytes, origin-form, no control bytes / DEL (C parity; NUL would truncate).
+    // < 1024 bytes, origin-form, no control bytes / DEL.
     if target.first() != Some(&b'/') || target.len() > PATH_MAX {
         return None;
     }
@@ -178,7 +178,7 @@ fn parse_complete(head: &[u8]) -> Option<Head<'_>> {
     })
 }
 
-// ---- serializer (spec §2.2), port of the `mq_http1_write_*` helpers ----
+// ---- serializer (spec §2.2) ----
 
 /// `HTTP/1.1 <code> <reason>\r\n`; the fetch client passes an empty reason.
 pub fn write_status(out: &mut Vec<u8>, code: u16, reason: &str) {
@@ -219,7 +219,7 @@ pub fn chunk_end(out: &mut Vec<u8>) {
 }
 
 /// Listener/reject reply: status, `Connection: close`, `Content-Length: 0`,
-/// optional `X-Mq-Error`, blank line (C `gw_build_error`).
+/// optional `X-Mq-Error`, blank line.
 pub fn error_reply(code: u16, reason: &str, xmq: Option<&str>) -> Vec<u8> {
     let mut o = Vec::with_capacity(96);
     write_status(&mut o, code, reason);
@@ -315,7 +315,7 @@ mod tests {
         b[..5].copy_from_slice(b"GET /");
         assert_eq!(parse_head(&b), Progress::TooLarge);
         assert_eq!(parse_head(&b[..HEAD_MAX - 1]), Progress::Need);
-        b.push(b'a'); // C's 17 KiB case
+        b.push(b'a');
         assert_eq!(parse_head(&b), Progress::TooLarge);
     }
 
@@ -362,7 +362,7 @@ mod tests {
             b.resize(5 + 1100, b'a');
             b.extend_from_slice(b" HTTP/1.1\r\n\r\n");
             b
-        }); // C test_path_too_long
+        });
     }
 
     #[test]

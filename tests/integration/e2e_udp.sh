@@ -7,10 +7,10 @@
 #   matches the spec:
 #
 #     udpsocks (SOCKS5 UDP ASSOCIATE client)
-#          → SOCKS5 TCP ingress (mq_listener / mq_udp_assoc)
-#          → mq_udp_cli (client-side session table, frag, datagram)
+#          → SOCKS5 TCP ingress (UDP ASSOCIATE)
+#          → client UDP lane (session table, frag, datagram)
 #          → MPQUIC tunnel
-#          → mq_udp_srv (server-side session table, defrag, UDP forward)
+#          → server UDP lane (session table, defrag, UDP forward)
 #          → udp_echo (loopback UDP echo server)
 #          → back along the same path.
 #
@@ -27,7 +27,7 @@
 #        process mid-flight (TCP EOF → server reaps session); assert server
 #        health by running a fresh udpsocks that succeeds.
 #     6. (NET_ADMIN-gated) 2-path: tc shapes two loopback paths; both paths'
-#        recv bytes > 0 from `mq_conn_dump_stats` in client.log after
+#        recv bytes > 0 from the per-path stats in client.log after
 #        SIGTERM. Without NET_ADMIN this sub-case prints a SKIP note; the
 #        script continues and exits 0 (cases 1-5,7 decide the result, mirroring
 #        e2e_gateway semantics).
@@ -44,9 +44,8 @@
 #   Server C (default, 2-path for case 6): NET_ADMIN-gated only.
 #   Server D (--scheduler backup, 2-path for case 8): NET_ADMIN-gated only.
 #
-#   Case 2 frag assertion: the frags_sent / frags_reassembled counters live on
-#   the per-conn mq_udp_srv struct and are logged at mq_udp_srv_free time
-#   (conn teardown, not per-session).  So the assertion fires at Server A
+#   Case 2 frag assertion: the frags_sent / frags_reassembled counters are
+#   per-conn and logged at conn teardown (not per-session).  So the assertion fires at Server A
 #   teardown (after all A-group cases complete), by grepping server_a.log.
 #
 # SKIP DISCIPLINE (matches e2e_gateway):
@@ -320,7 +319,7 @@ fi
 # datagrams (MSS is typically ~1200-1400 bytes). The byte-exact assertion is
 # handled by udpsocks internally (exit 0 = all sent/received/matched).
 # The frags_reassembled > 0 assertion happens at Server A teardown below
-# (mq_udp_srv_free logs the stats line to server_a.log on conn close).
+# (the server logs the stats line to server_a.log on conn close).
 if want 2; then
     if "${UDPSOCKS_BIN}" \
             --proxy "127.0.0.1:${SOCKS_PORT_A}" \
@@ -452,7 +451,7 @@ fi
 
 # ── Tear down Server A group + assert case 2 frags_reassembled > 0 ───────────
 # SIGTERM the client first (normal teardown), then the server.
-# mq_udp_srv_free → mq_udp_srv_dump_stats fires on server conn close, writing
+# The server's conn close writes
 #   "mq_udp_srv: stats frags_sent=... frags_reassembled=... ..."
 # to server_a.log. We wait for this line to appear after server exit.
 if [ "${NEED_A}" -eq 1 ]; then
@@ -461,7 +460,7 @@ if [ "${NEED_A}" -eq 1 ]; then
 fi
 
 # Wait up to 3s for the stats line to appear (the server may not flush
-# immediately; it writes on mq_udp_srv_free which runs at conn teardown).
+# immediately; it writes at conn teardown).
 if want 2; then
     STATS_A=""
     for _ in $(seq 1 30); do
@@ -538,7 +537,7 @@ want 4 && note "case 4 PASS (${PASS_COUNT} checks so far)."
 # Requires tc/netem on lo (NET_ADMIN). Without it: print a note and exit 0
 # (cases 1-5 already passed). With it: shape two equal-rate loopback paths,
 # start a client bound to both --path IPs, send a packet, SIGTERM the client,
-# and confirm BOTH paths carried bytes via `mq_conn_dump_stats` in client.log.
+# and confirm BOTH paths carried bytes via the per-path stats in client.log.
 if want 6 || want 8; then
     RATE="50mbit"; DELAY="10ms"
     can_tc=0
@@ -599,12 +598,12 @@ if want 6 || want 8; then
             exit 1
         fi
 
-        # SIGTERM the client → it dumps mq_conn_dump_stats per-path counters to client_c.log.
+        # SIGTERM the client → it dumps per-path counters to client_c.log.
         stop_process "${CLIENT_C_PID}"; CLIENT_C_PID=""
 
         # Assert both paths carried bytes: "mq.path id=<id> ... sent=<n> recv=<n> ..." lines
-        # where (sent > 0 OR recv > 0). The client logs these at INFO on SIGTERM via
-        # mq_conn_dump_stats (same pattern as e2e_multipath and e2e_gateway case 8).
+        # where (sent > 0 OR recv > 0). The client logs these at INFO on SIGTERM
+        # (same pattern as e2e_multipath and e2e_gateway case 8).
         PATHS_WITH_BYTES="$(grep -E 'mq\.path id=' \
                 "${WORK}/client_c.log" 2>/dev/null \
             | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
@@ -625,12 +624,12 @@ if want 6 || want 8; then
     # ─────────────────────────────────────────────────────────────────────────────
     # tc shaping is already active from case 6 (same two loopback paths).
     # We start a fresh server+client pair with --scheduler backup on BOTH sides,
-    # send a substantial burst, SIGTERM the client to flush mq_conn_dump_stats,
+    # send a substantial burst, SIGTERM the client to flush the per-path stats,
     # then assert that the busiest single path holds >=95% of total bytes.
     # The 5% headroom covers path-validation / mp-ping control traffic on the
     # secondary path, which the backup scheduler still uses for keepalives.
     # The pin is enforced by the backup scheduler TOGETHER WITH the STANDBY
-    # marking of extra paths in mq_conn_add_path / mq_h3_conn_add_path — without
+    # marking of extra paths when they are added — without
     # the standby marking, backup degenerates to minrtt-with-spill under
     # saturating load (it pins only while the best path has cwnd headroom).
     # Inverse of case 6: same shaped 2-path topology, but case 6 asserts the
@@ -673,7 +672,7 @@ if want 6 || want 8; then
             exit 1
         fi
 
-        # SIGTERM the client → flushes mq_conn_dump_stats per-path counters.
+        # SIGTERM the client → flushes the per-path counters.
         stop_process "${CLIENT_D_PID}"; CLIENT_D_PID=""
 
         # primary-pin assertion: with --scheduler backup, >=95% of bytes on one path.

@@ -35,7 +35,7 @@ pub fn wait(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// Stream type 0x01 then C `mq_encode_connect_tcp_req` for example.com:443.
+/// Stream type 0x01 then a `CONNECT_TCP_REQUEST` for example.com:443.
 pub const CONNECT_REQ_C: &[u8] = &[
     0x01, 0x00, 0x03, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x01,
     0xBB, 0x00,

@@ -1,6 +1,6 @@
 //! spec §6.4 "Config file": the INI loader, in process through `cli::parse`
-//! with `--config <tempfile>`. Ports C `tests/test_config.c` and gives every
-//! row of the SP1 flag table its INI equivalent.
+//! with `--config <tempfile>`. Every row of the SP1 flag table gets
+//! its INI equivalent.
 
 mod common;
 
@@ -93,10 +93,7 @@ fn warned(r: &Resolved, needle: &str) -> bool {
     r.warnings.iter().any(|w| w.contains(needle))
 }
 
-// ---- C tests/test_config.c ports ----
-
-/// C test_defaults + test_partial_file_keeps_defaults: keys absent from the
-/// file keep the defaults.
+/// Keys absent from the file keep the defaults.
 #[test]
 fn c_defaults_and_partial_file() {
     let r = srv("").unwrap();
@@ -113,7 +110,7 @@ fn c_defaults_and_partial_file() {
     );
 }
 
-/// C test_server_roundtrip.
+/// Every server key round-trips.
 #[test]
 fn c_server_roundtrip() {
     let ini = Ini::new(
@@ -136,7 +133,7 @@ fn c_server_roundtrip() {
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 }
 
-/// C test_client_roundtrip (bracketed IPv6 Address).
+/// Every client key round-trips (bracketed IPv6 `Address`).
 #[test]
 fn c_client_roundtrip() {
     let ini = Ini::new(
@@ -175,8 +172,8 @@ fn c_client_roundtrip() {
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 }
 
-/// C test_bool_variants: `yes`/`0` on the bool keys. C `parse_bool` is exact
-/// `true`/`yes`/`1`; anything else is false.
+/// `yes`/`0` on the bool keys. A bool is exact `true`/`yes`/`1`; anything
+/// else is false.
 #[test]
 fn c_bool_variants() {
     let r = srv("[Gateway]\nEnabled = yes\n[UDP]\nEnabled = 0\n").unwrap();
@@ -201,7 +198,7 @@ fn c_bool_variants() {
     }
 }
 
-/// C test_path_cap: 10 file paths → 8 kept, with a warning.
+/// 10 file paths → 8 kept, with a warning.
 #[test]
 fn c_path_cap() {
     let paths: String = (1..=10).map(|i| format!("Path = 10.0.0.{i}\n")).collect();
@@ -210,7 +207,7 @@ fn c_path_cap() {
     assert!(warned(&r, "10.0.0.9"), "{:?}", r.warnings);
 }
 
-/// C test_lenient_and_comments.
+/// Comments, unknown sections/keys and bad values warn but still load.
 #[test]
 fn c_lenient_and_comments() {
     let ini = Ini::new(&format!(
@@ -228,7 +225,7 @@ fn c_lenient_and_comments() {
     assert!(warned(&r, "Foo"), "{:?}", r.warnings);
 }
 
-/// C test_mitm_section: `[Mitm] Enabled = true` without `--tproxy` is exit 2
+/// `[Mitm] Enabled = true` without `--tproxy` is exit 2
 /// (this INI's only ingress is SOCKS5).
 #[test]
 fn c_mitm_section_enabled_exit_2() {
@@ -297,7 +294,7 @@ fn server_config_mitm_section_warns() {
     );
 }
 
-/// C test_mitm_enabled_missing_cacert: `Enabled = true` with `--tproxy` but no
+/// `Enabled = true` with `--tproxy` but no
 /// `CACert`/`CAKey` is exit 2 naming the missing key's flag.
 #[test]
 fn c_mitm_enabled_missing_cacert_exit_2() {
@@ -308,7 +305,7 @@ fn c_mitm_enabled_missing_cacert_exit_2() {
     assert!(e.message.contains("--ca-cert"), "{}", e.message);
 }
 
-/// C test_perms_warning (+ spec §6.4: 0620 warns too).
+/// spec §6.4: any group/other permission bit warns (0620 too).
 #[test]
 fn perms_warning() {
     for (mode, warns) in [(0o640, true), (0o620, true), (0o644, true), (0o600, false)] {
@@ -323,7 +320,6 @@ fn perms_warning() {
     }
 }
 
-/// C test_missing_file_fatal.
 #[test]
 fn unreadable_file_exit_2() {
     let e = exit(cli::parse(&[
@@ -409,7 +405,7 @@ fn paths_accumulate_file_then_cli_max_8_warn() {
 
 #[test]
 fn bool_values_exact_case() {
-    // C parse_bool: strcmp against "true", "yes", "1" — exact case.
+    // Only "true", "yes", "1" — exact case.
     let redirect = |v: &str| {
         client(&cli_(&format!("[Ingress]\nSetupRedirect = {v}\n")).unwrap()).setup_redirect
     };
@@ -504,7 +500,7 @@ fn client_implemented_keys_resolve() {
 }
 
 /// spec §8: `[Gateway] Enabled = false` is `--no-gateway`; the CLI can only
-/// turn the gateway off (C has no `--gateway` on the server).
+/// turn the gateway off (the server has no `--gateway`).
 #[test]
 fn ini_gateway_enabled_false_disables() {
     let r = srv("[Gateway]\nEnabled = false\n").unwrap();
@@ -522,7 +518,7 @@ fn ini_gateway_enabled_false_disables() {
     );
     let r = run("server", &ini, &["--no-gateway"]).unwrap();
     assert_eq!(server(&r).config.gateway, None);
-    // The gateway-only keys with the gateway off: warned, ignored (C text).
+    // The gateway-only keys with the gateway off: warned, ignored.
     let r = srv("[Gateway]\nEnabled = no\nMasquerade = true\n[Metrics]\nPerRequest = 1\n").unwrap();
     assert_eq!(server(&r).config.gateway, None);
     assert!(
@@ -575,7 +571,7 @@ fn server_udp_keys_take_effect() {
     assert!(!server(&r).config.udp_enabled);
     assert_eq!(server(&r).config.udp_idle_timeout, Duration::from_secs(30));
 
-    // C LONGV: below 1 warns and keeps the previous value.
+    // Below 1 warns and keeps the previous value.
     for v in ["0", "-3", "x"] {
         let r = srv(&format!("[UDP]\nIdleTimeout = 7\nIdleTimeout = {v}\n")).unwrap();
         assert!(warned(&r, "IdleTimeout"), "{v}: {:?}", r.warnings);

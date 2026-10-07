@@ -1,8 +1,6 @@
-//! Ports `tests/integration/test_max_conns_e2e.c` onto the shard pair (spec
-//! §8.1 "Shard pair", §4.7 `max_conns`). The C test's three `mq_client`s A,
-//! B and C are three connections of one `RawClient` (each sends the C
-//! `AUTH_REQUEST`); C's `mq_transport_n_conns` is `Transport::conn_count`.
-//! Nothing is excluded.
+//! `max_conns` on the shard pair (spec §8.1 "Shard pair", §4.7 `max_conns`):
+//! clients A, B and C are three connections of one `RawClient` (each sends the
+//! `AUTH_REQUEST`), counted by `Transport::conn_count`.
 #![forbid(unsafe_code)]
 
 use mq_integration::shard_pair::*;

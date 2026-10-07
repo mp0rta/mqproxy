@@ -282,7 +282,7 @@ fn mp_ready_and_udp_socket_route_to_gateway_paths() {
     log_capture::take();
     h.sh.on_udp_socket(h.now, op, Ok(SocketAddr::new(a, 40000)))
         .unwrap();
-    // C `mq_gw_client.c`: the gateway tunnel's own prefix.
+    // The gateway tunnel's own prefix.
     let lines = log_capture::take();
     assert!(
         lines

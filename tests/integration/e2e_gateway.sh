@@ -7,8 +7,8 @@
 #   byte-for-byte what the spec promises:
 #
 #     curl → POST /_mqproxy/fetch (local fetch ingress)
-#          → mq_gw_client → H3 over MPQUIC → mqproxy-server
-#          → mq_gw_server → libcurl → ORIGIN (TLS, verified) → back.
+#          → gateway client → H3 over MPQUIC → mqproxy-server
+#          → gateway server → ORIGIN (TLS, verified) → back.
 #
 #   Cases (all over the real chain, against a real TLS origin):
 #     1. 8MB download, byte-exact (cmp).
@@ -20,7 +20,7 @@
 #     7. x-mq-origin-protocol present on the download response (http/1.1).
 #     8. (NET_ADMIN-gated) 2-path aggregation smoke: shape two loopback
 #        paths, download 8MB over both, confirm BOTH gateway paths moved bytes
-#        (client logs mq_h3_conn_dump_stats per-path counters at SIGTERM).
+#        (client logs per-path counters at SIGTERM).
 #        Without NET_ADMIN this sub-case is SKIPPED (a note) — cases 1-7 still
 #        decide the exit status.
 #
@@ -499,10 +499,10 @@ note "cases 1-7 PASS (${PASS_COUNT}/7 checks)."
 
 # ── case 9: L1 origin-connection reuse proof (no root required) ──────────────
 # Proves that two sequential same-origin requests flip origin_reuse 0→1, which
-# validates both the Task-2 capture wiring and libcurl's implicit keep-alive.
+# validates both the capture wiring and the origin pool's keep-alive.
 #
 # COLD conncache: case 6 restarted the server with a short connect timeout;
-# there may be residual connections in the server's libcurl conncache from
+# there may be residual connections in the server's origin pool from
 # earlier cases. Restart server+client clean so the conncache starts fresh and
 # server.log is truncated to only case-9 traffic.
 stop_client
@@ -643,7 +643,7 @@ grep -qi '^x-mq-error:[[:space:]]*bad-origin-protocol' "${HV}" || \
 # mis-anchor onto case 1's default h1 download (which is 8 MiB). Then a REAL
 # 25×0.2s retry loop with fail-on-miss (mirror case 9) — an unconditional ok
 # would prove nothing. Field order is resp_bytes=… … origin_protocol=… so anchor
-# left-to-right (mq_gw_metrics.c).
+# left-to-right.
 C13_SIZE=4194304   # 4 MiB — NEW reserved size (not in {8MiB,3MiB,1MiB,2MiB,512KiB,73728})
 head -c "${C13_SIZE}" /dev/zero >"${WORK}/c13.bin"
 code13="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
@@ -670,7 +670,7 @@ ok 13 "X-Mq-Origin-Protocol: invalid→400 (+x-mq-error); h1→honored (origin_p
 # This is the only honest switch-proof: select h3 to an h3-capable origin and
 # assert the server actually negotiated h3 (mq.req origin_protocol=h3). It needs
 #   (1) the gateway built with MQPROXY_H3_CURL (server.log logs "HTTP3=yes" at
-#       startup — mq_origin_curl.c:49), and
+#       startup), and
 #   (2) an h3 origin: xquic's demo_server (NOT built by default).
 # On the system (no-h3) curl build this SKIPs with a note — it NEVER flips RESULT.
 if grep -q 'HTTP3=yes' "${WORK}/server.log" 2>/dev/null; then
@@ -704,7 +704,7 @@ if grep -q 'HTTP3=yes' "${WORK}/server.log" 2>/dev/null; then
         # until demo_server's QUIC listener is up (a not-yet-ready origin → non-200).
         code13h3=000
         H3_HDR="${WORK}/c13h3_headers.txt"
-        # Target https://localhost (NOT 127.0.0.1): the gateway's libcurl sends SNI
+        # Target https://localhost (NOT 127.0.0.1): the gateway sends SNI
         # only for a hostname, never for an IP literal, and xquic's demo_server REQUIRES
         # SNI (its cert callback errors "hostname is NULL" → CERT_CB_ERROR → 504). localhost
         # resolves to 127.0.0.1 where demo_server listens, and the dual-SAN origin cert
@@ -770,8 +770,8 @@ head -c "${C14_HIT}" /dev/urandom >"${WORK}/cache_hit.bin"
 head -c "${C14_NS}" /dev/urandom >"${WORK}/nostore-x.bin"
 
 # Spec §10.4: the Rust server has no response cache (it warns "origin response
-# cache was removed" for --cache-max-bytes), so a-c are skipped against it; the
-# C server still runs them. (d) is a client-side reject and always runs.
+# cache was removed" for --cache-max-bytes), so a-c are skipped against it.
+# (d) is a client-side reject and always runs.
 C14_RAN="14"
 if grep -q "origin response cache was removed" "${WORK}/server.log"; then
     note "case 14 (a-c) skipped: server has no response cache (origin response cache was removed); (d) still runs."
@@ -787,7 +787,7 @@ else
     [ "${code14a1}" = "200" ] || fail 14 "(a) first cacheable fetch HTTP code = ${code14a1} (want 200)"
 
     # First fetch must be a miss (anchored to resp_bytes=1572864 cache=miss; field
-    # order is resp_bytes=… … cache=… so anchor left-to-right — mq_gw_metrics.c).
+    # order is resp_bytes=… … cache=… so anchor left-to-right).
     c14_miss_found=0
     for _ in $(seq 1 25); do
         if grep -Eq 'mq\.req .* resp_bytes=1572864 .* cache=miss' "${WORK}/server.log"; then
@@ -912,8 +912,7 @@ ok 14 "X-Mq-Cache invalid TTL → 400 + x-mq-error: bad-cache-ttl"
 # already passed → exit 0). With it: shape two equal-rate loopback paths, run a
 # gateway-only client bound to both --path IPs, download 8MB over the tunnel,
 # SIGTERM the client, and confirm BOTH gateway paths carried bytes (the client
-# logs mq_h3_conn_dump_stats per-path counters at SIGTERM via
-# mq_gw_client_dump_stats).
+# logs per-path counters at SIGTERM).
 RATE="50mbit"; DELAY="10ms"
 can_tc=0
 if [ "$(id -u)" -eq 0 ] && tc qdisc add dev lo root netem delay 1ms 2>/dev/null; then
@@ -971,8 +970,9 @@ cmp -s "${BIGFILE}" "${DL8}" || fail 8 "2-path download body differs"
 # the per-stream-per-path cumulative byte counters) and classifies by path
 # APP-STATUS, not path count: 1=stream used both an Available- AND a Standby-class
 # path, 2=Standby-class only, 3=Available-class only. mqproxy creates ALL paths as
-# Available-class (path_status 0; it never marks a path STANDBY — see
-# mq_conn.c:412), so a multipath request here ALWAYS reads mp_state=3, never 1/2.
+# Available-class (path_status 0; only --scheduler backup marks paths STANDBY,
+# and this case uses the default), so a multipath request here ALWAYS reads
+# mp_state=3, never 1/2.
 # Note mp_state=3 does NOT prove 2-path aggregation: it's 3 whether 1 or 2
 # Available paths carried the stream (this download does aggregate — 8MiB in
 # ~750ms ≈ 90Mbit > a single 50mbit path — but mp_state alone can't show that).
@@ -1031,8 +1031,8 @@ ok 8 "2-path aggregation: both gateway paths carried bytes"
 # the QUIC port if it happened to collide numerically (free_port tcp vs
 # free_port udp are allocated independently).
 #
-# COLD conncache: case 8 may have left a live origin connection in libcurl's
-# pool. Restart server+client AFTER applying the shaping so the first shaped
+# COLD conncache: case 8 may have left a live origin connection in the
+# origin pool. Restart server+client AFTER applying the shaping so the first shaped
 # request opens a NEW, delayed connection.
 
 # Clear any tc state case 8 left, then install a fresh single-class HTB+netem

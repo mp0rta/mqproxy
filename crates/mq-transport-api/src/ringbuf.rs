@@ -1,5 +1,5 @@
 //! The relay's byte buffer (SP0/SP1 spec §5.6), also the transport's datagram receive ring
-//! (SP2 spec §3.2): a port of `src/util/mq_buf.c`.
+//! (SP2 spec §3.2).
 //!
 //! Linear, not wrapping: `space()` is the tail room after the write cursor, and
 //! both cursors return to 0 when everything written has been consumed.

@@ -104,7 +104,7 @@ fn origin_ca_unreadable_exits_1_with_message() {
     );
 }
 
-/// C order: the tproxy listener is bound before the fetch listener.
+/// The tproxy listener is bound before the fetch listener.
 #[test]
 fn client_binds_tproxy_before_fetch_listener() {
     let (tp, gw) = (
@@ -153,7 +153,7 @@ fn lines_until(p: &mut Proc, last: &str) -> Vec<String> {
 }
 
 /// spec §8: the server line's real `gateway=on|off`, the `mq_origin:` line
-/// only with the gateway on, the client's `gateway=ip:port` in C's ingress order.
+/// only with the gateway on, the client's `gateway=ip:port` in ingress order.
 #[test]
 fn startup_lines_golden() {
     let listen = format!("127.0.0.1:{}", free_udp());

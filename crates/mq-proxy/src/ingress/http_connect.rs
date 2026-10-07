@@ -1,5 +1,4 @@
-//! spec §6.1: HTTP CONNECT (authority-form) — port of `src/ingress/mq_http_connect.c`
-//! plus the parse-error replies of `mq_listener.c:drive_http`.
+//! spec §6.1: HTTP CONNECT (authority-form) parser and its replies.
 
 use super::Progress;
 use super::request::capped;
@@ -7,7 +6,7 @@ use mq_runtime::{Host, Target};
 use mq_wire::frames::TcpErr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-const MAX_HOST: usize = 255; // MQ_MAX_HOST
+const MAX_HOST: usize = 255;
 
 const R405: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
 const R400: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\r\n";
@@ -106,7 +105,7 @@ pub fn http_success_reply() -> &'static [u8] {
     b"HTTP/1.1 200 Connection Established\r\n\r\n"
 }
 
-/// spec §6.1: CONNECT failed (`mq_http_status_line`).
+/// spec §6.1: CONNECT failed.
 pub fn http_error_reply(e: TcpErr) -> &'static [u8] {
     match e {
         TcpErr::Timeout => b"HTTP/1.1 504 Gateway Timeout\r\n\r\n",

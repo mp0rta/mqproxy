@@ -1,4 +1,4 @@
-// spec §2.3; ports the non-UDP cases of tests/test_wire.c
+// spec §2.3
 use mq_wire::frames::*;
 use mq_wire::varint;
 use proptest::prelude::*;
@@ -98,7 +98,7 @@ fn connect_tcp_resp_roundtrip() {
     }
 }
 
-// ---- test_truncation (C covers AUTH_REQUEST; extended to all four frames) ----
+// ---- truncation, all four frames ----
 #[test]
 fn truncation() {
     let ar = AuthReq {
@@ -194,7 +194,7 @@ fn padding_skipped() {
     );
 }
 
-// ---- test_padding_overflow (C covers CONNECT_TCP_REQUEST; extended to all four) ----
+// ---- padding overflow, all four frames ----
 #[test]
 fn padding_overflow() {
     let buf = [0x00, 0x01, 0x04, 1, 2, 3, 4, 0x00, 0x50, 0x40, 99];
@@ -594,7 +594,7 @@ fn constants() {
 }
 
 // ---- UDP_SESSION_OPEN / UDP_SESSION_RESP (spec §2.1; unlike the TCP frames, both
-// sides validate semantics as src/wire/mq_wire.c does) ----
+// sides validate semantics) ----
 fn udp_open(at: AddrType, host: &[u8]) -> UdpSessionOpen<'_> {
     UdpSessionOpen {
         session_id: 0xDEAD_BEEF,
@@ -693,7 +693,7 @@ fn udp_resp_rejects_code_5() {
         UdpSessionResp::decode(&[0x01, 0x40, 0x64, 0x00, 0x00, 0x00]),
         Err(DecodeError::Invalid)
     );
-    // C checks the pairing before the message: Invalid wins over a truncated or over-long message.
+    // The pairing is checked before the message: Invalid wins over a truncated or over-long message.
     assert_eq!(
         UdpSessionResp::decode(&[0x01, 0x05]),
         Err(DecodeError::Invalid)
@@ -752,7 +752,7 @@ fn udp_resp_encode_rejects_inconsistent() {
     assert_eq!(udp_resp(0x02, 0, b"").encode(&mut b), e);
     // a code that is not a valid varint is rejected the same way
     assert_eq!(udp_resp(STATUS_ERROR, BIG, b"").encode(&mut b), e);
-    // the semantic check precedes the buffer check, as in C
+    // the semantic check precedes the buffer check
     assert_eq!(udp_resp(STATUS_OK, 1, b"").encode(&mut b[..0]), e);
 }
 

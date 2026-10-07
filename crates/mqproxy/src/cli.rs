@@ -1,4 +1,4 @@
-//! spec §6.4: the C-identical command line (cli/main.c `usage_*`, `longopts`).
+//! spec §6.4: the command line.
 //! `parse` turns argv into a fully resolved `Resolved` or an `Exit`.
 
 use crate::config::{self, FileConfig};
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// C `MQ_MAX_EXTRA_PATHS`.
+/// The most `--path` entries kept; extras warn and are ignored.
 const MAX_PATHS: usize = 8;
 /// xquic's client PING interval (fixed); an idle timeout at or below it still closes.
 const XQUIC_PING_SECS: u64 = 15;
@@ -318,7 +318,7 @@ fn usage_error(sub: &str, msg: String) -> Exit {
     }
 }
 
-// spec §6.4: each value below is `CLI.or(file)`, then the C default.
+// spec §6.4: each value below is `CLI.or(file)`, then the default.
 fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
     let mut warnings = f.warnings;
     // spec §8: default on; `--no-gateway` only ever turns the file's value off.
@@ -330,8 +330,8 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
         request_metrics,
         ..GatewayConfig::default()
     });
-    // C's order: request-metrics, cache, masquerade; the gateway-only two are
-    // warned and ignored with the gateway off (C text).
+    // Warning order: request-metrics, cache, masquerade; the gateway-only two are
+    // warned and ignored with the gateway off.
     let off = gateway.is_none();
     if off && request_metrics {
         warnings.push(
@@ -376,7 +376,7 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
             config: ServerConfig {
                 token,
                 metrics_interval: metrics_interval(a.metrics_interval, f.metrics_interval),
-                // `--no-udp` only ever turns the file's value off (C: it clears the flag).
+                // `--no-udp` only ever turns the file's value off.
                 udp_enabled: !a.no_udp && f.udp_enabled.unwrap_or(true),
                 udp_idle_timeout: a
                     .udp_idle_timeout
@@ -388,7 +388,7 @@ fn server(a: ServerArgs, f: FileConfig) -> Result<Resolved, String> {
             listen,
             cert: cert.into(),
             key: key.into(),
-            max_conns: a.max_conns.or(f.max_conns).unwrap_or(16), // C default
+            max_conns: a.max_conns.or(f.max_conns).unwrap_or(16),
         }),
         config: a.config,
         qlog: a.qlog.or(f.qlog),
@@ -436,7 +436,7 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
                 .map_err(|_| format!("invalid --path address: {p}"))?,
         );
     }
-    // C default 30; 0 disables the idle timeout (and so the PINGs).
+    // Default 30; 0 disables the idle timeout (and so the PINGs).
     let ka = a.keepalive_idle.or(f.keepalive_idle).unwrap_or(30);
     let keepalive_idle = (ka > 0).then(|| Duration::from_secs(ka));
     if (1..=XQUIC_PING_SECS).contains(&ka) {
@@ -446,7 +446,7 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
             ka
         ));
     }
-    // C's validation order: server, socks5, http-connect, gateway, tproxy.
+    // Validation order: server, socks5, http-connect, gateway, tproxy.
     let server = ip_port("--server", &server)?;
     let socks5 = opt("--socks5", socks5)?;
     let http_connect = opt("--http-connect", http_connect)?;
@@ -456,7 +456,7 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
     // settings are accepted and never looked at.
     let mitm = (a.mitm || f.mitm)
         .then(|| {
-            // File entries first, then the flags (the comma form skips empty tokens, as in C).
+            // File entries first, then the flags (the comma form skips empty tokens).
             let ignore = f.ignore_hosts.into_iter().chain(a.ignore_host).chain(
                 a.ignore_hosts
                     .into_iter()
@@ -501,7 +501,7 @@ fn client(a: ClientArgs, f: FileConfig) -> Result<Resolved, String> {
             http_connect,
             tproxy,
             tproxy_mode,
-            // C defaults: fwmark 1, table 100, dport 443, uid = geteuid().
+            // Defaults: fwmark 1, table 100, dport 443, uid = geteuid().
             tproxy_fwmark: a.tproxy_fwmark.or(f.tproxy_fwmark).unwrap_or(1),
             tproxy_table: a.tproxy_table.or(f.tproxy_table).unwrap_or(100),
             tproxy_dport: a.tproxy_dport.or(f.tproxy_dport).unwrap_or(443),
@@ -546,12 +546,12 @@ fn mitm_config(
     })
 }
 
-/// `--metrics-interval`, else the file's `[Metrics] Interval` (0 = off, as in C).
+/// `--metrics-interval`, else the file's `[Metrics] Interval` (0 = off).
 fn metrics_interval(cli: Option<u64>, file: Option<u64>) -> Option<Duration> {
     cli.or(file.filter(|&s| s > 0)).map(Duration::from_secs)
 }
 
-/// C `mq_cc_from_string`: exact, case-sensitive.
+/// Exact, case-sensitive.
 pub fn cc(s: Option<&str>) -> Result<CongestionControl, String> {
     match s {
         None | Some("bbr") => Ok(CongestionControl::Bbr),
@@ -561,7 +561,7 @@ pub fn cc(s: Option<&str>) -> Result<CongestionControl, String> {
     }
 }
 
-/// C `mq_sched_from_string`: exact, case-sensitive.
+/// Exact, case-sensitive.
 pub fn scheduler(s: Option<&str>) -> Result<Scheduler, String> {
     match s {
         None | Some("minrtt") => Ok(Scheduler::MinRtt),
@@ -571,7 +571,7 @@ pub fn scheduler(s: Option<&str>) -> Result<Scheduler, String> {
     }
 }
 
-/// C `parse_ip_port`: `[v6]:port`, or `ip:port` split at the last ':'; port 1..=65535.
+/// `[v6]:port`, or `ip:port` split at the last ':'; port 1..=65535.
 pub fn ip_port(flag: &str, s: &str) -> Result<SocketAddr, String> {
     let split = match s.strip_prefix('[') {
         Some(rest) => rest.split_once("]:"),
@@ -594,7 +594,7 @@ pub fn wants_h3(r: &Resolved) -> bool {
     }
 }
 
-/// spec §8: `MQ_GW_ORIGIN_CONNECT_TIMEOUT_S` (test-only, as C): an integer in
+/// spec §8: `MQ_GW_ORIGIN_CONNECT_TIMEOUT_S` (test-only): an integer in
 /// [1, 600], else 10 s (not clamped). `main` reads the variable.
 pub fn origin_connect_timeout(env: Option<&str>) -> Duration {
     let s = env

@@ -23,7 +23,7 @@ pub struct ClientConfig {
     pub scheduler: Scheduler,
     /// `--keepalive-idle`: the QUIC idle timeout; `None` disables it.
     pub keepalive_idle: Option<Duration>,
-    /// `--client-id` (C default "mqproxy"); truncated to 63 bytes on the wire.
+    /// `--client-id` (default "mqproxy"); truncated to 63 bytes on the wire.
     pub client_id: String,
     /// `--token`; truncated to 255 bytes on the wire.
     pub token: String,
@@ -44,7 +44,7 @@ pub struct ClientConfig {
     /// its own H3 tunnel connection.
     pub gateway: Option<SocketAddr>,
     /// SP3 spec §5.7: a TCP ingress (`--socks5` / `--http-connect` / `--tproxy`)
-    /// is configured, so the raw tunnel is created (C `need_client`).
+    /// is configured, so the raw tunnel is created.
     pub has_tcp_ingress: bool,
     /// SP4 spec §9: `--mitm` with its CA and IgnoreHosts.
     pub mitm: Option<MitmConfig>,

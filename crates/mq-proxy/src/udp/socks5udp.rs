@@ -1,4 +1,4 @@
-//! spec §5: SOCKS5 UDP encapsulation header (RFC 1928 §7) — `mq_socks5_parse_udp_hdr`.
+//! spec §5: SOCKS5 UDP encapsulation header (RFC 1928 §7).
 
 use mq_runtime::Target;
 use mq_wire::frames::AddrType;
@@ -12,7 +12,7 @@ pub struct Dst<'a> {
 }
 
 /// `RSV u16 | FRAG u8 | ATYP | DST.ADDR | DST.PORT`; returns the payload offset.
-/// `None`: short, `RSV != 0`, `FRAG != 0` (C: -2, dropped alike), unknown ATYP.
+/// `None`: short, `RSV != 0`, `FRAG != 0` (dropped alike), unknown ATYP.
 pub fn parse(buf: &[u8]) -> Option<(Dst<'_>, usize)> {
     let [0, 0, 0, atyp, rest @ ..] = buf else {
         return None;

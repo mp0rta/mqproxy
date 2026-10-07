@@ -1,26 +1,14 @@
-//! Ports `tests/integration/test_client_reconnect.c` onto the shard pair
-//! (spec §8.1 "Shard pair", §6.2 reconnect), real `Client` and `Server`:
+//! Client reconnect on the shard pair (spec §8.1 "Shard pair", §6.2
+//! reconnect), real `Client` and `Server`. Case 3 covers the TCP half only
+//! (UDP reconnect is SP2).
 //!
-//! | C case | test |
-//! |---|---|
-//! | `test_case1_tcp_reconnect` | `pair_rc_case1_tcp_reconnect` |
-//! | `test_case2_udp_reconnect` | excluded: UDP relay is SP2 |
-//! | `test_case3_open_during_window` | `pair_rc_case3_open_during_window` (TCP half; its UDP half is SP2) |
-//! | `test_case4_queue_carryover` | `pair_rc_case4_queue_carryover` |
-//! | `test_case5_free_while_reconnecting` | excluded: C object lifetimes (`mq_client_free`) |
-//! | `test_case6_keepalive_holds` | `pair_rc_case6_keepalive_holds` |
-//! | `test_case7_persistent_outage` | `pair_rc_case7_persistent_outage` |
-//! | `test_case8_open_after_terminal` | `pair_rc_case8_open_after_terminal` |
-//! | `test_case9_free_before_engine_destroy` | excluded: C object lifetimes (free order) |
-//!
-//! The C `mq_conn_close(mq_client_conn(..))` is `Cx::close_conn` on the
-//! client's connection; "re-authed" (C `on_auth` count) is the server's
-//! `auth_attempts`; the C `tcp_open` over a socketpair is a SOCKS5 request
+//! A connection drop is `Cx::close_conn` on the client's connection;
+//! "re-authed" is the server's `auth_attempts`; an open is a SOCKS5 request
 //! whose reply stands for the open callback. Case 7's "server gone" is a
 //! fabric black hole (every datagram dropped both ways) instead of tearing
 //! the server down and rebuilding it on the same port. Case 8 runs with
-//! reconnect off from the start (C turns it off after the first auth; the
-//! `ClientConfig` is fixed at construction).
+//! reconnect off from the start (the `ClientConfig` is fixed at
+//! construction).
 #![forbid(unsafe_code)]
 
 use mq_integration::shard_pair::*;
@@ -53,7 +41,7 @@ fn auths(p: &mut P, n: u64, limit: Duration) {
     );
 }
 
-/// C `run_tcp_echo_flow`: open, "ping", byte-exact echo.
+/// Open, "ping", byte-exact echo.
 fn echo_flow(p: &mut P) {
     let s = p.socks_open(origin_addr(), b"");
     assert!(

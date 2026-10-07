@@ -1,4 +1,4 @@
-// spec §2.2; mirrors src/wire/mq_udp_msg.c
+// spec §2.2
 //! The fixed 9-byte header that prefixes every UDP payload carried in a QUIC
 //! DATAGRAM frame (all big-endian) and the pure fragment split. Nothing here
 //! allocates; `split` hands out slices that borrow the caller's payload.

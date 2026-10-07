@@ -1,7 +1,7 @@
-//! spec §6.4 `--setup-redirect`: the nft / ip-rule commands of C
-//! `src/ingress/mq_tproxy_setup.c`, table `mqproxy`. Every invocation goes
-//! through `run`: a direct exec with separate argv elements, no shell, and the
-//! child's `PATH` pinned to `/usr/sbin:/usr/bin:/sbin:/bin` (C `run_cmd`).
+//! spec §6.4 `--setup-redirect`: the nft / ip-rule commands, table
+//! `mqproxy`. Every invocation goes through `run`: a direct exec with separate
+//! argv elements, no shell, and the child's `PATH` pinned to
+//! `/usr/sbin:/usr/bin:/sbin:/bin`.
 
 use mq_runtime::ListenKind;
 use std::io;
@@ -35,7 +35,7 @@ fn v(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
 
-/// C `install_redirect` / `install_tproxy`, in order; element 0 is the program.
+/// The redirect or tproxy install commands, in order; element 0 is the program.
 pub fn install_cmds(o: &Opts) -> Vec<Vec<String>> {
     let (uid, dport, mark, table) = (
         o.uid.to_string(),
@@ -100,7 +100,7 @@ pub fn install_cmds(o: &Opts) -> Vec<Vec<String>> {
     }
 }
 
-/// C `uninstall_redirect` / `uninstall_tproxy`, in order.
+/// The redirect or tproxy uninstall commands, in order.
 pub fn uninstall_cmds(o: &Opts) -> Vec<Vec<String>> {
     let mut c = vec![v(&["nft", "delete", "table", "ip", "mqproxy"])];
     if o.mode == ListenKind::Tproxy {
@@ -121,7 +121,7 @@ pub fn uninstall_cmds(o: &Opts) -> Vec<Vec<String>> {
     c
 }
 
-/// C `run_cmd`: logs the command, runs it, logs a failure; true on exit 0.
+/// Logs the command, runs it, logs a failure; true on exit 0.
 fn cmd(argv: &[String], log_failure: bool) -> bool {
     log::info!("mq_tproxy_setup: run: {}", argv.join(" "));
     let prog = &argv[0];
@@ -141,7 +141,7 @@ fn cmd(argv: &[String], log_failure: bool) -> bool {
 
 /// spec §6.4: removes leftovers of a crashed run (failures expected, not
 /// logged), then installs. `false` = a failed install, which the caller logs as a
-/// warning; as C, every command is tried and a partial install is left for
+/// warning; every command is tried and a partial install is left for
 /// `uninstall`.
 pub fn install(o: &Opts) -> bool {
     for c in uninstall_cmds(o) {
@@ -169,7 +169,7 @@ pub fn install(o: &Opts) -> bool {
     ok
 }
 
-/// spec §6.6: the shutdown hook; each failure is tolerated, as C.
+/// spec §6.6: the shutdown hook; each failure is tolerated.
 pub fn uninstall(o: &Opts) {
     let tproxy = o.mode == ListenKind::Tproxy;
     let mode = if tproxy { "TPROXY" } else { "REDIRECT" };
@@ -213,7 +213,6 @@ mod tests {
 
     #[test]
     fn argv_lists_match_c() {
-        // Transcribed from the `const char *const a[]` arrays of mq_tproxy_setup.c.
         let r = opts(ListenKind::Redirect);
         assert_eq!(
             install_cmds(&r),

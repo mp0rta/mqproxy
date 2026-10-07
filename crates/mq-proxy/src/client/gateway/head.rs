@@ -26,7 +26,7 @@ pub fn fetch_head(h: &h1::Head<'_>) -> Result<ReqHead, Reject> {
         return Err(Reject::DupControl);
     }
     let auth = find(b"x-mq-auth").ok_or(Reject::MissingAuth)?;
-    // C `mq_gw_client_prevalidate`: case-sensitive prefix, non-empty token.
+    // Case-sensitive prefix, non-empty token.
     if auth.len() <= 7 || !auth.starts_with(b"Bearer ") {
         return Err(Reject::BadAuthFormat);
     }
@@ -61,8 +61,8 @@ pub fn fetch_head(h: &h1::Head<'_>) -> Result<ReqHead, Reject> {
     if long(Some(auth)) || long(class) || long(ae) {
         return Err(Reject::HeaderTooLong);
     }
-    // An empty control header leaves the caller's `Accept-Encoding` alone (as
-    // C); a non-empty one replaces it, so the caller's is not forwarded.
+    // An empty control header leaves the caller's `Accept-Encoding` alone; a
+    // non-empty one replaces it, so the caller's is not forwarded.
     let ae = ae.filter(|v| !v.is_empty());
     let cookie = forward_cookie_requested(h.headers.iter().map(|x| (x.name, x.value)));
     let headers = (h.headers.iter())
@@ -121,7 +121,7 @@ mod tests {
 
         const CTL_VAL_MAX: usize = 1024;
 
-        /// C `MQ_GW_MAX_SEND_HDRS` (spec §5.2: at most 64 + 8 headers).
+        /// spec §5.2: at most 64 + 8 headers.
         const MAX_FWD: usize = h1::MAX_HEADERS + 8;
 
         /// The request head, owned (spec §5.2: the parser's borrows end at
@@ -194,7 +194,7 @@ mod tests {
                 return Err(Reject::DupControl);
             }
             let auth = head.auth.as_ref().ok_or(Reject::MissingAuth)?;
-            // C `mq_gw_client_prevalidate`: case-sensitive prefix, non-empty token.
+            // Case-sensitive prefix, non-empty token.
             if auth.len() <= 7 || !auth.starts_with(b"Bearer ") {
                 return Err(Reject::BadAuthFormat);
             }
@@ -271,7 +271,7 @@ mod tests {
             {
                 out.push(h("x-mq-cache", v));
             }
-            // An empty control header leaves the caller's `Accept-Encoding` alone (as C).
+            // An empty control header leaves the caller's `Accept-Encoding` alone.
             let ae = head.accept_encoding.as_ref().filter(|v| !v.is_empty());
             if let Some(v) = ae {
                 out.push(h("accept-encoding", v));

@@ -3,25 +3,23 @@
 # e2e_mitm_h2.sh — Phase 7 MITM Slice 3 Task 16: NET_ADMIN transparent-MITM H2 e2e.
 #
 # WHAT THIS PROVES (the capstone for the 🔒 security gate):
-#   This is the ONLY test that drives the LIVE mq_mitm_conn orchestrator end to
+#   This is the ONLY test that drives the LIVE MITM orchestrator end to
 #   end. A real browser (curl --http2) is transparently captured (nft REDIRECT),
 #   the client forges a per-SNI leaf signed by the MITM CA, terminates TLS,
 #   speaks h2 over the tunnel to the gateway server, which fetches the real
-#   origin via libcurl. The full live data path is:
+#   origin. The full live data path is:
 #
 #     curl (as nobody, --http2)
 #       → nft REDIRECT
 #       → mqproxy-client tproxy listener
-#       → mq_mitm_conn orchestrator (forge leaf for SNI, terminate TLS, ALPN=h2)
-#       → mq_gw_h2_adapter
-#       → gwc (gateway client) → MPQUIC tunnel
-#       → mqproxy-server (gateway mode) → libcurl → ORIGIN (HTTPS).
+#       → MITM orchestrator (forge leaf for SNI, terminate TLS, ALPN=h2)
+#       → H2 adapter
+#       → gateway client → MPQUIC tunnel
+#       → mqproxy-server (gateway mode) → ORIGIN (HTTPS).
 #
-#   The Slice-2 e2e (e2e_mitm_smoke.sh) only exercised mq_mitm_core over an
-#   SSL_set_fd socket with a hand-rolled single-shot server; the live
-#   orchestrator's BIO-pump + handshake + adapter→tunnel submit + teardown is
-#   NOT unit-covered (test_mitm_teardown is a fake-SSL teardown). THIS script is
-#   what genuinely exercises that path.
+#   e2e_mitm_smoke.sh only checks the MITM TLS endpoint with openssl s_client;
+#   THIS script is what exercises the live orchestrator's handshake +
+#   adapter→tunnel submit + teardown.
 #
 # THE TWO FALSIFIABILITY AXES (one per host, mirror e2e_tproxy's opacity proof):
 #   * MITM host  (SNI=mitm.test): curl trusts the MITM CA (--cacert mitm-ca.crt)
@@ -38,7 +36,7 @@
 #       handshake that FAILS against the MITM CA) proves the ignore-hosts splice
 #       is opaque (the origin's real ClientHello/cert reach the wire untouched).
 #
-# ASSERTIONS (cases a-f run by default; g and h are Rust-only):
+# ASSERTIONS (cases a-f run by default; g and h are opt-in):
 #   (a) curl --http2 to the MITM host gets the origin object over h2
 #       (http_version == 2, body byte-exact)        → transparent MITM works.
 #   (b) a second same-origin fetch REUSES the warm origin connection
@@ -59,18 +57,17 @@
 #       (the orchestrator's single h2 conn multiplexes N streams onto the tunnel).
 #   (f) a POST upload body reaches the origin byte-exact over h2 (no FIN-before-body
 #       regression: the H2 adapter must report a streaming body).
-#   (g) [Rust] curl --http1.1 --cacert <origin CA> succeeds: a client that does not
+#   (g) curl --http1.1 --cacert <origin CA> succeeds: a client that does not
 #       offer h2 takes the OPAQUE path (origin cert verifies; the MITM CA is rejected).
-#   (h) [Rust] a 6 KiB Cookie and a 3 KiB URL succeed (the C server stores forwarded
-#       values in 1024 bytes, so this case is not C-compatible).
+#   (h) a 6 KiB Cookie and a 3 KiB URL succeed.
 #
-# CASE SELECTION: MITM_CASES (default "a b c d e f", which CTest and the C interop
-# runs use). Rust<->Rust runs set MITM_CASES="a b c d e f g h".
+# CASE SELECTION: MITM_CASES (default "a b c d e f"); set
+# MITM_CASES="a b c d e f g h" to run all.
 #
 # HOW HOSTNAMES RESOLVE (both client AND server sides):
 #   The H2 adapter forwards the browser's :authority verbatim; the gateway server
-#   fetches https://<:authority><:path> via libcurl and verifies the origin cert
-#   against --origin-ca. So BOTH the SNI host (browser→client) and the libcurl
+#   fetches https://<:authority><:path> and verifies the origin cert
+#   against --origin-ca. So BOTH the SNI host (browser→client) and the origin
 #   target host (server→origin) are the SAME hostname, and BOTH must resolve to
 #   127.0.0.1 and be covered by the origin cert's SAN. We therefore:
 #     * generate a DEDICATED origin CA + leaf at runtime (in WORK); the leaf's SAN
@@ -81,7 +78,7 @@
 #       end-entity (CaUsedAsEndEntity). The e2e is self-contained, like
 #       e2e_gateway, which also generates its own files.
 #     * add /etc/hosts entries mitm.test/pinned.example → 127.0.0.1 (we are root
-#       in the NET_ADMIN container) so BOTH curl's SNI and the server's libcurl
+#       in the NET_ADMIN container) so BOTH curl's SNI and the server's origin fetch
 #       resolve the hostnames. The entries are removed on cleanup.
 #   curl connects to https://<host>:${ORIGIN_PORT}/ ; the nft REDIRECT (dport
 #   ${ORIGIN_PORT}) captures nobody's connection to the tproxy listener.
@@ -206,9 +203,8 @@ if [ ! -x "${MQPROXY_BIN}" ]; then
     note "  Build first (cargo build --release -p mqproxy --bins --examples) or set MQPROXY_BIN."
     exit 1
 fi
-# MITM capability is gated at runtime, not here: the Rust binary always has it;
-# a C binary built without the BoringSSL archives hard-errors on --mitm
-# ("--mitm unavailable"), which wait_mitm_ready below turns into a SKIP.
+# MITM capability is not checked here (the binary always has it);
+# wait_mitm_ready below still turns a "--mitm unavailable" error into a SKIP.
 for f in "${MITM_CA_CRT}" "${MITM_CA_KEY}" "${MQPROXY_CERT}" "${MQPROXY_KEY}"; do
     if [ ! -f "${f}" ]; then
         note "ERROR: cert/key missing: ${f} (run bash tests/certs/generate-mitm.sh or set MQ_MITM_CA_*)."
@@ -255,9 +251,9 @@ ORIGIN_CA_KEY="${WORK}/origin-ca.key"
 # the e2e_tproxy.sh note on the HTTP-000 path-permission trap).
 MITM_CA_PUB="${WORK}/mitm_ca.crt"
 ORIGIN_CA_PUB="${WORK}/origin_ca.crt"
-# Private CA copies that --ca-cert/--ca-key consume. mq_mitm_core REQUIRES the CA
+# Private CA copies that --ca-cert/--ca-key consume. The client REQUIRES the CA
 # KEY to be owned by the running euid with NO group/other perms (a deliberate
-# 0600-owner security gate — read_pem_file_safely). The tracked fixture key is
+# 0600-owner security gate). The tracked fixture key is
 # owned by the repo user, so when this script runs as root (uid 0) the original
 # would be REJECTED (st_uid != geteuid). We therefore stage root-owned 0600 copies
 # in WORK and point --ca-key/--ca-cert at THOSE.
@@ -333,8 +329,8 @@ mint_origin_cert() {
 }
 
 # ── /etc/hosts: map both test hostnames to 127.0.0.1 ─────────────────────────
-# Needed on BOTH sides: curl's SNI (client) and the server's libcurl (origin
-# fetch) must resolve the hostnames to 127.0.0.1.
+# Needed on BOTH sides: curl's SNI (client) and the server's origin fetch
+# must resolve the hostnames to 127.0.0.1.
 install_hosts() {
     cp /etc/hosts "${WORK}/hosts.bak" || return 1
     HOSTS_BACKED_UP=1
@@ -642,7 +638,7 @@ if want b; then
     # ── case (b): cache HIT — second fetch served origin-once ────────────────────
     # MITM-MODEL NOTE — why this is origin-CONNECTION-REUSE, not a server cache HIT:
     #   The Task-16 plan text says "origin-once (cache hit)". But §4.5 step 1 (the
-    #   S3-D11 untrusted-browser-header policy, enforced in mq_gw_h2_adapter on_header)
+    #   S3-D11 untrusted-browser-header policy, enforced in the H2 adapter)
     #   STRIPS every browser-supplied x-mq-* header UNCONDITIONALLY, and the MITM path
     #   injects EXACTLY two controls (x-mq-auth, x-mq-forward-cookie) — NOT X-Mq-Cache.
     #   The server-side response cache is therefore NOT reachable from a transparently

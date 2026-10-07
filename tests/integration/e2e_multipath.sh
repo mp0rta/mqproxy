@@ -272,8 +272,8 @@ start_client() {
 }
 
 stop_client() {
-    # SIGTERM: the CLI handles it (mq_runtime_stop -> loop breaks -> it logs
-    # mq_conn_dump_stats per-path counters to client.log before teardown).
+    # SIGTERM: the CLI handles it (the loop stops and it logs per-path
+    # counters to client.log before teardown).
     [ -n "${CLIENT_PID}" ] && kill -TERM "${CLIENT_PID}" 2>/dev/null
     wait "${CLIENT_PID}" 2>/dev/null
     CLIENT_PID=""
@@ -313,7 +313,7 @@ note "e2e_multipath: === two-path run (path A + path B) ==="
 start_client "${PATH_A_IP}" "${PATH_B_IP}"
 DUAL_BPS="$(run_transfer)"
 # Dump the client's per-path stats before killing it (logged at INFO on signal/
-# exit via mq_conn_dump_stats — captured in client.log). Give it a moment.
+# exit — captured in client.log). Give it a moment.
 stop_client
 note "e2e_multipath: two-path speed   = ${DUAL_BPS} bytes/s"
 
@@ -341,7 +341,7 @@ count_token() {
 }
 
 # (2) per-path split: both paths moved real bytes (GATE). The client logs
-#   "mq.path id=<id> ... sent=<n> recv=<n> ..." on teardown (mq_conn_dump_stats).
+#   "mq.path id=<id> ... sent=<n> recv=<n> ..." on teardown.
 PATHS_WITH_BYTES="$(grep -E 'mq\.path id=' "${WORK}/client.log" 2>/dev/null \
     | sed -E 's/.*mq\.path id=([0-9]+).*sent=([0-9]+) recv=([0-9]+).*/\1 \2 \3/' \
     | awk '($2+0 > 0 || $3+0 > 0) { print $1 }' \

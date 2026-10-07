@@ -1,11 +1,11 @@
-// spec §2.3; mirrors src/wire/mq_wire.c
+// spec §2.3
 //! AUTH, CONNECT_TCP and UDP_SESSION control frames. All fixed ints are
 //! big-endian; a `string` is a varint length + raw bytes. Decoders are strict
 //! (truncation → `Short`, over-cap field / bad address type → `BadValue`),
 //! accept non-minimal varints, skip trailing padding, and keep `status` /
 //! `error_code` raw. Encoders never allocate and always write
 //! `padding_length = 0`. The UDP_SESSION frames additionally validate
-//! semantics on both sides, as the C codec does (spec §2.1): `Invalid` on
+//! semantics on both sides (spec §2.1): `Invalid` on
 //! decode, `EncodeError::BadValue` on encode.
 use crate::varint;
 
@@ -67,7 +67,7 @@ impl TcpErr {
 }
 
 /// Wire `error_code` of a `UDP_SESSION_RESP` with `STATUS_ERROR` (spec §2.1).
-/// C's boundary-only `MQ_UDP_CLOSED` (5) never appears on the wire and has no variant.
+/// Code 5 (boundary-only "closed") never appears on the wire and has no variant.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UdpErr {
     DnsFailed = 1,
@@ -119,7 +119,7 @@ pub enum DecodeError {
 pub enum EncodeError {
     Short,
     TooLong,
-    /// varint > 2^62-1, or a `UdpSessionResp` status / error_code pair the C codec rejects
+    /// varint > 2^62-1, or a `UdpSessionResp` status / error_code pair that is inconsistent
     BadValue,
 }
 
@@ -203,7 +203,7 @@ impl ConnectTcpResp<'_> {
     }
 }
 
-// ---- private cursors mirroring the C put_*/get_* helpers ----
+// ---- private cursors ----
 
 struct Cursor<'a> {
     buf: &'a [u8],
@@ -394,7 +394,7 @@ impl<'a> UdpSessionOpen<'a> {
         w.finish()
     }
 
-    // spec §2.1: sid > u32 and an unknown address type are rejected as soon as read, as in C.
+    // spec §2.1: sid > u32 and an unknown address type are rejected as soon as read.
     pub fn decode(buf: &'a [u8]) -> Result<(Self, usize), DecodeError> {
         let mut r = Cursor::new(buf);
         let session_id = u32::try_from(r.varint()?).map_err(|_| DecodeError::Invalid)?;
@@ -412,7 +412,7 @@ impl<'a> UdpSessionOpen<'a> {
     }
 }
 
-/// C `udp_err_valid_for_wire` + `udp_status_err_consistent`: OK <=> code 0, ERROR <=> code 1..=4.
+/// OK <=> code 0, ERROR <=> code 1..=4.
 fn udp_status_code_valid(status: u8, error_code: u64) -> bool {
     matches!((status, error_code), (STATUS_OK, 0) | (STATUS_ERROR, 1..=4))
 }
@@ -431,7 +431,7 @@ impl<'a> UdpSessionResp<'a> {
         w.finish()
     }
 
-    // spec §2.1: the status / error_code pairing is checked before the message is read, as in C.
+    // spec §2.1: the status / error_code pairing is checked before the message is read.
     pub fn decode(buf: &'a [u8]) -> Result<(Self, usize), DecodeError> {
         let mut r = Cursor::new(buf);
         let status = r.u8()?;

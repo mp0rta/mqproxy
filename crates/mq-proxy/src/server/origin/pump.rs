@@ -516,7 +516,7 @@ impl Origin {
     }
 }
 
-/// §7.7 libcurl's second retry, h1 only (no h2 retry at all): a reused conn
+/// §7.7 retry, h1 only (no h2 retry at all): a reused conn
 /// closed before any response byte, for a bodiless request, once.
 fn bodiless_retry(
     proto: OriginProto,

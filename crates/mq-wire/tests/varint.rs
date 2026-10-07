@@ -1,4 +1,4 @@
-// spec §2.3; ports tests/test_varint.c
+// spec §2.3
 use mq_wire::varint::{Error, MAX, decode, encode, len};
 use proptest::prelude::*;
 

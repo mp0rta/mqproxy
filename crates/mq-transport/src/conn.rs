@@ -119,7 +119,7 @@ pub(crate) fn connect(
         ConnProto::Raw => t.inner.alpn.as_ptr(),
         ConnProto::H3 => c"h3".as_ptr(),
     };
-    // SAFETY: a plain C struct; all-zero is valid and what C passes.
+    // SAFETY: a plain C struct; all-zero is valid.
     let zero_cid: xqc_cid_t = unsafe { core::mem::zeroed() };
     let s = t
         .inner
@@ -269,7 +269,7 @@ pub(crate) fn add_path(
         let mut pid = 0u64;
         // SAFETY: the engine is live; the cid and `pid` outlive the calls.
         unsafe {
-            // 0 = AVAILABLE; the status is then set explicitly, as in C.
+            // 0 = AVAILABLE; the status is then set explicitly.
             let r = xqc_conn_create_path(engine, &cid, &mut pid, 0);
             if r == -(XQC_EMP_NO_AVAIL_PATH_ID as xqc_int_t) {
                 return Err(PathError::NoPathId);

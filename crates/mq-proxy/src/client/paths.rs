@@ -39,7 +39,7 @@ pub(super) struct Paths {
     /// spec §6.2: under the `backup` scheduler paths are added as standby.
     standby: bool,
     /// The log prefix: `mq_client` (raw tunnel) or `mq_gw_client` (gateway
-    /// tunnel), as C's two owners log (SP3 spec §5.7).
+    /// tunnel); SP3 spec §5.7.
     log: &'static str,
 }
 

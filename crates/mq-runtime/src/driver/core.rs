@@ -269,7 +269,7 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
             return Next::Exit(code);
         }
         if self.cap_hit {
-            return Next::Exit(0); // spec §5.3: exit 0 after a signal, as C does
+            return Next::Exit(0); // spec §5.3: exit 0 after a signal
         }
         // 10.
         self.next_wait = if self.runnable() {
@@ -542,7 +542,7 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
             } => {
                 self.deadlines.set(Expired::Dial(op), now + deadline);
                 match target.host {
-                    // C resolves only domains (mq_server.c:441).
+                    // Only domains are resolved.
                     Host::Ip(ip) => {
                         let a = SocketAddr::new(ip, target.port);
                         self.dials.insert(op, DialState::Connecting(a));
@@ -683,7 +683,7 @@ impl<I: Io, T: TransportOps, A: App> LoopCore<I, T, A> {
     }
 }
 
-/// spec §5.3 `io::Error → DialError` (C `srv_map_errno`) for connects;
+/// spec §5.3 `io::Error → DialError` for connects;
 /// resolve failures are `Dns`, the deadline `Timeout`, `Limit` only the cap.
 fn connect_error(e: &io::Error) -> DialError {
     match e.kind() {

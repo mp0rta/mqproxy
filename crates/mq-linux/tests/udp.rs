@@ -114,7 +114,7 @@ fn send_gso_rejects_more_than_64_segments_or_65507_bytes() {
     assert!(got.iter().all(|(_, d)| d == &vec![7u8; 100]));
 }
 
-// --- IPv6 (C supports AF_INET6 QUIC paths): the same three on [::1]. ---
+// --- IPv6: the same three on [::1]. ---
 
 #[test]
 fn v6_gso_send_arrives_as_segments() {

@@ -1,4 +1,4 @@
-// spec §2.2; ports tests/test_udp_msg.c
+// spec §2.2
 use mq_wire::udp_msg::*;
 
 /// Collects (header, slice length) per fragment.

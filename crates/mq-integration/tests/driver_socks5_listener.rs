@@ -1,15 +1,7 @@
-//! Port of C `tests/integration/test_socks5_listener.c` (spec §8.1, §6.1):
-//! the real `Client`'s SOCKS5 and HTTP CONNECT listeners under the production
-//! driver; the test is the ingress client, and the scripted transport stands
-//! in for the server (AUTH answered by the rig, CONNECT answered here) where C
-//! used a mock `tcp_open`.
-//!
-//! Ported: `socks5_happy`, `socks5_unsupported`, `socks5_malformed`,
-//! `http_connect_smoke`, `socks5_pipelined_prebuf`, `http_pipelined_prebuf`,
-//! `assoc_refused_no_udp`, `assoc_refused_unavail`. Not ported (SP2, UDP
-//! ASSOCIATE served): `assoc_establish_free`, `assoc_tcp_close_teardown`,
-//! `assoc_mixed_shutdown`, `assoc_no_close_after_err`,
-//! `assoc_availability_sweep`, `assoc_dst_reclaim_churn`.
+//! Spec §8.1, §6.1: the real `Client`'s SOCKS5 and HTTP CONNECT listeners
+//! under the production driver; the test is the ingress client, and the
+//! scripted transport stands in for the server (AUTH answered by the rig,
+//! CONNECT answered here). Served UDP ASSOCIATE (SP2) is not covered here.
 #![forbid(unsafe_code)]
 
 mod common;
@@ -137,8 +129,7 @@ fn associate_refused(r: &ClientRig, opened: usize) {
     assert_eq!(r.opened(), opened);
 }
 
-/// C: a listener without the UDP boundary. Here: no tunnel at all, so UDP
-/// availability is still unknown and the ASSOCIATE is accepted optimistically
+/// No tunnel at all, so UDP availability is still unknown and the ASSOCIATE is accepted optimistically
 /// (SP2 spec §6.2) on a UDP socket bound on the control connection's local IP.
 #[test]
 fn assoc_refused_no_udp() {
@@ -153,7 +144,7 @@ fn assoc_refused_no_udp() {
     r.stop();
 }
 
-/// C: UDP availability 0. Here: serving, the `AUTH_RESPONSE` without
+/// Serving, the `AUTH_RESPONSE` without
 /// `MQ_FEAT_UDP_RELAY`.
 #[test]
 fn assoc_refused_unavail() {

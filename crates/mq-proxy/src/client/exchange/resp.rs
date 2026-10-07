@@ -12,7 +12,7 @@ pub struct Malformed;
 /// A collected response head (spec §5.4).
 #[derive(Debug, PartialEq, Eq)]
 pub struct RespHead {
-    /// `:status`, 502 when outside 100..=599 (as C).
+    /// `:status`, 502 when outside 100..=599.
     pub status: u16,
     /// Every relayed header, as received (pseudo and hop-by-hop dropped).
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
@@ -39,7 +39,7 @@ impl HeadCollector {
         if self.bad {
             return;
         }
-        // Exactly three ASCII digits (C: no overflow on a hostile value).
+        // Exactly three ASCII digits: no overflow on a hostile value.
         if name == b":status" {
             match value {
                 [a, b, c] if value.iter().all(u8::is_ascii_digit) => {
@@ -57,7 +57,7 @@ impl HeadCollector {
             }
             return;
         }
-        // Other pseudo-headers and hop-by-hop: dropped; `x-mq-*` kept (as C).
+        // Other pseudo-headers and hop-by-hop: dropped; `x-mq-*` kept.
         if name.first() == Some(&b':') || is_hop_by_hop(name) {
             return;
         }
@@ -121,7 +121,7 @@ mod tests {
             assert_eq!(collect(&[(":status", s)]), Err(Malformed), "{s:?}");
         }
         assert_eq!(collect(&[("x", "y")]), Err(Malformed), "no :status");
-        // C: the last `:status` wins.
+        // The last `:status` wins.
         let two = collect(&[(":status", "200"), (":status", "404")]);
         assert_eq!(two.unwrap().status, 404);
     }

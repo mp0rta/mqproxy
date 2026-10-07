@@ -117,7 +117,7 @@ pub enum IoRequest {
     TcpShutdownWrite {
         tcp: TcpId,
     },
-    /// `TCP_NODELAY` on the socket (SP3: the origin bridge, libcurl parity).
+    /// `TCP_NODELAY` on the socket (SP3: the origin bridge).
     TcpSetNodelay {
         tcp: TcpId,
     },

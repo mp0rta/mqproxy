@@ -10,7 +10,7 @@ use mq_wire::frames::TcpErr;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-/// spec §6.2: C `MQ_CLIENT_QUEUE_MAX`.
+/// spec §6.2: the pending-request queue bound.
 pub const MAX_PENDING: usize = 256;
 
 /// spec §6.1: which ingress accepted the socket, i.e. which reply format it expects.

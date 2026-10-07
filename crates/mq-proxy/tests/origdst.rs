@@ -1,4 +1,4 @@
-//! spec §6.1: transparent capture target — port of tests/test_origdst.c.
+//! spec §6.1: transparent capture target.
 //! `unsupported_family` is covered by mq-linux's `sockaddr_conversion_rejects_unix_family`;
 //! `short_buffer` has no equivalent (owned `SocketAddr`, no caller buffer).
 
@@ -27,7 +27,7 @@ fn ipv4() {
 
 #[test]
 fn ipv6() {
-    // IPv4-only in SP1: expectation inverted from the C test.
+    // IPv4-only in SP1.
     assert_eq!(
         target_from_original_dst(&meta(Some("[2001:db8::1]:8080".parse().unwrap()))),
         None

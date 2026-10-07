@@ -1,10 +1,7 @@
-//! Ports `tests/integration/test_metrics_active_conn.c` onto the shard pair
-//! (spec §8.1 "Shard pair", §6.5: the server reports the most recently
-//! *accepted* connection — set at `NewConn`, before auth, as C `last_conn`
-//! in `srv_on_new_conn` — and clears it only when that same connection
-//! closes). The C `mq_conn_dump_stats` smoke is `conn_stats` + the formatter.
-//! Nothing is excluded; `pair_metrics_active_conn_replaced_by_unauthenticated_accept`
-//! is added.
+//! Active-connection metrics on the shard pair (spec §8.1 "Shard pair",
+//! §6.5: the server reports the most recently *accepted* connection — set at
+//! `NewConn`, before auth — and clears it only when that same connection
+//! closes), plus a `conn_stats` + formatter smoke.
 #![forbid(unsafe_code)]
 
 use mq_integration::shard_pair::*;

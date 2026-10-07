@@ -1,8 +1,8 @@
-//! `mq.req` log-line formatter (spec §2.4), byte-for-byte as C `mq_gw_format_req_line`.
+//! `mq.req` log-line formatter (spec §2.4).
 //! Works on bytes: no `String`, truncation is bytewise.
 use std::io::Write;
 
-/// C's `char line[1024]` including the NUL: a line of this length or more is dropped.
+/// A line of this length or more is dropped.
 pub const LINE_MAX: usize = 1024;
 const AUTHORITY_CAP: usize = 128;
 /// The quoted `path` cap; the server's call site also cuts the path here (spec §6.6).
@@ -261,7 +261,7 @@ reset=\"client-reset\""
 
     #[test]
     fn line_1024_dropped() {
-        // inflate `method` (uncapped, like C's %s) to hit the boundary.
+        // inflate `method` (uncapped) to hit the boundary.
         let l = base();
         let len = fmt(&l).len();
         let m1023 = vec![b'M'; 3 + 1023 - len];

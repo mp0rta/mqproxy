@@ -1,5 +1,4 @@
-//! spec §6.5: C `mq_log` (`src/util/mq_log.c:30`): `[LEVEL] msg\n` on stderr,
-//! no timestamp, level fixed at INFO (`main` calls `mq_log_set_level(MQ_LOG_INFO)`).
+//! spec §6.5: `[LEVEL] msg\n` on stderr, no timestamp, level fixed at INFO.
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::io::Write;
@@ -32,7 +31,7 @@ impl Log for Stderr {
     fn flush(&self) {}
 }
 
-/// C's prefixes: ERROR, WARN, INFO, DEBUG (`Trace` never passes the INFO level).
+/// Prefixes: ERROR, WARN, INFO, DEBUG (`Trace` never passes the INFO level).
 fn line(level: Level, msg: &std::fmt::Arguments, instance: Option<&str>) -> String {
     let prefix = match level {
         Level::Error => "ERROR",
@@ -46,7 +45,7 @@ fn line(level: Level, msg: &std::fmt::Arguments, instance: Option<&str>) -> Stri
     }
 }
 
-/// Installs the logger; the max level is INFO, as C.
+/// Installs the logger; the max level is INFO.
 pub fn init() {
     if log::set_logger(&Stderr).is_ok() {
         log::set_max_level(LevelFilter::Info);

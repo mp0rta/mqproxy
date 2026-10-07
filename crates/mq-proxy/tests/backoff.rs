@@ -1,4 +1,4 @@
-//! spec §6.2: reconnect backoff — port of tests/test_backoff.c plus the Rust-side schedule cases.
+//! spec §6.2: reconnect backoff schedule.
 
 use mq_proxy::client::backoff::{Backoff, backoff_ms};
 use mq_runtime::Rng;
@@ -8,14 +8,12 @@ use std::time::Duration;
 const BASE: u64 = 250;
 const CAP: u64 = 30_000;
 
-// test_backoff.c: test_doubling_sequence
 #[test]
 fn doubling_sequence() {
     let got: Vec<u64> = (0..=6).map(|a| backoff_ms(BASE, CAP, a)).collect();
     assert_eq!(got, [250, 500, 1000, 2000, 4000, 8000, 16000]);
 }
 
-// test_backoff.c: test_saturates_at_cap
 #[test]
 fn saturates_at_cap() {
     for a in [7, 8, 10] {
@@ -23,7 +21,6 @@ fn saturates_at_cap() {
     }
 }
 
-// test_backoff.c: test_no_overflow_large_attempts
 #[test]
 fn no_overflow_large_attempts() {
     assert_eq!(backoff_ms(BASE, CAP, 31), CAP);
@@ -31,7 +28,6 @@ fn no_overflow_large_attempts() {
     assert_eq!(backoff_ms(BASE, CAP, u32::MAX), CAP);
 }
 
-// test_backoff.c: test_generic
 #[test]
 fn generic() {
     let got = [0, 1, 2, 3, 4, 31].map(|a| backoff_ms(1, 8, a));

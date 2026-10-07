@@ -1,5 +1,5 @@
-//! spec §6.1: SOCKS5 (RFC 1928, no-auth, CONNECT and UDP ASSOCIATE) — port of
-//! `src/ingress/mq_socks5.c` plus the reply choices of `mq_listener.c:drive_socks5`.
+//! spec §6.1: SOCKS5 (RFC 1928, no-auth, CONNECT and UDP ASSOCIATE) parser
+//! and its replies.
 
 use super::Progress;
 use super::request::capped;
@@ -48,7 +48,7 @@ fn greeting(b: &[u8], greeted: &mut bool) -> Progress<'static> {
         return Progress::Need;
     }
     if b[0] != VER {
-        return Progress::Close; // mq_socks5.c:25 → MQ_DRIVE_CLOSE, no reply
+        return Progress::Close; // no reply
     }
     let total = 2 + b[1] as usize;
     if b.len() < total {
@@ -83,13 +83,13 @@ fn request(b: &[u8]) -> Progress<'static> {
         return Progress::Need;
     }
     if b[0] != VER {
-        return Progress::Close; // mq_socks5.c:52 → MQ_DRIVE_CLOSE, no reply
+        return Progress::Close; // no reply
     }
     let cmd = b[1];
     if cmd != CMD_CONNECT && cmd != CMD_ASSOCIATE {
         return refuse(&REP_CMD_UNSUPPORTED); // BIND and unknown commands
     }
-    // b[2] RSV ignored, as in C.
+    // b[2] RSV ignored.
     let atyp = b[3];
     let (off, len) = match atyp {
         0x01 => (4, 4),
@@ -105,7 +105,7 @@ fn request(b: &[u8]) -> Progress<'static> {
         return Progress::Need;
     }
     if cmd == CMD_ASSOCIATE {
-        // spec §6.1: parsed in full, the DST ignored (as C and RFC 1928 allow).
+        // spec §6.1: parsed in full, the DST ignored (as RFC 1928 allows).
         return Progress::Associate { consumed: total };
     }
     let addr = &b[off..off + len];
@@ -156,7 +156,7 @@ pub fn socks5_assoc_reply(bound: SocketAddr) -> Vec<u8> {
     b
 }
 
-/// spec §6.1: CONNECT failed; REP from `mq_socks5_reply_code`, with `Ok` as general failure.
+/// spec §6.1: CONNECT failed; REP per error, with `Ok` as general failure.
 pub fn socks5_error_reply(e: TcpErr) -> [u8; 10] {
     reply(match e {
         TcpErr::DnsFailed => 0x04,

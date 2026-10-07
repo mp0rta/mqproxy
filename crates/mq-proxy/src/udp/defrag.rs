@@ -1,9 +1,9 @@
-//! spec §2.3: 4-slot LRU datagram defragmenter — C `mq_defrag_feed`.
+//! spec §2.3: 4-slot LRU datagram defragmenter.
 
 use mq_wire::udp_msg::UdpMsgHdr;
 
 const SLOTS: usize = 4;
-/// Largest reassembled packet (C `DEFRAG_MAX_TOTAL`).
+/// Largest reassembled packet.
 const MAX_TOTAL: usize = 65_535;
 
 #[derive(PartialEq, Eq, Debug)]
@@ -15,7 +15,7 @@ pub enum Feed {
 
 struct Slot {
     packet_id: u16,
-    /// One entry per expected fragment; `Some` is the C bitmap bit.
+    /// One entry per expected fragment; `Some` once received.
     frags: Vec<Option<Vec<u8>>>,
     received: usize,
     total_len: usize,

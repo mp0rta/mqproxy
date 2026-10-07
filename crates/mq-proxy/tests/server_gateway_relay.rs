@@ -508,7 +508,7 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-/// libcurl parity: Nagle on the origin socket held the second write of a
+/// Without TCP_NODELAY, Nagle on the origin socket holds the second write of a
 /// request behind the origin's delayed ACK (~40 ms per 20 KB upload).
 #[test]
 fn origin_dial_sets_nodelay() {

@@ -45,9 +45,9 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 use udp_session::SrvSession;
 
-/// spec §6.3 "Auth accepted": as C `MQ_SERVER_ID`.
+/// spec §6.3 "Auth accepted": the `server_id`.
 const SERVER_ID: &[u8] = b"mqproxy-server";
-/// spec §6.3: the wire limit of `auth_token` (C `char[256]`).
+/// spec §6.3: the wire limit of `auth_token`.
 const MAX_TOKEN: usize = 255;
 /// spec §6.3: app-held streams per connection, control included.
 const STREAM_BUDGET: usize = 4096;
@@ -139,7 +139,7 @@ struct Data {
 enum Parsed {
     Wait,
     Bad,
-    /// A request whose target cannot be dialled: answered, not reset (as C).
+    /// A request whose target cannot be dialled: answered, not reset.
     Undialable(usize),
     Dial(usize, Target),
     /// SP2 spec §7.1: `UDP_SESSION_OPEN` — sid, target (`None`: undialable,
@@ -162,7 +162,7 @@ pub struct Server {
     /// SP2 spec §7.2: the `datagram_recv` scratch.
     rx: Vec<u8>,
     timers: HashMap<TimerId, Tm>,
-    /// spec §6.5: the most recently accepted connection (C `last_conn`).
+    /// spec §6.5: the most recently accepted connection.
     active: Option<ConnId>,
     auth_attempts: u64,
     shutting_down: bool,
@@ -184,7 +184,7 @@ fn tcp_resp(status: u8, e: TcpErr) -> Vec<u8> {
     b
 }
 
-/// spec §6.3 dial error table (C `srv_map_errno` maps unclassified errors to CONN_REFUSED).
+/// spec §6.3 dial error table; unclassified errors map to CONN_REFUSED.
 fn map_dial_error(e: DialError) -> TcpErr {
     match e {
         DialError::Dns => TcpErr::DnsFailed,
@@ -195,10 +195,10 @@ fn map_dial_error(e: DialError) -> TcpErr {
 }
 
 /// spec §6.3: stream type then `CONNECT_TCP_REQUEST` (or, SP2 spec §7.1,
-/// `UDP_SESSION_OPEN`), as C `srv_data_header_readable`.
+/// `UDP_SESSION_OPEN`).
 fn parse_request(buf: &[u8], fin: bool) -> Parsed {
-    // spec §6.2: a header (discriminator + frame) over 512 bytes never fits
-    // C's 512-byte frame buffer, complete or not.
+    // spec §6.2: a header (discriminator + frame) over 512 bytes is rejected,
+    // complete or not.
     let wait = if fin || buf.len() >= MAX_FRAME {
         Parsed::Bad
     } else {
@@ -214,7 +214,7 @@ fn parse_request(buf: &[u8], fin: bool) -> Parsed {
                 Err(DecodeError::Short) => return wait,
                 _ => return Parsed::Bad,
             };
-            // C `srv_resolve_target`: a wrong address length or an unusable name is DNS_FAILED.
+            // A wrong address length or an unusable name is DNS_FAILED.
             match host_of(req.address_type, req.host) {
                 Some(host) => Parsed::Dial(
                     used,
@@ -279,7 +279,7 @@ impl Server {
         self.gw.as_mut().map(Gateway::core_mut)
     }
 
-    /// Complete `AUTH_REQUEST`s seen (C `auth_attempts`), malformed ones included.
+    /// Complete `AUTH_REQUEST`s seen, malformed ones included.
     #[cfg(feature = "test-support")]
     pub fn auth_attempts(&self) -> u64 {
         self.auth_attempts
@@ -347,7 +347,7 @@ impl Server {
             },
         );
         if raw {
-            // spec §6.5: C sets `last_conn` at acceptance, before auth.
+            // spec §6.5: set at acceptance, before auth.
             self.active = Some(c);
         } else if let Some(g) = self.gw.as_mut() {
             g.on_new_conn(cx, c);
@@ -475,7 +475,7 @@ impl Server {
             status: if ok { STATUS_OK } else { STATUS_ERROR },
             error_code: u64::from(!ok), // AUTH_FAILED
             server_id: SERVER_ID,
-            // spec §7.3: as C, only an accepted auth advertises the capability.
+            // spec §7.3: only an accepted auth advertises the capability.
             features: if ok && self.cfg.udp_enabled {
                 FEAT_UDP_RELAY
             } else {
@@ -686,7 +686,7 @@ impl Server {
     }
 
     /// spec §6.5: the lines of the most recently accepted connection, if
-    /// open, then (SP3 spec §6) those of the most recent H3 conn, as C.
+    /// open, then (SP3 spec §6) those of the most recent H3 conn.
     fn dump_metrics(&self, cx: &Cx<'_>) {
         let last_h3 = self.gw.as_ref().and_then(Gateway::last_h3);
         for c in [self.active, last_h3].into_iter().flatten() {
@@ -852,7 +852,7 @@ impl App for Server {
                 if let Some(every) = self.cfg.metrics_interval {
                     self.timer(cx, every, Tm::Metrics);
                 }
-                // spec §6.5: silent without a connection, as C `srv_metrics_tick`.
+                // spec §6.5: silent without a connection.
                 self.dump_metrics(cx);
             }
             Tm::UdpIdle(c, sid) => self.udp_idle(cx, c, sid),

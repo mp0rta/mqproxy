@@ -1,10 +1,8 @@
-//! spec §6.5: `mq.conn` / `mq.path` lines — port of tests/test_metrics_format.c
-//! (`test_truncation` excluded: the Rust formatter returns a `String`, nothing truncates).
+//! spec §6.5: `mq.conn` / `mq.path` lines.
 
 use mq_proxy::metrics::{format_conn_line, format_metrics, format_path_line};
 use mq_transport_api::{ConnStats, PathStats};
 
-// test_metrics_format.c: test_path_line
 #[test]
 fn path_line() {
     let p = PathStats {
@@ -34,7 +32,6 @@ fn path_line() {
     assert!(l2.ends_with("inflight=4096"), "{l2}");
 }
 
-// test_metrics_format.c: test_conn_line
 #[test]
 fn conn_line() {
     let st = ConnStats {
@@ -61,7 +58,7 @@ fn negative_mp_state_is_signed() {
     );
 }
 
-// mq_conn_dump_stats_cid: the conn line, then one path line per path in order, or a diagnostic.
+// The conn line, then one path line per path in order, or a diagnostic.
 #[test]
 fn dump_lines_and_diagnostics() {
     assert_eq!(format_metrics(None), ["mq_conn stats: no connection"]);

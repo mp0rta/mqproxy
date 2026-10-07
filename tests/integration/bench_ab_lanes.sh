@@ -158,7 +158,6 @@ start_origin() {
 # returning.  The marker is:
 #
 #   "mq_client: extra path up: bind <ip> -> path_id <n>"
-#   (src/proxy/mq_client.c, client_mp_timer_cb)
 #
 # The bench passes --path PATH_A (primary bind, no log) and --path PATH_B
 # (one extra path, logged once when mp-ready fires).  We therefore poll for 1

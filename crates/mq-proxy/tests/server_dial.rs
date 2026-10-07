@@ -18,14 +18,14 @@ fn dial_error_mapping_table() {
         (DialError::Refused, 2), // CONN_REFUSED
         (DialError::Timeout, 3), // TIMEOUT
         (DialError::Limit, 4),   // POLICY_DENIED
-        (DialError::Other, 2),   // CONN_REFUSED, as C maps unclassified errors
+        (DialError::Other, 2),   // CONN_REFUSED: unclassified errors
     ] {
         let (s, op) = h.request(c, b"");
         h.dial_err(op, e);
         assert_eq!(h.t.sent_bytes(s), connect_resp(1, code), "{e:?}");
     }
-    // An IPv4 address that is not 4 bytes is DNS_FAILED without a dial, as C
-    // `srv_resolve_target` (answered, not reset).
+    // An IPv4 address that is not 4 bytes is DNS_FAILED without a dial
+    // (answered, not reset).
     let s = h.data(c);
     h.feed(
         s,

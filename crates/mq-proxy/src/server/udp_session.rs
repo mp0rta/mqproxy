@@ -56,12 +56,12 @@ pub(super) struct SrvSession {
     pub(super) idle_len: Duration,
     /// Client → target reassembly (spec §2.3).
     defrag: Defrag,
-    /// The next target → client `packet_id` (C `next_packet_id`).
+    /// The next target → client `packet_id`.
     packet_id: u16,
 }
 
 /// spec §7.3: the stats line of a connection that just closed, after its
-/// sessions were reaped. The C fields in C order, then `drops_empty`.
+/// sessions were reaped.
 pub(super) fn log_stats(c: &Counters) {
     log::info!(
         "mq_udp_srv: stats frags_sent={} frags_reassembled={} drops_send_fail={} \
@@ -78,7 +78,7 @@ pub(super) fn log_stats(c: &Counters) {
 }
 
 /// spec §7.1: `UDP_SESSION_RESP`, no message — OK with the negotiated idle
-/// timeout, or an error with idle 0 (C `srv_open_reject`).
+/// timeout, or an error with idle 0.
 fn udp_resp(r: Result<u64, UdpErr>) -> Vec<u8> {
     let (status, error_code, idle_timeout_ms) = match r {
         Ok(idle) => (STATUS_OK, 0, idle),
@@ -109,7 +109,7 @@ fn negotiated_idle(requested_ms: u64, server: Duration) -> u64 {
 }
 
 /// spec §7.2: the form `target` is kept in — IPv4-mapped unmapped, unspecified
-/// → loopback (C `connect()`s to it and the kernel picks loopback).
+/// → loopback (a `connect()` to it lands on loopback).
 fn canonical(mut a: SocketAddr) -> SocketAddr {
     a.set_ip(match a.ip().to_canonical() {
         IpAddr::V4(v) if v.is_unspecified() => Ipv4Addr::LOCALHOST.into(),
@@ -163,7 +163,7 @@ impl Server {
         let c = self.data[&s].conn;
         let udp = &self.conns[&c].udp;
         if udp.contains_key(&sid) {
-            // C design §9.2: the existing session is kept.
+            // The existing session is kept.
             log::warn!("mq_udp_srv: duplicate session_id {sid}, resetting new stream (no RESP)");
             return self.drop_data(cx, s, true);
         }
@@ -195,7 +195,7 @@ impl Server {
     }
 
     /// spec §7.1: `Resolving` → `Opening` on a socket of the resolved
-    /// address's family, or `DnsFailed` (`Dns` and `Timeout` alike, as C).
+    /// address's family, or `DnsFailed` (`Dns` and `Timeout` alike).
     pub(super) fn udp_resolved(
         &mut self,
         cx: &mut Cx<'_>,
@@ -328,13 +328,13 @@ impl Server {
         let Some(k) = self.conns.get_mut(&c) else {
             return;
         };
-        // C design §9.2: the only auth boundary for DATAGRAM frames.
+        // The only auth boundary for DATAGRAM frames.
         if !enabled || !k.authed() {
             k.counters.drops_preauth += 1;
             return;
         }
         let Some(h) = UdpMsgHdr::decode(d) else {
-            return; // short: silent, as C
+            return; // short: silent
         };
         let sid = h.session_id;
         let Some(SrvSession {
@@ -403,7 +403,7 @@ impl Server {
         }
         let out = send_packet(cx, c, &mut k.mss, sid, *packet_id, data, &mut k.counters);
         if out.frags_ok + out.failed > 0 {
-            *packet_id = packet_id.wrapping_add(1); // the split ran (C)
+            *packet_id = packet_id.wrapping_add(1); // the split ran
         }
         if out.frags_ok > 0 {
             *active = cx.now();

@@ -43,7 +43,7 @@ struct Session {
 
 /// spec §6.3: the session table of the client (one connection at a time).
 pub(super) struct Sessions {
-    /// Per client: it survives connections, as C `next_sid`.
+    /// Per client: it survives connections.
     next_sid: u32,
     /// By sid; ordered, so a post-auth flush runs in sid order (creation
     /// order until the counter wraps).
@@ -58,7 +58,7 @@ pub(super) struct Sessions {
 impl Sessions {
     pub(super) fn new() -> Sessions {
         Sessions {
-            next_sid: 1, // as C: 0 is valid, 1 reads better in logs
+            next_sid: 1, // 0 is valid, 1 reads better in logs
             by_sid: BTreeMap::new(),
             by_stream: HashMap::new(),
             mss: MssCache::new(),
@@ -79,7 +79,7 @@ fn alloc_sid(next: &mut u32, live: impl Fn(u32) -> bool) -> u32 {
     }
 }
 
-/// spec §6.3: C `cli_sendq_push` — an item over 8 KiB on its own is dropped,
+/// spec §6.3: an item over 8 KiB on its own is dropped,
 /// otherwise the oldest go until both bounds hold; each loss is one `sendq_evictions`.
 fn enqueue(q: &mut VecDeque<Vec<u8>>, p: &[u8], c: &mut Counters) {
     if p.len() > PREAUTH_SENDQ_BYTES {
@@ -95,7 +95,7 @@ fn enqueue(q: &mut VecDeque<Vec<u8>>, p: &[u8], c: &mut Counters) {
 }
 
 /// spec §6.3: stream type `0x02` then `UDP_SESSION_OPEN` for `dst` with
-/// `idle_timeout_ms = 0` (the server default), as C `mq_udp_cli_open`.
+/// `idle_timeout_ms = 0` (the server default).
 fn open_request(sid: u32, dst: &Dst<'_>) -> Vec<u8> {
     let mut buf = vec![0u8; MAX_FRAME];
     buf[0] = STREAM_TYPE_UDP_SESSION as u8;
@@ -167,7 +167,7 @@ impl Client {
     }
 
     /// spec §6.3/§5: queue while `PendingAuth`, else split onto the tunnel
-    /// under the fragment send policy; `packet_id` moves iff the split ran (C).
+    /// under the fragment send policy; `packet_id` moves iff the split ran.
     fn session_send(&mut self, cx: &mut Cx<'_>, sid: u32, payload: &[u8]) {
         let Sessions {
             by_sid,
@@ -381,7 +381,7 @@ impl Client {
     /// to the learned source.
     fn deliver(&mut self, cx: &mut Cx<'_>, d: &[u8]) {
         let Some(h) = UdpMsgHdr::decode(d) else {
-            return; // short: silent, as C
+            return; // short: silent
         };
         let c = &mut self.sess.counters;
         let Some(s) = self.sess.by_sid.get_mut(&h.session_id) else {

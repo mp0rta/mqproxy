@@ -1,7 +1,6 @@
 //! UDP sockets with GSO (`UDP_SEGMENT`) send and GRO (`UDP_GRO`) batched
-//! receive. spec §2.2. IPv4 or IPv6 by the bind address (C supports
-//! `AF_INET6` QUIC paths). An IPv6 socket is dual-stack (`IPV6_V6ONLY` = 0,
-//! as C's default socket): it sends to IPv4 destinations as v4-mapped
+//! receive. spec §2.2. IPv4 or IPv6 by the bind address. An IPv6 socket is
+//! dual-stack (`IPV6_V6ONLY` = 0): it sends to IPv4 destinations as v4-mapped
 //! addresses and reports IPv4 peers as `SocketAddr::V4`. An IPv4 socket
 //! sends only to IPv4.
 //!

@@ -2,7 +2,7 @@
 
 use mq_runtime::Target;
 
-/// spec §6.1: a parser looks at no more than this many buffered bytes (C `MQ_LISTENER_RXCAP`).
+/// spec §6.1: a parser looks at no more than this many buffered bytes.
 pub const INGRESS_CAP: usize = 8192;
 
 /// spec §6.1: what one `feed` over the buffered bytes produced. `consumed` counts bytes
@@ -26,7 +26,7 @@ pub enum Progress<'a> {
 }
 
 /// spec §6.1: parse at most `INGRESS_CAP` bytes; a full cap without a complete request
-/// closes without a reply, as `mq_listener.c:346` does.
+/// closes without a reply.
 pub(crate) fn capped<'a>(buf: &[u8], parse: impl FnOnce(&[u8]) -> Progress<'a>) -> Progress<'a> {
     match parse(&buf[..buf.len().min(INGRESS_CAP)]) {
         Progress::Need if buf.len() >= INGRESS_CAP => Progress::Close,

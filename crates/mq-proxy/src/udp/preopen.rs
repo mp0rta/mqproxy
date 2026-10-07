@@ -1,4 +1,4 @@
-//! spec §7.2: per-connection pre-OPEN datagram buffer — C `srv_preopen_*`.
+//! spec §7.2: per-connection pre-OPEN datagram buffer.
 
 use super::{PREOPEN_BYTES, PREOPEN_DGRAMS, PREOPEN_TTL};
 use mq_transport_api::Time;
@@ -14,7 +14,7 @@ pub struct PreOpen {
 
 impl PreOpen {
     /// Parks `datagram` for `sid`; returns the evictions it caused (the caller adds them
-    /// to `preopen_evictions`). Entries past the TTL are swept first and not counted (C).
+    /// to `preopen_evictions`). Entries past the TTL are swept first and not counted.
     pub fn push(&mut self, now: Time, sid: u32, datagram: &[u8]) -> u32 {
         // Pushes arrive in time order, so the expired entries are a prefix.
         while self.q.front().is_some_and(|e| now - e.1 > PREOPEN_TTL) {
@@ -37,7 +37,7 @@ impl PreOpen {
     }
 
     /// Removes and returns `sid`'s datagrams in arrival order; entries past the TTL at
-    /// `now` are dropped uncounted (C `srv_preopen_flush`). Other sids stay queued.
+    /// `now` are dropped uncounted. Other sids stay queued.
     pub fn take(&mut self, now: Time, sid: u32) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         for e in std::mem::take(&mut self.q) {

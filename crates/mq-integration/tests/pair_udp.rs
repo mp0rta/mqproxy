@@ -64,7 +64,7 @@ fn pair_udp_3000_byte_roundtrip_frags_reassembled_gt_0() {
     assert!(cli.frags_reassembled > 0, "{cli:?}");
 }
 
-/// spec §6.3/§7.2 (C design §2): the client hands the OPEN and the first
+/// spec §6.3/§7.2: the client hands the OPEN and the first
 /// datagram to the transport in one iteration and one server iteration takes
 /// that flight; the real engine surfaces the datagram before the OPEN's
 /// bytes, so the server holds it in the pre-OPEN buffer and delivers it once

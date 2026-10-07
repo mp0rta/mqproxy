@@ -13,7 +13,7 @@ use std::time::Duration;
 
 pub const SEED: u64 = 7;
 
-/// C `mq_encode_auth_req` for client_id "mqproxy", token "secret".
+/// `AUTH_REQUEST` for client_id "mqproxy", token "secret".
 pub const AUTH_REQ_C: &[u8] = &[
     0x01, // version
     0x07, b'm', b'q', b'p', b'r', b'o', b'x', b'y', // client_id
@@ -28,9 +28,9 @@ pub const SOCKS_CONNECT: &[u8] = &[
     0x05, 0x01, 0x00, 0x03, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm',
     0x01, 0xBB,
 ];
-/// Stream type 0x01 then C `mq_encode_connect_tcp_req` for example.com:443.
+/// Stream type 0x01 then `CONNECT_TCP_REQUEST` for example.com:443.
 pub const CONNECT_REQ_C: &[u8] = &[
-    0x01, // MQ_STREAM_TYPE_CONNECT_TCP
+    0x01, // stream type: CONNECT_TCP
     0x00, // flags
     0x03, // address_type = domain
     11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', // host

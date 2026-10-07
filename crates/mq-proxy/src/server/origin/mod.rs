@@ -45,7 +45,7 @@ use std::time::Duration;
 pub const HYPER_VERSION: &str = "1.10";
 /// spec §6.3/§9.3: one request's `UploadBuf`.
 pub const UPLOAD_CAP: usize = 256 * 1024;
-/// spec §7.7: idle expiry (curl's default `MAXAGE_CONN`).
+/// spec §7.7: idle expiry.
 pub const IDLE_MAX: Duration = Duration::from_secs(118);
 /// spec §7.7: the idle sweep interval.
 pub const SWEEP: Duration = Duration::from_secs(10);
@@ -590,7 +590,7 @@ impl Origin {
         let https = rec.https();
         match r {
             Ok(tcp) => {
-                // libcurl parity: Nagle would hold a request's later writes
+                // TCP_NODELAY: Nagle would hold a request's later writes
                 // behind the origin's delayed ACK (~40 ms per small upload).
                 cx.tcp_set_nodelay(tcp);
                 self.connected(cx, tcp, rec, ev)
@@ -751,7 +751,7 @@ impl Origin {
         self.by_tcp.insert(tcp, id);
         self.by_h3.insert(h3, Where::Conn(id));
         if plain {
-            // C used CONNECT_TIME_T: the TCP dial's duration.
+            // `connect_ms` is the TCP dial's duration.
             self.begin_hyper(cx, id, OriginProto::H1);
         }
     }

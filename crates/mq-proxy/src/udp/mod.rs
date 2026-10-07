@@ -21,14 +21,14 @@ pub const PREOPEN_BYTES: usize = 32 * 1024;
 pub const PREOPEN_TTL: Duration = Duration::from_millis(250);
 pub const DEFAULT_IDLE: Duration = Duration::from_secs(60);
 pub const SESSION_RESP_WAIT: Duration = Duration::from_secs(10);
-/// Successful emits between `datagram_mss` refreshes (C `MQ_MSS_REFRESH_INTERVAL`).
+/// Successful emits between `datagram_mss` refreshes.
 pub const MSS_REFRESH: u32 = 64;
-/// Per association, live sessions and negative-cache entries together (C `MQ_UDP_ASSOC_MAX_DST`).
+/// Per association, live sessions and negative-cache entries together.
 pub const MAX_DST_PER_ASSOC: usize = 64;
 /// The largest UDP datagram: the `datagram_recv` scratch, and the bound of a reply.
 pub(crate) const MAX_DGRAM: usize = 65_535;
 
-/// The host that wire address bytes name (C `srv_resolve_target`); `None` for a
+/// The host that wire address bytes name; `None` for a
 /// wrong address length or a non-UTF-8 name. An empty name is left to the caller.
 pub(crate) fn host_of(atype: AddrType, addr: &[u8]) -> Option<Host> {
     Some(match atype {
@@ -47,7 +47,7 @@ pub enum SessionEnd {
     Closed,
 }
 
-/// The fields of the `mq_udp_srv:` (§7.3) and `mq_udp_cli:` (§6.5) stats lines; `u32` as C `%u`.
+/// The fields of the `mq_udp_srv:` (§7.3) and `mq_udp_cli:` (§6.5) stats lines.
 /// The first eight are the server line, the next two exist on the client only, and the
 /// last two (spec §6.3 admission-limit drops) are on neither line.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
