@@ -141,10 +141,7 @@ fn plain_http_connect_ms_is_dial_duration() {
     );
     let conn = oh.with_host(|h, _| h.origin().conn_of(h3)).unwrap();
     assert_eq!(oh.with_host(|h, _| h.origin().connect_ms(conn)), Some(250));
-    assert!(
-        oh.events().is_empty(),
-        "the request is not sent here (Task 5.4)"
-    );
+    assert!(oh.events().is_empty(), "the request is not sent here");
 }
 
 #[test]

@@ -44,7 +44,7 @@ pub(crate) fn recv_datagram(
     })
 }
 
-/// spec §4.2 `drive`, §4.3, §4.7; order per plan Task 4.6.
+/// spec §4.2 `drive`, §4.3, §4.7.
 pub(crate) fn drive(t: &mut Transport, now: Time) {
     let inner = &mut *t.inner;
     inner.deadline = None; // spec §4.3: cleared before the engine runs

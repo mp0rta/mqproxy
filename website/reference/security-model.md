@@ -33,5 +33,6 @@ Use of mqproxy is at your own risk. Users are solely responsible for validating 
 ## Acknowledgments
 
 - [XQUIC](https://github.com/alibaba/xquic) (Alibaba) — the QUIC/MPQUIC transport, via the [mp0rta fork](https://github.com/mp0rta/xquic).
-- [BoringSSL](https://boringssl.googlesource.com/boringssl) — TLS backend.
-- [nghttp2](https://nghttp2.org/) — HTTP/2 framing for the C build's TLS MITM ingress (the Rust binary uses the `h2` crate and rustls).
+- [BoringSSL](https://boringssl.googlesource.com/boringssl) — TLS backend for the QUIC transport.
+- [h3wire](https://crates.io/crates/h3wire) — HTTP/3 framing and QPACK.
+- [hyper](https://hyper.rs/), [h2](https://crates.io/crates/h2) and [rustls](https://rustls.dev/) — origin HTTP, and the TLS/HTTP/2 side of the TLS MITM.

@@ -473,7 +473,7 @@ fn mitm_survives_tunnel_reconnect() {
 // SP4 spec §7.3 route step 3: no `h2` in ALPN → opaque.
 #[test]
 fn opaque_no_h2_alpn() {
-    let log = Logged::start("opaque(NoH2)");
+    let log = Logged::start("opaque(no_h2)");
     let o = origin(Proto::H2Tls, Handler::Status(200));
     let p = proxy(o.addr, p256());
     let b = browser(&p, o.addr, Path::new(ORIGIN_CA));
@@ -485,7 +485,7 @@ fn opaque_no_h2_alpn() {
 // SP4 spec §7.3 route step 4: an ignored host → opaque; h2 then runs with the origin.
 #[test]
 fn opaque_ignored_host() {
-    let log = Logged::start("opaque(Ignored)");
+    let log = Logged::start("opaque(ignored)");
     let o = origin(Proto::H2Tls, Handler::Status(200));
     let p = proxy(
         o.addr,
@@ -502,7 +502,7 @@ fn opaque_ignored_host() {
 // SP4 spec §7.3 "Peek": bytes that are not TLS → opaque, relayed as they are.
 #[test]
 fn opaque_non_tls_bytes() {
-    let log = Logged::start("opaque(NotTls)");
+    let log = Logged::start("opaque(not_tls)");
     let o = origin(Proto::H1Plain, Handler::Status(200));
     let p = proxy(o.addr, p256());
     let mut s = TcpStream::connect(p.mitm_addr()).unwrap();
@@ -519,7 +519,7 @@ fn opaque_non_tls_bytes() {
 // SP4 spec §7.3 route step 5: an SNI outside a NameConstraints CA's scope → opaque.
 #[test]
 fn opaque_out_of_scope_constrained_ca() {
-    let log = Logged::start("opaque(OutOfCaScope)");
+    let log = Logged::start("opaque(ca_scope)");
     let o = origin(Proto::H2Tls, Handler::Status(200));
     let mitm = mitm_cfg("ca-dns-constraint", &[], MitmTuning::default());
     let p = proxy(o.addr, mitm);
@@ -533,7 +533,7 @@ fn opaque_out_of_scope_constrained_ca() {
 // afterwards reaches the origin.
 #[test]
 fn opaque_peek_timeout() {
-    let log = Logged::start("opaque(Timeout)");
+    let log = Logged::start("opaque(timeout)");
     let o = origin(Proto::H2Tls, Handler::Status(200));
     let tuning = MitmTuning {
         peek: Duration::from_millis(200),
@@ -566,7 +566,7 @@ fn echo_to_eof() -> (SocketAddr, JoinHandle<Vec<u8>>) {
 // the relay carries the bytes and the EOF, and the answer still comes back.
 #[test]
 fn opaque_peek_eof_half_close() {
-    let log = Logged::start("opaque(Eof)");
+    let log = Logged::start("opaque(eof)");
     let (addr, origin) = echo_to_eof();
     let p = proxy(addr, p256());
     let mut s = TcpStream::connect(p.mitm_addr()).unwrap();
@@ -586,7 +586,7 @@ fn opaque_peek_eof_half_close() {
 // SP4 spec §7.3 "Accept" step 2: at `max_conns` (lowered to 1) a new flow goes opaque.
 #[test]
 fn opaque_at_capacity() {
-    let log = Logged::start("opaque(AtCapacity)");
+    let log = Logged::start("opaque(capacity)");
     let o = origin(Proto::H2Tls, Handler::Status(200));
     let tuning = MitmTuning {
         max_conns: 1,

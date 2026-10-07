@@ -238,7 +238,7 @@ fn server_gateway_on_by_default() {
     assert!(cli::wants_h3(&r));
     assert_eq!(
         r.startup_lines,
-        vec!["mq_origin: hyper 1.10 + rustls (HTTP3=no)".to_string()]
+        vec!["mq_origin: hyper 1.10 + rustls".to_string()]
     );
     // The gateway flags reach `GatewayConfig`.
     let r = parse(
@@ -1045,7 +1045,7 @@ fn spawn(args: &[String]) -> Proc {
 #[test]
 fn gateway_on_and_udp_lines_logged() {
     let mut p = spawn(&server_args(&format!("127.0.0.1:{}", free_udp()), &[]));
-    p.wait_line("[INFO] mq_origin: hyper 1.10 + rustls (HTTP3=no)");
+    p.wait_line("[INFO] mq_origin: hyper 1.10 + rustls");
     p.wait_line("gateway=on, udp=on, udp-idle=60s)");
     assert_eq!(p.term(), 0, "{:#?}", p.lines);
 }

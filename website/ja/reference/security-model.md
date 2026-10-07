@@ -33,5 +33,6 @@ mqproxy の利用は自己責任で行ってください。その適合性・セ
 ## 謝辞
 
 - [XQUIC](https://github.com/alibaba/xquic) (Alibaba) — QUIC/MPQUIC トランスポート。[mp0rta フォーク](https://github.com/mp0rta/xquic) 経由。
-- [BoringSSL](https://boringssl.googlesource.com/boringssl) — TLS バックエンド。
-- [nghttp2](https://nghttp2.org/) — C ビルドの TLS MITM イングレスの HTTP/2 フレーミング (Rust バイナリは `h2` クレートと rustls を使用)。
+- [BoringSSL](https://boringssl.googlesource.com/boringssl) — QUIC トランスポートの TLS バックエンド。
+- [h3wire](https://crates.io/crates/h3wire) — HTTP/3 フレーミングと QPACK。
+- [hyper](https://hyper.rs/)、[h2](https://crates.io/crates/h2)、[rustls](https://rustls.dev/) — オリジンへの HTTP 通信と、TLS MITM の TLS/HTTP/2 側。

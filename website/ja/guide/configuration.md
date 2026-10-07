@@ -40,7 +40,7 @@ mqproxy server --config /etc/mqproxy/edge1.conf
 | `[Auth]` | `Key` (トークン) | `Key` (トークン) |
 | `[Multipath]` | `CC`, `Scheduler` | `CC`, `Scheduler`, `Path` (繰り返し可) |
 | `[Ingress]` | — | `Socks5`, `HttpConnect`, `Gateway`, `TProxy`, `Mode`, `Fwmark`, `Table`, `Dport`, `SetupRedirect`, `SkipUid` |
-| `[Gateway]` | `Enabled`, `Masquerade`, `OriginCA`, `CacheMaxBytes` | — |
+| `[Gateway]` | `Enabled`, `Masquerade`, `OriginCA` | — |
 | `[Mitm]` | — | `Enabled`, `CACert`, `CAKey`, `IgnoreHosts` (繰り返し可) |
 | `[UDP]` | `Enabled`, `IdleTimeout` | — |
 | `[Metrics]` | `Interval`, `PerRequest` | `Interval` |

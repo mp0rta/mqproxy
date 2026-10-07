@@ -122,7 +122,7 @@ impl MStream {
 
     /// One §7.6 step: the upload, then the download, which always runs after
     /// a `SendOut::Done` (a send error leaves the core `Failed` with no
-    /// readiness to follow, Task 5.1 ruling). `room`: the TLS output is below
+    /// readiness to follow). `room`: the TLS output is below
     /// its caps. `true` when anything moved.
     pub(super) fn step(
         &mut self,

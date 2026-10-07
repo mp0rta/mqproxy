@@ -634,7 +634,7 @@ fn reject_before_head_xmq_error_response() {
     assert_eq!(t.streams(), 0);
 }
 
-/// Task 5.1 ruling: a send error leaves the core `Failed` with no readiness
+/// A send error leaves the core `Failed` with no readiness
 /// to follow, so the front pulls the download side after `SendOut::Done`.
 #[test]
 fn send_error_surfaces_without_an_h3_event() {

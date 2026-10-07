@@ -5,8 +5,9 @@
   │  POST /_mqproxy/fetch  (X-Mq-Auth / X-Mq-Target / X-Mq-Method + 生ボディ)
   ▼
 mqproxy-client ──────── MPQUIC 上の HTTP/3 (ALPN h3) ────────► mqproxy-server
-     1 HTTP リクエスト = 1 H3 リクエストストリーム = 1 MPQUIC ストリーム   │  libcurl (h2→h1,
-     パスにわたって分散                                                  │  TLS 検証 ON)
+     1 HTTP リクエスト = 1 H3 リクエストストリーム = 1 MPQUIC ストリーム   │  hyper + rustls
+     パスにわたって分散                                                  │  (h2 または HTTP/1.1,
+                                                                        │   TLS 検証 ON)
                                                                         ▼
                                                                     オリジンサーバー
 ```
@@ -17,10 +18,10 @@ mqproxy-client ──────── MPQUIC 上の HTTP/3 (ALPN h3) ───
 
 リクエストごとの `X-Mq-*` 制御により、API を変更せずにゲートウェイ機能をオプトインできます。
 
-- `X-Mq-Origin-Protocol` は上流の HTTP バージョンを固定します（`h1`/`h2`/`h3`）。
+- `X-Mq-Origin-Protocol`: `h1` は HTTP/1.1 を強制します。`h2`・`h3`・ヘッダなしの場合は、サーバーが ALPN で h2 か HTTP/1.1 をネゴシエートします（HTTP/3 のオリジンクライアントはありません）。それ以外の値は `400`（`x-mq-error: bad-origin-protocol`）になります。
 - `X-Mq-Accept-Encoding` はダウンロードの圧縮を要求します。
 - `X-Mq-Forward-Cookie` は `Cookie` ヘッダを上流へ転送します（指定しなければ送られません）。
-- `X-Mq-Cache` はレスポンスをインメモリのオリジンキャッシュ（`--cache-max-bytes`）にオプトインします。
+- `X-Mq-Cache` は引き続き検証されます（不正な値は `400`、`x-mq-error: bad-cache-ttl`）が、正しい値を指定しても効果はありません。オリジンのレスポンスキャッシュは削除されました。
 
 サーバーはまた、リクエストをまたいでオリジンコネクションをプールして再利用します。
 
@@ -49,4 +50,4 @@ curl -X POST http://127.0.0.1:8080/_mqproxy/fetch \
 
 `--path` はここでも同様に機能します。ゲートウェイの MPQUIC コネクションは、各リクエストをバインドされた全パスにわたってアグリゲーションします。
 
-サーバー側のフラグ（`--no-gateway`、`--origin-ca`、`--request-metrics`、`--cache-max-bytes`、`--masquerade`）は [オプションリファレンス](/ja/reference/options#http-ゲートウェイモード) を参照してください。
+サーバー側のフラグ（`--no-gateway`、`--origin-ca`、`--request-metrics`、`--masquerade`）は [オプションリファレンス](/ja/reference/options#http-ゲートウェイモード) を参照してください。

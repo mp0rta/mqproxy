@@ -51,8 +51,7 @@ pub const UPLOAD_CAP: usize = 256 * 1024;
 pub const IDLE_MAX: Duration = Duration::from_secs(118);
 /// spec §7.7: the idle sweep interval.
 pub const SWEEP: Duration = Duration::from_secs(10);
-/// spec §7.3 step 4: pump iterations per callback.
-pub const PUMP_CAP: usize = 16;
+pub use crate::tls_pipe::PUMP_CAP;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Scheme {
     Http,
@@ -260,8 +259,6 @@ impl<T> Default for Conns<T> {
 type ConnKey = (Scheme, String, u16);
 /// Reusable conns by key, several per key (§7.7).
 type Pool = HashMap<ConnKey, Vec<OriginConnId>>;
-
-// The §7.1 state below is filled by Tasks 5.2–5.6c.
 
 /// Where a request's record lives (§7.1 lookups).
 #[derive(Copy, Clone, Debug)]

@@ -47,28 +47,13 @@ pub struct Handoff {
 struct Stats {
     mitm: u64,
     /// By `Why as usize`.
-    opaque: [u64; 11],
+    opaque: [u64; Why::ALL.len()],
     tls_fail: u64,
     h2_fail: u64,
     dead: u64,
     reqs: u64,
     rejects: u64,
 }
-
-/// The `opaque_*` keys of the `mq.mitm` line, in `Why` order.
-const WHY_KEYS: [&str; 11] = [
-    "not_tls",
-    "no_sni",
-    "bad_sni",
-    "no_h2",
-    "ignored",
-    "ca_scope",
-    "tls_incompat",
-    "timeout",
-    "too_large",
-    "eof",
-    "capacity",
-];
 
 /// SP4 spec §2.2: the front's timers, by id → their conn.
 #[derive(Default)]
@@ -127,7 +112,7 @@ impl Mitm {
             h2,
             stats: Stats::default(),
             timers: Timers::default(),
-            pump_cap: crate::server::origin::PUMP_CAP,
+            pump_cap: crate::tls_pipe::PUMP_CAP,
         }
     }
 
@@ -309,8 +294,8 @@ impl Mitm {
         }
         let leaf = self.leaf.stats();
         let mut line = format!("mq.mitm conns={live} streams={streams} mitm={}", s.mitm);
-        for (k, n) in WHY_KEYS.iter().zip(s.opaque) {
-            line += &format!(" opaque_{k}={n}");
+        for (w, n) in Why::ALL.iter().zip(s.opaque) {
+            line += &format!(" opaque_{}={n}", w.key());
         }
         line += &format!(
             " tls_fail={} h2_fail={} dead={} leaf_hit={} leaf_miss={} reqs={} rejects={}",
@@ -352,7 +337,7 @@ impl Mitm {
 
     fn count_opaque(&mut self, why: Why, sni: Option<&str>) {
         self.stats.opaque[why as usize] += 1;
-        log::debug!("mq_mitm: {} → opaque({why:?})", sni.unwrap_or("-"));
+        log::debug!("mq_mitm: {} → opaque({})", sni.unwrap_or("-"), why.key());
     }
 }
 
