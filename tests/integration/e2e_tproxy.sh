@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 #
 # e2e_tproxy.sh — Phase 7 MITM Slice 0+1: transparent capture + opaque relay e2e.
 #

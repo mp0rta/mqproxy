@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §4.7, §8.4 "Incomplete ClientHello flood": provisional connections are refused at
 //! the provisional cap; closing starts exactly 10 s after acceptance (the transport's
 //! deadline, not xquic's re-armed idle timer); every slot is released exactly once after

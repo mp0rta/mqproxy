@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The origin bridge against a real hyper h1 origin (spec §7.7 "h1 conns",
 //! §10.3), on the `OriginLoop` / `OriginServer` harness.
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! A connected client/server pair over the lockstep harness, with virtual-time stepping and
 //! an event log per side.
 

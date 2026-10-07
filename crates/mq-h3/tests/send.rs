@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Request send: client start, DATA framing with partial writes, the finish latch, the
 //! pending FIN, `SendStopped` per role and GOAWAY (adoption spec §4.3 "Start", §4.4, §4.5).
 

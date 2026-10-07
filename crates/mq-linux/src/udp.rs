@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! UDP sockets with GSO (`UDP_SEGMENT`) send and GRO (`UDP_GRO`) batched
 //! receive. spec §2.2. IPv4 or IPv6 by the bind address. An IPv6 socket is
 //! dual-stack (`IPV6_V6ONLY` = 0): it sends to IPv4 destinations as v4-mapped

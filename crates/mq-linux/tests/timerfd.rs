@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 // spec §2.2: timerfd armed at an absolute CLOCK_MONOTONIC deadline.
 use mq_linux::{TimerFd, now_monotonic_micros};
 use std::io::ErrorKind;

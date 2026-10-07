@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §4.8 "Abandoned streams are drained by the transport": resets from either side,
 //! before and after the peer's FIN, release every slot on both sides.
 mod common;

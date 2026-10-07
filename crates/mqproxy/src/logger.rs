@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.5: `[LEVEL] msg\n` on stderr, no timestamp, level fixed at INFO.
 
 use log::{Level, LevelFilter, Log, Metadata, Record};

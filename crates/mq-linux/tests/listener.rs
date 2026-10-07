@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 // spec §2.2 / §5.2 / §5.3: listener construction and socket options.
 use mq_linux::{TcpListenerBuilder, geteuid, original_dst, set_linger_zero, so_error};
 use std::io::{ErrorKind, Read};

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Shard-pair tests (spec §8.1 "Shard pair", §8.4): the real `Client` and
 //! `Server` relaying end to end below the syscall layer, on one and two paths.
 #![forbid(unsafe_code)]

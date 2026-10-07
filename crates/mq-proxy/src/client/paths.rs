@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.2 "Paths": the `--path` entries after the first, each brought up as an
 //! extra multipath path on its own ephemeral UDP socket; and the primary path.
 //!

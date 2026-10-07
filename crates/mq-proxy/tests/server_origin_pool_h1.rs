@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §7.7 "h1 conns", §7.2 step 2: the h1 pool hit, idleness, the class
 //! B / C / E decisions at the settling and the one retry, driven through
 //! `OriginHost` with plain HTTP/1.1 bytes played by the test.

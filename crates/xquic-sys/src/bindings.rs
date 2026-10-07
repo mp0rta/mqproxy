@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 use libc::{sockaddr, socklen_t, iovec};
 
 pub const XQC_OK: u32 = 0;

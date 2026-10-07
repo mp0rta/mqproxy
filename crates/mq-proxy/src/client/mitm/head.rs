@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §7.5 / §7.7: the browser's h2 request head → the exchange core's
 //! `ReqHead`, and the core's `RespHead` → an h2 response head.
 

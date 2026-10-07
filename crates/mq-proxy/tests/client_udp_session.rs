@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.3 client UDP sessions: sid, 1024 cap, `PendingAuth`, optimistic
 //! OPEN with the partial-write retry, outbound and inbound datagram paths;
 //! spec §6.4 the session stream's RESP, its ends and the negative cache.

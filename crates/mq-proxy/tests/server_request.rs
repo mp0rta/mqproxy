@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.3 "Other streams" / "Data streams": the stream type, the
 //! `CONNECT_TCP_REQUEST`, its 10 s deadline and 1 KiB buffer, and the
 //! 4096-stream budget.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! IPv4 TCP listener construction. spec §2.2 / §5.3: `SO_REUSEADDR` and
 //! optional `IP_TRANSPARENT` are set before `bind`; backlog 64; non-blocking.
 

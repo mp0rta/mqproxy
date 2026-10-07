@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `RecordingApp`: an `App` that records every callback and runs test
 //! closures against `Cx` from inside callbacks (spec §8.1).
 

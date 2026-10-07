@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The shard's inputs, called by the driver (spec §5.2 "Inputs").
 
 use super::tcp::TcpEntry;

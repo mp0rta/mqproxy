@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §7, §8.4: sparse stream ids. A peer stream id makes xquic hold an entry for every
 //! lower id it skipped; the fork's implicit-stream cap (`max_implicit_streams`, 16384 live
 //! entries) closes the connection with `TRA_STREAM_LIMIT_ERROR` before it would grow past it.

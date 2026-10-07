@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # ci_bench_mitm.sh — Per-commit MITM H2 throughput benchmark; Rust vs C when
 # MQPROXY_BIN_RUST is set (SP4 spec §11.5).
 #

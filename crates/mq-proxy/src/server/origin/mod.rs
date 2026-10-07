@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7: the origin bridge — hyper 1.x client `conn` API + rustls,
 //! polled from the shard with the `Dirty` waker and `ShardExec` (§7.1); no
 //! tokio task or channel on the data path.

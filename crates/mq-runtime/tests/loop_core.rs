@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §5.3 loop core, §5.5 one loop iteration: `LoopCore` over `FakeIo`
 //! (virtual time), with a `ScriptedTransport` and a `RecordingApp`.
 

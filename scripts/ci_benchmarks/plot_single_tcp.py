@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 """Plot single-TCP aggregation bench CSV → 2 grouped-bar PNGs.
 
 Usage: plot_single_tcp.py <csv> <out-dir>

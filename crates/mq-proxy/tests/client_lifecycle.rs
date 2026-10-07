@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.2 tunnel loss / reconnect / `--no-reconnect`, §6.5 metrics, §6.6 shutdown.
 
 mod common;

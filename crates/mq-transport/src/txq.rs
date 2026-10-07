@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 

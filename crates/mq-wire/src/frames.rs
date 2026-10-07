@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 // spec §2.3
 //! AUTH, CONNECT_TCP and UDP_SESSION control frames. All fixed ints are
 //! big-endian; a `string` is a varint length + raw bytes. Decoders are strict

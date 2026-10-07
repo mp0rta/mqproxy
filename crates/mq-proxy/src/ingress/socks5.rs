@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.1: SOCKS5 (RFC 1928, no-auth, CONNECT and UDP ASSOCIATE) parser
 //! and its replies.
 

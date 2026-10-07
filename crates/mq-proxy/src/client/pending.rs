@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.2 "Pending requests (before auth)": at most 256, kept across reconnects,
 //! 30 s deadline.
 

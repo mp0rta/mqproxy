@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §7.1: UDP session streams — the `UDP_SESSION_OPEN`, the admission
 //! gates, the resolve and the app socket, the RESP, and a FIN in every phase.
 

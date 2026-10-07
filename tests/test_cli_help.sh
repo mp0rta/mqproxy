@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # test_cli_help.sh — smoke test for the mqproxy CLI.
 #
 # Asserts that --help works at the top level and per subcommand (exit 0, output

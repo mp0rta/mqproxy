@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §3 (layer ③): the H3 tunnel connection shared by the client's H3
 //! fronts — connect, reconnect with backoff, extra paths, metrics, shutdown.
 //! Extracted from SP3's gateway (SP3 spec §5.7); log lines are unchanged.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Harness for the server tests (spec §6.3): `Shard<ScriptedTransport, Server>`,
 //! with dial completions fed by hand as the driver would.
 #![allow(dead_code)]

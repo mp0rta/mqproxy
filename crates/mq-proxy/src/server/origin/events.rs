@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §6.4/§7.5: what the bridge reports to the gateway. Every entry
 //! point that can complete an exchange takes the sink as a parameter, so
 //! `Gateway { origin, core }` calls `self.origin.pump(cx, &mut self.core)`

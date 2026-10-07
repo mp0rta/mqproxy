@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §2.1: the rustls ⇄ pipe ⇄ TCP pump, generic over the rustls side
 //! (client for the origin bridge, server for the MITM conn). The origin
 //! pump's TLS logic, moved; one change: ciphertext staging is capped.

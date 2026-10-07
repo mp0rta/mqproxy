@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 """Plot a SIMPLIFIED single-TCP aggregation figure for the README.
 
 Unlike plot_single_tcp.py (the full 6-variant report figure), this renders just

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Link smoke test: the statically built xquic + BoringSSL create and destroy a client engine.
 use core::ffi::{c_char, c_uchar, c_void};
 use core::ptr;

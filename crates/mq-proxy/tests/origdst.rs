@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.1: transparent capture target.
 //! `unsupported_family` is covered by mq-linux's `sockaddr_conversion_rejects_unix_family`;
 //! `short_buffer` has no equivalent (owned `SocketAddr`, no caller buffer).

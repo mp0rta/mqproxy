@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Spec §8.3: a full handshake and a stream echo with FIN both ways, entirely in memory;
 //! per-connection `MpReady` with two connections on one client transport, one of which then
 //! closes. There is no mp-ready subscriber table; `MpReady` carries the connection id.

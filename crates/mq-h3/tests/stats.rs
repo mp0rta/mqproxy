@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Request metrics: the `H3ReqStats` of `H3Closed` (adoption spec §4.6).
 
 mod common;

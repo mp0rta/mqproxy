@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `Driver`: the setup API around `LoopCore<MioIo, ..>` (spec §5.3 "Setup").
 
 use super::core::{LoopConfig, LoopCore};

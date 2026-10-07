@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `max_conns` on the shard pair (spec §8.1 "Shard pair", §4.7 `max_conns`):
 //! clients A, B and C are three connections of one `RawClient` (each sends the
 //! `AUTH_REQUEST`), counted by `Transport::conn_count`.

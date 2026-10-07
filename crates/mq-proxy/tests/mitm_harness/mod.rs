@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Harness for the MITM front tests (SP4 spec §7): `MH`, a
 //! `Shard<ScriptedTransport, MitmHost>` whose `TRANSPARENT` accepts carry an
 //! original destination, and `Browser`, a rustls client trusting `ca-p256`

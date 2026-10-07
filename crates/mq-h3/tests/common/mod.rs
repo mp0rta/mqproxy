@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `Rig`: an `H3Wire<ScriptedTransport>` joined to a real `h3wire::Connection` peer.
 #![allow(dead_code)]
 

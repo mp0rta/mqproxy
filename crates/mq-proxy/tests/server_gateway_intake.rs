@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §6.2, §6.3 (drain), §6.5: H3 intake on the composed server.
 
 mod server_harness;

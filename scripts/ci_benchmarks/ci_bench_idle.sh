@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # ci_bench_idle.sh — Idle CPU benchmark.
 #
 # Brings the two-path tunnel up (one short iperf3 transfer through SOCKS5 so

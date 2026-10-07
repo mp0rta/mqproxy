@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Harness for the origin bridge tests (spec §7): `Shard<ScriptedTransport,
 //! OriginHost>`, with dial results and socket bytes fed by hand as the driver
 //! would, and `TlsPeer`, a hand-driven rustls server playing the origin.

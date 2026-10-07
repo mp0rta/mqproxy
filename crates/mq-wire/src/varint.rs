@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 // spec §2.3
 pub const MAX: u64 = 0x3FFF_FFFF_FFFF_FFFF;
 

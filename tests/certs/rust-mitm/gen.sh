@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # Test-only CA fixtures for crates/mq-proxy/src/client/mitm/ca.rs (SP4 spec §7.1).
 # Run once (openssl 3); the outputs are committed. Every certificate lasts
 # 36500 days so tests on the real clock never age out, except ca-expiring.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Spec §8.3, §4.7: with `max_conns = 1` a second client is refused
 //! in `server_accept`; after the first connection is destroyed a third client connects;
 //! `conn_count()` follows.

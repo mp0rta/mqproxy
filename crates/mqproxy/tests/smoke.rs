@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.4 smoke: server + client binaries on loopback; an in-test SOCKS5
 //! client fetches 1 MiB from an in-test origin through the client; bytes equal;
 //! both processes exit 0 on SIGTERM.

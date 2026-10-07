@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 """Verify the actual tar/deb payloads cannot install builder-owned writable files."""
 import subprocess
 import sys

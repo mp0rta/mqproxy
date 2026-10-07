@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 #![no_main]
 //! spec §6.1: the HTTP CONNECT parser driven as the app would, whole and in data-sized chunks.
 use libfuzzer_sys::fuzz_target;

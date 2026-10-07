@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `OriginHost` (test-support): an `App` that owns an `Origin` and a recording
 //! `BridgeEvents` sink, so tests drive the bridge as the gateway would — every
 //! routed callback, `start` and `cancel` pump afterwards (spec §6.7).

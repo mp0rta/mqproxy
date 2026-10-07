@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.5 / §6.4: the origin's response head, normalised for the
 //! gateway — or the reason it cannot be relayed (502 `upstream-protocol`).
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §5.4: the fetch download's response head — collected from the H3
 //! header section under the shared limits (SP4 spec §5), rendered as the local
 //! HTTP/1.1 head (`adp_resp_head`).

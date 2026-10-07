@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Resolver queue accounting (spec §5.3): at most 64 resolutions run; further
 //! dials wait FIFO. A queued dial can be cancelled; a running resolution keeps
 //! its slot until its result returns, and that result is then dropped.

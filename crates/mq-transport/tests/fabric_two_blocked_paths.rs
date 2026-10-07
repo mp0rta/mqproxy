@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §4.4, §8.4 "Two paths blocked, one drains": `resume_pending` becomes true at once,
 //! without any timer.
 mod common;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §6.2: an H3 request's header section — captured header by
 //! header (`Capture::each`), then judged in the spec's order (`decide`,
 //! steps 2–8). Step 1 (the recv error) and step 9 (`origin.start`) are the

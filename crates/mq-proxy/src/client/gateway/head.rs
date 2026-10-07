@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §5.2: the fetch request head — the gateway reject sequence (steps
 //! 1–8) building the front-neutral `ReqHead` (SP4 spec §6.2); §5.6 the
 //! synthesised error reply.

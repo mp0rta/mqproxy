@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §2.3: 4-slot LRU datagram defragmenter.
 
 use mq_wire::udp_msg::UdpMsgHdr;

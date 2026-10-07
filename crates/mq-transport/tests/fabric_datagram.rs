@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP2 spec §3.1–§3.2: the datagram lane over real xquic — send, the receive ring,
 //! `DatagramReadable` coalescing, drop counting and the multipath-aware mss.
 //!

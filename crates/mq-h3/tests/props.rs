@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Property test (adoption spec §6.1, §5.4, §4.3): random peer, gateway and transport steps
 //! over a `Rig`, both roles.
 //!

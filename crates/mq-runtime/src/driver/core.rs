@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The loop core (spec §5.3 "Loop core and `Io`", §5.5 "One loop iteration"):
 //! the synchronous sequencing shared by the production driver and the fakes.
 //! It owns the per-socket latches, the driver deadlines, the resolver queue,

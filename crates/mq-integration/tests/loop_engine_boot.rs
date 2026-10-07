@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Engine boot on the loopback harness (spec §8.1 "Loopback"): both sides
 //! boot (real xquic engine, production driver, each on its own thread) on
 //! `127.0.0.1:0`, the client completes a handshake with the server, and each

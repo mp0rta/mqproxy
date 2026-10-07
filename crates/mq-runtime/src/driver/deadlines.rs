@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The driver's own deadline set (spec §5.3 "Driver deadlines"): dial
 //! deadlines, the listener retry after `EMFILE`, and the shutdown cap.
 

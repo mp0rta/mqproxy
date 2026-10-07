@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §4.2/§4.3: the H3 exchange core — open, the upload send rules,
 //! the upload EOF rule, reset, event routing, the pull reads, the `H3Closed`
 //! close handling, the end rule and failure settlement — on a

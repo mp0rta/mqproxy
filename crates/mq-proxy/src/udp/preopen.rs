@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §7.2: per-connection pre-OPEN datagram buffer.
 
 use super::{PREOPEN_BYTES, PREOPEN_DGRAMS, PREOPEN_TTL};

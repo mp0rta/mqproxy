@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Caller-supplied monotonic time (spec §4.1, §4.3).
 
 use std::ops::{Add, Sub};

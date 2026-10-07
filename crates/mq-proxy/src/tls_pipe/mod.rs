@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §2.1: the in-shard pipe and executor shared by the SP3 origin
 //! bridge and the MITM front — hyper, h2 and rustls are polled by hand with
 //! the `Dirty` waker; no tokio task or channel on the data path.

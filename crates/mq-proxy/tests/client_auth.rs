@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.2 Connecting → Authing → Serving: the control stream, the auth
 //! deadline, auth refusal, control-stream loss and handshake write retries.
 

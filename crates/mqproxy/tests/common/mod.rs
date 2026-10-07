@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Running-binary helpers: spawn `mqproxy`, watch stderr with a deadline, SIGTERM.
 #![allow(dead_code)] // each test binary uses a subset
 

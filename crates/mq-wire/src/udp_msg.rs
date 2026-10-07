@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 // spec §2.2
 //! The fixed 9-byte header that prefixes every UDP payload carried in a QUIC
 //! DATAGRAM frame (all big-endian) and the pure fragment split. Nothing here

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 #
 # e2e_udp.sh — Phase 3 Task 7.2: UDP relay end-to-end scenarios.
 #

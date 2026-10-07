@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `OriginLoop`: the origin bridge (`OriginHost`) on the production loop core
 //! over real sockets, on the **test thread** — a `DriverThread` can neither be
 //! commanded nor inspected, and `StartReq` holds `!Send` state (spec §10.3).

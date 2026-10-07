@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.5 metrics for the most recently accepted connection and §6.6 shutdown.
 
 mod server_harness;

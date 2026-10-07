@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Shard-pair reconnect tests (spec §8.4 "QUIC connection lost", "Accept
 //! during reconnect"; §6.2 Backoff and pending requests).
 #![forbid(unsafe_code)]

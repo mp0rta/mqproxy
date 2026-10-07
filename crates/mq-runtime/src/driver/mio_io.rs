@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `MioIo`: the production `Io` (spec §5.3) — an edge-triggered `mio::Poll`
 //! waited on through a `current_thread` tokio runtime, a `timerfd` for
 //! microsecond deadlines, the resolver on the runtime's blocking pool, and

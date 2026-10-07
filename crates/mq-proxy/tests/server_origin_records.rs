@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §7.7: request records, the settling point, the removal classes A, D,
 //! E and E′, `closing`, `by_h3` upkeep, the idle sweep and shutdown, driven
 //! through `OriginHost` with plain HTTP/1.1 bytes (B and C:

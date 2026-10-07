@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §7.7: an origin conn's record accounting and the pure decisions
 //! taken from it — the h2 pool-hit rule, `draining`, retirement and the idle
 //! sweep's verdict. No hyper here; the settling feeds the counters.

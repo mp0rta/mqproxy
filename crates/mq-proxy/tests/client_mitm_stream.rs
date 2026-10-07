@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §7.5–§7.8: `MStream` — one h2 stream ⇄ one H3 exchange. The
 //! upload and its backpressure, the download's §7.6 gates, the settlement
 //! table, admission, and open-stream liveness. The H3 side is scripted.

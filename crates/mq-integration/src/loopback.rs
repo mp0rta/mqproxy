@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The loopback harness (spec §8.1 "Loopback"): a server side and a client
 //! side, each a production `Driver` with a shard over the real transport,
 //! each on its own thread, talking over loopback UDP. The test thread plays

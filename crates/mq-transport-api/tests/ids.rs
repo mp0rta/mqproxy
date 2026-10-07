@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 use mq_transport_api::{ConnId, SlotId, StreamId, Time};
 use std::time::Duration;
 

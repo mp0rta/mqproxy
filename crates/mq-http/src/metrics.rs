@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `mq.req` log-line formatter (spec §2.4).
 //! Works on bytes: no `String`, truncation is bytewise.
 use std::io::Write;

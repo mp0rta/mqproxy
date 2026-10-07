@@ -16,6 +16,10 @@ jobs:
         with:
           submodules: recursive
       - run: python3 scripts/ci_benchmarks/test_gateway_summary.py
+      - name: SPDX license headers
+        run: |
+          missing="$(git ls-files '*.rs' '*.sh' '*.py' '*.c' '*.h' ':!third_party' ':!website' | xargs grep -L 'SPDX-License-Identifier: Apache-2.0' || true)"
+          [ -z "$missing" ] || { echo "missing SPDX header:"; echo "$missing"; exit 1; }
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 

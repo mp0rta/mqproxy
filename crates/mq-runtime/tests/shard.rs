@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §5.2 Shard, §5.4 app interface: the shard driven by a `ScriptedTransport`
 //! on the QUIC side and by hand (as the driver would) on the socket side.
 

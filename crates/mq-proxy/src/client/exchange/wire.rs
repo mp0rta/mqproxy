@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §4.4: the request head on the wire. `WireHead` exists only after
 //! the complete list (pseudo and control headers included) passed the shared
 //! limits; this is the single place where request sizes are checked.

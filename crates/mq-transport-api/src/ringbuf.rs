@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The relay's byte buffer (SP0/SP1 spec §5.6), also the transport's datagram receive ring
 //! (SP2 spec §3.2).
 //!

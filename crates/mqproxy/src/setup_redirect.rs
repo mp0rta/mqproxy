@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.4 `--setup-redirect`: the nft / ip-rule commands, table
 //! `mqproxy`. Every invocation goes through `run`: a direct exec with separate
 //! argv elements, no shell, and the child's `PATH` pinned to

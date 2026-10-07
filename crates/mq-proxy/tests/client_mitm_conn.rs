@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §7.3 / §7.4 / §7.8: the MITM conn — peek and routing, the TLS
 //! and h2 handshakes, idle, and the `Closing` drain. Streams are the Task
 //! 7.2 stub: every request is answered 502 `tunnel-unavailable`.

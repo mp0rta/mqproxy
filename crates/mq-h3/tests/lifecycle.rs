@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Request lifecycle: closure conditions, `h3_reset`, the connection-close fan-out with
 //! client-side retention, and stale ids after close (adoption spec §4.3, §5.1, §5.2).
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.4 "Config file": the typed values an INI file sets. `cli` layers the command line on top (defaults < file < CLI). Text
 //! values (`CC`, `Scheduler`, addresses, `[Ingress] Mode`, `Path`) are kept as
 //! text and validated by `cli` at startup, exactly like the flag values.

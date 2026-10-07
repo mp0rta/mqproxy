@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 # bench_single_tcp_aggregation.sh — single-TCP aggregation A/B/C bench.
 #
 # THIS FILE IS THE CONTRACT for the bench. The 2-netns direct topology

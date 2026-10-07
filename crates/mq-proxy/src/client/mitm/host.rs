@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! `MitmHost` (test-support): an `App` holding `Exchanges<Owner>` and a
 //! `Mitm`, routing its sockets' TCP events, its timers and the H3 events of
 //! its exchanges to the front, as `Client` does. Every `Handoff`

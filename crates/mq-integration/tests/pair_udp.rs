@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP2 spec §10.3: the UDP relay on the shard pair — the real `Client` and
 //! `Server` over the real xquic pair, with the SOCKS5 UDP app played on the
 //! client's `FakeIo` and the UDP target (an echo) on the server's. Then the

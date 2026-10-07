@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Generational slot tables (spec §4.8): ids handed across the FFI boundary are
 //! `(index, generation)`; a stale id never resolves to a reused slot.
 

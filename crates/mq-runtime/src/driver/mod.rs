@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The driver (spec §5.3): the loop core over an `Io` trait.
 
 mod core;

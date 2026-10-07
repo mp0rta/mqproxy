@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §4.2, §4.8: a released id is stale — every call on it fails with `Stale` or is a
 //! no-op, and it never resolves to the slot's next occupant.
 mod common;

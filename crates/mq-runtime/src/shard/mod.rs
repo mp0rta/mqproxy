@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! The shard (spec §5.2): a synchronous state machine that owns the transport,
 //! the `App`, the TCP socket table, relays, app timers and the UDP socket map.
 //! It performs no syscalls; a driver feeds it and carries out its requests.

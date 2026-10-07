@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.2, §6.3, §6.5: client and server settings; the CLI maps onto these (Task 9.1).
 
 use crate::client::mitm::MitmTuning;

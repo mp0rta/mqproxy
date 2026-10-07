@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §4.3, §8.4 "Timer hygiene": a deadline set during `connect` is visible at once; after
 //! `drive` on an idle connection `next_timeout()` is not in the past.
 mod common;

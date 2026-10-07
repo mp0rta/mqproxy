@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! Connections: connect, close, stats, paths, packet input, `drive` (spec §4.2–§4.4, §4.7).
 
 use crate::engine::conn_settings;

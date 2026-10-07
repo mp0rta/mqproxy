@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP3 spec §6: the server gateway — H3 requests authenticated per request
 //! and replayed to the origin through the bridge (§7), composed into
 //! `Server` (§6.7). `Gateway { origin, core }`: the bridge reports into

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! SP4 spec §7.5 / §7.6: `MStream` — one h2 stream ⇄ one H3 exchange. The
 //! settlement table is the only place a stream's state ends.
 

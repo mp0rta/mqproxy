@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqproxy contributors
 #
 # bench_ab_lanes.sh — block (TCP->STREAM) vs relay (inner H3 -> DATAGRAM) A/B.
 # Spec: docs/superpowers/specs/2026-06-13-ab-lanes-bench-design.md

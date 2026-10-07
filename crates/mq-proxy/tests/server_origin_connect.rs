@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §7.2/§7.3/§7.6/§7.7: the origin bridge's dial, TLS handshake and
 //! connect deadline, driven through `OriginHost` on a scripted shard.
 

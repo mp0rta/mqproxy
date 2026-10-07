@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §5.7 the gateway's H3 tunnel (eager connect, establish, loss, backoff,
 //! `--no-reconnect`), §5.8 routing inside `Client`, §5.9 the joint shutdown exit.
 

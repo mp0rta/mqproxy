@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 //! spec §6.1 UDP ASSOCIATE, §6.2 availability, §6.3 source learning.
 
 mod common;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqproxy contributors
 // spec §4.3 and §4.8
 use crate::{Error, Inner};
 use core::{cell::Cell, ptr};
