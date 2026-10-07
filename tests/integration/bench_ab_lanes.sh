@@ -157,11 +157,10 @@ start_origin() {
 # steps) for evidence that the extra MPQUIC path has been established before
 # returning.  The marker is:
 #
-#   "mq_client: extra path up: bind <ip> -> path_id <n>"
+#   "mq_client: path up: bind <PATH_B_IP> -> path_id <n>"
 #
 # The bench passes --path PATH_A (primary bind, no log) and --path PATH_B
-# (one extra path, logged once when mp-ready fires).  We therefore poll for 1
-# occurrence of "extra path up" in the client log.  On timeout we continue but
+# (one extra path, logged once when mp-ready fires).  On timeout we continue but
 # emit a loud stderr warning so the CSV row is flagged by the consumer.
 start_pair() {
     local tag="$1"; shift
@@ -182,12 +181,12 @@ start_pair() {
     local waited=0 found=0 clog="${WORK}/client_${tag}.log"
     while [ "${waited}" -lt 40 ]; do
         sleep 0.2; waited=$((waited + 1))
-        if grep -q 'extra path up:' "${clog}" 2>/dev/null; then
+        if grep -qF "mq_client: path up: bind ${PATH_B_IP} " "${clog}" 2>/dev/null; then
             found=1; break
         fi
     done
     if [ "${found}" -eq 0 ]; then
-        note "bench_ab_lanes: WARNING: ${tag}: second path not confirmed at start (extra path up not seen after 8 s) — continuing, CSV row may be 1-path only"
+        note "bench_ab_lanes: WARNING: ${tag}: second path not confirmed at start (path up for ${PATH_B_IP} not seen after 8 s) — continuing, CSV row may be 1-path only"
     fi
     kill -0 "${SERVER_PID}" 2>/dev/null && kill -0 "${CLIENT_PID}" 2>/dev/null
 }
